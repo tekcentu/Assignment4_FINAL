@@ -1,0 +1,242 @@
+"""
+Main orchestrator: runs the full analysis pipeline (Steps A–G).
+"""
+
+from __future__ import annotations
+
+import sys
+import numpy as np
+
+from .model import StructuralModel, AnalysisResult
+from .element import FrameElement2D, TrussElement2D
+from .file_io import read_input_file
+from .assembler import assemble_global_system, DofManager
+from .solver import solve_system
+from .postprocessor import compute_member_forces, compute_reactions, equilibrium_check
+
+
+def run_analysis(model: StructuralModel, verbose: bool = True) -> AnalysisResult:
+    """Run the complete structural analysis (Steps A–G).
+
+    Args:
+        model: The structural model to analyse.
+        verbose: If True, print formatted output to stdout.
+
+    Returns:
+        AnalysisResult containing all outputs (displacements, forces,
+        reactions) or partial results with error messages if analysis fails.
+    """
+    lines: list[str] = []
+
+    def log(msg: str = ""):
+        lines.append(msg)
+        if verbose:
+            print(msg)
+
+    log("=" * 70)
+    log(f"  2D Structural Analysis — {model.title}")
+    log("=" * 70)
+
+    # ── Step A: Input ──
+    log("\n── Step A: Input ──")
+    n_frame = sum(1 for e in model.elements if isinstance(e, FrameElement2D))
+    n_truss = sum(1 for e in model.elements if isinstance(e, TrussElement2D))
+    n_released = sum(1 for e in model.elements
+                     if isinstance(e, FrameElement2D) and (e.release_i or e.release_j))
+    n_member_loaded = sum(1 for e in model.elements if e.member_loads)
+
+    log(f"  Nodes: {len(model.nodes)}, Elements: {len(model.elements)} "
+        f"(frame: {n_frame}, truss: {n_truss})")
+    log(f"  Materials: {len(model.materials)}, Supports: {len(model.supports)}, "
+        f"Nodal loads: {len(model.nodal_loads)}")
+    if n_released:
+        log(f"  Moment releases: {n_released}")
+    if n_member_loaded:
+        log(f"  Elements with member loads: {n_member_loaded}")
+
+    # ── Step B + C: Assembly ──
+    log("\n── Step B: Equation Numbering ──")
+    try:
+        K, F, dofs, warnings, elem_data = assemble_global_system(model)
+    except ValueError as e:
+        log(f"  ERROR: {e}")
+        return AnalysisResult(status="error", title=model.title,
+                              warnings=[str(e)])
+
+    for w in warnings:
+        log(f"  {w}")
+
+    NumEq = len(dofs.free_indices)
+    log(f"  Active DOFs: {dofs.n_total}, Free DOFs (NumEq): {NumEq}")
+
+    # E matrix
+    E_display = dofs.e_matrix_for_display(model)
+    log(f"\n  E matrix (equation numbers):")
+    log(f"  {'Node':>6}  {'Tx':>6}  {'Ty':>6}  {'Rz':>6}")
+    for nid in model.node_ids:
+        eq = E_display[nid]
+        log(f"  {nid:>6}  {eq[0]:>6}  {eq[1]:>6}  {eq[2]:>6}")
+
+    # G vectors
+    log(f"\n  G vectors:")
+    for elem in model.elements:
+        G = dofs.g_vector_for_display(elem)
+        rel = ""
+        if isinstance(elem, FrameElement2D):
+            if elem.release_i and elem.release_j:
+                rel = " [both released]"
+            elif elem.release_i:
+                rel = " [start released]"
+            elif elem.release_j:
+                rel = " [end released]"
+        log(f"  Elem {elem.id} ({elem.node_i}→{elem.node_j}, {elem.kind}{rel}): G = {G}")
+
+    # ── Step C: K and F ──
+    log(f"\n── Step C: Assembled Global K ({dofs.n_total}×{dofs.n_total}) ──")
+    if dofs.n_total <= 15:
+        log("  K =")
+        for i in range(dofs.n_total):
+            row = "  " + " ".join(f"{K[i,j]:12.2f}" for j in range(dofs.n_total))
+            log(row)
+    else:
+        log(f"  (K is {dofs.n_total}×{dofs.n_total} — too large to display)")
+
+    # K symmetry check
+    asym = np.max(np.abs(K - K.T))
+    log(f"\n  K symmetry check: max|K − Kᵀ| = {asym:.2e}")
+
+    log(f"\n  Load vector F:")
+    for i in range(dofs.n_total):
+        log(f"    F[{i}] ({dofs.labels[i]}) = {F[i]:12.4f}")
+
+    # ── Step D: Solve (with optional support settlements) ──
+    log("\n── Step D: Solve K·D = F ──")
+
+    # Build prescribed-displacement vector from support settlements
+    D_prescribed = np.zeros(dofs.n_total)
+    has_settlement = False
+    for nid in model.node_ids:
+        sup = model.support_for(nid)
+        for dof in ("ux", "uy", "rz"):
+            idx = dofs.index(nid, dof)
+            if idx is None:
+                continue
+            val = sup.prescribed(dof)
+            if val != 0.0 and getattr(sup, dof):
+                D_prescribed[idx] = val
+                has_settlement = True
+    if has_settlement:
+        log("  Support settlements applied:")
+        for nid in model.node_ids:
+            sup = model.support_for(nid)
+            for dof in ("ux", "uy", "rz"):
+                v = sup.prescribed(dof)
+                if v != 0.0 and getattr(sup, dof):
+                    log(f"    Node {nid} {dof}: {v:+.6e}")
+
+    D, residual, solve_warnings = solve_system(K, F, dofs, D_prescribed)
+
+    for w in solve_warnings:
+        log(f"  {w}")
+
+    if np.any(np.isnan(D)):
+        log("\n*** ANALYSIS FAILED: Singular stiffness matrix. ***")
+        return AnalysisResult(
+            status="error", title=model.title,
+            warnings=warnings + solve_warnings,
+            K=K, F=F, E_map=dofs.active_map, num_eq=NumEq,
+        )
+
+    log(f"  Residual ||K_ff·D_f − F_f|| = {residual:.4e}")
+
+    # Displacement table
+    log(f"\n  Nodal displacements:")
+    log(f"  {'Node':>6}  {'ux (m)':>14}  {'uy (m)':>14}  {'rz (rad)':>14}")
+    for nid in model.node_ids:
+        nm = dofs.active_map[nid]
+        ux = D[nm["ux"]] if nm["ux"] is not None else 0.0
+        uy = D[nm["uy"]] if nm["uy"] is not None else 0.0
+        rz = D[nm["rz"]] if nm["rz"] is not None else 0.0
+        log(f"  {nid:>6}  {ux:>14.6e}  {uy:>14.6e}  {rz:>14.6e}")
+
+    # ── Step E: Member End Forces ──
+    log("\n── Step E: Member End Forces ──")
+    member_results = compute_member_forces(model, D, dofs, elem_data)
+
+    log(f"  {'Elem':>6} {'Type':>6}  {'N_i':>10}  {'V_i':>10}  {'M_i':>10}"
+        f"  {'N_j':>10}  {'V_j':>10}  {'M_j':>10}")
+    for elem in model.elements:
+        f = member_results[elem.id]["f_local"]
+        log(f"  {elem.id:>6} {elem.kind:>6}  " +
+            "  ".join(f"{f[j]:>10.4f}" for j in range(6)))
+
+    # ── Step F: Reactions & Equilibrium ──
+    log("\n── Step F: Support Reactions ──")
+    reactions = compute_reactions(model, K, D, F, dofs)
+
+    log(f"  {'Node':>6}  {'Rx (kN)':>12}  {'Ry (kN)':>12}  {'Mz (kN·m)':>12}")
+    for nid in sorted(reactions.keys()):
+        r = reactions[nid]
+        log(f"  {nid:>6}  {r.get('ux', 0):>12.4f}  {r.get('uy', 0):>12.4f}  {r.get('rz', 0):>12.4f}")
+
+    eq_res, eq_msgs = equilibrium_check(model, member_results, dofs)
+    for m in eq_msgs:
+        log(f"  {m}")
+    log(f"  Max equilibrium residual at free nodes: {eq_res:.4e}")
+
+    # Global equilibrium
+    total_rx = sum(r.get("ux", 0) for r in reactions.values()) + sum(l.fx for l in model.nodal_loads)
+    total_ry = sum(r.get("uy", 0) for r in reactions.values()) + sum(l.fy for l in model.nodal_loads)
+    log(f"  Global: ΣFx = {total_rx:.4f}, ΣFy = {total_ry:.4f}")
+
+    # ── Step G: Storage Report ──
+    log("\n── Step G: Storage Report ──")
+    n_full = dofs.n_total
+    dense_count = n_full * n_full
+    # Compute half-bandwidth from element DOF maps
+    hbw = 0
+    for eid, ed in elem_data.items():
+        active = [g for g in ed["mapping"] if g is not None]
+        if active:
+            hbw = max(hbw, max(active) - min(active))
+    banded_count = n_full * (hbw + 1)
+    log(f"  Dense:  {dense_count} elements ({n_full}×{n_full})")
+    log(f"  Banded: {banded_count} elements (hbw = {hbw}), "
+        f"savings = {100*(1 - banded_count/max(dense_count,1)):.0f}%")
+    log(f"  Note: bandwidth depends on node numbering order.")
+
+    log("\n" + "=" * 70)
+    log("  Analysis complete.")
+    log("=" * 70)
+
+    return AnalysisResult(
+        status="ok", title=model.title,
+        warnings=warnings + solve_warnings,
+        E_map=dofs.active_map, num_eq=NumEq,
+        G_vectors={e.id: dofs.g_vector_for_display(e) for e in model.elements},
+        K=K, F=F, D=D, residual=residual,
+        member_results=member_results,
+        reactions=reactions, eq_residual=eq_res,
+        elem_data=elem_data,
+    )
+
+
+def run_from_file(filepath: str, verbose: bool = True) -> AnalysisResult:
+    """Read an input file and run the full analysis.
+
+    Args:
+        filepath: Path to the text input file.
+        verbose: If True, print formatted output to stdout.
+
+    Returns:
+        AnalysisResult with all outputs.
+    """
+    model = read_input_file(filepath)
+    return run_analysis(model, verbose=verbose)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python -m structural_analysis.main <input_file>")
+        sys.exit(1)
+    run_from_file(sys.argv[1])

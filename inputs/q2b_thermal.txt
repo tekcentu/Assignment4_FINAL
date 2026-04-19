@@ -1,0 +1,73 @@
+# ═══════════════════════════════════════════════════════════════════
+#  Assignment 4 — Q2(b)  [REFACTORED]
+#  Concrete beam ABC + steel truss members BD and BE
+#  Thermal: ABC has bottom +50°C (t_top=0, t_bottom=50)
+#           BD, BE trusses have uniform +50°C
+# ═══════════════════════════════════════════════════════════════════
+#
+# Geometry (0 + 3 + 4 + 6 + 3 = 16 m along x):
+#                 3m    4m         6m         3m
+#   A(0,8) ───────── B(7,8) ──────────────── C(16,8)
+#                   ╱ ╲
+#                  ╱   ╲
+#                 ╱     ╲
+#              D(3,0)  E(13,0)
+#
+# Supports:
+#   A: FIXED (ux, uy, rz restrained)
+#   C: PIN (ux, uy restrained)
+#   D: PIN (ground, truss base)
+#   E: PIN (ground, truss base)
+#
+# Section properties:
+#   Concrete 40×80:  E = 3.0e7,  A = 0.32,  I = 0.01707,  α = 8e-6,  depth = 0.80
+#   Steel pipe OD 30, t 1 mm:  E = 2.0e8,  A = 9.111e-5,  α = 1.2e-5
+#
+# Thermal inputs:
+#   Beam ABC:  FrameTemperatureLoad(t_top=0, t_bottom=50) on elements 1 and 2
+#   Truss BD, BE:  TrussTemperatureLoad(delta_T=50) on elements 3 and 4
+# ═══════════════════════════════════════════════════════════════════
+
+TITLE
+Q2(b) Concrete Beam with Steel Truss Members and Thermal Load
+
+NODES 5
+1   0.0   8.0    # A
+2   7.0   8.0    # B
+3  16.0   8.0    # C
+4   3.0   0.0    # D (truss base)
+5  13.0   0.0    # E (truss base)
+
+# MATERIALS: id  A  I  E  [alpha]  [depth]
+MATERIALS 2
+1  0.32       0.017067     3.0e7   8.0e-6   0.80   # Concrete 40x80, α, depth
+2  9.1106e-5  1.0e-12      2.0e8   1.2e-5   0.0    # Steel pipe, α, depth=0
+
+ELEMENTS 4
+1  1  2  1  FRAME     # A–B beam
+2  2  3  1  FRAME     # B–C beam
+3  2  4  2  TRUSS     # B–D diagonal truss
+4  2  5  2  TRUSS     # B–E diagonal truss
+
+SUPPORTS 4
+1  1  1  1     # A: FIXED (clamped wall)
+3  1  1  0     # C: PIN
+4  1  1  0     # D: PIN (truss base)
+5  1  1  0     # E: PIN (truss base)
+
+LOADS 0
+
+# Frame thermal: element_id  t_top  t_bottom
+# Literal interpretation of the assignment statement:
+# "The bottom of the ABC ... is equal to +50°C" — bottom fiber heated by
+# +50°C relative to reference, top fiber unchanged. This gives both a
+# mean-temperature axial effect (ΔT_mean = 25°C) AND a gradient bending
+# effect (ΔT_diff = 50°C), which is the physically richer interpretation.
+FRAME_TEMPERATURE 2
+1  0.0  50.0       # A-B beam: t_top=0, t_bottom=+50°C
+2  0.0  50.0       # B-C beam: t_top=0, t_bottom=+50°C
+
+# Truss thermal: element_id  delta_T
+TRUSS_TEMPERATURE 2
+3  50.0            # B-D truss uniform +50°C
+4  50.0            # B-E truss uniform +50°C

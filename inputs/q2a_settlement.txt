@@ -1,0 +1,55 @@
+# ═══════════════════════════════════════════════════════════════════
+#  Assignment 4 — Q2(a)  [REFACTORED]
+#  Concrete frame ABCD + BE column + steel truss FC (DIAGONAL)
+#  Support settlement Δ = −2 mm (vertical) at node E
+# ═══════════════════════════════════════════════════════════════════
+#
+# Geometry (faithful to assignment figure: 4 + 5 + 3 + 3 = 15 m):
+#   A(0,4) ─── B(4,4) ──────────── C(12,4) ──── D(15,4)
+#                │                   ╲
+#                │ FRAME              ╲  TRUSS
+#                │ (concrete)          ╲ (diagonal, steel pipe)
+#                │                      ╲
+#                E(4,0)        F(9,0) ──╱──
+#
+# Truss FC: F(9, 0) → C(12, 4), length = √(3² + 4²) = 5 m
+#
+# Supports:
+#   A: pin (ux, uy restrained)
+#   E: pin + settlement uy = −0.002 m
+#   F: PIN (ux, uy restrained) — ground-fixed truss base
+#
+# Section properties (kN, m):
+#   Concrete 50×50:  E = 3.0e7,  A = 0.25,    I = 5.208e-3
+#   Steel pipe OD 30 mm, t 1 mm:  E = 2.0e8,  A = 9.111e-5
+# ═══════════════════════════════════════════════════════════════════
+
+TITLE
+Q2(a) Concrete Frame with Steel Truss (Diagonal) and Support Settlement
+
+NODES 6
+1   0.0   4.0    # A
+2   4.0   4.0    # B
+3  12.0   4.0    # C  (moved to x=12 for diagonal truss FC)
+4  15.0   4.0    # D  (overhang tip at x=15)
+5   4.0   0.0    # E
+6   9.0   0.0    # F
+
+# MATERIALS: id  A  I  E  [alpha]  [depth]
+MATERIALS 2
+1  0.25       5.208333e-3  3.0e7    # Concrete 50x50
+2  9.1106e-5  1.0e-12      2.0e8    # Steel pipe (I ≈ 0 for truss)
+
+ELEMENTS 5
+1  1  2  1  FRAME     # A–B
+2  2  3  1  FRAME     # B–C (8 m span)
+3  3  4  1  FRAME     # C–D (overhang, 3 m)
+4  2  5  1  FRAME     # B–E column
+5  6  3  2  TRUSS     # F–C diagonal truss (5 m)
+
+SUPPORTS 3
+1  1  1  0                        # A: pin
+5  1  1  0   0.0  -0.002  0.0     # E: pin + uy settlement = -2 mm
+6  1  1  0                        # F: pin (ground, no settlement)
+
+LOADS 0

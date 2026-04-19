@@ -1,0 +1,89 @@
+======================================================================
+  2D Structural Analysis — Q2(a) Concrete Frame with Steel Truss (Diagonal) and Support Settlement
+======================================================================
+
+── Step A: Input ──
+  Nodes: 6, Elements: 5 (frame: 4, truss: 1)
+  Materials: 2, Supports: 3, Nodal loads: 0
+
+── Step B: Equation Numbering ──
+  Active DOFs: 17, Free DOFs (NumEq): 11
+
+  E matrix (equation numbers):
+    Node      Tx      Ty      Rz
+       1       0       0       1
+       2       2       3       4
+       3       5       6       7
+       4       8       9      10
+       5       0       0      11
+       6       0       0       0
+
+  G vectors:
+  Elem 1 (1→2, frame): G = [0, 0, 1, 2, 3, 4]
+  Elem 2 (2→3, frame): G = [2, 3, 4, 5, 6, 7]
+  Elem 3 (3→4, frame): G = [5, 6, 7, 8, 9, 10]
+  Elem 4 (2→5, frame): G = [2, 3, 4, 0, 0, 11]
+  Elem 5 (6→3, truss): G = [0, 0, 0, 5, 6, 0]
+
+── Step C: Assembled Global K (17×17) ──
+  (K is 17×17 — too large to display)
+
+  K symmetry check: max|K − Kᵀ| = 0.00e+00
+
+  Load vector F:
+    F[0] (Node 1 UX) =       0.0000
+    F[1] (Node 1 UY) =       0.0000
+    F[2] (Node 1 RZ) =       0.0000
+    F[3] (Node 2 UX) =       0.0000
+    F[4] (Node 2 UY) =       0.0000
+    F[5] (Node 2 RZ) =       0.0000
+    F[6] (Node 3 UX) =       0.0000
+    F[7] (Node 3 UY) =       0.0000
+    F[8] (Node 3 RZ) =       0.0000
+    F[9] (Node 4 UX) =       0.0000
+    F[10] (Node 4 UY) =       0.0000
+    F[11] (Node 4 RZ) =       0.0000
+    F[12] (Node 5 UX) =       0.0000
+    F[13] (Node 5 UY) =       0.0000
+    F[14] (Node 5 RZ) =       0.0000
+    F[15] (Node 6 UX) =       0.0000
+    F[16] (Node 6 UY) =       0.0000
+
+── Step D: Solve K·D = F ──
+  Support settlements applied:
+    Node 5 uy: -2.000000e-03
+  Residual ||K_ff·D_f − F_f|| = 4.5484e-13
+
+  Nodal displacements:
+    Node          ux (m)          uy (m)        rz (rad)
+       1    0.000000e+00    0.000000e+00   -6.607477e-04
+       2    3.590705e-06   -1.993743e-03   -1.738114e-04
+       3    5.368562e-06   -9.568662e-04    2.813200e-04
+       4    5.368562e-06   -1.129062e-04    2.813200e-04
+       5    0.000000e+00   -2.000000e-03    8.555919e-05
+       6    0.000000e+00    0.000000e+00    0.000000e+00
+
+── Step E: Member End Forces ──
+    Elem   Type         N_i         V_i         M_i         N_j         V_j         M_j
+       1  frame     -6.7326      9.5105      0.0000      6.7326     -9.5105     38.0419
+       2  frame     -1.6667     -2.2223    -17.7786      1.6667      2.2223     -0.0000
+       3  frame      0.0000     -0.0000      0.0000      0.0000      0.0000      0.0000
+       4  frame    -11.7328     -5.0658    -20.2633     11.7328      5.0658      0.0000
+       5  truss      2.7779      0.0000      0.0000     -2.7779      0.0000      0.0000
+
+── Step F: Support Reactions ──
+    Node       Rx (kN)       Ry (kN)     Mz (kN·m)
+       1       -6.7326        9.5105        0.0000
+       5        5.0658      -11.7328        0.0000
+       6        1.6667        2.2223        0.0000
+  Max equilibrium residual at free nodes: 4.5121e-13
+  Global: ΣFx = 0.0000, ΣFy = -0.0000
+
+── Step G: Storage Report ──
+  Dense:  289 elements (17×17)
+  Banded: 204 elements (hbw = 11), savings = 29%
+  Note: bandwidth depends on node numbering order.
+
+======================================================================
+  Analysis complete.
+======================================================================
