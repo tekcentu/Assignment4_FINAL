@@ -333,7 +333,10 @@ class MemberLoadDialog(_ModalDialog):
     def __init__(self, parent, *, model: StructuralModel, elem_id: int):
         self._model = model
         self._elem_id = elem_id
-        self._elem = next(e for e in model.elements if e.id == elem_id)
+        elem = next((e for e in model.elements if e.id == elem_id), None)
+        if elem is None:
+            raise ValueError(f"Element {elem_id} does not exist.")
+        self._elem = elem
         super().__init__(parent, f"Member load on element {elem_id}")
 
     def _build_body(self, master: ttk.Frame) -> None:
@@ -473,11 +476,10 @@ class MaterialListDialog(_ModalDialog):
         d = MaterialDialog(self, existing=None, default_id=next_id)
         self.wait_window(d)
         if d.result is not None:
-            try:
-                self._on_add_or_update(d.result)
-            except ValueError as e:
-                messagebox.showerror("Invalid input", str(e), parent=self)
-                return
+            # ``_on_add_or_update`` is wired to MainApplication.execute(), which
+            # already routes ValueError to a messagebox — don't duplicate the
+            # catch here, just refresh the list view.
+            self._on_add_or_update(d.result)
             self._refresh()
 
     def _edit(self) -> None:
@@ -487,22 +489,15 @@ class MaterialListDialog(_ModalDialog):
         d = MaterialDialog(self, existing=self._model.materials[mid], default_id=mid)
         self.wait_window(d)
         if d.result is not None:
-            try:
-                self._on_add_or_update(d.result)
-            except ValueError as e:
-                messagebox.showerror("Invalid input", str(e), parent=self)
-                return
+            self._on_add_or_update(d.result)
             self._refresh()
 
     def _delete(self) -> None:
         mid = self._selected_id()
         if mid is None:
             return
-        try:
-            self._on_delete(mid)
-        except ValueError as e:
-            messagebox.showerror("Cannot delete", str(e), parent=self)
-            return
+        # Errors are reported by MainApplication.execute() via its own dialog.
+        self._on_delete(mid)
         self._refresh()
 
     def _accept(self) -> None:

@@ -52,7 +52,14 @@ def write_input_file(model: StructuralModel, path: str) -> None:
     elem_to_mat: dict[int, int] = _element_material_lookup(model)
     for elem in model.elements:
         kind = "TRUSS" if isinstance(elem, TrussElement2D) else "FRAME"
-        mat_id = elem_to_mat.get(elem.id, _first_or_zero(mat_ids))
+        if elem.id not in elem_to_mat:
+            raise ValueError(
+                f"Element {elem.id} has E={elem.E}, A={elem.A}"
+                + (f", I={elem.I}" if isinstance(elem, FrameElement2D) else "")
+                + " which does not match any material in the model — "
+                "cannot serialise."
+            )
+        mat_id = elem_to_mat[elem.id]
         line = f"{elem.id}  {elem.node_i}  {elem.node_j}  {mat_id}  {kind}"
         if isinstance(elem, FrameElement2D):
             if elem.release_i and elem.release_j:
@@ -125,18 +132,19 @@ def _element_material_lookup(model: StructuralModel) -> dict[int, int]:
     """Recover (elem_id → material_id) by matching E/A/I against the material table.
 
     The element classes only store E, A, (I), alpha, depth — not the material id.
-    For round-tripping we match those numbers back to the material list.
+    For round-tripping we match those numbers back to the material list. Matching
+    is done in sorted id order so the pick is deterministic when multiple
+    materials happen to share the same numeric properties.
     """
     lookup: dict[int, int] = {}
+    sorted_mids = sorted(model.materials)
     for elem in model.elements:
-        for mid, m in model.materials.items():
-            if m.E == elem.E and m.A == elem.A:
-                if isinstance(elem, FrameElement2D) and m.I != elem.I:
-                    continue
-                lookup[elem.id] = mid
-                break
+        for mid in sorted_mids:
+            m = model.materials[mid]
+            if m.E != elem.E or m.A != elem.A:
+                continue
+            if isinstance(elem, FrameElement2D) and m.I != elem.I:
+                continue
+            lookup[elem.id] = mid
+            break
     return lookup
-
-
-def _first_or_zero(ids: list[int]) -> int:
-    return ids[0] if ids else 0

@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import (
     FigureCanvasTkAgg, NavigationToolbar2Tk,
 )
+from matplotlib.ticker import MultipleLocator
 
 from ..element import FrameElement2D, TrussElement2D
 from ..model import (
@@ -203,6 +204,9 @@ class ModelCanvas:
     # ── drawing ──
 
     def _draw_grid(self) -> None:
+        # Tie the visible grid to the snap spacing so the user sees what they snap to.
+        self.ax.xaxis.set_major_locator(MultipleLocator(self.grid_spacing))
+        self.ax.yaxis.set_major_locator(MultipleLocator(self.grid_spacing))
         self.ax.grid(True, which="major", linestyle=":", linewidth=0.5,
                      color="#cccccc")
 

@@ -101,6 +101,11 @@ class DeleteNodeCmd(Command):
     def do(self, model: StructuralModel) -> None:
         if self.node_id not in model.nodes:
             raise ValueError(f"Node {self.node_id} does not exist.")
+        # Reset saved state so redo (after a prior undo) doesn't accumulate.
+        self._saved_node = None
+        self._saved_support = None
+        self._saved_loads = []
+        self._saved_elements = []
         self._saved_node = model.nodes.pop(self.node_id)
         self._saved_support = model.supports.pop(self.node_id, None)
         self._saved_loads = [ld for ld in model.nodal_loads if ld.node_id == self.node_id]

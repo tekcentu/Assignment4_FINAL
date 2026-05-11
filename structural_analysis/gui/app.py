@@ -15,10 +15,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-from ..element import FrameElement2D, TrussElement2D
 from ..file_io import read_input_file
 from ..main import run_analysis
-from ..model import AnalysisResult, StructuralModel, Support
+from ..model import AnalysisResult, StructuralModel
 from .canvas import HitResult, ModelCanvas
 from .commands import (
     AddElementCmd,
@@ -347,7 +346,11 @@ class MainApplication(tk.Tk):
         self.execute(SetNodalLoadCmd(node_id=node_id, fx=fx, fy=fy, mz=mz))
 
     def _add_member_load(self, elem_id: int) -> None:
-        d = MemberLoadDialog(self, model=self._model, elem_id=elem_id)
+        try:
+            d = MemberLoadDialog(self, model=self._model, elem_id=elem_id)
+        except ValueError as e:
+            messagebox.showerror("Cannot edit element", str(e), parent=self)
+            return
         self.wait_window(d)
         if d.result is None:
             return
@@ -400,6 +403,11 @@ class MainApplication(tk.Tk):
         if hit.element_id is not None:
             parts.append(f"elem {hit.element_id}")
         self._coord_var.set("  |  ".join(parts))
+        # Forward to the active tool so it can implement hover/highlight.
+        try:
+            self._active_tool.on_motion(hit)
+        except Exception:
+            pass  # tooltips must never raise
 
     # ── overlay toggles ───────────────────────────────────────────
 

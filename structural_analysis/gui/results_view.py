@@ -31,15 +31,24 @@ def format_result(model: StructuralModel, result: AnalysisResult) -> str:
                  f"Nodal loads: {len(model.nodal_loads)}")
 
     # Step B
-    lines.append("\n── Step B: Equation Numbering ──")
+    # Note: values printed are 0-based global DOF indices from the active_map.
+    # A value of None means the DOF is either restrained at a support ("fix")
+    # or inactive (e.g. the rotational DOF of a node connected only to
+    # truss elements — labelled "—").
+    lines.append("\n── Step B: Global DOF Indices ──")
     lines.append(f"  Active DOFs: {sum(1 for em in result.E_map.values() for v in em.values() if v is not None)}, "
                  f"Free DOFs (NumEq): {result.num_eq}")
-    lines.append(f"  {'Node':>6}  {'Tx':>6}  {'Ty':>6}  {'Rz':>6}")
+    lines.append(f"  {'Node':>6}  {'Tx':>6}  {'Ty':>6}  {'Rz':>6}"
+                 f"   (index = global DOF #; fix = restrained; — = inactive)")
     for nid in sorted(result.E_map):
         em = result.E_map[nid]
-        def f(v):
-            return "fix" if v is None else str(v)
-        lines.append(f"  {nid:>6}  {f(em['ux']):>6}  {f(em['uy']):>6}  {f(em['rz']):>6}")
+        sup = model.support_for(nid)
+        def f(v, dof):
+            if v is not None:
+                return str(v)
+            return "fix" if getattr(sup, dof) else "—"
+        lines.append(f"  {nid:>6}  {f(em['ux'],'ux'):>6}  "
+                     f"{f(em['uy'],'uy'):>6}  {f(em['rz'],'rz'):>6}")
 
     # Step D
     lines.append("\n── Step D: Solve K·D = F ──")
