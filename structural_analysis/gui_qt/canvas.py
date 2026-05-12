@@ -30,6 +30,8 @@ from ..model import (
     TrussTemperatureLoad,
     UniformDistributedLoad,
 )
+from .grid import GridSystem
+from .snap import SnapCandidate, SnapEngine
 
 
 @dataclass
@@ -39,6 +41,8 @@ class HitResult:
     y: float
     node_id: Optional[int] = None
     element_id: Optional[int] = None
+    snap_kind: str = ""    # e.g. "node", "grid", "midpoint", "endpoint", "project"
+    snap_label: str = ""   # human-readable target description
 
 
 class ModelCanvas(QWidget):
@@ -48,11 +52,14 @@ class ModelCanvas(QWidget):
     ELEM_PICK_RADIUS_PX = 8
 
     def __init__(self, parent: QWidget | None,
-                 model_provider: Callable[[], StructuralModel]) -> None:
+                 model_provider: Callable[[], StructuralModel],
+                 grid_provider: Callable[[], GridSystem] | None = None) -> None:
         super().__init__(parent)
         self._model = model_provider
+        self._grid_provider = grid_provider or (lambda: GridSystem())
         self.grid_spacing: float = 0.5
         self.snap_enabled: bool = True
+        self.snap_engine = SnapEngine(tolerance_px=10.0)
 
         self.show_deformed: bool = True
         self.show_reactions: bool = True
@@ -61,6 +68,7 @@ class ModelCanvas(QWidget):
         self.deformed_scale: float = 1.0
         self.diagram_scale: float = 1.0
         self._result = None
+        self._snap_marker = None  # current SnapCandidate
 
         self.on_click: Callable[[HitResult, str], None] | None = None
         self.on_motion: Callable[[HitResult], None] | None = None
@@ -103,6 +111,7 @@ class ModelCanvas(QWidget):
     def redraw(self) -> None:
         self.ax.clear()
         self.ax.set_aspect("equal", adjustable="datalim")
+        self._set_axes_limits()  # set extents up-front so grid labels know y1/x1
         self._draw_grid()
         self._draw_model()
         if self._result is not None and self._result.status == "ok":
@@ -112,7 +121,7 @@ class ModelCanvas(QWidget):
                 self._draw_reactions()
             if self.show_diagrams:
                 self._draw_diagrams()
-        self._set_axes_limits()
+        self._draw_snap_marker()
         self._mpl_canvas.draw_idle()
 
     # ── event forwarding ──
@@ -148,9 +157,8 @@ class ModelCanvas(QWidget):
         return round(x / s) * s, round(y / s) * s
 
     def _hit_test(self, event) -> HitResult:
-        sx, sy = self._snap(event.xdata, event.ydata)
-        hit = HitResult(x=sx, y=sy)
         model = self._model()
+        grid = self._grid_provider()
 
         bbox = self.ax.bbox
         x0, x1 = self.ax.get_xlim()
@@ -158,20 +166,30 @@ class ModelCanvas(QWidget):
         px_per_dx = bbox.width / max(x1 - x0, 1e-9)
         px_per_dy = bbox.height / max(y1 - y0, 1e-9)
 
-        best_nid = None
-        best_dpx = self.NODE_PICK_RADIUS_PX
-        for nid, n in model.nodes.items():
-            dpx = (((event.xdata - n.x) * px_per_dx) ** 2 +
-                   ((event.ydata - n.y) * px_per_dy) ** 2) ** 0.5
-            if dpx < best_dpx:
-                best_dpx = dpx
-                best_nid = nid
-        if best_nid is not None:
-            hit.node_id = best_nid
-            hit.x = model.nodes[best_nid].x
-            hit.y = model.nodes[best_nid].y
+        # Run the snap engine.
+        candidate = None
+        if self.snap_enabled:
+            candidate = self.snap_engine.find_snap(
+                cursor_x=event.xdata, cursor_y=event.ydata,
+                px_per_dx=px_per_dx, px_per_dy=px_per_dy,
+                model=model, grid=grid,
+            )
+        self._snap_marker = candidate
+
+        if candidate is not None:
+            hit = HitResult(x=candidate.x, y=candidate.y,
+                            snap_kind=candidate.kind,
+                            snap_label=candidate.label)
+            if candidate.kind == "node":
+                hit.node_id = candidate.object_id
+            elif candidate.kind in ("endpoint", "midpoint", "project"):
+                hit.element_id = candidate.object_id
             return hit
 
+        # No snap → fall back to rectangular-grid snapping + element pick.
+        sx, sy = self._snap(event.xdata, event.ydata)
+        hit = HitResult(x=sx, y=sy)
+        # Still try to pick a nearby element (for select/right-click on a line).
         best_eid = None
         best_dpx = self.ELEM_PICK_RADIUS_PX
         for elem in model.elements:
@@ -192,10 +210,50 @@ class ModelCanvas(QWidget):
     # ── drawing ──
 
     def _draw_grid(self) -> None:
-        self.ax.xaxis.set_major_locator(MultipleLocator(self.grid_spacing))
-        self.ax.yaxis.set_major_locator(MultipleLocator(self.grid_spacing))
-        self.ax.grid(True, which="major", linestyle=":", linewidth=0.5,
-                     color="#cccccc")
+        grid = self._grid_provider()
+        if grid.is_empty():
+            # Fall back to a uniform-spacing grid.
+            self.ax.xaxis.set_major_locator(MultipleLocator(self.grid_spacing))
+            self.ax.yaxis.set_major_locator(MultipleLocator(self.grid_spacing))
+            self.ax.grid(True, which="major", linestyle=":", linewidth=0.5,
+                         color="#cccccc")
+            return
+        # Draw the labeled grid manually. Don't enable matplotlib's auto-grid.
+        self.ax.grid(False)
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        # Adjust limits to encompass the grid extent if needed.
+        if grid.x_lines:
+            x0 = min(x0, min(ln.coord for ln in grid.x_lines))
+            x1 = max(x1, max(ln.coord for ln in grid.x_lines))
+        if grid.y_lines:
+            y0 = min(y0, min(ln.coord for ln in grid.y_lines))
+            y1 = max(y1, max(ln.coord for ln in grid.y_lines))
+        for ln in grid.x_lines:
+            self.ax.axvline(ln.coord, color="#aac8ff", linewidth=0.7,
+                            linestyle="-", alpha=0.6, zorder=0)
+            self.ax.text(ln.coord, y1, f"  {ln.label}", color="#3060c0",
+                         fontsize=8, va="bottom", ha="center", zorder=1)
+        for ln in grid.y_lines:
+            self.ax.axhline(ln.coord, color="#aac8ff", linewidth=0.7,
+                            linestyle="-", alpha=0.6, zorder=0)
+            self.ax.text(x1, ln.coord, f"  {ln.label}", color="#3060c0",
+                         fontsize=8, va="center", ha="left", zorder=1)
+
+    def _draw_snap_marker(self) -> None:
+        c = self._snap_marker
+        if c is None:
+            return
+        marker_styles = {
+            "node":     ("o", "#ff7f0e"),  # filled circle, orange
+            "grid":     ("s", "#1f77b4"),  # square, blue
+            "endpoint": ("^", "#9467bd"),  # triangle, purple
+            "midpoint": ("D", "#17becf"),  # diamond, cyan
+            "project":  ("x", "#2ca02c"),  # x, green
+        }
+        marker, color = marker_styles.get(c.kind, ("o", "#888"))
+        self.ax.plot(c.x, c.y, marker=marker, color=color, markersize=12,
+                     markerfacecolor="none", markeredgewidth=2, zorder=10)
 
     def _draw_model(self) -> None:
         model = self._model()
@@ -451,12 +509,15 @@ class ModelCanvas(QWidget):
 
     def _set_axes_limits(self) -> None:
         model = self._model()
-        if not model.nodes:
+        grid = self._grid_provider()
+        xs: list[float] = [n.x for n in model.nodes.values()]
+        ys: list[float] = [n.y for n in model.nodes.values()]
+        xs += [ln.coord for ln in grid.x_lines]
+        ys += [ln.coord for ln in grid.y_lines]
+        if not xs or not ys:
             self.ax.set_xlim(-1, 11)
             self.ax.set_ylim(-1, 11)
             return
-        xs = [n.x for n in model.nodes.values()]
-        ys = [n.y for n in model.nodes.values()]
         span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
         pad = 0.15 * span
         self.ax.set_xlim(min(xs) - pad, max(xs) + pad)

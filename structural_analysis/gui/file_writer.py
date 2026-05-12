@@ -1,4 +1,11 @@
-"""Write a StructuralModel back to the text format consumed by file_io.read_input_file."""
+"""Write a StructuralModel back to the text format consumed by file_io.read_input_file.
+
+Emits the **new** MATERIALS + SECTIONS shape (which carries no A/I/depth on
+materials and an explicit SECTIONS block referencing materials). Legacy
+inputs that lacked a SECTIONS block are still readable by file_io thanks
+to its backwards-compat shim, but the writer always produces the new
+shape so saved files are explicit about the material/section separation.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +13,7 @@ from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     FrameTemperatureLoad,
     PointLoad,
+    Section,
     StructuralModel,
     TrussTemperatureLoad,
     UniformDistributedLoad,
@@ -24,6 +32,11 @@ def write_input_file(model: StructuralModel, path: str) -> None:
 
     The format is round-trip compatible: open the file with read_input_file
     and you get an equivalent model back (modulo internal id identity).
+
+    Raises:
+        ValueError: if an element cannot be matched to any Section + Material
+            combination in the model (e.g. element constructed with raw
+            properties that don't appear in the section table).
     """
     out: list[str] = []
 
@@ -38,29 +51,42 @@ def write_input_file(model: StructuralModel, path: str) -> None:
         out.append(f"{nid}  {_fmt(n.x)}  {_fmt(n.y)}")
     out.append("")
 
+    # MATERIALS (new shape): id  E  alpha  [name]
     mat_ids = sorted(model.materials)
     out.append(f"MATERIALS {len(mat_ids)}")
     for mid in mat_ids:
         m = model.materials[mid]
-        line = f"{mid}  {_fmt(m.A)}  {_fmt(m.I)}  {_fmt(m.E)}"
-        if m.alpha or m.depth:
-            line += f"  {_fmt(m.alpha)}  {_fmt(m.depth)}"
+        line = f"{mid}  {_fmt(m.E)}  {_fmt(m.alpha)}"
+        if m.name:
+            line += f"  {m.name}"
+        out.append(line)
+    out.append("")
+
+    # SECTIONS: id  material_id  A  I  depth  [name]
+    sec_ids = sorted(model.sections)
+    out.append(f"SECTIONS {len(sec_ids)}")
+    for sid in sec_ids:
+        s = model.sections[sid]
+        line = (f"{sid}  {s.material_id}  {_fmt(s.A)}  {_fmt(s.I)}"
+                f"  {_fmt(s.depth)}")
+        if s.name:
+            line += f"  {s.name}"
         out.append(line)
     out.append("")
 
     out.append(f"ELEMENTS {len(model.elements)}")
-    elem_to_mat: dict[int, int] = _element_material_lookup(model)
+    elem_to_sec: dict[int, int] = _element_section_lookup(model)
     for elem in model.elements:
         kind = "TRUSS" if isinstance(elem, TrussElement2D) else "FRAME"
-        if elem.id not in elem_to_mat:
+        if elem.id not in elem_to_sec:
             raise ValueError(
                 f"Element {elem.id} has E={elem.E}, A={elem.A}"
                 + (f", I={elem.I}" if isinstance(elem, FrameElement2D) else "")
-                + " which does not match any material in the model — "
-                "cannot serialise."
+                + " which does not match any Material+Section combination "
+                "in the model — cannot serialise."
             )
-        mat_id = elem_to_mat[elem.id]
-        line = f"{elem.id}  {elem.node_i}  {elem.node_j}  {mat_id}  {kind}"
+        sec_id = elem_to_sec[elem.id]
+        line = f"{elem.id}  {elem.node_i}  {elem.node_j}  {sec_id}  {kind}"
         if isinstance(elem, FrameElement2D):
             if elem.release_i and elem.release_j:
                 line += "  BOTH"
@@ -128,23 +154,30 @@ def write_input_file(model: StructuralModel, path: str) -> None:
         f.write("\n".join(out).rstrip() + "\n")
 
 
-def _element_material_lookup(model: StructuralModel) -> dict[int, int]:
-    """Recover (elem_id → material_id) by matching E/A/I against the material table.
+def _element_section_lookup(model: StructuralModel) -> dict[int, int]:
+    """Recover (elem_id → section_id) by matching against the section table.
 
-    The element classes only store E, A, (I), alpha, depth — not the material id.
-    For round-tripping we match those numbers back to the material list. Matching
-    is done in sorted id order so the pick is deterministic when multiple
-    materials happen to share the same numeric properties.
+    Elements continue to store flat E/A/I/α/depth. For round-tripping we
+    match those numbers back to (material, section) pairs. Matching is done
+    in sorted id order for deterministic results when multiple sections
+    share identical numeric properties.
     """
     lookup: dict[int, int] = {}
-    sorted_mids = sorted(model.materials)
+    sorted_sids = sorted(model.sections)
     for elem in model.elements:
-        for mid in sorted_mids:
-            m = model.materials[mid]
-            if m.E != elem.E or m.A != elem.A:
+        for sid in sorted_sids:
+            sec = model.sections[sid]
+            mat = model.materials.get(sec.material_id)
+            if mat is None:
                 continue
-            if isinstance(elem, FrameElement2D) and m.I != elem.I:
+            if mat.E != elem.E or sec.A != elem.A:
                 continue
-            lookup[elem.id] = mid
+            if isinstance(elem, FrameElement2D) and sec.I != elem.I:
+                continue
+            if mat.alpha != elem.alpha:
+                continue
+            if sec.depth != elem.depth:
+                continue
+            lookup[elem.id] = sid
             break
     return lookup

@@ -8,7 +8,7 @@ Creates Element2D subclass instances (FrameElement2D / TrussElement2D).
 from __future__ import annotations
 
 from .model import (
-    StructuralModel, Node, Material, Support, NodalLoad,
+    StructuralModel, Node, Material, Section, Support, NodalLoad,
     UniformDistributedLoad, PointLoad,
     TrussTemperatureLoad, FrameTemperatureLoad,
 )
@@ -18,10 +18,20 @@ from .element import FrameElement2D, TrussElement2D
 def read_input_file(filepath: str) -> StructuralModel:
     """Parse a structural model from a text input file.
 
-    Supports sections: TITLE, NODES, MATERIALS, ELEMENTS, SUPPORTS,
-    LOADS, MEMBER_POINT_LOADS, MEMBER_UDL. Lines starting with # are
-    comments. Element lines accept optional type (FRAME/TRUSS) and
-    release (START/END/BOTH) fields.
+    Supports sections: TITLE, NODES, MATERIALS, SECTIONS, ELEMENTS,
+    SUPPORTS, LOADS, MEMBER_POINT_LOADS, MEMBER_UDL, TRUSS_TEMPERATURE,
+    FRAME_TEMPERATURE. Lines starting with # are comments. Element lines
+    accept optional type (FRAME/TRUSS) and release (START/END/BOTH).
+
+    Two MATERIALS shapes are supported:
+
+    - **New shape** (paired with a SECTIONS block):
+      ``<id>  <E>  [alpha]  [name]``
+    - **Legacy shape** (Assignment 2/3/4 compatibility — no SECTIONS block):
+      ``<id>  <A>  <I>  <E>  [alpha]  [depth]``
+      Detected automatically when a SECTIONS block is absent. The parser
+      synthesises a 1:1 :class:`Section` for each legacy row so existing
+      ``inputs/q2*.txt`` files load unchanged.
 
     Args:
         filepath: Path to the input file.
@@ -34,9 +44,13 @@ def read_input_file(filepath: str) -> StructuralModel:
     with open(filepath, "r") as f:
         lines = [ln.strip() for ln in f.readlines()]
 
-    # Temporary storage for member loads (we need elements to exist first)
-    pending_point_loads: list[tuple[int, float, float, float]] = []
-    pending_udls: list[tuple[int, float, float]] = []
+    # First pass: does this file declare a SECTIONS block? That decides
+    # whether MATERIALS rows are the new (id, E, …) or legacy (id, A, I, E, …)
+    # shape.
+    has_sections_block = any(
+        ln.split("#")[0].strip().split()[:1] == ["SECTIONS"]
+        for ln in lines if ln and not ln.startswith("#")
+    )
 
     i = 0
     while i < len(lines):
@@ -70,12 +84,45 @@ def read_input_file(filepath: str) -> StructuralModel:
                     i += 1
                 parts = lines[i].split("#")[0].split()
                 mid = int(parts[0])
-                A_val, I_val, E_val = float(parts[1]), float(parts[2]), float(parts[3])
-                # Optional α and depth for thermal effects
-                alpha = float(parts[4]) if len(parts) > 4 else 0.0
-                depth = float(parts[5]) if len(parts) > 5 else 0.0
-                model.materials[mid] = Material(mid, E_val, A_val, I_val,
-                                                alpha=alpha, depth=depth)
+                if has_sections_block:
+                    # New shape: id  E  [alpha]  [name]
+                    E_val = float(parts[1])
+                    alpha = float(parts[2]) if len(parts) > 2 else 0.0
+                    name = parts[3] if len(parts) > 3 else ""
+                    model.materials[mid] = Material(id=mid, name=name,
+                                                    E=E_val, alpha=alpha)
+                else:
+                    # Legacy shape: id  A  I  E  [alpha]  [depth]
+                    # Synthesise a 1:1 Material+Section pair so existing
+                    # inputs (q2a, q2b, course examples) load unchanged.
+                    A_val = float(parts[1])
+                    I_val = float(parts[2])
+                    E_val = float(parts[3])
+                    alpha = float(parts[4]) if len(parts) > 4 else 0.0
+                    depth = float(parts[5]) if len(parts) > 5 else 0.0
+                    model.materials[mid] = Material(id=mid, E=E_val, alpha=alpha)
+                    model.sections[mid] = Section(
+                        id=mid, material_id=mid,
+                        A=A_val, I=I_val, depth=depth,
+                    )
+
+        elif keyword == "SECTIONS":
+            count = int(tokens[1])
+            for _ in range(count):
+                i += 1
+                while i < len(lines) and (not lines[i] or lines[i].startswith("#")):
+                    i += 1
+                parts = lines[i].split("#")[0].split()
+                sid = int(parts[0])
+                material_id = int(parts[1])
+                A_val = float(parts[2])
+                I_val = float(parts[3])
+                depth = float(parts[4]) if len(parts) > 4 else 0.0
+                name = parts[5] if len(parts) > 5 else ""
+                model.sections[sid] = Section(
+                    id=sid, name=name, material_id=material_id,
+                    A=A_val, I=I_val, depth=depth,
+                )
 
         elif keyword == "ELEMENTS":
             count = int(tokens[1])
@@ -85,8 +132,25 @@ def read_input_file(filepath: str) -> StructuralModel:
                     i += 1
                 parts = lines[i].split("#")[0].split()
                 eid = int(parts[0])
-                sn, en, mat_id = int(parts[1]), int(parts[2]), int(parts[3])
-                mat = model.materials[mat_id]
+                sn, en = int(parts[1]), int(parts[2])
+                # Column 4 historically referenced a Material id (legacy
+                # combined storage). With the Material/Section split, it now
+                # references the Section id. The 1:1 synthesis in the
+                # MATERIALS shim above means legacy files still resolve
+                # correctly: section_id == legacy_material_id.
+                ref_id = int(parts[3])
+                section = model.sections.get(ref_id)
+                if section is None:
+                    raise ValueError(
+                        f"Element {eid} references section/material id "
+                        f"{ref_id}, which has no SECTIONS entry."
+                    )
+                mat = model.materials.get(section.material_id)
+                if mat is None:
+                    raise ValueError(
+                        f"Section {section.id} references material id "
+                        f"{section.material_id}, which has no MATERIALS entry."
+                    )
 
                 # Optional element type
                 etype = "FRAME"
@@ -109,14 +173,14 @@ def read_input_file(filepath: str) -> StructuralModel:
                 if etype == "TRUSS":
                     elem = TrussElement2D(
                         id=eid, node_i=sn, node_j=en,
-                        E=mat.E, A=mat.A,
-                        alpha=mat.alpha, depth=mat.depth,
+                        E=mat.E, A=section.A,
+                        alpha=mat.alpha, depth=section.depth,
                     )
                 else:
                     elem = FrameElement2D(
                         id=eid, node_i=sn, node_j=en,
-                        E=mat.E, A=mat.A, I=mat.I,
-                        alpha=mat.alpha, depth=mat.depth,
+                        E=mat.E, A=section.A, I=section.I,
+                        alpha=mat.alpha, depth=section.depth,
                         release_i=release_i, release_j=release_j,
                     )
                 model.elements.append(elem)
@@ -180,6 +244,14 @@ def read_input_file(filepath: str) -> StructuralModel:
                 eid = int(parts[0])
                 wx = float(parts[1]) if len(parts) > 1 else 0.0
                 wy = float(parts[2]) if len(parts) > 2 else 0.0
+                if wx != 0.0:
+                    # Axial distributed loads are not implemented. Fail loudly
+                    # rather than silently dropping the value.
+                    raise ValueError(
+                        f"MEMBER_UDL for element {eid}: non-zero wx={wx} is "
+                        "not supported (only transverse wy is implemented). "
+                        "Set wx to 0.0 or remove the column."
+                    )
                 for elem in model.elements:
                     if elem.id == eid:
                         elem.member_loads.append(UniformDistributedLoad(wy=wy))

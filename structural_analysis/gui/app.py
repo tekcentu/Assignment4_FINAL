@@ -276,7 +276,7 @@ class MainApplication(tk.Tk):
             return
         self.execute(AddElementCmd(
             node_i=n_i, node_j=n_j,
-            material_id=d.result["material_id"],
+            section_id=d.result["section_id"],
             kind=d.result["kind"],
             release_i=d.result["release_i"],
             release_j=d.result["release_j"],
@@ -357,12 +357,19 @@ class MainApplication(tk.Tk):
         self.execute(AddMemberLoadCmd(elem_id=elem_id, load=d.result))
 
     def _open_material_list(self) -> None:
-        def add_or_update(mat):
+        from .commands import AddOrUpdateSectionCmd, DeleteSectionCmd
+
+        def add_or_update(payload):
+            # MaterialDialog (Tk path) returns (Material, Section) sharing an id.
+            mat, sec = payload
             self.execute(AddOrUpdateMaterialCmd(material=mat))
+            self.execute(AddOrUpdateSectionCmd(section=sec))
 
         def delete(mid):
-            cmd = DeleteMaterialCmd(material_id=mid)
-            self.execute(cmd)
+            # Delete the matching Section first (otherwise Material won't unlink).
+            if mid in self._model.sections:
+                self.execute(DeleteSectionCmd(section_id=mid))
+            self.execute(DeleteMaterialCmd(material_id=mid))
 
         d = MaterialListDialog(
             self, model=self._model,

@@ -24,6 +24,7 @@ from structural_analysis.model import (
     Material,
     NodalLoad,
     PointLoad,
+    Section,
     StructuralModel,
     Support,
     TrussTemperatureLoad,
@@ -69,30 +70,34 @@ def test_round_trip_synthetic_kitchen_sink():
     from structural_analysis.model import Node
 
     m = StructuralModel(title="kitchen sink")
-    m.materials[1] = Material(1, E=2.0e8, A=0.01, I=1e-4, alpha=1.2e-5, depth=0.3)
-    m.materials[2] = Material(2, E=2.0e8, A=1e-4, I=1e-12)
+    m.materials[1] = Material(id=1, name="steel", E=2.0e8, alpha=1.2e-5)
+    m.materials[2] = Material(id=2, name="steel-truss", E=2.0e8)
+    m.sections[1] = Section(id=1, name="50x50", material_id=1,
+                             A=0.01, I=1e-4, depth=0.3)
+    m.sections[2] = Section(id=2, name="rod", material_id=2,
+                             A=1e-4, I=1e-12)
 
     m.nodes[1] = Node(1, 0.0, 0.0)
     m.nodes[2] = Node(2, 4.0, 0.0)
     m.nodes[3] = Node(3, 8.0, 0.0)
     m.nodes[4] = Node(4, 4.0, 3.0)
 
-    mat1 = m.materials[1]
-    mat2 = m.materials[2]
+    mat1, sec1 = m.materials[1], m.sections[1]
+    mat2, sec2 = m.materials[2], m.sections[2]
     m.elements.append(FrameElement2D(
-        id=1, node_i=1, node_j=2, E=mat1.E, A=mat1.A, I=mat1.I,
-        alpha=mat1.alpha, depth=mat1.depth,
+        id=1, node_i=1, node_j=2, E=mat1.E, A=sec1.A, I=sec1.I,
+        alpha=mat1.alpha, depth=sec1.depth,
         release_i=False, release_j=True,
         member_loads=[UniformDistributedLoad(wy=-5.0)],
     ))
     m.elements.append(FrameElement2D(
-        id=2, node_i=2, node_j=3, E=mat1.E, A=mat1.A, I=mat1.I,
-        alpha=mat1.alpha, depth=mat1.depth,
+        id=2, node_i=2, node_j=3, E=mat1.E, A=sec1.A, I=sec1.I,
+        alpha=mat1.alpha, depth=sec1.depth,
         member_loads=[PointLoad(py=-3.0, a=2.0),
                        FrameTemperatureLoad(t_top=10.0, t_bottom=-10.0)],
     ))
     m.elements.append(TrussElement2D(
-        id=3, node_i=4, node_j=2, E=mat2.E, A=mat2.A,
+        id=3, node_i=4, node_j=2, E=mat2.E, A=sec2.A,
         member_loads=[TrussTemperatureLoad(delta_T=25.0)],
     ))
 
@@ -107,20 +112,21 @@ def test_round_trip_synthetic_kitchen_sink():
 
 
 def test_writer_raises_when_element_material_unrecoverable():
-    """If an element's E/A/I doesn't match any material, the writer must fail loudly."""
+    """If an element's E/A/I doesn't match any Section, the writer fails loudly."""
     m = StructuralModel(title="orphan element")
     from structural_analysis.model import Node
     m.nodes[1] = Node(1, 0.0, 0.0)
     m.nodes[2] = Node(2, 1.0, 0.0)
-    m.materials[1] = Material(1, E=1.0, A=1.0, I=1.0)
-    # Element references properties that don't match material 1.
+    m.materials[1] = Material(id=1, E=1.0)
+    m.sections[1] = Section(id=1, material_id=1, A=1.0, I=1.0)
+    # Element references properties that don't match any section.
     m.elements.append(FrameElement2D(
         id=1, node_i=1, node_j=2, E=999.0, A=999.0, I=999.0,
     ))
     fd, tmp = tempfile.mkstemp(suffix=".txt")
     os.close(fd)
     try:
-        with pytest.raises(ValueError, match="does not match any material"):
+        with pytest.raises(ValueError, match="does not match any Material\\+Section"):
             write_input_file(m, tmp)
     finally:
         os.unlink(tmp)

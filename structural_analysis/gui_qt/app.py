@@ -38,11 +38,14 @@ from ..gui.commands import (
     AddElementCmd,
     AddMemberLoadCmd,
     AddOrUpdateMaterialCmd,
+    AddOrUpdateSectionCmd,
     ClearMemberLoadsCmd,
     Command,
     DeleteElementCmd,
     DeleteMaterialCmd,
     DeleteNodeCmd,
+    DeleteSectionCmd,
+    SetGridSystemCmd,
     SetNodalLoadCmd,
     SetSupportCmd,
 )
@@ -63,12 +66,64 @@ from .controllers import (
 )
 from .dialogs import (
     ElementDialog,
+    GridDialog,
     GridSpacingDialog,
     MaterialListDialog,
     MemberLoadDialog,
     NodalLoadDialog,
     SupportDialog,
 )
+from .grid import GridSystem
+
+
+def _validate_model_for_solve(model: StructuralModel) -> tuple[list[str], list[str]]:
+    """Run lightweight pre-solve checks. Returns (fatal, warnings).
+
+    Fatal issues block the solve outright; warnings are non-blocking.
+    The solver itself does a more thorough pass during assembly — this
+    pass exists so the GUI can show a friendly summary first.
+    """
+    fatal: list[str] = []
+    warnings: list[str] = []
+
+    if not model.materials:
+        fatal.append("No materials defined.")
+    if not model.sections:
+        fatal.append("No sections defined.")
+    for sec in model.sections.values():
+        if sec.material_id not in model.materials:
+            fatal.append(
+                f"Section {sec.id} references missing material "
+                f"{sec.material_id}."
+            )
+    if not model.elements:
+        fatal.append("Model has no elements.")
+    for elem in model.elements:
+        if elem.node_i not in model.nodes:
+            fatal.append(f"Element {elem.id} references missing start "
+                         f"node {elem.node_i}.")
+        if elem.node_j not in model.nodes:
+            fatal.append(f"Element {elem.id} references missing end "
+                         f"node {elem.node_j}.")
+    used_nodes = set()
+    for elem in model.elements:
+        used_nodes.add(elem.node_i)
+        used_nodes.add(elem.node_j)
+    isolated = sorted(set(model.nodes) - used_nodes)
+    if isolated:
+        warnings.append(
+            f"Isolated nodes (not connected to any element): {isolated}."
+        )
+    if not model.supports:
+        warnings.append(
+            "No supports defined — the stiffness matrix will be singular."
+        )
+    for ld in model.nodal_loads:
+        if ld.node_id not in model.nodes:
+            fatal.append(
+                f"Nodal load references missing node {ld.node_id}."
+            )
+    return fatal, warnings
 
 
 class MainWindow(QMainWindow):
@@ -80,6 +135,7 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
 
         self._model = StructuralModel(title="Untitled")
+        self._grid: GridSystem = GridSystem()
         self._undo: list[Command] = []
         self._redo: list[Command] = []
         self._modified = False
@@ -119,7 +175,8 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         splitter = QSplitter(Qt.Orientation.Vertical, self)
-        self.canvas = ModelCanvas(splitter, lambda: self._model)
+        self.canvas = ModelCanvas(splitter, lambda: self._model,
+                                    grid_provider=lambda: self._grid)
         splitter.addWidget(self.canvas)
 
         result_frame = QFrame(splitter)
@@ -168,8 +225,22 @@ class MainWindow(QMainWindow):
 
         self.act_grid_spacing = QAction("&Grid spacing…", self,
                                           triggered=self._set_grid_spacing)
+        self.act_grid_system = QAction("Grid s&ystem…", self,
+                                         triggered=self._edit_grid_system)
         self.act_snap = QAction("Snap to grid", self, checkable=True, checked=True,
                                   triggered=self._toggle_snap)
+        # Snap-kind toggles
+        self._snap_actions: dict[str, QAction] = {}
+        for kind, label in [
+            ("node",     "Snap: node"),
+            ("grid",     "Snap: grid intersection"),
+            ("endpoint", "Snap: element endpoint"),
+            ("midpoint", "Snap: element midpoint"),
+            ("project",  "Snap: nearest on element"),
+        ]:
+            a = QAction(label, self, checkable=True, checked=True)
+            a.triggered.connect(lambda _checked, k=kind: self._toggle_snap_kind(k))
+            self._snap_actions[kind] = a
 
         self.act_solve = QAction("&Solve", self, shortcut="F5",
                                    triggered=self._do_solve)
@@ -214,8 +285,12 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_materials)
 
         m_view = self.menuBar().addMenu("&View")
+        m_view.addAction(self.act_grid_system)
         m_view.addAction(self.act_grid_spacing)
         m_view.addAction(self.act_snap)
+        m_view.addSeparator()
+        for a in self._snap_actions.values():
+            m_view.addAction(a)
 
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)
@@ -304,7 +379,7 @@ class MainWindow(QMainWindow):
         if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
             self.execute(AddElementCmd(
                 node_i=n_i, node_j=n_j,
-                material_id=d.result_value["material_id"],
+                section_id=d.result_value["section_id"],
                 kind=d.result_value["kind"],
                 release_i=d.result_value["release_i"],
                 release_j=d.result_value["release_j"],
@@ -381,8 +456,14 @@ class MainWindow(QMainWindow):
     def _open_material_list(self) -> None:
         d = MaterialListDialog(
             self, model=self._model,
-            on_add_or_update=lambda mat: self.execute(AddOrUpdateMaterialCmd(material=mat)),
-            on_delete=lambda mid: self.execute(DeleteMaterialCmd(material_id=mid)),
+            on_add_or_update_material=lambda mat: self.execute(
+                AddOrUpdateMaterialCmd(material=mat)),
+            on_delete_material=lambda mid: self.execute(
+                DeleteMaterialCmd(material_id=mid)),
+            on_add_or_update_section=lambda sec: self.execute(
+                AddOrUpdateSectionCmd(section=sec)),
+            on_delete_section=lambda sid: self.execute(
+                DeleteSectionCmd(section_id=sid)),
         )
         d.exec()
 
@@ -413,11 +494,15 @@ class MainWindow(QMainWindow):
 
     def _on_canvas_motion(self, hit: HitResult) -> None:
         parts = [f"({hit.x:.3f}, {hit.y:.3f})"]
-        if hit.node_id is not None:
+        if hit.snap_label:
+            parts.append(f"Snap: {hit.snap_label}")
+        elif hit.node_id is not None:
             parts.append(f"node {hit.node_id}")
-        if hit.element_id is not None:
+        elif hit.element_id is not None:
             parts.append(f"elem {hit.element_id}")
         self._coord_label.setText("  |  ".join(parts))
+        # Repaint canvas if the snap marker changed.
+        self.canvas.redraw()
         try:
             self._active_tool.on_motion(hit)
         except Exception:
@@ -436,6 +521,23 @@ class MainWindow(QMainWindow):
         self.canvas.redraw()
 
     # ── grid / snap ──
+
+    def _edit_grid_system(self) -> None:
+        d = GridDialog(self, current=self._grid if not self._grid.is_empty() else None)
+        if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
+            # Route through SetGridSystemCmd so undo/redo works.
+            new_grid = d.result_value
+            self.execute(SetGridSystemCmd(
+                new_grid=new_grid,
+                getter=lambda: self._grid,
+                setter=lambda g: setattr(self, "_grid", g),
+            ))
+
+    def _toggle_snap_kind(self, kind: str) -> None:
+        if self._snap_actions[kind].isChecked():
+            self.canvas.snap_engine.enabled_kinds.add(kind)
+        else:
+            self.canvas.snap_engine.enabled_kinds.discard(kind)
 
     def _set_grid_spacing(self) -> None:
         d = GridSpacingDialog(self, current=self.canvas.grid_spacing)
@@ -504,6 +606,7 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         self._model = StructuralModel(title="Untitled")
+        self._grid = GridSystem()
         self._undo.clear()
         self._redo.clear()
         self._modified = False
@@ -516,16 +619,26 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open input file", "",
-            "Text files (*.txt);;All files (*.*)",
+            self, "Open input or project file", "",
+            "All supported (*.txt *.spa.json *.json);;"
+            "Solver input (*.txt);;GUI project (*.spa.json *.json);;"
+            "All files (*.*)",
         )
         if not path:
             return
         self._open_path(path)
 
     def _open_path(self, path: str) -> None:
+        is_json = path.lower().endswith(".spa.json") or path.lower().endswith(".json")
         try:
-            new_model = read_input_file(path)
+            if is_json:
+                from .project_io import load_project_json
+                project = load_project_json(path)
+                new_model = project.model
+                new_grid = project.grid
+            else:
+                new_model = read_input_file(path)
+                new_grid = GridSystem()
         except FileNotFoundError:
             QMessageBox.warning(self, "Open failed",
                                   f"File not found: {path}")
@@ -538,6 +651,7 @@ class MainWindow(QMainWindow):
             )
             return
         self._model = new_model
+        self._grid = new_grid
         self._undo.clear()
         self._redo.clear()
         self._modified = False
@@ -554,8 +668,8 @@ class MainWindow(QMainWindow):
 
     def _do_save_as(self) -> bool:
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save input file", "",
-            "Text files (*.txt);;All files (*.*)",
+            self, "Save project", "",
+            "GUI project (*.spa.json);;Solver input (*.txt);;All files (*.*)",
         )
         if not path:
             return False
@@ -566,8 +680,22 @@ class MainWindow(QMainWindow):
         return False
 
     def _save_to(self, path: str) -> bool:
+        is_json = path.lower().endswith(".spa.json") or path.lower().endswith(".json")
         try:
-            write_input_file(self._model, path)
+            if is_json:
+                from .project_io import Project, ViewState, save_project_json
+                view = ViewState(
+                    xlim=tuple(self.canvas.ax.get_xlim()),
+                    ylim=tuple(self.canvas.ax.get_ylim()),
+                    snap_kinds=sorted(self.canvas.snap_engine.enabled_kinds),
+                )
+                project = Project(
+                    model=self._model, grid=self._grid,
+                    view=view, title=self._model.title,
+                )
+                save_project_json(project, path)
+            else:
+                write_input_file(self._model, path)
         except Exception as e:
             QMessageBox.warning(self, "Save failed",
                                   f"{type(e).__name__}: {e}")
@@ -586,11 +714,22 @@ class MainWindow(QMainWindow):
                 "The model has no elements. Draw some nodes and elements first.",
             )
             return
-        if not self._model.supports:
+
+        # Pre-solve validation — collect both fatal and warning issues.
+        fatal, warnings = _validate_model_for_solve(self._model)
+        if fatal:
+            QMessageBox.critical(
+                self, "Model not ready to solve",
+                "The following problems must be fixed first:\n\n  - "
+                + "\n  - ".join(fatal),
+            )
+            return
+        if warnings:
             ans = QMessageBox.question(
-                self, "No supports defined",
-                "The model has no supports — the stiffness matrix will be "
-                "singular. Solve anyway?",
+                self, "Warnings before solve",
+                "The model has these warnings:\n\n  - "
+                + "\n  - ".join(warnings)
+                + "\n\nSolve anyway?",
                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             )
             if ans != QMessageBox.StandardButton.Ok:

@@ -17,6 +17,7 @@ from ..model import (
     Material,
     NodalLoad,
     PointLoad,
+    Section,
     StructuralModel,
     Support,
     TrussTemperatureLoad,
@@ -117,6 +118,16 @@ class MaterialDialog(_ModalDialog):
         self._default_id = default_id
         super().__init__(parent, "Edit material" if existing else "Add material")
 
+    def __init__(self, parent, *, existing: Material | None,
+                 existing_section: Section | None = None,
+                 default_id: int = 1):
+        # Tk path keeps the combined UI for backwards compatibility — the
+        # dialog returns a (Material, Section) pair sharing the same id.
+        self._existing = existing
+        self._existing_section = existing_section
+        self._default_id = default_id
+        super().__init__(parent, "Edit material" if existing else "Add material")
+
     def _build_body(self, master: ttk.Frame) -> None:
         labels = [
             ("ID", "id"), ("E (kN/m²)", "E"), ("A (m²)", "A"),
@@ -134,16 +145,17 @@ class MaterialDialog(_ModalDialog):
             self._entries["id"].insert(0, str(m.id))
             self._entries["id"].config(state="readonly")
             self._entries["E"].insert(0, repr(m.E))
-            self._entries["A"].insert(0, repr(m.A))
-            self._entries["I"].insert(0, repr(m.I))
             self._entries["alpha"].insert(0, repr(m.alpha))
-            self._entries["depth"].insert(0, repr(m.depth))
+            sec = self._existing_section
+            self._entries["A"].insert(0, repr(sec.A if sec else 0.0))
+            self._entries["I"].insert(0, repr(sec.I if sec else 0.0))
+            self._entries["depth"].insert(0, repr(sec.depth if sec else 0.0))
         else:
             self._entries["id"].insert(0, str(self._default_id))
             self._entries["alpha"].insert(0, "0.0")
             self._entries["depth"].insert(0, "0.0")
 
-    def _accept(self) -> Material:
+    def _accept(self) -> tuple[Material, Section]:
         mid = parse_int(self._entries["id"].get(), "Material ID")
         E = parse_float(self._entries["E"].get(), "E")
         A = parse_float(self._entries["A"].get(), "A")
@@ -156,24 +168,27 @@ class MaterialDialog(_ModalDialog):
             raise ValueError("A must be > 0.")
         if I < 0:
             raise ValueError("I cannot be negative.")
-        return Material(id=mid, E=E, A=A, I=I, alpha=alpha, depth=depth)
+        return (
+            Material(id=mid, E=E, alpha=alpha),
+            Section(id=mid, material_id=mid, A=A, I=I, depth=depth),
+        )
 
 
 # ── element properties ──────────────────────────────────────────────────
 
 
 class ElementDialog(_ModalDialog):
-    """Configure a new or existing element (kind, material, releases)."""
+    """Configure a new or existing element (kind, section, releases)."""
 
     def __init__(self, parent, *,
                  model: StructuralModel,
                  existing_kind: str | None = None,
-                 existing_material_id: int | None = None,
+                 existing_section_id: int | None = None,
                  existing_release_i: bool = False,
                  existing_release_j: bool = False):
         self._model = model
         self._existing_kind = existing_kind
-        self._existing_mat = existing_material_id
+        self._existing_sec = existing_section_id
         self._existing_ri = existing_release_i
         self._existing_rj = existing_release_j
         super().__init__(parent, "Element properties")
@@ -190,13 +205,13 @@ class ElementDialog(_ModalDialog):
                         value="truss", command=self._refresh_release_state
                         ).pack(side="left")
 
-        ttk.Label(master, text="Material:").grid(row=1, column=0, sticky="w", pady=2)
-        mats = sorted(self._model.materials.keys())
-        if not mats:
-            raise ValueError("No materials defined — add a material first.")
-        self._mat_var = tk.StringVar(value=str(self._existing_mat or mats[0]))
-        cb = ttk.Combobox(master, textvariable=self._mat_var,
-                          values=[str(m) for m in mats], state="readonly", width=10)
+        ttk.Label(master, text="Section:").grid(row=1, column=0, sticky="w", pady=2)
+        sections = sorted(self._model.sections.keys())
+        if not sections:
+            raise ValueError("No sections defined — add a section first.")
+        self._sec_var = tk.StringVar(value=str(self._existing_sec or sections[0]))
+        cb = ttk.Combobox(master, textvariable=self._sec_var,
+                          values=[str(s) for s in sections], state="readonly", width=10)
         cb.grid(row=1, column=1, sticky="w", pady=2)
 
         self._ri_var = tk.BooleanVar(value=self._existing_ri)
@@ -216,12 +231,12 @@ class ElementDialog(_ModalDialog):
 
     def _accept(self) -> dict:
         kind = self._kind_var.get()
-        material_id = parse_int(self._mat_var.get(), "Material")
-        if material_id not in self._model.materials:
-            raise ValueError(f"Material {material_id} does not exist.")
+        section_id = parse_int(self._sec_var.get(), "Section")
+        if section_id not in self._model.sections:
+            raise ValueError(f"Section {section_id} does not exist.")
         return {
             "kind": kind,
-            "material_id": material_id,
+            "section_id": section_id,
             "release_i": bool(self._ri_var.get()) if kind == "frame" else False,
             "release_j": bool(self._rj_var.get()) if kind == "frame" else False,
         }
@@ -459,11 +474,17 @@ class MaterialListDialog(_ModalDialog):
     def _refresh(self) -> None:
         for it in self._tree.get_children():
             self._tree.delete(it)
+        # Show one row per Material, pulling A/I/depth from the matching
+        # Section (1:1 association is the legacy norm).
         for mid in sorted(self._model.materials):
             m = self._model.materials[mid]
+            sec = self._model.sections.get(mid)
+            A = sec.A if sec else 0.0
+            I = sec.I if sec else 0.0
+            depth = sec.depth if sec else 0.0
             self._tree.insert("", "end", iid=str(mid), values=(
-                m.id, f"{m.E:g}", f"{m.A:g}", f"{m.I:g}",
-                f"{m.alpha:g}", f"{m.depth:g}",
+                m.id, f"{m.E:g}", f"{A:g}", f"{I:g}",
+                f"{m.alpha:g}", f"{depth:g}",
             ))
 
     def _selected_id(self) -> int | None:
@@ -486,7 +507,12 @@ class MaterialListDialog(_ModalDialog):
         mid = self._selected_id()
         if mid is None:
             return
-        d = MaterialDialog(self, existing=self._model.materials[mid], default_id=mid)
+        d = MaterialDialog(
+            self,
+            existing=self._model.materials[mid],
+            existing_section=self._model.sections.get(mid),
+            default_id=mid,
+        )
         self.wait_window(d)
         if d.result is not None:
             self._on_add_or_update(d.result)

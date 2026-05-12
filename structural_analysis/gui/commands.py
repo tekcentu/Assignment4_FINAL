@@ -16,6 +16,7 @@ from ..model import (
     Material,
     Node,
     NodalLoad,
+    Section,
     StructuralModel,
     Support,
 )
@@ -135,7 +136,7 @@ class DeleteNodeCmd(Command):
 class AddElementCmd(Command):
     node_i: int
     node_j: int
-    material_id: int
+    section_id: int
     kind: str  # "frame" or "truss"
     release_i: bool = False
     release_j: bool = False
@@ -149,8 +150,15 @@ class AddElementCmd(Command):
             raise ValueError(f"End node {self.node_j} does not exist.")
         if self.node_i == self.node_j:
             raise ValueError("Element start and end node cannot be the same.")
-        if self.material_id not in model.materials:
-            raise ValueError(f"Material {self.material_id} does not exist.")
+        if self.section_id not in model.sections:
+            raise ValueError(f"Section {self.section_id} does not exist.")
+        section = model.sections[self.section_id]
+        if section.material_id not in model.materials:
+            raise ValueError(
+                f"Section {self.section_id} references material "
+                f"{section.material_id}, which does not exist."
+            )
+        mat = model.materials[section.material_id]
         ni = model.nodes[self.node_i]
         nj = model.nodes[self.node_j]
         if abs(ni.x - nj.x) < 1e-12 and abs(ni.y - nj.y) < 1e-12:
@@ -171,16 +179,16 @@ class AddElementCmd(Command):
         elif any(e.id == self.elem_id for e in model.elements):
             raise ValueError(f"Element id {self.elem_id} already exists.")
 
-        mat = model.materials[self.material_id]
         if kind == "truss":
             elem = TrussElement2D(
                 id=self.elem_id, node_i=self.node_i, node_j=self.node_j,
-                E=mat.E, A=mat.A, alpha=mat.alpha, depth=mat.depth,
+                E=mat.E, A=section.A, alpha=mat.alpha, depth=section.depth,
             )
         else:
             elem = FrameElement2D(
                 id=self.elem_id, node_i=self.node_i, node_j=self.node_j,
-                E=mat.E, A=mat.A, I=mat.I, alpha=mat.alpha, depth=mat.depth,
+                E=mat.E, A=section.A, I=section.I,
+                alpha=mat.alpha, depth=section.depth,
                 release_i=self.release_i, release_j=self.release_j,
             )
         model.elements.append(elem)
@@ -221,24 +229,23 @@ class AddOrUpdateMaterialCmd(Command):
     description: str = "edit material"
 
     def do(self, model: StructuralModel) -> None:
-        if self.material.E <= 0 or self.material.A <= 0:
-            raise ValueError("Material E and A must be positive.")
-        if self.material.I < 0:
-            raise ValueError("Material I cannot be negative.")
+        if self.material.E <= 0:
+            raise ValueError("Material E must be positive.")
         self._previous = model.materials.get(self.material.id)
         model.materials[self.material.id] = self.material
-        # Propagate updated E/A/I/alpha/depth to all elements that reference this material.
+        # Propagate updated E/α to all elements that reference any section
+        # that, in turn, references this material.
         if self._previous is not None:
             prev = self._previous
-            for elem in model.elements:
-                if (elem.E == prev.E and elem.A == prev.A
-                        and (not isinstance(elem, FrameElement2D) or elem.I == prev.I)):
-                    elem.E = self.material.E
-                    elem.A = self.material.A
-                    elem.alpha = self.material.alpha
-                    elem.depth = self.material.depth
-                    if isinstance(elem, FrameElement2D):
-                        elem.I = self.material.I
+            for sec in model.sections.values():
+                if sec.material_id != self.material.id:
+                    continue
+                for elem in model.elements:
+                    if (elem.E == prev.E and elem.A == sec.A
+                            and (not isinstance(elem, FrameElement2D) or elem.I == sec.I)
+                            and elem.alpha == prev.alpha and elem.depth == sec.depth):
+                        elem.E = self.material.E
+                        elem.alpha = self.material.alpha
 
     def undo(self, model: StructuralModel) -> None:
         if self._previous is None:
@@ -247,15 +254,15 @@ class AddOrUpdateMaterialCmd(Command):
             model.materials[self.material.id] = self._previous
             new = self.material
             prev = self._previous
-            for elem in model.elements:
-                if (elem.E == new.E and elem.A == new.A
-                        and (not isinstance(elem, FrameElement2D) or elem.I == new.I)):
-                    elem.E = prev.E
-                    elem.A = prev.A
-                    elem.alpha = prev.alpha
-                    elem.depth = prev.depth
-                    if isinstance(elem, FrameElement2D):
-                        elem.I = prev.I
+            for sec in model.sections.values():
+                if sec.material_id != self.material.id:
+                    continue
+                for elem in model.elements:
+                    if (elem.E == new.E and elem.A == sec.A
+                            and (not isinstance(elem, FrameElement2D) or elem.I == sec.I)
+                            and elem.alpha == new.alpha and elem.depth == sec.depth):
+                        elem.E = prev.E
+                        elem.alpha = prev.alpha
 
 
 @dataclass
@@ -267,22 +274,99 @@ class DeleteMaterialCmd(Command):
     def do(self, model: StructuralModel) -> None:
         if self.material_id not in model.materials:
             raise ValueError(f"Material {self.material_id} does not exist.")
-        used_by = []
-        target = model.materials[self.material_id]
-        for elem in model.elements:
-            if (elem.E == target.E and elem.A == target.A
-                    and (not isinstance(elem, FrameElement2D) or elem.I == target.I)):
-                used_by.append(elem.id)
-        if used_by:
+        used_by_sec = [s.id for s in model.sections.values()
+                       if s.material_id == self.material_id]
+        if used_by_sec:
             raise ValueError(
-                f"Material {self.material_id} is in use by element(s) {used_by}; "
-                "delete those elements first."
+                f"Material {self.material_id} is in use by section(s) "
+                f"{used_by_sec}; delete those sections first."
             )
         self._saved = model.materials.pop(self.material_id)
 
     def undo(self, model: StructuralModel) -> None:
         if self._saved is not None:
             model.materials[self.material_id] = self._saved
+
+
+# ── sections ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class AddOrUpdateSectionCmd(Command):
+    section: Section
+    _previous: Section | None = None
+    description: str = "edit section"
+
+    def do(self, model: StructuralModel) -> None:
+        if self.section.A <= 0:
+            raise ValueError("Section A must be positive.")
+        if self.section.I < 0:
+            raise ValueError("Section I cannot be negative.")
+        if self.section.material_id not in model.materials:
+            raise ValueError(
+                f"Section references material {self.section.material_id}, "
+                "which does not exist."
+            )
+        self._previous = model.sections.get(self.section.id)
+        model.sections[self.section.id] = self.section
+        # Propagate A/I/depth to elements that match the previous shape.
+        if self._previous is not None:
+            prev = self._previous
+            mat = model.materials.get(prev.material_id)
+            if mat is not None:
+                for elem in model.elements:
+                    if (elem.E == mat.E and elem.A == prev.A
+                            and (not isinstance(elem, FrameElement2D) or elem.I == prev.I)
+                            and elem.alpha == mat.alpha and elem.depth == prev.depth):
+                        elem.A = self.section.A
+                        elem.depth = self.section.depth
+                        if isinstance(elem, FrameElement2D):
+                            elem.I = self.section.I
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._previous is None:
+            model.sections.pop(self.section.id, None)
+        else:
+            model.sections[self.section.id] = self._previous
+            new = self.section
+            prev = self._previous
+            mat = model.materials.get(new.material_id)
+            if mat is not None:
+                for elem in model.elements:
+                    if (elem.E == mat.E and elem.A == new.A
+                            and (not isinstance(elem, FrameElement2D) or elem.I == new.I)
+                            and elem.alpha == mat.alpha and elem.depth == new.depth):
+                        elem.A = prev.A
+                        elem.depth = prev.depth
+                        if isinstance(elem, FrameElement2D):
+                            elem.I = prev.I
+
+
+@dataclass
+class DeleteSectionCmd(Command):
+    section_id: int
+    _saved: Section | None = None
+    description: str = "delete section"
+
+    def do(self, model: StructuralModel) -> None:
+        if self.section_id not in model.sections:
+            raise ValueError(f"Section {self.section_id} does not exist.")
+        target = model.sections[self.section_id]
+        mat = model.materials.get(target.material_id)
+        if mat is not None:
+            used_by = [e.id for e in model.elements
+                       if e.E == mat.E and e.A == target.A
+                       and (not isinstance(e, FrameElement2D) or e.I == target.I)]
+            if used_by:
+                raise ValueError(
+                    f"Section {self.section_id} is in use by element(s) "
+                    f"{used_by}; delete those elements first."
+                )
+        self._saved = model.sections.pop(self.section_id)
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._saved is not None:
+            model.sections[self.section_id] = self._saved
 
 
 # ── supports ─────────────────────────────────────────────────────────────
@@ -426,6 +510,7 @@ def _snapshot(model: StructuralModel) -> StructuralModel:
         title=model.title,
         nodes=dict(model.nodes),
         materials=dict(model.materials),
+        sections=dict(model.sections),
         elements=list(model.elements),
         supports=dict(model.supports),
         nodal_loads=list(model.nodal_loads),
@@ -436,6 +521,35 @@ def _restore(model: StructuralModel, source: StructuralModel) -> None:
     model.title = source.title
     model.nodes = dict(source.nodes)
     model.materials = dict(source.materials)
+    model.sections = dict(source.sections)
     model.elements = list(source.elements)
     model.supports = dict(source.supports)
     model.nodal_loads = list(source.nodal_loads)
+
+
+# ── grid system (GUI-only metadata, not part of StructuralModel) ────────
+
+
+@dataclass
+class SetGridSystemCmd(Command):
+    """Replace the host's GridSystem.
+
+    The grid lives on the GUI side (not on StructuralModel). The host
+    must expose a mutable container via the ``host_grid_setter`` callback
+    pair so the command can do/undo without touching the structural model.
+    """
+
+    new_grid: object   # GridSystem
+    getter: object     # callable() -> GridSystem
+    setter: object     # callable(GridSystem) -> None
+    _previous: object | None = None
+    description: str = "edit grid"
+
+    def do(self, model: StructuralModel) -> None:
+        # ``model`` is unused; grid is GUI state. We still go through the
+        # command pipeline so undo/redo behaves uniformly.
+        self._previous = self.getter()
+        self.setter(self.new_grid)
+
+    def undo(self, model: StructuralModel) -> None:
+        self.setter(self._previous)

@@ -30,12 +30,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from PyQt6.QtWidgets import QTabWidget
+
 from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     FrameTemperatureLoad,
     Material,
     NodalLoad,
     PointLoad,
+    Section,
     StructuralModel,
     Support,
     TrussTemperatureLoad,
@@ -106,6 +109,9 @@ class _ModalDialog(QDialog):
 
 
 class MaterialDialog(_ModalDialog):
+    """Edit a single Material (id, name, E, α). Section properties are
+    edited separately via :class:`SectionDialog`."""
+
     def __init__(self, parent, *, existing: Material | None, default_id: int):
         self._existing = existing
         self._default_id = default_id
@@ -114,9 +120,8 @@ class MaterialDialog(_ModalDialog):
     def _build_body(self, body: QWidget) -> None:
         form = QFormLayout(body)
         self._entries: dict[str, QLineEdit] = {}
-        labels = [("ID", "id"), ("E (kN/m²)", "E"), ("A (m²)", "A"),
-                  ("I (m⁴)", "I"), ("α (1/°C)", "alpha"), ("depth (m)", "depth")]
-        for label, key in labels:
+        for label, key in [("ID", "id"), ("Name", "name"),
+                           ("E (kN/m²)", "E"), ("α (1/°C)", "alpha")]:
             e = QLineEdit(body)
             form.addRow(label, e)
             self._entries[key] = e
@@ -125,30 +130,88 @@ class MaterialDialog(_ModalDialog):
             m = self._existing
             self._entries["id"].setText(str(m.id))
             self._entries["id"].setReadOnly(True)
+            self._entries["name"].setText(m.name)
             self._entries["E"].setText(repr(m.E))
-            self._entries["A"].setText(repr(m.A))
-            self._entries["I"].setText(repr(m.I))
             self._entries["alpha"].setText(repr(m.alpha))
-            self._entries["depth"].setText(repr(m.depth))
         else:
             self._entries["id"].setText(str(self._default_id))
             self._entries["alpha"].setText("0.0")
-            self._entries["depth"].setText("0.0")
 
     def _accept(self) -> Material:
         mid = parse_int(self._entries["id"].text(), "Material ID")
+        name = self._entries["name"].text().strip()
         E = parse_float(self._entries["E"].text(), "E")
-        A = parse_float(self._entries["A"].text(), "A")
-        I = parse_float(self._entries["I"].text(), "I")
         alpha = parse_float(self._entries["alpha"].text(), "α", allow_blank=True) or 0.0
-        depth = parse_float(self._entries["depth"].text(), "depth", allow_blank=True) or 0.0
         if E <= 0:
             raise ValueError("E must be > 0.")
+        return Material(id=mid, name=name, E=E, alpha=alpha)
+
+
+class SectionDialog(_ModalDialog):
+    """Edit a single Section (id, name, material_id, A, I, depth)."""
+
+    def __init__(self, parent, *,
+                 model: StructuralModel,
+                 existing: Section | None,
+                 default_id: int):
+        self._model = model
+        self._existing = existing
+        self._default_id = default_id
+        if not model.materials:
+            raise ValueError("No materials defined — add a material first.")
+        super().__init__(parent, "Edit section" if existing else "Add section")
+
+    def _build_body(self, body: QWidget) -> None:
+        form = QFormLayout(body)
+        self._id_entry = QLineEdit(body)
+        form.addRow("ID", self._id_entry)
+        self._name_entry = QLineEdit(body)
+        form.addRow("Name", self._name_entry)
+
+        self._mat_combo = QComboBox(body)
+        for mid in sorted(self._model.materials):
+            m = self._model.materials[mid]
+            label = f"{mid} ({m.name})" if m.name else str(mid)
+            self._mat_combo.addItem(label, mid)
+        form.addRow("Material", self._mat_combo)
+
+        self._a_entry = QLineEdit(body)
+        self._i_entry = QLineEdit(body)
+        self._d_entry = QLineEdit(body)
+        form.addRow("A (m²)", self._a_entry)
+        form.addRow("I (m⁴)", self._i_entry)
+        form.addRow("depth (m)", self._d_entry)
+
+        if self._existing:
+            s = self._existing
+            self._id_entry.setText(str(s.id))
+            self._id_entry.setReadOnly(True)
+            self._name_entry.setText(s.name)
+            idx = self._mat_combo.findData(s.material_id)
+            if idx >= 0:
+                self._mat_combo.setCurrentIndex(idx)
+            self._a_entry.setText(repr(s.A))
+            self._i_entry.setText(repr(s.I))
+            self._d_entry.setText(repr(s.depth))
+        else:
+            self._id_entry.setText(str(self._default_id))
+            self._d_entry.setText("0.0")
+
+    def _accept(self) -> Section:
+        sid = parse_int(self._id_entry.text(), "Section ID")
+        name = self._name_entry.text().strip()
+        material_id = self._mat_combo.currentData()
+        if material_id not in self._model.materials:
+            raise ValueError(f"Material {material_id} does not exist.")
+        A = parse_float(self._a_entry.text(), "A")
+        I = parse_float(self._i_entry.text(), "I")
+        depth = parse_float(self._d_entry.text(), "depth", allow_blank=True) or 0.0
         if A <= 0:
             raise ValueError("A must be > 0.")
         if I < 0:
             raise ValueError("I cannot be negative.")
-        return Material(id=mid, E=E, A=A, I=I, alpha=alpha, depth=depth)
+        return Section(id=sid, name=name, material_id=int(material_id),
+                       A=A, I=I, depth=depth)
 
 
 # ── element properties ──
@@ -157,14 +220,14 @@ class MaterialDialog(_ModalDialog):
 class ElementDialog(_ModalDialog):
     def __init__(self, parent, *, model: StructuralModel,
                  existing_kind: str | None = None,
-                 existing_material_id: int | None = None,
+                 existing_section_id: int | None = None,
                  existing_release_i: bool = False,
                  existing_release_j: bool = False):
         self._model = model
-        if not model.materials:
-            raise ValueError("No materials defined — add a material first.")
+        if not model.sections:
+            raise ValueError("No sections defined — add a section first.")
         self._existing_kind = existing_kind
-        self._existing_mat = existing_material_id
+        self._existing_sec = existing_section_id
         self._existing_ri = existing_release_i
         self._existing_rj = existing_release_j
         super().__init__(parent, "Element properties")
@@ -186,14 +249,16 @@ class ElementDialog(_ModalDialog):
         self._rb_frame.toggled.connect(self._refresh_release_state)
         form.addRow("Kind:", kind_box)
 
-        self._mat_combo = QComboBox(body)
-        for mid in sorted(self._model.materials):
-            self._mat_combo.addItem(str(mid), mid)
-        if self._existing_mat is not None:
-            idx = self._mat_combo.findData(self._existing_mat)
+        self._sec_combo = QComboBox(body)
+        for sid in sorted(self._model.sections):
+            s = self._model.sections[sid]
+            label = f"{sid} ({s.name})" if s.name else str(sid)
+            self._sec_combo.addItem(label, sid)
+        if self._existing_sec is not None:
+            idx = self._sec_combo.findData(self._existing_sec)
             if idx >= 0:
-                self._mat_combo.setCurrentIndex(idx)
-        form.addRow("Material:", self._mat_combo)
+                self._sec_combo.setCurrentIndex(idx)
+        form.addRow("Section:", self._sec_combo)
 
         self._cb_ri = QCheckBox("Moment release at start (i)", body)
         self._cb_rj = QCheckBox("Moment release at end (j)", body)
@@ -210,12 +275,12 @@ class ElementDialog(_ModalDialog):
 
     def _accept(self) -> dict:
         kind = "frame" if self._rb_frame.isChecked() else "truss"
-        material_id = self._mat_combo.currentData()
-        if material_id not in self._model.materials:
-            raise ValueError(f"Material {material_id} does not exist.")
+        section_id = self._sec_combo.currentData()
+        if section_id not in self._model.sections:
+            raise ValueError(f"Section {section_id} does not exist.")
         return {
             "kind": kind,
-            "material_id": int(material_id),
+            "section_id": int(section_id),
             "release_i": self._cb_ri.isChecked() if kind == "frame" else False,
             "release_j": self._cb_rj.isChecked() if kind == "frame" else False,
         }
@@ -419,7 +484,64 @@ class MemberLoadDialog(_ModalDialog):
         raise ValueError(f"Unknown load type {kind!r}.")
 
 
-# ── grid spacing ──
+# ── labeled grid system ──
+
+
+class GridDialog(_ModalDialog):
+    """Define the X and Y grid lines (SAP2000-style)."""
+
+    def __init__(self, parent, *, current=None):
+        # ``current`` is an optional GridSystem (None ⇒ blank).
+        self._current = current
+        super().__init__(parent, "Grid system")
+
+    def _build_body(self, body: QWidget) -> None:
+        v = QVBoxLayout(body)
+        v.addWidget(QLabel(
+            "Enter labels and coordinates as comma-separated pairs.\n"
+            "Example: A=0, B=4, C=8, D=12  /  1=0, 2=3, 3=6",
+            body,
+        ))
+        form = QFormLayout()
+        self._x_entry = QLineEdit(body)
+        self._y_entry = QLineEdit(body)
+        form.addRow("X lines:", self._x_entry)
+        form.addRow("Y lines:", self._y_entry)
+        v.addLayout(form)
+
+        if self._current is not None:
+            self._x_entry.setText(", ".join(
+                f"{ln.label}={ln.coord:g}" for ln in self._current.x_lines))
+            self._y_entry.setText(", ".join(
+                f"{ln.label}={ln.coord:g}" for ln in self._current.y_lines))
+
+    def _parse_axis(self, text: str, axis_name: str):
+        from .grid import GridLine
+        lines: list = []
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise ValueError(
+                    f"{axis_name} entry '{part}' is not in 'label=value' form."
+                )
+            label, coord_s = part.split("=", 1)
+            label = label.strip()
+            if not label:
+                raise ValueError(f"{axis_name} entry has empty label.")
+            coord = parse_float(coord_s.strip(), f"{axis_name} '{label}' coord")
+            lines.append(GridLine(label=label, coord=coord))
+        return lines
+
+    def _accept(self):
+        from .grid import GridSystem
+        x_lines = self._parse_axis(self._x_entry.text(), "X")
+        y_lines = self._parse_axis(self._y_entry.text(), "Y")
+        if not x_lines and not y_lines:
+            # Empty grid is permitted (treats canvas as blank).
+            return GridSystem(x_lines=[], y_lines=[])
+        return GridSystem(x_lines=x_lines, y_lines=y_lines)
 
 
 class GridSpacingDialog(_ModalDialog):
@@ -444,74 +566,148 @@ class GridSpacingDialog(_ModalDialog):
 
 
 class MaterialListDialog(_ModalDialog):
-    """Browse / add / edit / delete materials."""
+    """Tabbed Materials + Sections editor.
+
+    The callbacks are wired by the host:
+        on_add_or_update_material(Material)
+        on_delete_material(int)
+        on_add_or_update_section(Section)
+        on_delete_section(int)
+    Each callback dispatches the matching command via MainWindow.execute().
+    """
 
     def __init__(self, parent, *, model: StructuralModel,
-                 on_add_or_update, on_delete) -> None:
+                 on_add_or_update_material,
+                 on_delete_material,
+                 on_add_or_update_section,
+                 on_delete_section) -> None:
         self._model = model
-        self._on_add_or_update = on_add_or_update
-        self._on_delete = on_delete
-        super().__init__(parent, "Materials")
+        self._on_add_or_update_material = on_add_or_update_material
+        self._on_delete_material = on_delete_material
+        self._on_add_or_update_section = on_add_or_update_section
+        self._on_delete_section = on_delete_section
+        super().__init__(parent, "Materials and Sections")
 
     def _build_body(self, body: QWidget) -> None:
         v = QVBoxLayout(body)
-        self._tree = QTreeWidget(body)
-        self._tree.setHeaderLabels(["id", "E", "A", "I", "α", "depth"])
-        self._tree.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        v.addWidget(self._tree)
+        self._tabs = QTabWidget(body)
+        v.addWidget(self._tabs)
+
+        # ── Materials tab ──
+        mat_page = QWidget(self._tabs)
+        ml = QVBoxLayout(mat_page)
+        self._mat_tree = QTreeWidget(mat_page)
+        self._mat_tree.setHeaderLabels(["id", "name", "E (kN/m²)", "α (1/°C)"])
+        self._mat_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        ml.addWidget(self._mat_tree)
+        mb = QHBoxLayout()
+        for label, slot in [("Add", self._add_mat),
+                             ("Edit", self._edit_mat),
+                             ("Delete", self._delete_mat)]:
+            b = QPushButton(label, mat_page)
+            b.clicked.connect(slot)
+            mb.addWidget(b)
+        mb.addStretch(1)
+        ml.addLayout(mb)
+        self._tabs.addTab(mat_page, "Materials")
+
+        # ── Sections tab ──
+        sec_page = QWidget(self._tabs)
+        sl = QVBoxLayout(sec_page)
+        self._sec_tree = QTreeWidget(sec_page)
+        self._sec_tree.setHeaderLabels(
+            ["id", "name", "material", "A (m²)", "I (m⁴)", "depth (m)"]
+        )
+        self._sec_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        sl.addWidget(self._sec_tree)
+        sb = QHBoxLayout()
+        for label, slot in [("Add", self._add_sec),
+                             ("Edit", self._edit_sec),
+                             ("Delete", self._delete_sec)]:
+            b = QPushButton(label, sec_page)
+            b.clicked.connect(slot)
+            sb.addWidget(b)
+        sb.addStretch(1)
+        sl.addLayout(sb)
+        self._tabs.addTab(sec_page, "Sections")
+
         self._refresh()
 
-        btns = QHBoxLayout()
-        b_add = QPushButton("Add", body)
-        b_edit = QPushButton("Edit", body)
-        b_del = QPushButton("Delete", body)
-        b_add.clicked.connect(self._add)
-        b_edit.clicked.connect(self._edit)
-        b_del.clicked.connect(self._delete)
-        btns.addWidget(b_add)
-        btns.addWidget(b_edit)
-        btns.addWidget(b_del)
-        btns.addStretch(1)
-        v.addLayout(btns)
-
     def _refresh(self) -> None:
-        self._tree.clear()
+        self._mat_tree.clear()
         for mid in sorted(self._model.materials):
             m = self._model.materials[mid]
-            QTreeWidgetItem(self._tree, [
-                str(m.id), f"{m.E:g}", f"{m.A:g}", f"{m.I:g}",
-                f"{m.alpha:g}", f"{m.depth:g}",
+            QTreeWidgetItem(self._mat_tree, [
+                str(m.id), m.name, f"{m.E:g}", f"{m.alpha:g}",
+            ])
+        self._sec_tree.clear()
+        for sid in sorted(self._model.sections):
+            s = self._model.sections[sid]
+            QTreeWidgetItem(self._sec_tree, [
+                str(s.id), s.name, str(s.material_id),
+                f"{s.A:g}", f"{s.I:g}", f"{s.depth:g}",
             ])
 
-    def _selected_id(self) -> int | None:
-        items = self._tree.selectedItems()
+    def _selected_id(self, tree: QTreeWidget) -> int | None:
+        items = tree.selectedItems()
         if not items:
             return None
         return int(items[0].text(0))
 
-    def _add(self) -> None:
-        existing_ids = list(self._model.materials.keys())
-        next_id = (max(existing_ids) + 1) if existing_ids else 1
+    # ── Materials tab handlers ──
+    def _add_mat(self) -> None:
+        existing = list(self._model.materials.keys())
+        next_id = (max(existing) + 1) if existing else 1
         d = MaterialDialog(self, existing=None, default_id=next_id)
         if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
-            self._on_add_or_update(d.result_value)
+            self._on_add_or_update_material(d.result_value)
             self._refresh()
 
-    def _edit(self) -> None:
-        mid = self._selected_id()
+    def _edit_mat(self) -> None:
+        mid = self._selected_id(self._mat_tree)
         if mid is None:
             return
         d = MaterialDialog(self, existing=self._model.materials[mid], default_id=mid)
         if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
-            self._on_add_or_update(d.result_value)
+            self._on_add_or_update_material(d.result_value)
             self._refresh()
 
-    def _delete(self) -> None:
-        mid = self._selected_id()
+    def _delete_mat(self) -> None:
+        mid = self._selected_id(self._mat_tree)
         if mid is None:
             return
-        # Errors are reported by MainWindow.execute() via its own dialog.
-        self._on_delete(mid)
+        self._on_delete_material(mid)
+        self._refresh()
+
+    # ── Sections tab handlers ──
+    def _add_sec(self) -> None:
+        existing = list(self._model.sections.keys())
+        next_id = (max(existing) + 1) if existing else 1
+        try:
+            d = SectionDialog(self, model=self._model, existing=None,
+                               default_id=next_id)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot add section", str(e))
+            return
+        if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
+            self._on_add_or_update_section(d.result_value)
+            self._refresh()
+
+    def _edit_sec(self) -> None:
+        sid = self._selected_id(self._sec_tree)
+        if sid is None:
+            return
+        d = SectionDialog(self, model=self._model,
+                           existing=self._model.sections[sid], default_id=sid)
+        if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
+            self._on_add_or_update_section(d.result_value)
+            self._refresh()
+
+    def _delete_sec(self) -> None:
+        sid = self._selected_id(self._sec_tree)
+        if sid is None:
+            return
+        self._on_delete_section(sid)
         self._refresh()
 
     def _accept(self) -> None:

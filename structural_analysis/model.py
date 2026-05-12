@@ -36,28 +36,44 @@ class Node:
 
 @dataclass(frozen=True)
 class Material:
-    """Material and cross-section properties.
+    """Pure material properties (E and α).
 
-    Combines material (E, α) and section (A, I, depth) properties. The
-    thermal expansion coefficient α and the section depth live here because
-    they are intrinsic to the material/section, not to any particular load.
+    Sections (A, I, depth) are stored separately on the model as
+    :class:`Section` objects, with each section referencing a material.
 
     Attributes:
         id: Material identifier.
+        name: Optional human-readable name (e.g. "C40/50", "S355").
         E: Modulus of elasticity (kN/m²).
+        alpha: Coefficient of thermal expansion (1/°C). Default 0 (inert).
+    """
+
+    id: int
+    name: str = ""
+    E: float = 0.0
+    alpha: float = 0.0
+
+
+@dataclass(frozen=True)
+class Section:
+    """Cross-section properties, pointing back to a material.
+
+    Attributes:
+        id: Section identifier.
+        name: Optional human-readable name (e.g. "W360x196", "50x50").
+        material_id: id of the :class:`Material` this section uses.
         A: Cross-sectional area (m²).
         I: Moment of inertia (m⁴).
-        alpha: Coefficient of thermal expansion (1/°C). Default 0 (inert).
-        depth: Section depth (m), used for frame thermal gradient curvature.
+        depth: Section depth (m), used for frame thermal-gradient curvature.
             Default 0 (required only if a thermal gradient is applied).
     """
 
     id: int
-    E: float   # modulus of elasticity (kN/m²)
-    A: float   # cross-sectional area (m²)
-    I: float   # moment of inertia (m⁴)
-    alpha: float = 0.0   # thermal expansion coefficient (1/°C)
-    depth: float = 0.0   # section depth (m) — for frame thermal gradient
+    name: str = ""
+    material_id: int = 0
+    A: float = 0.0
+    I: float = 0.0
+    depth: float = 0.0
 
 
 # ── Supports ───────────────────────────────────────────────────
@@ -191,6 +207,7 @@ class StructuralModel:
     title: str = "Untitled"
     nodes: dict[int, Node] = field(default_factory=dict)
     materials: dict[int, Material] = field(default_factory=dict)
+    sections: dict[int, "Section"] = field(default_factory=dict)
     elements: list = field(default_factory=list)        # list[Element2D]
     supports: dict[int, Support] = field(default_factory=dict)
     nodal_loads: list[NodalLoad] = field(default_factory=list)

@@ -79,8 +79,10 @@ def test_all_dialogs_construct(qt_app):
     GridSpacingDialog(w, current=0.5)
     ElementDialog(w, model=m)
     MaterialListDialog(w, model=m,
-                        on_add_or_update=lambda _x: None,
-                        on_delete=lambda _x: None)
+                        on_add_or_update_material=lambda _x: None,
+                        on_delete_material=lambda _x: None,
+                        on_add_or_update_section=lambda _x: None,
+                        on_delete_section=lambda _x: None)
 
 
 def test_member_load_dialog_raises_for_unknown_element(qt_app):
