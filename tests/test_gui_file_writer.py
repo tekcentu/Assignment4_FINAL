@@ -86,18 +86,18 @@ def test_round_trip_synthetic_kitchen_sink():
     mat2, sec2 = m.materials[2], m.sections[2]
     m.elements.append(FrameElement2D(
         id=1, node_i=1, node_j=2, E=mat1.E, A=sec1.A, I=sec1.I,
-        alpha=mat1.alpha, depth=sec1.depth,
+        alpha=mat1.alpha, depth=sec1.depth, section_id=sec1.id,
         release_i=False, release_j=True,
         member_loads=[UniformDistributedLoad(wy=-5.0)],
     ))
     m.elements.append(FrameElement2D(
         id=2, node_i=2, node_j=3, E=mat1.E, A=sec1.A, I=sec1.I,
-        alpha=mat1.alpha, depth=sec1.depth,
+        alpha=mat1.alpha, depth=sec1.depth, section_id=sec1.id,
         member_loads=[PointLoad(py=-3.0, a=2.0),
                        FrameTemperatureLoad(t_top=10.0, t_bottom=-10.0)],
     ))
     m.elements.append(TrussElement2D(
-        id=3, node_i=4, node_j=2, E=mat2.E, A=sec2.A,
+        id=3, node_i=4, node_j=2, E=mat2.E, A=sec2.A, section_id=sec2.id,
         member_loads=[TrussTemperatureLoad(delta_T=25.0)],
     ))
 
@@ -111,22 +111,44 @@ def test_round_trip_synthetic_kitchen_sink():
     _assert_results_equal(m, m2)
 
 
-def test_writer_raises_when_element_material_unrecoverable():
-    """If an element's E/A/I doesn't match any Section, the writer fails loudly."""
+def test_writer_raises_when_element_has_no_section_id():
+    """Elements built outside the model layer have section_id=None.
+    The writer must refuse to serialise them rather than silently dropping
+    the section assignment."""
     m = StructuralModel(title="orphan element")
     from structural_analysis.model import Node
     m.nodes[1] = Node(1, 0.0, 0.0)
     m.nodes[2] = Node(2, 1.0, 0.0)
     m.materials[1] = Material(id=1, E=1.0)
     m.sections[1] = Section(id=1, material_id=1, A=1.0, I=1.0)
-    # Element references properties that don't match any section.
+    # No section_id assigned (default None).
     m.elements.append(FrameElement2D(
-        id=1, node_i=1, node_j=2, E=999.0, A=999.0, I=999.0,
+        id=1, node_i=1, node_j=2, E=1.0, A=1.0, I=1.0,
     ))
     fd, tmp = tempfile.mkstemp(suffix=".txt")
     os.close(fd)
     try:
-        with pytest.raises(ValueError, match="does not match any Material\\+Section"):
+        with pytest.raises(ValueError, match="no section_id assigned"):
+            write_input_file(m, tmp)
+    finally:
+        os.unlink(tmp)
+
+
+def test_writer_raises_when_section_id_dangles():
+    """If section_id points at a section that's been deleted, fail loudly."""
+    m = StructuralModel(title="dangling section_id")
+    from structural_analysis.model import Node
+    m.nodes[1] = Node(1, 0.0, 0.0)
+    m.nodes[2] = Node(2, 1.0, 0.0)
+    m.materials[1] = Material(id=1, E=1.0)
+    # Note: no section with id 99
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2, E=1.0, A=1.0, I=1.0, section_id=99,
+    ))
+    fd, tmp = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with pytest.raises(ValueError, match="references section 99"):
             write_input_file(m, tmp)
     finally:
         os.unlink(tmp)

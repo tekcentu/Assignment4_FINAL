@@ -13,7 +13,6 @@ from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     FrameTemperatureLoad,
     PointLoad,
-    Section,
     StructuralModel,
     TrussTemperatureLoad,
     UniformDistributedLoad,
@@ -75,18 +74,20 @@ def write_input_file(model: StructuralModel, path: str) -> None:
     out.append("")
 
     out.append(f"ELEMENTS {len(model.elements)}")
-    elem_to_sec: dict[int, int] = _element_section_lookup(model)
     for elem in model.elements:
         kind = "TRUSS" if isinstance(elem, TrussElement2D) else "FRAME"
-        if elem.id not in elem_to_sec:
+        if elem.section_id is None:
             raise ValueError(
-                f"Element {elem.id} has E={elem.E}, A={elem.A}"
-                + (f", I={elem.I}" if isinstance(elem, FrameElement2D) else "")
-                + " which does not match any Material+Section combination "
-                "in the model — cannot serialise."
+                f"Element {elem.id} has no section_id assigned — was it "
+                "constructed without going through the model layer "
+                "(file_io / AddElementCmd)? Cannot serialise."
             )
-        sec_id = elem_to_sec[elem.id]
-        line = f"{elem.id}  {elem.node_i}  {elem.node_j}  {sec_id}  {kind}"
+        if elem.section_id not in model.sections:
+            raise ValueError(
+                f"Element {elem.id} references section {elem.section_id}, "
+                "which is not in the model. Cannot serialise."
+            )
+        line = f"{elem.id}  {elem.node_i}  {elem.node_j}  {elem.section_id}  {kind}"
         if isinstance(elem, FrameElement2D):
             if elem.release_i and elem.release_j:
                 line += "  BOTH"
@@ -152,32 +153,3 @@ def write_input_file(model: StructuralModel, path: str) -> None:
 
     with open(path, "w") as f:
         f.write("\n".join(out).rstrip() + "\n")
-
-
-def _element_section_lookup(model: StructuralModel) -> dict[int, int]:
-    """Recover (elem_id → section_id) by matching against the section table.
-
-    Elements continue to store flat E/A/I/α/depth. For round-tripping we
-    match those numbers back to (material, section) pairs. Matching is done
-    in sorted id order for deterministic results when multiple sections
-    share identical numeric properties.
-    """
-    lookup: dict[int, int] = {}
-    sorted_sids = sorted(model.sections)
-    for elem in model.elements:
-        for sid in sorted_sids:
-            sec = model.sections[sid]
-            mat = model.materials.get(sec.material_id)
-            if mat is None:
-                continue
-            if mat.E != elem.E or sec.A != elem.A:
-                continue
-            if isinstance(elem, FrameElement2D) and sec.I != elem.I:
-                continue
-            if mat.alpha != elem.alpha:
-                continue
-            if sec.depth != elem.depth:
-                continue
-            lookup[elem.id] = sid
-            break
-    return lookup

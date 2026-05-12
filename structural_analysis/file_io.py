@@ -175,12 +175,14 @@ def read_input_file(filepath: str) -> StructuralModel:
                         id=eid, node_i=sn, node_j=en,
                         E=mat.E, A=section.A,
                         alpha=mat.alpha, depth=section.depth,
+                        section_id=section.id,
                     )
                 else:
                     elem = FrameElement2D(
                         id=eid, node_i=sn, node_j=en,
                         E=mat.E, A=section.A, I=section.I,
                         alpha=mat.alpha, depth=section.depth,
+                        section_id=section.id,
                         release_i=release_i, release_j=release_j,
                     )
                 model.elements.append(elem)

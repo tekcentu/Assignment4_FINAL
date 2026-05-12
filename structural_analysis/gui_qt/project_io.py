@@ -23,7 +23,9 @@ from ..gui.file_writer import write_input_file
 
 from .grid import GridSystem
 
-PROJECT_VERSION = 1
+SCHEMA_VERSION = 1
+# Legacy alias kept while transitioning — readers accept either key.
+PROJECT_VERSION = SCHEMA_VERSION
 
 
 @dataclass
@@ -82,7 +84,7 @@ def save_project_json(project: Project, path: str) -> None:
             pass
 
     payload: dict[str, Any] = {
-        "version": PROJECT_VERSION,
+        "schema_version": SCHEMA_VERSION,
         "title": project.title or project.model.title,
         "units": "kN_m",
         "grid": project.grid.to_dict(),
@@ -100,11 +102,14 @@ def load_project_json(path: str) -> Project:
         payload = json.load(f)
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: top-level JSON is not an object.")
-    version = payload.get("version")
-    if version != PROJECT_VERSION:
+    # Accept the new key (schema_version) and the legacy one (version) so
+    # files written during the transitional release still load. New files
+    # are always written with schema_version (see save_project_json).
+    version = payload.get("schema_version", payload.get("version"))
+    if version != SCHEMA_VERSION:
         raise ValueError(
-            f"{path}: unsupported project version {version}; "
-            f"expected {PROJECT_VERSION}."
+            f"{path}: unsupported schema_version {version}; "
+            f"expected {SCHEMA_VERSION}."
         )
     model_txt = payload.get("model_txt")
     if not isinstance(model_txt, str):

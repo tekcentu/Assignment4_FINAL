@@ -77,6 +77,11 @@ class Element2D:
         A: Cross-sectional area (m²).
         alpha: Coefficient of thermal expansion (1/°C). Default 0 (inert).
         depth: Section depth (m), used for frame thermal gradient. Default 0.
+        section_id: id of the :class:`Section` this element was assigned to
+            (None for elements built outside the model layer, e.g. raw unit
+            tests). Stiffness math ignores this — it's a back-reference used
+            by the writer and the GUI command propagation logic to find
+            elements that belong to a given Section/Material.
         member_loads: List of MemberLoad objects (UDL, PointLoad, thermal).
     """
 
@@ -87,6 +92,7 @@ class Element2D:
     A: float
     alpha: float = 0.0
     depth: float = 0.0
+    section_id: int | None = None
     member_loads: list[MemberLoad] = field(default_factory=list)
 
     @property
