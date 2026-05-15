@@ -11,7 +11,7 @@ import pytest
 
 from structural_analysis.element import FrameElement2D, TrussElement2D
 from structural_analysis.file_io import read_input_file
-from structural_analysis.gui.file_writer import write_input_file
+from structural_analysis.gui_common.file_writer import write_input_file
 from structural_analysis.main import run_analysis
 from structural_analysis.model import (
     Material,

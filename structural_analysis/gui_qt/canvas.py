@@ -1,8 +1,8 @@
-"""Matplotlib QtAgg canvas — same drawing logic as the Tk backend.
+"""Matplotlib QtAgg canvas for the PyQt6 frontend.
 
-We keep the drawing/hit-test code identical to ``structural_analysis.gui.canvas``
-because ``mpl_connect`` events are backend-agnostic; only the embedding widget
-and the toolbar type change between Tk and Qt.
+``mpl_connect`` events are backend-agnostic, so the drawing and hit-test
+code here stays plain matplotlib; only the embedding widget and the
+toolbar are Qt-specific.
 """
 
 from __future__ import annotations

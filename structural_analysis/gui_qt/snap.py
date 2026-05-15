@@ -21,7 +21,6 @@ pair so the engine doesn't depend on matplotlib axes geometry.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
 
 # Priority constants — lower wins when two candidates tie within tolerance.
 NODE      = ("node",     0)

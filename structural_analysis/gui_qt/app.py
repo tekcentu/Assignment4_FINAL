@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
 from ..file_io import read_input_file
 from ..main import run_analysis
 from ..model import AnalysisResult, StructuralModel
-from ..gui.commands import (
+from ..gui_common.commands import (
     AddElementCmd,
     AddMemberLoadCmd,
     AddOrUpdateMaterialCmd,
@@ -49,8 +49,8 @@ from ..gui.commands import (
     SetNodalLoadCmd,
     SetSupportCmd,
 )
-from ..gui.file_writer import write_input_file
-from ..gui.results_view import format_result
+from ..gui_common.file_writer import write_input_file
+from ..gui_common.results_view import format_result
 
 from .canvas import HitResult, ModelCanvas
 from .controllers import (

@@ -85,7 +85,9 @@ def read_input_file(filepath: str) -> StructuralModel:
                 parts = lines[i].split("#")[0].split()
                 mid = int(parts[0])
                 if has_sections_block:
-                    # New shape: id  E  [alpha]  [name]
+                    # New shape: id  E  [alpha  [name]]
+                    # (alpha is required when name is present, since name is
+                    # parsed positionally as the 4th token)
                     E_val = float(parts[1])
                     alpha = float(parts[2]) if len(parts) > 2 else 0.0
                     name = parts[3] if len(parts) > 3 else ""

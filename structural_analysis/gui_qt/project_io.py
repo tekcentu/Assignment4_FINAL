@@ -1,5 +1,5 @@
 """JSON project I/O — saves both the structural model (as the canonical
-``.txt`` text emitted by :func:`gui.file_writer.write_input_file`) and
+``.txt`` text emitted by :func:`gui_common.file_writer.write_input_file`) and
 GUI-only state (labeled grid system, view limits, snap settings) in a
 single ``.spa.json`` file.
 
@@ -10,7 +10,6 @@ and run via the CLI with identical results.
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import tempfile
@@ -19,7 +18,7 @@ from typing import Any
 
 from ..file_io import read_input_file
 from ..model import StructuralModel
-from ..gui.file_writer import write_input_file
+from ..gui_common.file_writer import write_input_file
 
 from .grid import GridSystem
 

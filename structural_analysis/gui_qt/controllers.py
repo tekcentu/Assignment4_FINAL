@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Optional, Protocol
 
 from .canvas import HitResult
-from ..gui.commands import AddElementCmd, AddNodeCmd, DeleteElementCmd, DeleteNodeCmd
+from ..gui_common.commands import AddElementCmd, AddNodeCmd, DeleteElementCmd, DeleteNodeCmd
 
 
 class _Host(Protocol):

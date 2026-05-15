@@ -6,7 +6,7 @@ from ..element import FrameElement2D
 from ..model import AnalysisResult, StructuralModel
 
 
-def format_result(model: StructuralModel, result: AnalysisResult) -> str:
+def format_result(model: StructuralModel, result: AnalysisResult | None) -> str:
     if result is None:
         return "(no analysis run yet)"
     lines: list[str] = []
