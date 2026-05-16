@@ -67,8 +67,7 @@ positive-definite mass), returning natural angular frequencies `ω_n` and
 mode shapes `φ_n`. The post-processor will convert these to frequencies
 `f_n = ω_n / (2π)` and periods `T_n = 1 / f_n`, normalise each mode (either
 mass-orthonormal `φ_n^T · M · φ_n = 1` or max-component = 1, user choice),
-and expose the result through the same `AnalysisResult` channel already
-used for static results.
+and return them in a dedicated modal result object — see Section 5.
 
 **Required output of the modal feature:**
 
@@ -91,14 +90,25 @@ unchanged). A single addition is required for the modal feature:
 
 ```text
 MATERIALS n
-<id> <E> [alpha] [density] [name]
+<id> <E> <alpha> <density> [name]
 ```
 
-`density` is appended after `alpha` in the new positional shape. When
-absent the value defaults to 0 kg/m³, which is the explicit signal that
-**no modal analysis is possible** for that material — the modal solver
+The first four columns are positional and required in the new shape; the
+optional `name` follows. Legacy input files written before the modal
+feature may omit `density`, in which case it defaults to 0.0 kg/m³ on
+load; static analysis runs unchanged. **Modal analysis requires a
+positive density on every element's material** — the modal solver
 refuses to run on a model whose elements all carry `density = 0` and
 returns a clear error to the GUI.
+
+**Unit consistency.** The static solver uses kN-m engineering units (`E`
+in kN/m², lengths in m, forces in kN), while material density is most
+naturally written in SI kg/m³. The modal module will convert density
+from kg/m³ into the consistent force-time-length system used by the
+static solver internally before assembling the mass matrix `M`, so the
+user supplies density in familiar SI units and the eigenvalue result
+comes out in s⁻¹ (and Hz after dividing by 2π) without further unit
+work.
 
 No new top-level block is required: modal analysis is a runtime mode
 chosen from the GUI's *Run → Modal* menu, not a property of the input
@@ -160,7 +170,9 @@ disturbing this layout:
 - `MassAssembler` (module) — `assemble_mass_matrix(model, dofs)`, reusing
   the existing rotation and DOF-map utilities.
 - `ModalAnalyzer` (module) — `solve_modal(K_ff, M_ff, n_modes)`, returning
-  an extended `AnalysisResult` with `frequencies`, `periods`, and `modes`.
+  a dedicated **modal result object** with `frequencies`, `periods`, and
+  `modes`. The static `AnalysisResult` is left untouched; the GUI
+  dispatches on the result type rather than overloading a single class.
 - `gui_qt/modal_view.py` and `gui_qt/dialogs.ModalDialog` — the table,
   slider, and *Run → Modal* entry point.
 
