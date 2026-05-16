@@ -89,7 +89,19 @@ def read_input_file(filepath: str) -> StructuralModel:
                     # (alpha is required when name is present, since name is
                     # parsed positionally as the 4th token)
                     E_val = float(parts[1])
-                    alpha = float(parts[2]) if len(parts) > 2 else 0.0
+                    if len(parts) > 2:
+                        try:
+                            alpha = float(parts[2])
+                        except ValueError:
+                            raise ValueError(
+                                f"MATERIALS row for id {mid}: expected a numeric "
+                                f"thermal-expansion coefficient (alpha) in column 3, "
+                                f"got {parts[2]!r}. The new MATERIALS shape is "
+                                f"'id E [alpha [name]]'; a name without an alpha "
+                                f"is not allowed because tokens are positional."
+                            )
+                    else:
+                        alpha = 0.0
                     name = parts[3] if len(parts) > 3 else ""
                     model.materials[mid] = Material(id=mid, name=name,
                                                     E=E_val, alpha=alpha)

@@ -630,12 +630,14 @@ class MainWindow(QMainWindow):
 
     def _open_path(self, path: str) -> None:
         is_json = path.lower().endswith(".spa.json") or path.lower().endswith(".json")
+        new_view = None
         try:
             if is_json:
                 from .project_io import load_project_json
                 project = load_project_json(path)
                 new_model = project.model
                 new_grid = project.grid
+                new_view = project.view
             else:
                 new_model = read_input_file(path)
                 new_grid = GridSystem()
@@ -659,7 +661,20 @@ class MainWindow(QMainWindow):
         self._clear_result()
         self._update_title()
         self.canvas.redraw()
+        if new_view is not None:
+            self._apply_view_state(new_view)
         self.set_status(f"Opened {path}")
+
+    def _apply_view_state(self, view) -> None:
+        if view.xlim is not None:
+            self.canvas.ax.set_xlim(view.xlim)
+        if view.ylim is not None:
+            self.canvas.ax.set_ylim(view.ylim)
+        enabled = set(view.snap_kinds)
+        self.canvas.snap_engine.enabled_kinds = set(enabled)
+        for kind, action in self._snap_actions.items():
+            action.setChecked(kind in enabled)
+        self.canvas.draw_idle()
 
     def _do_save(self) -> bool:
         if self._current_path is None:

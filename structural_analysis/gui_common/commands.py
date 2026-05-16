@@ -3,6 +3,15 @@
 Every user-visible mutation flows through a Command. ``do(model)`` validates
 its inputs **before** mutating; if validation fails it raises ``ValueError``
 with a human-readable message and the model is left untouched.
+
+Invariant: each command captures the inverse-state it needs (via ``_previous``,
+``_saved``, or ``_snapshot``) **before** it mutates the model, and performs all
+the reads it needs from the model (e.g. which sections own a material, which
+elements point at a section) before any writes. ``do()`` and ``undo()`` are
+inverses when ``do()`` completes successfully. If ``do()`` raises mid-mutation
+the controller must not push the command on the undo stack — the model layer
+trusts internal callers to pass well-formed data, so no transactional rollback
+is wired in.
 """
 
 from __future__ import annotations
@@ -233,13 +242,14 @@ class AddOrUpdateMaterialCmd(Command):
     def do(self, model: StructuralModel) -> None:
         if self.material.E <= 0:
             raise ValueError("Material E must be positive.")
-        self._previous = model.materials.get(self.material.id)
+        previous = model.materials.get(self.material.id)
+        owned_sections = {s.id for s in model.sections.values()
+                          if s.material_id == self.material.id}
+        self._previous = previous
         model.materials[self.material.id] = self.material
         # Propagate updated E/α to elements that belong to any section
         # whose material_id is this material.
-        if self._previous is not None:
-            owned_sections = {s.id for s in model.sections.values()
-                              if s.material_id == self.material.id}
+        if previous is not None:
             for elem in model.elements:
                 if elem.section_id in owned_sections:
                     elem.E = self.material.E
@@ -300,21 +310,23 @@ class AddOrUpdateSectionCmd(Command):
                 f"Section references material {self.section.material_id}, "
                 "which does not exist."
             )
-        self._previous = model.sections.get(self.section.id)
+        previous = model.sections.get(self.section.id)
+        new_mat = model.materials.get(self.section.material_id)
+        affected_elements = [e for e in model.elements
+                             if e.section_id == self.section.id]
+        self._previous = previous
         model.sections[self.section.id] = self.section
         # Propagate A/I/depth to elements that point at this section.
         # If the section's material_id changed, also re-pull E/α from the
         # new material so the element matches the new combination.
-        new_mat = model.materials.get(self.section.material_id)
-        for elem in model.elements:
-            if elem.section_id == self.section.id:
-                elem.A = self.section.A
-                elem.depth = self.section.depth
-                if isinstance(elem, FrameElement2D):
-                    elem.I = self.section.I
-                if new_mat is not None:
-                    elem.E = new_mat.E
-                    elem.alpha = new_mat.alpha
+        for elem in affected_elements:
+            elem.A = self.section.A
+            elem.depth = self.section.depth
+            if isinstance(elem, FrameElement2D):
+                elem.I = self.section.I
+            if new_mat is not None:
+                elem.E = new_mat.E
+                elem.alpha = new_mat.alpha
 
     def undo(self, model: StructuralModel) -> None:
         if self._previous is None:

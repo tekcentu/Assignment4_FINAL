@@ -195,6 +195,14 @@ class Element2D:
         Returns:
             Tuple (d_local, q_local) where d_local is the 6-element local
             displacement vector and q_local is [N_i, V_i, M_i, N_j, V_j, M_j].
+
+        Sign convention: ``q_local = K·d − p_local`` is the action of the
+        nodes on the element in the element's local frame. ``+N_i`` is
+        tension at the i-end; ``+V_i`` is in the +y_local direction at the
+        i-end; ``+M_i`` is in the +z_local (out-of-plane CCW) direction at
+        the i-end. ``q_global = Rᵀ·q_local`` satisfies ``Σ q_global = applied``
+        at every free node (see :func:`postprocessor.equilibrium_check`),
+        i.e. q is the force the node applies to the element.
         """
         R = self.transformation_matrix(nodes)
         d_local = R @ u_global_elem

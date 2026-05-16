@@ -558,17 +558,33 @@ def _diagram_ordinates(elem, ni, nj, f_local, kind: str,
             points.append((ml.a, ml.py))
     xs = [i * L / (n_samples - 1) for i in range(n_samples)]
     if kind == "axial":
+        # Axial: plot ``-N_i`` so compression on the element reads positive
+        # on the page (the local-frame member-end axial force is positive in
+        # the +x_local direction, which is tension on the i-end; flipping
+        # the sign gives the conventional compression-positive diagram).
         ys = [-N_i for _ in xs]
         return xs, ys
     if isinstance(elem, TrussElement2D):
         return None, None
     w = sum(udls)
 
+    # Shear and moment from the left-of-cut free body. ``V_i`` and ``M_i``
+    # are the local member-end shear/moment at the i-end (see
+    # FrameElement2D.local_displacement_and_end_forces — they are the
+    # entries of ``q_local = K·d − p_local``). ``w`` is the summed UDL
+    # intensity in the element's +y_local direction (so ``wy < 0`` is a
+    # downward load on a horizontal beam), and ``points = [(a, py)]`` are
+    # in-span point loads with ``py`` in +y_local.
+    #
+    # The point-load contributions in ``shear`` and ``moment`` carry the
+    # **same** sign of ``py`` so the differential identity ``dM/dx = V``
+    # holds across the in-span discontinuity — see
+    # ``tests/test_diagram_signs.py`` for the regression.
     def shear(x):
         v = V_i - w * x
         for a, py in points:
             if x > a:
-                v -= py
+                v += py
         return v
 
     def moment(x):
