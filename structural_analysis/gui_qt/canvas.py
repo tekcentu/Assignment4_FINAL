@@ -72,13 +72,28 @@ class ModelCanvas(QWidget):
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
+        # Fallback hover cursor when no snap candidate is active. This
+        # is what the user sees when their cursor is over empty space
+        # between grid lines — it marks the point a left-click would
+        # actually land on (the rectangular-grid-snapped coords).
+        self._hover_xy: tuple[float, float] | None = None
+        # Whether the view has been initialised at least once. Until
+        # this is True, redraw() auto-fits the model + grid extent. Once
+        # set, redraw() preserves the user's current xlim/ylim so
+        # placing a node or moving the mouse no longer collapses the
+        # zoom level.
+        self._view_initialised: bool = False
 
         self.on_click: Callable[[HitResult, str], None] | None = None
         self.on_motion: Callable[[HitResult], None] | None = None
 
         self.fig = plt.Figure(figsize=(7.5, 6.0), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_aspect("equal", adjustable="datalim")
+        # adjustable="box" lets the user's xlim/ylim be honored exactly
+        # (matplotlib resizes the axes rectangle to keep aspect=1).
+        # The legacy "datalim" mode would silently rewrite our limits
+        # and emit "Ignoring fixed y limits…" on every redraw.
+        self.ax.set_aspect("equal", adjustable="box")
 
         self._mpl_canvas = FigureCanvasQTAgg(self.fig)
         self.toolbar = NavigationToolbar2QT(self._mpl_canvas, self)
@@ -139,10 +154,38 @@ class ModelCanvas(QWidget):
         self._modal_result = None
         self.redraw()
 
+    def fit_to_view(self) -> None:
+        """Re-fit the axes to enclose the current model + grid extent.
+
+        ``redraw()`` preserves the user's pan/zoom state by default, so
+        callers need to invoke this explicitly to reset the view (e.g.
+        after loading a file or via the View → Fit action).
+        """
+        self._view_initialised = False
+        self.redraw()
+
     def redraw(self) -> None:
+        # Preserve the current view across the clear()/redraw cycle so
+        # mouse motion and node-placement events don't collapse the
+        # zoom level. On the very first redraw we have nothing to
+        # preserve — call _set_axes_limits to fit the (possibly empty)
+        # model + grid, and remember that we did.
+        if self._view_initialised:
+            saved_xlim = self.ax.get_xlim()
+            saved_ylim = self.ax.get_ylim()
+        else:
+            saved_xlim = saved_ylim = None
+
         self.ax.clear()
-        self.ax.set_aspect("equal", adjustable="datalim")
-        self._set_axes_limits()  # set extents up-front so grid labels know y1/x1
+        self.ax.set_aspect("equal", adjustable="box")
+
+        if saved_xlim is not None:
+            self.ax.set_xlim(saved_xlim)
+            self.ax.set_ylim(saved_ylim)
+        else:
+            self._set_axes_limits()
+            self._view_initialised = True
+
         self._draw_grid()
         self._draw_model()
         if self._result is not None and self._result.status == "ok":
@@ -172,10 +215,18 @@ class ModelCanvas(QWidget):
 
     def _handle_motion(self, event) -> None:
         if self.on_motion is None or event.inaxes is not self.ax:
+            # Cursor left the axes — drop the hover marker.
+            if self._hover_xy is not None:
+                self._hover_xy = None
+                self._mpl_canvas.draw_idle()
             return
         if event.xdata is None or event.ydata is None:
             return
         hit = self._hit_test(event)
+        # Record the position a click would land on, so the hover
+        # marker can be drawn even when the snap engine has no
+        # candidate (empty space between labeled grid lines).
+        self._hover_xy = (hit.x, hit.y)
         try:
             self.on_motion(hit)
         except Exception:
@@ -275,18 +326,27 @@ class ModelCanvas(QWidget):
 
     def _draw_snap_marker(self) -> None:
         c = self._snap_marker
-        if c is None:
+        if c is not None:
+            marker_styles = {
+                "node":     ("o", "#ff7f0e"),  # filled circle, orange
+                "grid":     ("s", "#1f77b4"),  # square, blue
+                "endpoint": ("^", "#9467bd"),  # triangle, purple
+                "midpoint": ("D", "#17becf"),  # diamond, cyan
+                "project":  ("x", "#2ca02c"),  # x, green
+            }
+            marker, color = marker_styles.get(c.kind, ("o", "#888"))
+            self.ax.plot(c.x, c.y, marker=marker, color=color, markersize=12,
+                         markerfacecolor="none", markeredgewidth=2,
+                         zorder=10)
             return
-        marker_styles = {
-            "node":     ("o", "#ff7f0e"),  # filled circle, orange
-            "grid":     ("s", "#1f77b4"),  # square, blue
-            "endpoint": ("^", "#9467bd"),  # triangle, purple
-            "midpoint": ("D", "#17becf"),  # diamond, cyan
-            "project":  ("x", "#2ca02c"),  # x, green
-        }
-        marker, color = marker_styles.get(c.kind, ("o", "#888"))
-        self.ax.plot(c.x, c.y, marker=marker, color=color, markersize=12,
-                     markerfacecolor="none", markeredgewidth=2, zorder=10)
+        # No real snap candidate → draw a faint "ghost" crosshair at
+        # the rectangular-grid-snapped cursor so the user always knows
+        # where a left-click would land.
+        if self._hover_xy is None:
+            return
+        x, y = self._hover_xy
+        self.ax.plot(x, y, marker="+", color="#888888", markersize=14,
+                     markeredgewidth=1.5, alpha=0.7, zorder=10)
 
     def _draw_model(self) -> None:
         model = self._model()

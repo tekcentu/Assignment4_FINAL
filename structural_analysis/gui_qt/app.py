@@ -229,6 +229,8 @@ class MainWindow(QMainWindow):
                                           triggered=self._set_grid_spacing)
         self.act_grid_system = QAction("Grid s&ystem…", self,
                                          triggered=self._edit_grid_system)
+        self.act_fit_view = QAction("&Fit to view", self, shortcut="Home",
+                                      triggered=self._do_fit_view)
         self.act_snap = QAction("Snap to grid", self, checkable=True, checked=True,
                                   triggered=self._toggle_snap)
         # Snap-kind toggles
@@ -289,6 +291,8 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_materials)
 
         m_view = self.menuBar().addMenu("&View")
+        m_view.addAction(self.act_fit_view)
+        m_view.addSeparator()
         m_view.addAction(self.act_grid_system)
         m_view.addAction(self.act_grid_spacing)
         m_view.addAction(self.act_snap)
@@ -544,6 +548,11 @@ class MainWindow(QMainWindow):
         else:
             self.canvas.snap_engine.enabled_kinds.discard(kind)
 
+    def _do_fit_view(self) -> None:
+        """Re-fit the canvas axes to enclose the model and grid extent."""
+        self.canvas.fit_to_view()
+        self.set_status("View fitted to model.")
+
     def _set_grid_spacing(self) -> None:
         d = GridSpacingDialog(self, current=self.canvas.grid_spacing)
         if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
@@ -618,7 +627,7 @@ class MainWindow(QMainWindow):
         self._current_path = None
         self._clear_result()
         self._update_title()
-        self.canvas.redraw()
+        self.canvas.fit_to_view()
 
     def _do_open(self) -> None:
         if not self._confirm_discard():
@@ -665,7 +674,9 @@ class MainWindow(QMainWindow):
         self._current_path = path
         self._clear_result()
         self._update_title()
-        self.canvas.redraw()
+        # New file → fit the view by default; if the project carries a
+        # saved ViewState, that overrides the fit a moment later.
+        self.canvas.fit_to_view()
         if new_view is not None:
             self._apply_view_state(new_view)
         self.set_status(f"Opened {path}")
@@ -675,11 +686,16 @@ class MainWindow(QMainWindow):
             self.canvas.ax.set_xlim(view.xlim)
         if view.ylim is not None:
             self.canvas.ax.set_ylim(view.ylim)
+        # We've just established a custom view — future redraws should
+        # preserve it instead of auto-fitting back to the model extent.
+        if view.xlim is not None or view.ylim is not None:
+            self.canvas._view_initialised = True
         enabled = set(view.snap_kinds)
         self.canvas.snap_engine.enabled_kinds = set(enabled)
         for kind, action in self._snap_actions.items():
             action.setChecked(kind in enabled)
-        self.canvas.draw_idle()
+        # Repaint so the new xlim/ylim and snap-toggle state show up.
+        self.canvas.redraw()
 
     def _do_save(self) -> bool:
         if self._current_path is None:
