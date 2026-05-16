@@ -36,7 +36,7 @@ class Node:
 
 @dataclass(frozen=True)
 class Material:
-    """Pure material properties (E and α).
+    """Pure material properties (E, α, ρ).
 
     Sections (A, I, depth) are stored separately on the model as
     :class:`Section` objects, with each section referencing a material.
@@ -46,12 +46,17 @@ class Material:
         name: Optional human-readable name (e.g. "C40/50", "S355").
         E: Modulus of elasticity (kN/m²).
         alpha: Coefficient of thermal expansion (1/°C). Default 0 (inert).
+        density: Mass density (kg/m³). Default 0 (modal analysis disabled
+            for elements whose material carries density = 0). The unit
+            conversion to the kN-m-s consistent system used by the static
+            solver is done inside :mod:`structural_analysis.mass`.
     """
 
     id: int
     name: str = ""
     E: float = 0.0
     alpha: float = 0.0
+    density: float = 0.0
 
 
 @dataclass(frozen=True)

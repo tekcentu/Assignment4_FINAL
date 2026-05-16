@@ -61,13 +61,13 @@ def write_input_file(model: StructuralModel, path: str) -> None:
         out.append(f"{nid}  {_fmt(n.x)}  {_fmt(n.y)}")
     out.append("")
 
-    # MATERIALS (new shape): id  E  alpha  [name]
+    # MATERIALS (new shape): id  E  alpha  density  [name]
     mat_ids = sorted(model.materials)
     out.append(f"MATERIALS {len(mat_ids)}")
     for mid in mat_ids:
         m = model.materials[mid]
         _check_name("Material", mid, m.name)
-        line = f"{mid}  {_fmt(m.E)}  {_fmt(m.alpha)}"
+        line = f"{mid}  {_fmt(m.E)}  {_fmt(m.alpha)}  {_fmt(m.density)}"
         if m.name:
             line += f"  {m.name}"
         out.append(line)

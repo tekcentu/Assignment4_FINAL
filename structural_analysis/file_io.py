@@ -85,9 +85,12 @@ def read_input_file(filepath: str) -> StructuralModel:
                 parts = lines[i].split("#")[0].split()
                 mid = int(parts[0])
                 if has_sections_block:
-                    # New shape: id  E  [alpha  [name]]
-                    # (alpha is required when name is present, since name is
-                    # parsed positionally as the 4th token)
+                    # New shape: id  E  <alpha>  <density>  [name]
+                    # The four leading numeric columns are positional.
+                    # Legacy files written before the density column can
+                    # also be loaded: if parts[3] is non-numeric (a name)
+                    # density defaults to 0.0 and parts[3] is treated as
+                    # the name token.
                     E_val = float(parts[1])
                     if len(parts) > 2:
                         try:
@@ -97,14 +100,26 @@ def read_input_file(filepath: str) -> StructuralModel:
                                 f"MATERIALS row for id {mid}: expected a numeric "
                                 f"thermal-expansion coefficient (alpha) in column 3, "
                                 f"got {parts[2]!r}. The new MATERIALS shape is "
-                                f"'id E [alpha [name]]'; a name without an alpha "
-                                f"is not allowed because tokens are positional."
+                                f"'id E alpha [density] [name]'; tokens are positional."
                             )
                     else:
                         alpha = 0.0
-                    name = parts[3] if len(parts) > 3 else ""
+
+                    density = 0.0
+                    name_start = 3
+                    if len(parts) > 3:
+                        try:
+                            density = float(parts[3])
+                            name_start = 4
+                        except ValueError:
+                            # parts[3] is non-numeric → legacy file: treat
+                            # it as the name token and leave density = 0.
+                            density = 0.0
+                            name_start = 3
+                    name = parts[name_start] if len(parts) > name_start else ""
                     model.materials[mid] = Material(id=mid, name=name,
-                                                    E=E_val, alpha=alpha)
+                                                    E=E_val, alpha=alpha,
+                                                    density=density)
                 else:
                     # Legacy shape: id  A  I  E  [alpha]  [depth]
                     # Synthesise a 1:1 Material+Section pair so existing
@@ -189,6 +204,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                         id=eid, node_i=sn, node_j=en,
                         E=mat.E, A=section.A,
                         alpha=mat.alpha, depth=section.depth,
+                        rho=mat.density,
                         section_id=section.id,
                     )
                 else:
@@ -196,6 +212,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                         id=eid, node_i=sn, node_j=en,
                         E=mat.E, A=section.A, I=section.I,
                         alpha=mat.alpha, depth=section.depth,
+                        rho=mat.density,
                         section_id=section.id,
                         release_i=release_i, release_j=release_j,
                     )

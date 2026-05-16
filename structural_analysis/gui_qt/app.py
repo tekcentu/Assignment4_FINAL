@@ -141,6 +141,8 @@ class MainWindow(QMainWindow):
         self._modified = False
         self._current_path: Optional[str] = None
         self._result: Optional[AnalysisResult] = None
+        self._modal_result = None
+        self._modal_results_dialog = None
 
         self._build_ui()
         self._build_actions()
@@ -244,6 +246,8 @@ class MainWindow(QMainWindow):
 
         self.act_solve = QAction("&Solve", self, shortcut="F5",
                                    triggered=self._do_solve)
+        self.act_modal = QAction("&Modal analysis…", self, shortcut="F6",
+                                   triggered=self._do_modal)
         self.act_clear_result = QAction("&Clear results", self,
                                           triggered=self._clear_result)
 
@@ -294,6 +298,7 @@ class MainWindow(QMainWindow):
 
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)
+        m_run.addAction(self.act_modal)
         m_run.addAction(self.act_clear_result)
 
     def _build_toolbar(self) -> None:
@@ -766,9 +771,63 @@ class MainWindow(QMainWindow):
         else:
             self.set_status(f"Analysis status: {self._result.status}")
 
+    def _do_modal(self) -> None:
+        if not self._model.elements:
+            QMessageBox.warning(
+                self, "Cannot run modal analysis",
+                "The model has no elements. Draw some nodes and elements first.",
+            )
+            return
+        from .dialogs import ModalAnalysisDialog
+        from .modal_view import ModalResultsDialog
+        from ..modal import solve_modal
+
+        d = ModalAnalysisDialog(self, default_n_modes=6)
+        if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
+            return
+        try:
+            modal_result = solve_modal(
+                self._model,
+                n_modes=d.result_value["n_modes"],
+                normalisation=d.result_value["normalisation"],
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Modal analysis", str(e))
+            return
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Modal analysis failed",
+                f"{type(e).__name__}: {e}\n\nThe model is unchanged.",
+            )
+            return
+
+        self._modal_result = modal_result
+        self.canvas.set_modal_result(modal_result, mode_idx=0, scale=1.0)
+
+        def _select(mode_idx: int, scale: float) -> None:
+            self.canvas.update_modal_view(mode_idx, scale)
+
+        def _on_close() -> None:
+            # Closing the results pane clears the modal overlay so the
+            # canvas returns to the plain model view.
+            self.canvas.clear_modal_result()
+            self._modal_results_dialog = None
+
+        # Keep a reference so the non-modal dialog is not garbage-collected.
+        self._modal_results_dialog = ModalResultsDialog(
+            self, modal_result, on_select=_select, on_close=_on_close,
+        )
+        self._modal_results_dialog.show()
+        self.set_status(
+            f"Modal analysis: {modal_result.n_modes} modes · "
+            f"f₁ = {float(modal_result.frequencies[0]):.4g} Hz"
+        )
+
     def _clear_result(self) -> None:
         self._result = None
+        self._modal_result = None
         self.canvas.clear_result()
+        self.canvas.clear_modal_result()
         self._update_result_text()
 
     def _invalidate_result(self) -> None:
@@ -776,6 +835,12 @@ class MainWindow(QMainWindow):
             self._result = None
             self.canvas.clear_result()
             self._update_result_text()
+        if self._modal_result is not None:
+            self._modal_result = None
+            self.canvas.clear_modal_result()
+            if self._modal_results_dialog is not None:
+                self._modal_results_dialog.close()
+                self._modal_results_dialog = None
 
     def _update_result_text(self) -> None:
         text = format_result(self._model, self._result) if self._result \

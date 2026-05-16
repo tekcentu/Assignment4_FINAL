@@ -121,7 +121,8 @@ class MaterialDialog(_ModalDialog):
         form = QFormLayout(body)
         self._entries: dict[str, QLineEdit] = {}
         for label, key in [("ID", "id"), ("Name", "name"),
-                           ("E (kN/m²)", "E"), ("α (1/°C)", "alpha")]:
+                           ("E (kN/m²)", "E"), ("α (1/°C)", "alpha"),
+                           ("density (kg/m³)", "density")]:
             e = QLineEdit(body)
             form.addRow(label, e)
             self._entries[key] = e
@@ -133,18 +134,24 @@ class MaterialDialog(_ModalDialog):
             self._entries["name"].setText(m.name)
             self._entries["E"].setText(repr(m.E))
             self._entries["alpha"].setText(repr(m.alpha))
+            self._entries["density"].setText(repr(m.density))
         else:
             self._entries["id"].setText(str(self._default_id))
             self._entries["alpha"].setText("0.0")
+            self._entries["density"].setText("0.0")
 
     def _accept(self) -> Material:
         mid = parse_int(self._entries["id"].text(), "Material ID")
         name = self._entries["name"].text().strip()
         E = parse_float(self._entries["E"].text(), "E")
         alpha = parse_float(self._entries["alpha"].text(), "α", allow_blank=True) or 0.0
+        density = parse_float(self._entries["density"].text(), "density",
+                              allow_blank=True) or 0.0
         if E <= 0:
             raise ValueError("E must be > 0.")
-        return Material(id=mid, name=name, E=E, alpha=alpha)
+        if density < 0:
+            raise ValueError("density cannot be negative.")
+        return Material(id=mid, name=name, E=E, alpha=alpha, density=density)
 
 
 class SectionDialog(_ModalDialog):
@@ -597,7 +604,9 @@ class MaterialListDialog(_ModalDialog):
         mat_page = QWidget(self._tabs)
         ml = QVBoxLayout(mat_page)
         self._mat_tree = QTreeWidget(mat_page)
-        self._mat_tree.setHeaderLabels(["id", "name", "E (kN/m²)", "α (1/°C)"])
+        self._mat_tree.setHeaderLabels(
+            ["id", "name", "E (kN/m²)", "α (1/°C)", "ρ (kg/m³)"]
+        )
         self._mat_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         ml.addWidget(self._mat_tree)
         mb = QHBoxLayout()
@@ -639,6 +648,7 @@ class MaterialListDialog(_ModalDialog):
             m = self._model.materials[mid]
             QTreeWidgetItem(self._mat_tree, [
                 str(m.id), m.name, f"{m.E:g}", f"{m.alpha:g}",
+                f"{m.density:g}",
             ])
         self._sec_tree.clear()
         for sid in sorted(self._model.sections):
@@ -712,3 +722,41 @@ class MaterialListDialog(_ModalDialog):
 
     def _accept(self) -> None:
         return None
+
+
+# ── modal analysis input dialog ────────────────────────────────
+
+
+class ModalAnalysisDialog(_ModalDialog):
+    """Ask the user how many modes to extract and the normalisation."""
+
+    def __init__(self, parent, *, default_n_modes: int = 6) -> None:
+        self._default_n_modes = max(1, int(default_n_modes))
+        super().__init__(parent, "Modal analysis")
+
+    def _build_body(self, body: QWidget) -> None:
+        form = QFormLayout(body)
+        self._n_modes = QLineEdit(body)
+        self._n_modes.setText(str(self._default_n_modes))
+        form.addRow("Number of modes", self._n_modes)
+
+        self._norm_combo = QComboBox(body)
+        self._norm_combo.addItem("Mass-orthonormal  (φᵀ·M·φ = 1)", "mass")
+        self._norm_combo.addItem("Max-component = 1", "max")
+        form.addRow("Normalisation", self._norm_combo)
+
+        note = QLabel(
+            "Modal analysis requires a positive density on every "
+            "element's material.\nSet density (kg/m³) on each Material "
+            "via Edit → Materials and sections.",
+            body,
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+
+    def _accept(self) -> dict:
+        n = parse_int(self._n_modes.text(), "Number of modes")
+        if n < 1:
+            raise ValueError("Number of modes must be at least 1.")
+        norm = self._norm_combo.currentData()
+        return {"n_modes": n, "normalisation": norm}

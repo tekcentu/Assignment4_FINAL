@@ -242,18 +242,21 @@ class AddOrUpdateMaterialCmd(Command):
     def do(self, model: StructuralModel) -> None:
         if self.material.E <= 0:
             raise ValueError("Material E must be positive.")
+        if self.material.density < 0:
+            raise ValueError("Material density cannot be negative.")
         previous = model.materials.get(self.material.id)
         owned_sections = {s.id for s in model.sections.values()
                           if s.material_id == self.material.id}
         self._previous = previous
         model.materials[self.material.id] = self.material
-        # Propagate updated E/α to elements that belong to any section
+        # Propagate updated E/α/ρ to elements that belong to any section
         # whose material_id is this material.
         if previous is not None:
             for elem in model.elements:
                 if elem.section_id in owned_sections:
                     elem.E = self.material.E
                     elem.alpha = self.material.alpha
+                    elem.rho = self.material.density
 
     def undo(self, model: StructuralModel) -> None:
         if self._previous is None:
@@ -266,6 +269,7 @@ class AddOrUpdateMaterialCmd(Command):
                 if elem.section_id in owned_sections:
                     elem.E = self._previous.E
                     elem.alpha = self._previous.alpha
+                    elem.rho = self._previous.density
 
 
 @dataclass
@@ -327,6 +331,7 @@ class AddOrUpdateSectionCmd(Command):
             if new_mat is not None:
                 elem.E = new_mat.E
                 elem.alpha = new_mat.alpha
+                elem.rho = new_mat.density
 
     def undo(self, model: StructuralModel) -> None:
         if self._previous is None:
@@ -344,6 +349,7 @@ class AddOrUpdateSectionCmd(Command):
                     if prev_mat is not None:
                         elem.E = prev_mat.E
                         elem.alpha = prev_mat.alpha
+                        elem.rho = prev_mat.density
 
 
 @dataclass

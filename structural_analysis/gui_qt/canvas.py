@@ -68,6 +68,9 @@ class ModelCanvas(QWidget):
         self.deformed_scale: float = 1.0
         self.diagram_scale: float = 1.0
         self._result = None
+        self._modal_result = None    # ModalResult or None
+        self._modal_mode_idx: int = 0
+        self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
 
         self.on_click: Callable[[HitResult, str], None] | None = None
@@ -102,10 +105,38 @@ class ModelCanvas(QWidget):
 
     def set_result(self, result) -> None:
         self._result = result
+        # Static and modal results are mutually exclusive on screen.
+        self._modal_result = None
         self.redraw()
 
     def clear_result(self) -> None:
         self._result = None
+        self.redraw()
+
+    def set_modal_result(self, modal_result, mode_idx: int = 0,
+                         scale: float = 1.0) -> None:
+        """Display a single mode of a ModalResult on the canvas.
+
+        Static-result overlays are cleared while a modal result is shown
+        (the canvas displays one analysis kind at a time).
+        """
+        self._result = None
+        self._modal_result = modal_result
+        self._modal_mode_idx = max(0, int(mode_idx))
+        self._modal_scale = float(scale)
+        self.redraw()
+
+    def update_modal_view(self, mode_idx: int, scale: float) -> None:
+        """Update the displayed mode index and/or scale for the current
+        :class:`ModalResult` without rebuilding it."""
+        if self._modal_result is None:
+            return
+        self._modal_mode_idx = max(0, int(mode_idx))
+        self._modal_scale = float(scale)
+        self.redraw()
+
+    def clear_modal_result(self) -> None:
+        self._modal_result = None
         self.redraw()
 
     def redraw(self) -> None:
@@ -121,6 +152,8 @@ class ModelCanvas(QWidget):
                 self._draw_reactions()
             if self.show_diagrams:
                 self._draw_diagrams()
+        elif self._modal_result is not None and self._modal_result.status == "ok":
+            self._draw_mode_shape()
         self._draw_snap_marker()
         self._mpl_canvas.draw_idle()
 
@@ -407,6 +440,64 @@ class ModelCanvas(QWidget):
             f"deformed × {scale:.2g} (max |u|={max_disp:.3e} m)",
             (0.02, 0.98), xycoords="axes fraction",
             fontsize=8, color="#ff7f0e", va="top",
+        )
+
+    def _mode_displacement(self, node_id: int) -> tuple[float, float]:
+        """Return (ux, uy) for ``node_id`` in the currently-shown mode."""
+        mr = self._modal_result
+        if mr is None or mr.dofs is None:
+            return 0.0, 0.0
+        emap = mr.dofs.active_map.get(node_id)
+        if emap is None:
+            return 0.0, 0.0
+        col = self._modal_mode_idx
+        if col < 0 or col >= mr.modes.shape[1]:
+            return 0.0, 0.0
+        phi = mr.modes[:, col]
+        ux = float(phi[emap["ux"]]) if emap["ux"] is not None else 0.0
+        uy = float(phi[emap["uy"]]) if emap["uy"] is not None else 0.0
+        return ux, uy
+
+    def _draw_mode_shape(self) -> None:
+        mr = self._modal_result
+        model = self._model()
+        k = self._modal_mode_idx
+        if mr is None or k < 0 or k >= mr.n_modes:
+            return
+        span = self._model_span()
+        max_disp = 0.0
+        for nid in model.nodes:
+            ux, uy = self._mode_displacement(nid)
+            max_disp = max(max_disp, abs(ux), abs(uy))
+        if max_disp <= 0.0:
+            return
+        # Auto-scale to a tenth of the model span, multiplied by the
+        # user-controlled scale slider on the results pane.
+        scale = self._modal_scale * 0.10 * span / max_disp
+        for elem in model.elements:
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            uxi, uyi = self._mode_displacement(elem.node_i)
+            uxj, uyj = self._mode_displacement(elem.node_j)
+            self.ax.plot(
+                [ni.x, nj.x], [ni.y, nj.y],
+                color="#888888", linestyle=":", linewidth=1.0, alpha=0.6,
+                zorder=2,
+            )
+            self.ax.plot(
+                [ni.x + scale * uxi, nj.x + scale * uxj],
+                [ni.y + scale * uyi, nj.y + scale * uyj],
+                color="#d62728", linestyle="-", linewidth=1.8, alpha=0.85,
+                zorder=4,
+            )
+        f = float(mr.frequencies[k])
+        T = float(mr.periods[k])
+        self.ax.annotate(
+            f"mode {k + 1} · f = {f:.4g} Hz · T = {T:.4g} s · scale × {scale:.2g}",
+            (0.02, 0.98), xycoords="axes fraction",
+            fontsize=8, color="#d62728", va="top",
         )
 
     def _draw_reactions(self) -> None:
