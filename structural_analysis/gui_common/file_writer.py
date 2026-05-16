@@ -26,6 +26,17 @@ def _fmt(x: float) -> str:
     return repr(float(x))
 
 
+def _check_name(kind: str, obj_id: int, name: str) -> None:
+    # The parser reads name as a single whitespace-delimited token, so any
+    # embedded whitespace would silently truncate on reload.
+    if name and any(ch.isspace() for ch in name):
+        raise ValueError(
+            f"{kind} {obj_id} name {name!r} contains whitespace; the "
+            "input-file format stores name as a single token. Rename "
+            "the entry (use underscores or hyphens) before saving."
+        )
+
+
 def write_input_file(model: StructuralModel, path: str) -> None:
     """Serialize ``model`` to ``path`` in the text format used by read_input_file.
 
@@ -55,6 +66,7 @@ def write_input_file(model: StructuralModel, path: str) -> None:
     out.append(f"MATERIALS {len(mat_ids)}")
     for mid in mat_ids:
         m = model.materials[mid]
+        _check_name("Material", mid, m.name)
         line = f"{mid}  {_fmt(m.E)}  {_fmt(m.alpha)}"
         if m.name:
             line += f"  {m.name}"
@@ -66,6 +78,7 @@ def write_input_file(model: StructuralModel, path: str) -> None:
     out.append(f"SECTIONS {len(sec_ids)}")
     for sid in sec_ids:
         s = model.sections[sid]
+        _check_name("Section", sid, s.name)
         line = (f"{sid}  {s.material_id}  {_fmt(s.A)}  {_fmt(s.I)}"
                 f"  {_fmt(s.depth)}")
         if s.name:

@@ -66,7 +66,7 @@ def save_project_json(project: Project, path: str) -> None:
     """Write the project to ``path`` as ``.spa.json``.
 
     The structural model is serialised to its canonical .txt form (via
-    :func:`gui.file_writer.write_input_file`) and embedded as a string,
+    :func:`gui_common.file_writer.write_input_file`) and embedded as a string,
     so the solver remains the single source of truth for model parsing.
     """
     # write_input_file writes to a file; capture via a temp file then read back.

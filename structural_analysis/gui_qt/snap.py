@@ -12,7 +12,10 @@ Snap kinds, in priority order (lower wins):
     ELEMENT_ENDPOINT    2
     ELEMENT_MIDPOINT    3
     PROJECTION_ON_ELEM  4
-    FREE                9   (returned only when nothing is within tolerance)
+
+:func:`SnapEngine.find_snap` returns ``None`` when no candidate is
+within the configured pixel tolerance — callers should treat that as
+"free placement at the raw cursor position".
 
 Pixel distance is computed using a caller-supplied (px_per_dx, px_per_dy)
 pair so the engine doesn't depend on matplotlib axes geometry.
@@ -28,7 +31,6 @@ GRID      = ("grid",     1)
 ENDPOINT  = ("endpoint", 2)
 MIDPOINT  = ("midpoint", 3)
 PROJECT   = ("project",  4)
-FREE      = ("free",     9)
 
 
 @dataclass(frozen=True)
@@ -37,11 +39,11 @@ class SnapCandidate:
 
     Attributes:
         x, y: World coordinates of the snap point.
-        kind: Snap kind ("node", "grid", "endpoint", "midpoint", "project", "free").
+        kind: Snap kind ("node", "grid", "endpoint", "midpoint", "project").
         priority: Lower-wins ordering value.
         screen_distance_px: How far the candidate is from the cursor on screen.
         label: Optional human-readable target ("e3", "A-2", ...).
-        object_id: Node id / element id depending on kind (None for grid/free).
+        object_id: Node id / element id depending on kind (None for grid).
     """
 
     x: float

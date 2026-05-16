@@ -152,3 +152,38 @@ def test_writer_raises_when_section_id_dangles():
             write_input_file(m, tmp)
     finally:
         os.unlink(tmp)
+
+
+def test_writer_rejects_whitespace_in_material_or_section_name():
+    """Names round-trip as single whitespace-delimited tokens, so the writer
+    must refuse names containing spaces rather than silently truncate on
+    reload."""
+    from structural_analysis.model import Node
+    base = StructuralModel(title="ws names")
+    base.nodes[1] = Node(1, 0.0, 0.0)
+    base.nodes[2] = Node(2, 1.0, 0.0)
+    base.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2, E=1.0, A=1.0, I=1.0, section_id=1,
+    ))
+    fd, tmp = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        m_bad_mat = StructuralModel(title=base.title)
+        m_bad_mat.nodes = dict(base.nodes)
+        m_bad_mat.elements = list(base.elements)
+        m_bad_mat.materials[1] = Material(id=1, name="A 36 steel", E=1.0)
+        m_bad_mat.sections[1] = Section(id=1, material_id=1, A=1.0, I=1.0)
+        with pytest.raises(ValueError, match="Material 1 name"):
+            write_input_file(m_bad_mat, tmp)
+
+        m_bad_sec = StructuralModel(title=base.title)
+        m_bad_sec.nodes = dict(base.nodes)
+        m_bad_sec.elements = list(base.elements)
+        m_bad_sec.materials[1] = Material(id=1, name="A36", E=1.0)
+        m_bad_sec.sections[1] = Section(
+            id=1, name="W 12x26", material_id=1, A=1.0, I=1.0,
+        )
+        with pytest.raises(ValueError, match="Section 1 name"):
+            write_input_file(m_bad_sec, tmp)
+    finally:
+        os.unlink(tmp)
