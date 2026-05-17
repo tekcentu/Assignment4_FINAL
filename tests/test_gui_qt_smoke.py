@@ -208,8 +208,8 @@ def test_grid_dialog_accepts_numeric_lists_and_sorts(qt_app):
 
     w = MainWindow()
     d = GridDialog(w, model=w._model)
-    d._x_entry.setText("12, 0, 6")
-    d._y_entry.setText("8, 0, 4")
+    d._x_entry.setText("12, 0, 6, 0")
+    d._y_entry.setText("8, 0, 4, 4")
 
     grid = d._accept()
 

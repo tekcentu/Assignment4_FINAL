@@ -553,14 +553,8 @@ class GridDialog(_ModalDialog):
 
     @staticmethod
     def _auto_label(index: int, axis_name: str) -> str:
-        if axis_name == "Y":
-            return str(index + 1)
-        s = ""
-        n = index + 1
-        while n > 0:
-            n, rem = divmod(n - 1, 26)
-            s = chr(ord("A") + rem) + s
-        return s
+        from .grid import _label
+        return _label(index, "numeric" if axis_name == "Y" else "alpha")
 
     @staticmethod
     def _format_axis(lines) -> str:
@@ -595,7 +589,7 @@ class GridDialog(_ModalDialog):
                     ) from None
                 lines.append(GridLine(label=label, coord=coord))
         else:
-            coords: list[float] = []
+            coords: set[float] = set()
             for part in parts:
                 try:
                     coord = parse_float(part, f"{axis_name} coordinate")
@@ -603,7 +597,7 @@ class GridDialog(_ModalDialog):
                     raise ValueError(
                         f"{axis_name} token '{part}' is invalid: {e}"
                     ) from None
-                coords.append(coord)
+                coords.add(coord)
             for idx, coord in enumerate(sorted(coords)):
                 lines.append(GridLine(label=self._auto_label(idx, axis_name),
                                       coord=coord))
