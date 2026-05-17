@@ -18,13 +18,19 @@ SECTIONS 3
 2  2  0.15  0.003125  0.5  Concrete_30x50
 3  2  0.09  0.000675  0.3  Concrete_30x30
 
-ELEMENTS 6
+ELEMENTS 12
 1  1  3  2  FRAME
 2  2  4  2  FRAME
 3  3  5  2  FRAME
 4  4  6  2  FRAME
 5  3  4  2  FRAME
 6  5  6  2  FRAME
+7  5  4  1  FRAME
+8  4  1  1  FRAME
+9  3  6  1  TRUSS
+10  3  2  1  TRUSS
+11  1  6  1  TRUSS
+12  5  2  1  TRUSS
 
 SUPPORTS 2
 1  1  1  1
