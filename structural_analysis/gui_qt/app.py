@@ -116,7 +116,8 @@ def _validate_model_for_solve(model: StructuralModel) -> tuple[list[str], list[s
         )
     if not model.supports:
         warnings.append(
-            "No supports defined — the stiffness matrix will be singular."
+            "No supports defined — add at least one support before "
+            "solving, otherwise the model is unstable."
         )
     for ld in model.nodal_loads:
         if ld.node_id not in model.nodes:
@@ -197,6 +198,11 @@ class MainWindow(QMainWindow):
 
         self._update_title()
         self.canvas.redraw()
+        self.set_status(
+            "Ready. Default Steel + Concrete materials loaded. "
+            "Press N for Node, then F (Frame) or T (Truss) between nodes. "
+            "F5 solves, F6 modal."
+        )
 
         if initial_path:
             # defer to event loop start
@@ -265,7 +271,7 @@ class MainWindow(QMainWindow):
             "Forget element defaults", self,
             triggered=self._forget_element_defaults,
         )
-        self.act_snap = QAction("Snap to grid", self, checkable=True, checked=True,
+        self.act_snap = QAction("Snapping enabled", self, checkable=True, checked=True,
                                   triggered=self._toggle_snap)
         # Snap-kind toggles
         self._snap_actions: dict[str, QAction] = {}
@@ -308,6 +314,45 @@ class MainWindow(QMainWindow):
             group.addAction(a)
             self._tool_actions[name] = a
         self._tool_actions["select"].setChecked(True)
+
+        # Action tips. setStatusTip drives both the floating tooltip
+        # and the bottom-bar hint when a menu item is highlighted, so
+        # one string per action covers both demo flows.
+        _tips = {
+            self.act_new:           "Start a new model (clears current work — confirms first).",
+            self.act_open:          "Open a .txt or .spa.json file from disk.",
+            self.act_save:          "Save the current model to its current file.",
+            self.act_save_as:       "Save the current model under a new filename (defaults to .spa.json so view + grid + snap are preserved).",
+            self.act_undo:          "Undo the last model change.",
+            self.act_redo:          "Redo the last undone change.",
+            self.act_materials:     "Edit materials and sections (E, density, A, I).",
+            self.act_grid_spacing:  "Set the rectangular click-snap grid spacing.",
+            self.act_grid_system:   "Edit the labelled X / Y grid lines (SAP2000-style).",
+            self.act_fit_view:      "Fit the canvas to the model + grid extent (shortcut: Home).",
+            self.act_forget_elem_defaults:
+                                    "Clear the remembered Frame/Truss kind + section so the dialog asks again on the next pair click.",
+            self.act_snap:          "Master snap switch — turn off to place nodes at exact cursor coordinates.",
+            self.act_solve:         "Run the static analysis (F5).",
+            self.act_modal:         "Run a free-vibration modal analysis (F6) — requires positive material density.",
+            self.act_clear_result:  "Discard the currently displayed analysis results.",
+        }
+        for action, tip in _tips.items():
+            action.setStatusTip(tip)
+            action.setToolTip(tip)
+        _tool_tips = {
+            "select":      "Select / right-click for context menu on the clicked node or element.",
+            "node":        "Click an empty grid point to place a node.",
+            "frame":       "Click two existing nodes to place a frame element (Euler-Bernoulli beam).",
+            "truss":       "Click two existing nodes to place a truss element (pin-pin bar).",
+            "support":     "Click an existing node to add or edit its support / settlement.",
+            "nodal_load":  "Click an existing node to add or edit its applied force / moment.",
+            "member_load": "Click an existing element line to add a UDL, point load, or thermal load.",
+            "delete":      "Click a node or element line to delete it.",
+        }
+        for tool_name, tip in _tool_tips.items():
+            act = self._tool_actions[tool_name]
+            act.setStatusTip(tip)
+            act.setToolTip(tip)
 
     def _build_menus(self) -> None:
         m_file = self.menuBar().addMenu("&File")
@@ -620,7 +665,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_canvas_motion(self, hit: HitResult) -> None:
-        parts = [f"({hit.x:.3f}, {hit.y:.3f})"]
+        parts = [f"x={hit.x:.3f} m, y={hit.y:.3f} m"]
         if hit.snap_label:
             parts.append(f"Snap: {hit.snap_label}")
         elif hit.node_id is not None:
@@ -720,6 +765,19 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         self._open_path(path)
+        # Examples ship inside the package; opening one as a regular
+        # path would set _current_path to the example file, so a
+        # subsequent Ctrl+S would overwrite the bundled example. Treat
+        # an example open as "load the model into a fresh untitled
+        # document" so Save is forced to ask the user where to write.
+        self._current_path = None
+        self._modified = False
+        self._update_title()
+        title = self._model.title or os.path.basename(path)
+        self.set_status(
+            f"Opened example copy «{title}». Use File → Save As to save "
+            f"changes. F5 solves, F6 modal, Home fits view."
+        )
 
     def _set_grid_spacing(self) -> None:
         d = GridSpacingDialog(self, current=self.canvas.grid_spacing)
@@ -847,7 +905,11 @@ class MainWindow(QMainWindow):
         self.canvas.fit_to_view()
         if new_view is not None:
             self._apply_view_state(new_view)
-        self.set_status(f"Opened {path}")
+        title = self._model.title or os.path.basename(path)
+        hint = " · Press Home to fit view." if not is_json else ""
+        self.set_status(
+            f"Opened {os.path.basename(path)} — {title}.{hint}"
+        )
 
     def _apply_view_state(self, view) -> None:
         if view.xlim is not None:
@@ -877,6 +939,16 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return False
+        # If the user typed a filename without a recognised extension
+        # ("mymodel"), default to the GUI project format since that's
+        # the only form that round-trips grid, view limits, and snap
+        # toggles. Typing "mymodel.txt" still opts into the solver
+        # text format explicitly.
+        lower = path.lower()
+        if not (lower.endswith(".spa.json")
+                or lower.endswith(".json")
+                or lower.endswith(".txt")):
+            path = path + ".spa.json"
         if self._save_to(path):
             self._current_path = path
             self._update_title()

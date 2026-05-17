@@ -102,7 +102,7 @@ class ModalResultsDialog(QDialog):
 
         # Optional animation toggle (polish, opt-in).
         self._anim_box = QCheckBox(
-            "Animate (sinusoidal sweep at ω) — optional polish", self,
+            "Animate mode shape", self,
         )
         self._anim_box.stateChanged.connect(self._on_anim_toggled)
         v.addWidget(self._anim_box)

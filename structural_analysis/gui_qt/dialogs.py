@@ -261,13 +261,16 @@ class ElementDialog(_ModalDialog):
         self._sec_combo = QComboBox(body)
         for sid in sorted(self._model.sections):
             s = self._model.sections[sid]
-            label = f"{sid} ({s.name})" if s.name else str(sid)
+            mat = self._model.materials.get(s.material_id)
+            mat_name = (mat.name if mat and mat.name
+                         else f"mat {s.material_id}")
+            label = f"{sid} — {s.name or 'unnamed'} / {mat_name}"
             self._sec_combo.addItem(label, sid)
         if self._existing_sec is not None:
             idx = self._sec_combo.findData(self._existing_sec)
             if idx >= 0:
                 self._sec_combo.setCurrentIndex(idx)
-        form.addRow("Section:", self._sec_combo)
+        form.addRow("Section / material:", self._sec_combo)
 
         self._cb_ri = QCheckBox("Moment release at start (i)", body)
         self._cb_rj = QCheckBox("Moment release at end (j)", body)
@@ -687,6 +690,8 @@ class MaterialListDialog(_ModalDialog):
     def _edit_mat(self) -> None:
         mid = self._selected_id(self._mat_tree)
         if mid is None:
+            QMessageBox.information(self, "No selection",
+                                      "Select a material row in the table first.")
             return
         d = MaterialDialog(self, existing=self._model.materials[mid], default_id=mid)
         if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
@@ -696,6 +701,8 @@ class MaterialListDialog(_ModalDialog):
     def _delete_mat(self) -> None:
         mid = self._selected_id(self._mat_tree)
         if mid is None:
+            QMessageBox.information(self, "No selection",
+                                      "Select a material row in the table first.")
             return
         self._on_delete_material(mid)
         self._refresh()
@@ -717,6 +724,8 @@ class MaterialListDialog(_ModalDialog):
     def _edit_sec(self) -> None:
         sid = self._selected_id(self._sec_tree)
         if sid is None:
+            QMessageBox.information(self, "No selection",
+                                      "Select a section row in the table first.")
             return
         d = SectionDialog(self, model=self._model,
                            existing=self._model.sections[sid], default_id=sid)
@@ -727,6 +736,8 @@ class MaterialListDialog(_ModalDialog):
     def _delete_sec(self) -> None:
         sid = self._selected_id(self._sec_tree)
         if sid is None:
+            QMessageBox.information(self, "No selection",
+                                      "Select a section row in the table first.")
             return
         self._on_delete_section(sid)
         self._refresh()
