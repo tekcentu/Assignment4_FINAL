@@ -492,3 +492,149 @@ def test_modal_results_dialog_round_trip(qt_app):
     assert closed == [True]
     # After close, the canvas modal overlay is cleared.
     assert w.canvas._modal_result is None
+
+
+def test_version_label_visible_in_menubar(qt_app):
+    """The window menu bar must carry a version + what's-new label."""
+    from structural_analysis import __version__, __what_is_new__
+
+    w = MainWindow()
+    qt_app.processEvents()
+    assert hasattr(w, "_version_label")
+    text = w._version_label.text()
+    assert __version__ in text
+    assert __what_is_new__ in text
+    # Corner widget is wired into the menu bar.
+    from PyQt6.QtCore import Qt as _Qt
+    assert (
+        w.menuBar().cornerWidget(_Qt.Corner.TopRightCorner)
+        is w._version_label
+    )
+
+
+def test_building_wizard_creates_model(qt_app):
+    """The wizard generates a portal frame and routes through ReplaceModelCmd
+    so a single Undo restores the previous model."""
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+
+    w = MainWindow()
+    qt_app.processEvents()
+
+    # The starter model is empty of nodes/elements but has sections,
+    # so the wizard dialog should construct.
+    d = BuildingWizardDialog(w, model=w._model)
+    d._stories.setValue(2)
+    d._story_h.setValue(3.0)
+    d._bays.setValue(2)
+    d._bay_w.setValue(4.0)
+    d._fixed_base.setChecked(True)
+    new_model = d._accept()
+    # 2 stories × 2 bays → (2+1)*(2+1) = 9 nodes,
+    # columns: 3 lines × 2 stories = 6; beams: 2 floors × 2 bays = 4
+    assert len(new_model.nodes) == 9
+    assert len(new_model.elements) == 10
+    # All ground nodes get fixed supports.
+    assert len(new_model.supports) == 3
+    # Materials / sections preserved from source.
+    assert new_model.materials == w._model.materials
+    assert new_model.sections == w._model.sections
+
+
+def test_building_wizard_action_undoable(qt_app):
+    """Driving the wizard handler through a stubbed dialog must apply
+    ReplaceModelCmd; one Undo must restore the previous (empty) model."""
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+
+    w = MainWindow()
+    qt_app.processEvents()
+    original_exec = BuildingWizardDialog.exec
+
+    def fake_exec(self):
+        from PyQt6.QtWidgets import QDialog as _QD
+        self._stories.setValue(1)
+        self._bays.setValue(1)
+        self.result_value = self._accept()
+        return _QD.DialogCode.Accepted
+
+    # Bypass the QMessageBox.question confirmation when the model already
+    # has content. Starter model is empty so the confirm path isn't taken.
+    BuildingWizardDialog.exec = fake_exec
+    try:
+        w._do_building_wizard()
+    finally:
+        BuildingWizardDialog.exec = original_exec
+
+    # 1 story × 1 bay → 4 nodes, 2 columns + 1 beam = 3 elements
+    assert len(w._model.nodes) == 4
+    assert len(w._model.elements) == 3
+    # Undo restores the empty starter model.
+    w._do_undo()
+    assert len(w._model.nodes) == 0
+    assert len(w._model.elements) == 0
+
+
+def test_canvas_scroll_zoom_changes_xlim(qt_app):
+    """Scrolling up over the canvas zooms in (xlim/ylim shrink around the
+    cursor)."""
+    import types
+    w = MainWindow()
+    qt_app.processEvents()
+    w.canvas.ax.set_xlim(0.0, 10.0)
+    w.canvas.ax.set_ylim(0.0, 10.0)
+    w.canvas._view_initialised = True
+
+    ev = types.SimpleNamespace(
+        inaxes=w.canvas.ax, xdata=5.0, ydata=5.0, button="up",
+    )
+    w.canvas._handle_scroll(ev)
+    x0, x1 = w.canvas.ax.get_xlim()
+    # Range must have shrunk and stayed centered on (5, 5).
+    assert (x1 - x0) < 10.0 - 1e-9
+    assert abs((x0 + x1) / 2 - 5.0) < 1e-6
+
+
+def test_canvas_middle_button_pan(qt_app):
+    """Pressing the middle button, dragging, and releasing pans the
+    axes by the data-space delta."""
+    import types
+    w = MainWindow()
+    qt_app.processEvents()
+    w.canvas.ax.set_xlim(0.0, 10.0)
+    w.canvas.ax.set_ylim(0.0, 10.0)
+    w.canvas._view_initialised = True
+
+    press = types.SimpleNamespace(
+        button=2, inaxes=w.canvas.ax, xdata=5.0, ydata=5.0,
+    )
+    w.canvas._handle_pan_press(press)
+    assert w.canvas._pan_state is not None
+
+    move = types.SimpleNamespace(xdata=6.0, ydata=5.5)
+    w.canvas._handle_pan_motion(move)
+    # 1.0 unit drag right and 0.5 up means the world shifts left/down.
+    x0, x1 = w.canvas.ax.get_xlim()
+    y0, y1 = w.canvas.ax.get_ylim()
+    assert abs(x0 - (-1.0)) < 1e-6
+    assert abs(x1 - 9.0) < 1e-6
+    assert abs(y0 - (-0.5)) < 1e-6
+    assert abs(y1 - 9.5) < 1e-6
+
+    release = types.SimpleNamespace(button=2)
+    w.canvas._handle_pan_release(release)
+    assert w.canvas._pan_state is None
+
+
+def test_canvas_middle_click_does_not_trigger_tools(qt_app):
+    """Middle-button presses must be reserved for panning and never reach
+    the active tool's on_click."""
+    import types
+    w = MainWindow()
+    qt_app.processEvents()
+    received: list[tuple] = []
+    w.canvas.on_click = lambda hit, button: received.append((hit, button))
+    ev = types.SimpleNamespace(
+        button=2, inaxes=w.canvas.ax, xdata=1.0, ydata=2.0,
+    )
+    w.canvas._handle_click(ev)
+    assert received == []

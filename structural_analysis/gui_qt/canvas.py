@@ -116,6 +116,15 @@ class ModelCanvas(QWidget):
 
         self._mpl_canvas.mpl_connect("button_press_event", self._handle_click)
         self._mpl_canvas.mpl_connect("motion_notify_event", self._handle_motion)
+        # Scroll-wheel zoom and middle-button (wheel-press) pan run
+        # independently of matplotlib's navigation toolbar — users get
+        # SAP/AutoCAD-style navigation without needing to toggle a tool.
+        self._mpl_canvas.mpl_connect("scroll_event", self._handle_scroll)
+        self._mpl_canvas.mpl_connect("button_press_event", self._handle_pan_press)
+        self._mpl_canvas.mpl_connect("button_release_event",
+                                       self._handle_pan_release)
+        self._mpl_canvas.mpl_connect("motion_notify_event", self._handle_pan_motion)
+        self._pan_state: tuple[float, float, tuple, tuple] | None = None
 
     # ── public API ──
 
@@ -245,6 +254,10 @@ class ModelCanvas(QWidget):
     # ── event forwarding ──
 
     def _handle_click(self, event) -> None:
+        # Middle button is reserved for panning the canvas (see
+        # _handle_pan_press) — never forward it to the active tool.
+        if event.button == 2:
+            return
         if self.on_click is None or event.inaxes is not self.ax:
             return
         if event.xdata is None or event.ydata is None:
@@ -266,6 +279,10 @@ class ModelCanvas(QWidget):
         self.on_click(hit, button_name)
 
     def _handle_motion(self, event) -> None:
+        if self._pan_state is not None:
+            # A pan drag is in progress — suppress snap/hover updates so
+            # the canvas doesn't flicker between snap and pan redraws.
+            return
         if self.on_motion is None or event.inaxes is not self.ax:
             # Cursor left the axes — drop the hover marker.
             if self._hover_xy is not None:
@@ -283,6 +300,55 @@ class ModelCanvas(QWidget):
             self.on_motion(hit)
         except Exception:
             pass
+
+    # ── navigation (scroll-zoom + middle-button pan) ──
+
+    def _handle_scroll(self, event) -> None:
+        if event.inaxes is not self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        # Zoom factor 1.2 per notch (zoom in on scroll-up).
+        base = 1.2
+        factor = 1.0 / base if event.button == "up" else base
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        cx, cy = event.xdata, event.ydata
+        self.ax.set_xlim(cx + (x0 - cx) * factor, cx + (x1 - cx) * factor)
+        self.ax.set_ylim(cy + (y0 - cy) * factor, cy + (y1 - cy) * factor)
+        self._view_initialised = True
+        self._mpl_canvas.draw_idle()
+
+    def _handle_pan_press(self, event) -> None:
+        if event.button != 2:                       # middle button only
+            return
+        if event.inaxes is not self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self._pan_state = (
+            float(event.xdata), float(event.ydata),
+            self.ax.get_xlim(), self.ax.get_ylim(),
+        )
+
+    def _handle_pan_motion(self, event) -> None:
+        if self._pan_state is None:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        x0, y0, xlim0, ylim0 = self._pan_state
+        # Convert pixel delta to data delta using the *frozen* axes
+        # transform from press time, otherwise the pan grows quadratically.
+        dx_data = float(event.xdata) - x0
+        dy_data = float(event.ydata) - y0
+        self.ax.set_xlim(xlim0[0] - dx_data, xlim0[1] - dx_data)
+        self.ax.set_ylim(ylim0[0] - dy_data, ylim0[1] - dy_data)
+        self._view_initialised = True
+        self._mpl_canvas.draw_idle()
+
+    def _handle_pan_release(self, event) -> None:
+        if event.button == 2:
+            self._pan_state = None
 
     # ── geometry / hit-test ──
 
