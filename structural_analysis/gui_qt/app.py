@@ -37,6 +37,7 @@ from ..model import AnalysisResult, Material, Section, StructuralModel
 from ..gui_common.commands import (
     AddElementCmd,
     AddMemberLoadCmd,
+    AddNodeCmd,
     AddOrUpdateMaterialCmd,
     AddOrUpdateSectionCmd,
     ClearMemberLoadsCmd,
@@ -67,11 +68,14 @@ from .controllers import (
 )
 from .dialogs import (
     ElementDialog,
+    ElementPropertiesDialog,
+    FineNodeDialog,
     GridDialog,
     GridSpacingDialog,
     MaterialListDialog,
     MemberLoadDialog,
     NodalLoadDialog,
+    NodePropertiesDialog,
     SupportDialog,
 )
 from .grid import GridSystem
@@ -255,6 +259,11 @@ class MainWindow(QMainWindow):
                                  triggered=self._do_redo)
         self.act_materials = QAction("&Materials…", self,
                                        triggered=self._open_material_list)
+        self.act_add_node_coords = QAction(
+            "Add node at &coordinates…", self,
+            shortcut="Shift+N",
+            triggered=self._do_add_node_at_coords,
+        )
 
         self.act_grid_spacing = QAction("&Grid spacing…", self,
                                           triggered=self._set_grid_spacing)
@@ -325,6 +334,7 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_undo)
         m_edit.addAction(self.act_redo)
         m_edit.addSeparator()
+        m_edit.addAction(self.act_add_node_coords)
         m_edit.addAction(self.act_materials)
         m_edit.addAction(self.act_forget_elem_defaults)
 
@@ -591,6 +601,22 @@ class MainWindow(QMainWindow):
             self.execute(ClearMemberLoadsCmd(elem_id=elem_id))
         elif chosen is a5:
             self.execute(DeleteElementCmd(elem_id=elem_id))
+
+    def show_node_details(self, node_id: int) -> None:
+        try:
+            d = NodePropertiesDialog(self, self._model, node_id, self._result)
+        except ValueError as e:
+            QMessageBox.warning(self, "Node not found", str(e))
+            return
+        d.exec()
+
+    def show_element_details(self, elem_id: int) -> None:
+        try:
+            d = ElementPropertiesDialog(self, self._model, elem_id, self._result)
+        except ValueError as e:
+            QMessageBox.warning(self, "Element not found", str(e))
+            return
+        d.exec()
 
     # ── editing flows ──
 
@@ -931,6 +957,13 @@ class MainWindow(QMainWindow):
                 self.canvas.set_grid_spacing(d.result_value)
             except ValueError as e:
                 QMessageBox.warning(self, "Invalid input", str(e))
+
+    def _do_add_node_at_coords(self) -> None:
+        d = FineNodeDialog(self, model=self._model)
+        if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
+            return
+        x, y = d.result_value
+        self.execute(AddNodeCmd(x=x, y=y))
 
     def _toggle_snap(self, checked: bool) -> None:
         self.canvas.toggle_snap(checked)

@@ -853,3 +853,274 @@ class ModalAnalysisDialog(_ModalDialog):
             raise ValueError("Number of modes must be at least 1.")
         norm = self._norm_combo.currentData()
         return {"n_modes": n, "normalisation": norm}
+
+
+# ── read-only property inspectors (left-click in Select tool) ──
+
+
+def _support_summary(support: Support | None) -> str:
+    if support is None:
+        return "free"
+    flags = (bool(support.ux), bool(support.uy), bool(support.rz))
+    if flags == (True, True, True):
+        kind = "fixed"
+    elif flags == (True, True, False):
+        kind = "pin"
+    elif flags == (False, True, False):
+        kind = "roller (uy)"
+    elif flags == (True, False, False):
+        kind = "roller (ux)"
+    elif flags == (False, False, False):
+        kind = "free"
+    else:
+        kind = "custom"
+    parts = [f"ux={support.ux}", f"uy={support.uy}", f"rz={support.rz}"]
+    settle = []
+    for dof in ("ux", "uy", "rz"):
+        v = getattr(support, f"settle_{dof}")
+        if v is not None and abs(v) > 0.0:
+            settle.append(f"Δ{dof}={v:g}")
+    body = "  ".join(parts) + (f"  ·  settle: {', '.join(settle)}" if settle else "")
+    return f"{kind}  ·  {body}"
+
+
+def _nodal_load_summary(model: StructuralModel, node_id: int) -> str:
+    load = next((ld for ld in model.nodal_loads if ld.node_id == node_id), None)
+    if load is None:
+        return "(none)"
+    return f"Fx = {load.fx:g} kN,  Fy = {load.fy:g} kN,  Mz = {load.mz:g} kN·m"
+
+
+def _member_loads_summary(elem) -> list[str]:
+    loads = list(getattr(elem, "member_loads", []) or [])
+    if not loads:
+        return ["(none)"]
+    out: list[str] = []
+    for ld in loads:
+        if isinstance(ld, UniformDistributedLoad):
+            out.append(f"UDL: wy = {ld.wy:g} kN/m")
+        elif isinstance(ld, PointLoad):
+            out.append(f"Point: py = {ld.py:g} kN at a = {ld.a:g} m")
+        elif isinstance(ld, FrameTemperatureLoad):
+            out.append(
+                f"Thermal frame: t_top = {ld.t_top:g} °C, "
+                f"t_bottom = {ld.t_bottom:g} °C"
+            )
+        elif isinstance(ld, TrussTemperatureLoad):
+            out.append(f"Thermal truss: ΔT = {ld.delta_T:g} °C")
+        else:
+            out.append(repr(ld))
+    return out
+
+
+class NodePropertiesDialog(QDialog):
+    """Read-only inspector for a node — opened by left-click in Select tool."""
+
+    def __init__(self, parent, model: StructuralModel, node_id: int,
+                 result=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Node {node_id} properties")
+        self.setModal(True)
+        if node_id not in model.nodes:
+            raise ValueError(f"Node {node_id} does not exist.")
+
+        node = model.nodes[node_id]
+        support = model.supports.get(node_id)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        form.addRow("Node ID:", QLabel(str(node_id)))
+        form.addRow("Coordinates:",
+                     QLabel(f"x = {node.x:g} m,  y = {node.y:g} m"))
+        form.addRow("Support:", QLabel(_support_summary(support)))
+        form.addRow("Nodal load:", QLabel(_nodal_load_summary(model, node_id)))
+
+        # Result rows (only if a successful static result is available).
+        if result is not None and getattr(result, "status", None) == "ok":
+            sep = QLabel("── Result ──")
+            sep.setStyleSheet("font-weight: bold;")
+            layout.addWidget(sep)
+            res_form = QFormLayout()
+            layout.addLayout(res_form)
+
+            disp = _node_displacement(result, node_id)
+            res_form.addRow("Displacement:", QLabel(disp))
+            reac = _node_reaction(result, node_id)
+            if reac is not None:
+                res_form.addRow("Reaction:", QLabel(reac))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close,
+                                     parent=self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        # Close button on a Close-only box fires `rejected`; wire it to accept too.
+        close_btn = buttons.button(QDialogButtonBox.StandardButton.Close)
+        if close_btn is not None:
+            close_btn.clicked.connect(self.accept)
+        layout.addWidget(buttons)
+
+
+def _node_displacement(result, node_id: int) -> str:
+    nm = result.E_map.get(node_id)
+    if nm is None or result.D is None:
+        return "(not available)"
+    parts = []
+    for dof in ("ux", "uy", "rz"):
+        idx = nm.get(dof)
+        if idx is None:
+            parts.append(f"{dof} = 0  (restrained)")
+        else:
+            val = float(result.D[idx])
+            unit = "rad" if dof == "rz" else "m"
+            parts.append(f"{dof} = {val:.6e} {unit}")
+    return ",  ".join(parts)
+
+
+def _node_reaction(result, node_id: int) -> str | None:
+    reactions = getattr(result, "reactions", None) or {}
+    r = reactions.get(node_id)
+    if not r:
+        return None
+    parts = []
+    for dof, label, unit in (("ux", "Rx", "kN"),
+                              ("uy", "Ry", "kN"),
+                              ("rz", "Mz", "kN·m")):
+        if dof in r:
+            parts.append(f"{label} = {r[dof]:.4f} {unit}")
+    if not parts:
+        return None
+    return ",  ".join(parts)
+
+
+class ElementPropertiesDialog(QDialog):
+    """Read-only inspector for an element — opened by left-click in Select tool."""
+
+    def __init__(self, parent, model: StructuralModel, elem_id: int,
+                 result=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Element {elem_id} properties")
+        self.setModal(True)
+
+        elem = next((e for e in model.elements if e.id == elem_id), None)
+        if elem is None:
+            raise ValueError(f"Element {elem_id} does not exist.")
+
+        section = model.sections.get(getattr(elem, "section_id", None) or -1)
+        material = (model.materials.get(section.material_id)
+                     if section is not None else None)
+
+        ni = model.nodes.get(elem.node_i)
+        nj = model.nodes.get(elem.node_j)
+        if ni is None or nj is None:
+            length = 0.0
+        else:
+            length = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        form.addRow("Element ID:", QLabel(str(elem_id)))
+        form.addRow("Kind:", QLabel(elem.kind.capitalize()))
+        form.addRow("Nodes:", QLabel(f"{elem.node_i} → {elem.node_j}"))
+        form.addRow("Length:", QLabel(f"{length:g} m"))
+
+        if section is not None:
+            sec_text = section.name or f"section {section.id}"
+            form.addRow("Section:", QLabel(f"{sec_text}  (id {section.id})"))
+        else:
+            form.addRow("Section:", QLabel("(none)"))
+        if material is not None:
+            mat_text = material.name or f"material {material.id}"
+            form.addRow("Material:", QLabel(f"{mat_text}  (id {material.id})"))
+
+        form.addRow("E:", QLabel(f"{elem.E:g} kN/m²"))
+        form.addRow("A:", QLabel(f"{elem.A:g} m²"))
+        if isinstance(elem, FrameElement2D):
+            form.addRow("I:", QLabel(f"{elem.I:g} m⁴"))
+            form.addRow("Releases:",
+                         QLabel(f"i={elem.release_i},  j={elem.release_j}"))
+
+        loads = _member_loads_summary(elem)
+        form.addRow("Member loads:", QLabel(loads[0]))
+        for line in loads[1:]:
+            form.addRow("", QLabel(line))
+
+        # End-force result block (only if a successful static result exists).
+        if result is not None and getattr(result, "status", None) == "ok":
+            f_local = _element_local_forces(result, elem_id)
+            if f_local is not None:
+                sep = QLabel("── End forces (local) ──")
+                sep.setStyleSheet("font-weight: bold;")
+                layout.addWidget(sep)
+                ef_form = QFormLayout()
+                layout.addLayout(ef_form)
+                Ni, Vi, Mi, Nj, Vj, Mj = f_local
+                if isinstance(elem, TrussElement2D):
+                    ef_form.addRow("Node i:", QLabel(f"N = {Ni:+.4f} kN"))
+                    ef_form.addRow("Node j:", QLabel(f"N = {Nj:+.4f} kN"))
+                else:
+                    ef_form.addRow(
+                        "Node i:",
+                        QLabel(
+                            f"N = {Ni:+.4f} kN,  V = {Vi:+.4f} kN,  "
+                            f"M = {Mi:+.4f} kN·m"
+                        ),
+                    )
+                    ef_form.addRow(
+                        "Node j:",
+                        QLabel(
+                            f"N = {Nj:+.4f} kN,  V = {Vj:+.4f} kN,  "
+                            f"M = {Mj:+.4f} kN·m"
+                        ),
+                    )
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close,
+                                     parent=self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        close_btn = buttons.button(QDialogButtonBox.StandardButton.Close)
+        if close_btn is not None:
+            close_btn.clicked.connect(self.accept)
+        layout.addWidget(buttons)
+
+
+def _element_local_forces(result, elem_id: int):
+    member = getattr(result, "member_results", None) or {}
+    entry = member.get(elem_id)
+    if not entry:
+        return None
+    f = entry.get("f_local")
+    if f is None or len(f) < 6:
+        return None
+    return tuple(float(v) for v in f[:6])
+
+
+class FineNodeDialog(_ModalDialog):
+    """Add a node at typed (x, y) coordinates — alternative to canvas click."""
+
+    def __init__(self, parent, *, model: StructuralModel) -> None:
+        self._model = model
+        super().__init__(parent, "Add node at coordinates")
+
+    def _build_body(self, body: QWidget) -> None:
+        form = QFormLayout(body)
+        self._x_entry = QLineEdit(body)
+        self._y_entry = QLineEdit(body)
+        self._x_entry.setText("0.0")
+        self._y_entry.setText("0.0")
+        form.addRow("X (m):", self._x_entry)
+        form.addRow("Y (m):", self._y_entry)
+        hint = QLabel(
+            "The node is created via the same Add-Node command used by\n"
+            "canvas clicks — undo / duplicate detection still apply.",
+            body,
+        )
+        hint.setWordWrap(True)
+        form.addRow(hint)
+
+    def _accept(self) -> tuple[float, float]:
+        x = parse_float(self._x_entry.text(), "X")
+        y = parse_float(self._y_entry.text(), "Y")
+        return (x, y)

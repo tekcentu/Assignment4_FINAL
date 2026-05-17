@@ -15,7 +15,7 @@ PyQt6 = pytest.importorskip("PyQt6")
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 
 from structural_analysis.gui_qt.app import MainWindow  # noqa: E402
 from structural_analysis.gui_qt.canvas import HitResult  # noqa: E402
@@ -340,6 +340,103 @@ def test_member_load_dialog_raises_for_unknown_element(qt_app):
     qt_app.processEvents()
     with pytest.raises(ValueError):
         MemberLoadDialog(w, model=w._model, elem_id=9999)
+
+
+def test_select_tool_left_click_shows_details(qt_app):
+    """Left-clicking a node or element with the Select tool must open
+    the read-only details dialog directly — no right-click menu needed."""
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+
+    calls: list[tuple[str, int]] = []
+    w.show_node_details = lambda nid: calls.append(("node", nid))
+    w.show_element_details = lambda eid: calls.append(("elem", eid))
+
+    w._select_tool("select")
+    w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
+    assert calls == [("node", 1)]
+    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=2), "left")
+    assert calls == [("node", 1), ("elem", 2)]
+    # Empty click — no detail dialog opens.
+    w._on_canvas_click(HitResult(x=5.0, y=5.0), "left")
+    assert calls == [("node", 1), ("elem", 2)]
+
+
+def test_property_dialogs_construct(qt_app):
+    """ElementPropertiesDialog and NodePropertiesDialog must build for
+    every element / node in the q2a model, with and without a solver
+    result loaded."""
+    from structural_analysis.gui_qt.dialogs import (
+        ElementPropertiesDialog,
+        NodePropertiesDialog,
+    )
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    m = w._model
+    # Pre-solve variants
+    ElementPropertiesDialog(w, m, m.elements[0].id, None)
+    NodePropertiesDialog(w, m, next(iter(m.nodes)), None)
+    # Post-solve: include the result for every element / node
+    for elem in m.elements:
+        ElementPropertiesDialog(w, m, elem.id, w._result)
+    for nid in m.nodes:
+        NodePropertiesDialog(w, m, nid, w._result)
+
+
+def test_property_dialogs_raise_for_unknown_ids(qt_app):
+    from structural_analysis.gui_qt.dialogs import (
+        ElementPropertiesDialog,
+        NodePropertiesDialog,
+    )
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    with pytest.raises(ValueError):
+        ElementPropertiesDialog(w, w._model, 9999, None)
+    with pytest.raises(ValueError):
+        NodePropertiesDialog(w, w._model, 9999, None)
+
+
+def test_fine_node_dialog_constructs(qt_app):
+    from structural_analysis.gui_qt.dialogs import FineNodeDialog
+
+    w = MainWindow()
+    d = FineNodeDialog(w, model=w._model)
+    assert d._x_entry.text() == "0.0"
+    assert d._y_entry.text() == "0.0"
+
+
+def test_fine_node_action_creates_node(qt_app):
+    """_do_add_node_at_coords must route through AddNodeCmd so undo
+    works and duplicate detection fires."""
+    from structural_analysis.gui_qt.dialogs import FineNodeDialog
+
+    w = MainWindow()
+    n_before = len(w._model.nodes)
+    original_exec = FineNodeDialog.exec
+
+    def fake_exec(self):
+        self._x_entry.setText("5.0")
+        self._y_entry.setText("3.0")
+        self.result_value = self._accept()
+        return QDialog.DialogCode.Accepted
+
+    FineNodeDialog.exec = fake_exec
+    try:
+        w._do_add_node_at_coords()
+    finally:
+        FineNodeDialog.exec = original_exec
+
+    assert len(w._model.nodes) == n_before + 1
+    assert any(abs(n.x - 5.0) < 1e-9 and abs(n.y - 3.0) < 1e-9
+               for n in w._model.nodes.values())
+    # Undo removes the typed node.
+    w._do_undo()
+    assert len(w._model.nodes) == n_before
 
 
 def test_modal_results_dialog_round_trip(qt_app):
