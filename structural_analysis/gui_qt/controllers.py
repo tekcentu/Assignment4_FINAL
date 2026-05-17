@@ -136,7 +136,10 @@ class SupportTool(Tool):
     description = "Support tool: click a node to edit its support."
 
     def on_click(self, hit: HitResult, button: str) -> None:
-        if button != "left" or hit.node_id is None:
+        if button != "left":
+            return
+        if hit.node_id is None:
+            self.host.set_status("Support tool: click an existing node, not empty space.")
             return
         self.host.show_node_menu(hit.node_id, action="support")
 
@@ -146,7 +149,10 @@ class NodalLoadTool(Tool):
     description = "Nodal load tool: click a node to add/edit its load."
 
     def on_click(self, hit: HitResult, button: str) -> None:
-        if button != "left" or hit.node_id is None:
+        if button != "left":
+            return
+        if hit.node_id is None:
+            self.host.set_status("Nodal-load tool: click an existing node, not empty space.")
             return
         self.host.show_node_menu(hit.node_id, action="nodal_load")
 
@@ -156,7 +162,10 @@ class MemberLoadTool(Tool):
     description = "Member load tool: click an element to add a load."
 
     def on_click(self, hit: HitResult, button: str) -> None:
-        if button != "left" or hit.element_id is None:
+        if button != "left":
+            return
+        if hit.element_id is None:
+            self.host.set_status("Member-load tool: click an element line, not empty space or a node.")
             return
         self.host.show_element_menu(hit.element_id, action="member_load")
 
@@ -172,3 +181,5 @@ class DeleteTool(Tool):
             self.host.execute(DeleteNodeCmd(node_id=hit.node_id))
         elif hit.element_id is not None:
             self.host.execute(DeleteElementCmd(elem_id=hit.element_id))
+        else:
+            self.host.set_status("Delete tool: click a node or element to remove it.")

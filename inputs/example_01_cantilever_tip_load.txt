@@ -1,0 +1,24 @@
+TITLE
+Cantilever beam, 4 m, tip load 10 kN downward
+
+NODES 2
+1  0.0  0.0
+2  4.0  0.0
+
+MATERIALS 2
+1  210000000.0  1.2e-05  7850.0  Steel_S275
+2  33000000.0  1e-05  2500.0  Concrete_C30
+
+SECTIONS 3
+1  1  0.00285  1.94e-05  0.2  Steel_IPE200
+2  2  0.15  0.003125  0.5  Concrete_30x50
+3  2  0.09  0.000675  0.3  Concrete_30x30
+
+ELEMENTS 1
+1  1  2  1  FRAME
+
+SUPPORTS 1
+1  1  1  1
+
+LOADS 1
+2  0.0  -10.0  0.0

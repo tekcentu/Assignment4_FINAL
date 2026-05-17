@@ -21,6 +21,34 @@ def format_result(model: StructuralModel, result: AnalysisResult | None) -> str:
         lines.append(f"\n  Status: {result.status}")
         return "\n".join(lines)
 
+    # ── Summary (top-of-report quick read) ──
+    # Scan D through E_map for the largest translational displacement
+    # magnitude across all nodes so a beginner sees "the answer" before
+    # the step-by-step breakdown.
+    max_disp = 0.0
+    max_disp_node: int | None = None
+    has_disp_dofs = False
+    if result.D is not None:
+        for nid, em in result.E_map.items():
+            if em["ux"] is None and em["uy"] is None:
+                continue
+            has_disp_dofs = True
+            ux = float(result.D[em["ux"]]) if em["ux"] is not None else 0.0
+            uy = float(result.D[em["uy"]]) if em["uy"] is not None else 0.0
+            mag = (ux * ux + uy * uy) ** 0.5
+            if mag >= max_disp:
+                max_disp = mag
+                max_disp_node = nid
+    lines.append("\n── Summary ──")
+    lines.append(f"  Status:                      {result.status}")
+    lines.append(f"  Max equilibrium residual:    {result.eq_residual:.4e}")
+    if not has_disp_dofs:
+        lines.append("  Max nodal displacement:      (no displacement DOFs)")
+    elif max_disp_node is not None:
+        lines.append(
+            f"  Max nodal displacement:      |u| = {max_disp:.4e} m at node {max_disp_node}"
+        )
+
     # Step A
     n_frame = sum(1 for e in model.elements if isinstance(e, FrameElement2D))
     n_truss = len(model.elements) - n_frame
