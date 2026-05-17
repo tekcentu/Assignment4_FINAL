@@ -48,6 +48,7 @@ from ..gui_common.commands import (
     SetGridSystemCmd,
     SetNodalLoadCmd,
     SetSupportCmd,
+    UpdateElementCmd,
 )
 from ..gui_common.file_writer import write_input_file
 from ..gui_common.results_view import format_result
@@ -367,9 +368,12 @@ class MainWindow(QMainWindow):
         self._cb_reactions.toggled.connect(self._refresh_overlays)
         self._cb_diagrams = QCheckBox("Force diagrams", self._overlay_panel)
         self._cb_diagrams.toggled.connect(self._refresh_overlays)
+        self._cb_section_labels = QCheckBox("Section/material names", self._overlay_panel)
+        self._cb_section_labels.toggled.connect(self._refresh_overlays)
         v.addWidget(self._cb_deformed)
         v.addWidget(self._cb_reactions)
         v.addWidget(self._cb_diagrams)
+        v.addWidget(self._cb_section_labels)
 
         self._dia_group = QButtonGroup(self._overlay_panel)
         for label, val in [("M (moment)", "moment"),
@@ -401,6 +405,47 @@ class MainWindow(QMainWindow):
 
     def clear_element_preview(self) -> None:
         self.canvas.clear_element_preview()
+        self.canvas.redraw()
+
+    def select_node(self, node_id: int) -> None:
+        node = self._model.nodes.get(node_id)
+        if node is None:
+            self.clear_selection()
+            return
+        self.canvas.select_node(node_id)
+        support = "support" if node_id in self._model.supports else "no support"
+        loads = [ld for ld in self._model.nodal_loads if ld.node_id == node_id]
+        load_text = f"{len(loads)} nodal load(s)" if loads else "no nodal load"
+        self.set_status(
+            f"Selected node {node_id}: x={node.x:.3f} m, y={node.y:.3f} m; "
+            f"{support}; {load_text}. Right-click for actions."
+        )
+        self.canvas.redraw()
+
+    def select_element(self, element_id: int) -> None:
+        elem = next((e for e in self._model.elements if e.id == element_id), None)
+        if elem is None:
+            self.clear_selection()
+            return
+        self.canvas.select_element(element_id)
+        ni = self._model.nodes.get(elem.node_i)
+        nj = self._model.nodes.get(elem.node_j)
+        length = ""
+        if ni is not None and nj is not None:
+            L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+            length = f", L={L:.3f} m"
+        kind = getattr(elem, "kind", elem.__class__.__name__).lower()
+        section = self._model.sections.get(getattr(elem, "section_id", None))
+        section_name = section.name if section and section.name else "unnamed section"
+        self.set_status(
+            f"Selected element {element_id}: {kind}, {section_name}, "
+            f"nodes {elem.node_i}-{elem.node_j}{length}. Right-click for actions."
+        )
+        self.canvas.redraw()
+
+    def clear_selection(self) -> None:
+        self.canvas.clear_selection()
+        self.set_status("Selection cleared. Click a node or element to inspect it.")
         self.canvas.redraw()
 
     def execute(self, command: Command) -> None:
@@ -530,15 +575,21 @@ class MainWindow(QMainWindow):
             self._add_member_load(elem_id)
             return
         menu = QMenu(self)
-        a1 = menu.addAction(f"Element {elem_id}: add member load…")
-        a2 = menu.addAction(f"Element {elem_id}: clear member loads")
-        a3 = menu.addAction(f"Element {elem_id}: delete")
+        a1 = menu.addAction(f"Element {elem_id}: edit section/material...")
+        a2 = menu.addAction(f"Element {elem_id}: show results / FBD...")
+        a3 = menu.addAction(f"Element {elem_id}: add member load...")
+        a4 = menu.addAction(f"Element {elem_id}: clear member loads")
+        a5 = menu.addAction(f"Element {elem_id}: delete")
         chosen = menu.exec(self.cursor().pos())
         if chosen is a1:
-            self._add_member_load(elem_id)
+            self._edit_element(elem_id)
         elif chosen is a2:
-            self.execute(ClearMemberLoadsCmd(elem_id=elem_id))
+            self._show_element_results(elem_id)
         elif chosen is a3:
+            self._add_member_load(elem_id)
+        elif chosen is a4:
+            self.execute(ClearMemberLoadsCmd(elem_id=elem_id))
+        elif chosen is a5:
             self.execute(DeleteElementCmd(elem_id=elem_id))
 
     # ── editing flows ──
@@ -573,6 +624,78 @@ class MainWindow(QMainWindow):
         if d.exec() != QDialog.DialogCode.Accepted:
             return
         self.execute(AddMemberLoadCmd(elem_id=elem_id, load=d.result_value))
+
+    def _edit_element(self, elem_id: int) -> None:
+        elem = next((e for e in self._model.elements if e.id == elem_id), None)
+        if elem is None:
+            QMessageBox.warning(self, "Cannot edit element",
+                                f"Element {elem_id} does not exist.")
+            return
+        d = ElementDialog(
+            self, model=self._model,
+            existing_kind=getattr(elem, "kind", None),
+            existing_section_id=getattr(elem, "section_id", None),
+            existing_release_i=getattr(elem, "release_i", False),
+            existing_release_j=getattr(elem, "release_j", False),
+            remember_default=False,
+        )
+        if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
+            return
+        rv = d.result_value
+        self.execute(UpdateElementCmd(
+            elem_id=elem_id,
+            section_id=rv["section_id"],
+            kind=rv["kind"],
+            release_i=rv["release_i"],
+            release_j=rv["release_j"],
+        ))
+        self.select_element(elem_id)
+
+    def _show_element_results(self, elem_id: int) -> None:
+        elem = next((e for e in self._model.elements if e.id == elem_id), None)
+        if elem is None:
+            QMessageBox.warning(self, "Element results",
+                                f"Element {elem_id} does not exist.")
+            return
+        if self._result is None or self._result.status != "ok":
+            QMessageBox.information(
+                self, "Element results",
+                "Run static analysis first (F5), then open element results.",
+            )
+            return
+        mr = self._result.member_results.get(elem_id)
+        if mr is None:
+            QMessageBox.information(
+                self, "Element results",
+                f"No post-processing result is available for element {elem_id}.",
+            )
+            return
+        f_local = [float(v) for v in mr["f_local"]]
+        lines = [
+            f"Element {elem_id} free-body / local end forces",
+            f"Type: {getattr(elem, 'kind', elem.__class__.__name__)}",
+            f"Nodes: {elem.node_i} -> {elem.node_j}",
+            "",
+            "Local member-end forces:",
+            f"  i-end: N={f_local[0]:+.6g} kN, V={f_local[1]:+.6g} kN, "
+            f"M={f_local[2]:+.6g} kN*m",
+            f"  j-end: N={f_local[3]:+.6g} kN, V={f_local[4]:+.6g} kN, "
+            f"M={f_local[5]:+.6g} kN*m",
+            "",
+            "Free-body convention:",
+            "  N is local axial force; V is local transverse shear; "
+            "M is local end moment.",
+            "  Use the canvas M / V / N diagram overlay for span shape "
+            "and critical values.",
+        ]
+        box = QMessageBox(self)
+        box.setWindowTitle("Element results / FBD")
+        box.setText(f"Element {elem_id} results")
+        box.setInformativeText(
+            "Open details to see local end forces and the free-body sign convention."
+        )
+        box.setDetailedText("\n".join(lines))
+        box.exec()
 
     def _open_material_list(self) -> None:
         d = MaterialListDialog(
@@ -716,6 +839,7 @@ class MainWindow(QMainWindow):
         self.canvas.show_deformed = self._cb_deformed.isChecked()
         self.canvas.show_reactions = self._cb_reactions.isChecked()
         self.canvas.show_diagrams = self._cb_diagrams.isChecked()
+        self.canvas.show_section_labels = self._cb_section_labels.isChecked()
         for btn in self._dia_group.buttons():
             if btn.isChecked():
                 self.canvas.diagram_kind = btn.property("diagram_kind")

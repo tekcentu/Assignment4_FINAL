@@ -97,6 +97,111 @@ def test_truss_tool_passes_truss_kind_to_element_dialog(qt_app):
     assert seen == [(1, 2, "truss")]
 
 
+def test_canvas_draws_origin_axes(qt_app):
+    w = MainWindow()
+    w.canvas.redraw()
+
+    labels = [text.get_text() for text in w.canvas.ax.texts]
+    assert "0,0" in labels
+    assert "X" in labels
+    assert "Y" in labels
+
+
+def test_select_tool_highlights_and_reports_selection(qt_app):
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 2.0, 0.0),
+    }
+    w._model.elements = [
+        FrameElement2D(
+            id=1, node_i=1, node_j=2,
+            E=2.0e8, A=0.01, I=1.0e-4,
+            section_id=1,
+        )
+    ]
+
+    w._select_tool("select")
+    w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
+    assert w.canvas._selected_node_id == 1
+    assert "Selected node 1" in w._status_label.text()
+
+    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=1), "left")
+    assert w.canvas._selected_element_id == 1
+    assert w.canvas._selected_node_id is None
+    assert "Selected element 1" in w._status_label.text()
+
+    w._on_canvas_click(HitResult(x=5.0, y=5.0), "left")
+    assert w.canvas._selected_element_id is None
+    assert w.canvas._selected_node_id is None
+    assert "Selection cleared" in w._status_label.text()
+
+
+def test_nodal_load_components_draw_separately(qt_app):
+    from structural_analysis.model import Node, NodalLoad
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0)}
+    w._model.nodal_loads = [NodalLoad(1, fx=10.0, fy=-5.0, mz=0.0)]
+    w.canvas.redraw()
+
+    labels = [text.get_text() for text in w.canvas.ax.texts]
+    assert "Fx=+10" in labels
+    assert "Fy=-5" in labels
+    assert "11.2 kN" not in labels
+
+
+def test_section_material_labels_can_be_drawn(qt_app):
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Material, Node, Section
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.materials = {1: Material(1, name="Steel", E=200e6)}
+    w._model.sections = {
+        1: Section(1, name="IPE200", material_id=1, A=0.01, I=1e-4)
+    }
+    w._model.elements = [
+        FrameElement2D(1, 1, 2, E=200e6, A=0.01, I=1e-4, section_id=1)
+    ]
+    w.canvas.show_section_labels = True
+    w.canvas.redraw()
+
+    labels = [text.get_text() for text in w.canvas.ax.texts]
+    assert "IPE200 / Steel" in labels
+
+
+def test_update_element_command_changes_section(qt_app):
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.gui_common.commands import UpdateElementCmd
+    from structural_analysis.model import Material, Node, Section
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.materials = {
+        1: Material(1, name="Steel", E=200e6),
+        2: Material(2, name="Concrete", E=30e6),
+    }
+    w._model.sections = {
+        1: Section(1, name="IPE200", material_id=1, A=0.01, I=1e-4),
+        2: Section(2, name="C30x30", material_id=2, A=0.09, I=6.75e-4),
+    }
+    w._model.elements = [
+        FrameElement2D(1, 1, 2, E=200e6, A=0.01, I=1e-4, section_id=1)
+    ]
+
+    cmd = UpdateElementCmd(elem_id=1, section_id=2, kind="frame")
+    cmd.do(w._model)
+
+    elem = w._model.elements[0]
+    assert elem.section_id == 2
+    assert elem.E == 30e6
+    assert elem.A == 0.09
+
+
 def test_sticky_truss_then_frame_tool_places_frame(qt_app):
     """Bug fix: with sticky=truss remembered, switching to the Frame
     tool and clicking two nodes must place a FrameElement2D — not
