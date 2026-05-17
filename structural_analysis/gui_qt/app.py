@@ -167,6 +167,11 @@ class MainWindow(QMainWindow):
         self._result: Optional[AnalysisResult] = None
         self._modal_result = None
         self._modal_results_dialog = None
+        # Sticky element-creation defaults (None = ask the user on the
+        # next pair-click). When the ElementDialog's "Remember" box is
+        # checked these are saved and applied silently for subsequent
+        # frame/truss pair clicks until the user clears them.
+        self._sticky_element: dict | None = None
 
         self._build_ui()
         self._build_actions()
@@ -188,6 +193,7 @@ class MainWindow(QMainWindow):
 
         self.canvas.on_click = self._on_canvas_click
         self.canvas.on_motion = self._on_canvas_motion
+        self.canvas.on_nav_mode_block = self._on_nav_mode_block
 
         self._update_title()
         self.canvas.redraw()
@@ -255,6 +261,10 @@ class MainWindow(QMainWindow):
                                          triggered=self._edit_grid_system)
         self.act_fit_view = QAction("&Fit to view", self, shortcut="Home",
                                       triggered=self._do_fit_view)
+        self.act_forget_elem_defaults = QAction(
+            "Forget element defaults", self,
+            triggered=self._forget_element_defaults,
+        )
         self.act_snap = QAction("Snap to grid", self, checkable=True, checked=True,
                                   triggered=self._toggle_snap)
         # Snap-kind toggles
@@ -315,6 +325,7 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_redo)
         m_edit.addSeparator()
         m_edit.addAction(self.act_materials)
+        m_edit.addAction(self.act_forget_elem_defaults)
 
         m_view = self.menuBar().addMenu("&View")
         m_view.addAction(self.act_fit_view)
@@ -406,19 +417,68 @@ class MainWindow(QMainWindow):
                 "Define a material first (Edit → Materials…) before placing elements.",
             )
             return
+
+        # Sticky path: if a previous element-pair click checked "Remember",
+        # reuse those settings without re-opening the dialog. The setting
+        # is invalidated automatically if the remembered section no
+        # longer exists.
+        sticky = self._sticky_element
+        if (
+            sticky is not None
+            and sticky.get("section_id") in self._model.sections
+        ):
+            self.execute(AddElementCmd(
+                node_i=n_i, node_j=n_j,
+                section_id=sticky["section_id"],
+                kind=sticky["kind"],
+                release_i=sticky["release_i"],
+                release_j=sticky["release_j"],
+            ))
+            return
+
         try:
-            d = ElementDialog(self, model=self._model)
+            d = ElementDialog(self, model=self._model,
+                              existing_kind=(sticky or {}).get("kind"),
+                              existing_section_id=(sticky or {}).get("section_id"))
         except ValueError as e:
             QMessageBox.warning(self, "Cannot add element", str(e))
             return
         if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
+            rv = d.result_value
+            if rv.get("remember"):
+                self._sticky_element = {
+                    "kind": rv["kind"],
+                    "section_id": rv["section_id"],
+                    "release_i": rv["release_i"],
+                    "release_j": rv["release_j"],
+                }
+                # Hint the user that subsequent pair clicks will skip
+                # the dialog until they clear the setting.
+                sec = self._model.sections[rv["section_id"]]
+                label = (f"{rv['kind']} · section {sec.id}"
+                         + (f" ({sec.name})" if sec.name else ""))
+                self.set_status(
+                    f"Reusing element settings: {label}. "
+                    f"Switch tool or use Edit → Forget element defaults to reset."
+                )
+            else:
+                self._sticky_element = None
             self.execute(AddElementCmd(
                 node_i=n_i, node_j=n_j,
-                section_id=d.result_value["section_id"],
-                kind=d.result_value["kind"],
-                release_i=d.result_value["release_i"],
-                release_j=d.result_value["release_j"],
+                section_id=rv["section_id"],
+                kind=rv["kind"],
+                release_i=rv["release_i"],
+                release_j=rv["release_j"],
             ))
+
+    def _forget_element_defaults(self) -> None:
+        """Clear sticky element-creation settings so the next frame/truss
+        pair click re-opens the ElementDialog."""
+        if self._sticky_element is None:
+            self.set_status("No remembered element settings to clear.")
+            return
+        self._sticky_element = None
+        self.set_status("Cleared remembered element settings.")
 
     def show_node_menu(self, node_id: int, action: str | None = None) -> None:
         if action == "support":
@@ -511,7 +571,28 @@ class MainWindow(QMainWindow):
         if name in self._tool_actions:
             self._tool_actions[name].setChecked(True)
         self._active_tool = self._tools[name]
-        self._active_tool.activate()
+        # Switching to an editing tool clears the static result overlay
+        # so the new geometry isn't covered by the previous deformed
+        # shape / reactions / diagrams. The result data itself is kept
+        # until an edit fires (_invalidate_result handles that).
+        if name in {"node", "frame", "truss", "support", "nodal_load",
+                    "member_load", "delete"}:
+            if self._result is not None:
+                self.canvas.clear_result()
+            if self._modal_result is not None:
+                self.canvas.clear_modal_result()
+        # Heads-up for the most common click-doesn't-do-anything trap:
+        # matplotlib navigation toolbar's pan / zoom modes silently
+        # absorb every left-click on the canvas. Tell the user.
+        nav_mode = getattr(self.canvas.toolbar, "mode", "")
+        if nav_mode:
+            self.set_status(
+                f"{self._active_tool.description}  ·  WARNING: matplotlib "
+                f"{nav_mode!s} is active on the canvas toolbar — click it "
+                f"again to deactivate, otherwise tool clicks are ignored."
+            )
+        else:
+            self._active_tool.activate()
 
     def _on_canvas_click(self, hit: HitResult, button: str) -> None:
         if button == "right":
@@ -526,6 +607,17 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Tool error",
                                   f"{type(e).__name__}: {e}")
+
+    def _on_nav_mode_block(self, mode_name: str) -> None:
+        # Triggered when the user clicks on the canvas while the
+        # matplotlib navigation toolbar is in pan or zoom mode (which
+        # silently swallows tool clicks). Surface a status message so
+        # the user notices instead of thinking the tool is broken.
+        self.set_status(
+            f"matplotlib {mode_name!s} mode is active — click the "
+            f"toolbar icon to turn it off, then your tool clicks will "
+            f"work again."
+        )
 
     def _on_canvas_motion(self, hit: HitResult) -> None:
         parts = [f"({hit.x:.3f}, {hit.y:.3f})"]

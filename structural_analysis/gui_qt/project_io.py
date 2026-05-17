@@ -74,7 +74,7 @@ def save_project_json(project: Project, path: str) -> None:
     os.close(fd)
     try:
         write_input_file(project.model, tmp)
-        with open(tmp, "r") as f:
+        with open(tmp, "r", encoding="utf-8") as f:
             model_txt = f.read()
     finally:
         try:
@@ -90,14 +90,14 @@ def save_project_json(project: Project, path: str) -> None:
         "view": project.view.to_dict(),
         "model_txt": model_txt,
     }
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
 
 def load_project_json(path: str) -> Project:
     """Read a ``.spa.json`` file. The embedded model_txt is parsed by
     :func:`structural_analysis.file_io.read_input_file`."""
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: top-level JSON is not an object.")
@@ -118,7 +118,7 @@ def load_project_json(path: str) -> Project:
     fd, tmp = tempfile.mkstemp(suffix=".txt")
     os.close(fd)
     try:
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(model_txt)
         model = read_input_file(tmp)
     finally:

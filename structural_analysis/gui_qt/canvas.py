@@ -13,6 +13,7 @@ from typing import Callable, Optional
 import matplotlib
 matplotlib.use("QtAgg")  # noqa: E402  must precede pyplot import
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon as _MplPolygon
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT,
 )
@@ -208,7 +209,17 @@ class ModelCanvas(QWidget):
         if event.xdata is None or event.ydata is None:
             return
         if self.toolbar.mode:
-            return  # pan/zoom mode active
+            # The matplotlib navigation toolbar is in pan or zoom mode,
+            # so it absorbs every left-click on the canvas. Surface a
+            # status hint via the on_nav_mode_block callback (if the
+            # host has wired one up) — otherwise silently swallow.
+            cb = getattr(self, "on_nav_mode_block", None)
+            if cb is not None:
+                try:
+                    cb(str(self.toolbar.mode))
+                except Exception:
+                    pass
+            return
         hit = self._hit_test(event)
         button_name = {1: "left", 2: "middle", 3: "right"}.get(event.button, "left")
         self.on_click(hit, button_name)
@@ -350,6 +361,34 @@ class ModelCanvas(QWidget):
 
     def _draw_model(self) -> None:
         model = self._model()
+        # Pre-compute the largest force/UDL/point-load magnitude in the
+        # model so every drawn arrow length is proportional to the
+        # actual load magnitude relative to the rest of the model. We
+        # cap it at the model span so a runaway 1e9 load doesn't fill
+        # the screen.
+        max_force = 0.0
+        max_udl = 0.0
+        max_point = 0.0
+        for ld in model.nodal_loads:
+            max_force = max(max_force, (ld.fx ** 2 + ld.fy ** 2) ** 0.5)
+        for elem in model.elements:
+            for ml in getattr(elem, "member_loads", []):
+                if isinstance(ml, UniformDistributedLoad):
+                    max_udl = max(max_udl, abs(ml.wy))
+                elif isinstance(ml, PointLoad):
+                    max_point = max(max_point, abs(ml.py))
+        span = self._model_span()
+        # Map the largest load in each family to ~12% of the model
+        # span on screen; smaller loads scale linearly down from there.
+        # If no loads of a given family exist, the scale is 0 so the
+        # zero-magnitude check inside each draw call falls through.
+        target = 0.12 * span
+        load_scales = {
+            "force": target / max_force if max_force > 0 else 0.0,
+            "udl":   target / max_udl   if max_udl   > 0 else 0.0,
+            "point": target / max_point if max_point > 0 else 0.0,
+        }
+
         for elem in model.elements:
             ni = model.nodes.get(elem.node_i)
             nj = model.nodes.get(elem.node_j)
@@ -373,7 +412,7 @@ class ModelCanvas(QWidget):
                                  nj.y - 0.15 * (nj.y - ni.y),
                                  marker="o", color="white", markersize=7,
                                  markeredgecolor=color, zorder=5)
-            self._draw_member_loads(elem, ni, nj)
+            self._draw_member_loads(elem, ni, nj, load_scales)
 
         for nid, n in model.nodes.items():
             self.ax.plot(n.x, n.y, "o", color="black", markersize=6, zorder=5)
@@ -387,7 +426,7 @@ class ModelCanvas(QWidget):
             n = model.nodes.get(ld.node_id)
             if n is None:
                 continue
-            self._draw_nodal_load(ld, n.x, n.y)
+            self._draw_nodal_load(ld, n.x, n.y, load_scales["force"])
 
     def _draw_support(self, sup: Support, x: float, y: float) -> None:
         if sup.ux and sup.uy and sup.rz:
@@ -414,13 +453,16 @@ class ModelCanvas(QWidget):
                              xytext=(5, -15), textcoords="offset points",
                              fontsize=7, color="#444444", zorder=6)
 
-    def _draw_nodal_load(self, ld: NodalLoad, x: float, y: float) -> None:
-        if ld.fx or ld.fy:
+    def _draw_nodal_load(self, ld: NodalLoad, x: float, y: float,
+                          force_scale: float) -> None:
+        # ``force_scale`` is "world-units of arrow length per kN" so
+        # arrow length is directly proportional to the load magnitude
+        # (set by _draw_model from the largest nodal load in the model).
+        if (ld.fx or ld.fy) and force_scale > 0:
             mag = (ld.fx ** 2 + ld.fy ** 2) ** 0.5
             if mag > 0:
-                scale = 0.5
-                dx = ld.fx / mag * scale
-                dy = ld.fy / mag * scale
+                dx = ld.fx * force_scale
+                dy = ld.fy * force_scale
                 self.ax.annotate(
                     "",
                     xy=(x, y),
@@ -435,15 +477,52 @@ class ModelCanvas(QWidget):
                              textcoords="offset points", fontsize=7,
                              color="#2ca02c", zorder=6)
 
-    def _draw_member_loads(self, elem, ni, nj) -> None:
+    def _draw_member_loads(self, elem, ni, nj, load_scales: dict) -> None:
         if not elem.member_loads:
             return
+        L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+        if L < 1e-12:
+            return
+        # Element local axes for drawing transverse loads on the member.
+        tx, ty = (nj.x - ni.x) / L, (nj.y - ni.y) / L   # axial
+        nx, ny = -ty, tx                                # transverse (+y_local)
+
         labels = []
+        udl_scale = load_scales.get("udl", 0.0)
+        point_scale = load_scales.get("point", 0.0)
         for ml in elem.member_loads:
             if isinstance(ml, UniformDistributedLoad):
                 labels.append(f"UDL {ml.wy:+.3g}")
+                if udl_scale > 0:
+                    h = ml.wy * udl_scale
+                    # Build a filled polygon showing the UDL band on
+                    # the +y_local side of the element. The band height
+                    # is proportional to the load intensity relative to
+                    # the model maximum.
+                    p0 = (ni.x,             ni.y            )
+                    p1 = (nj.x,             nj.y            )
+                    p2 = (nj.x + nx * h,    nj.y + ny * h    )
+                    p3 = (ni.x + nx * h,    ni.y + ny * h    )
+                    poly = _MplPolygon([p0, p1, p2, p3],
+                                        closed=True,
+                                        facecolor="#9467bd", alpha=0.18,
+                                        edgecolor="#9467bd", linewidth=0.5,
+                                        zorder=1)
+                    self.ax.add_patch(poly)
             elif isinstance(ml, PointLoad):
                 labels.append(f"P {ml.py:+.3g}@{ml.a:.3g}")
+                if point_scale > 0:
+                    a = max(0.0, min(L, float(ml.a)))
+                    bx = ni.x + tx * a
+                    by = ni.y + ty * a
+                    h = ml.py * point_scale
+                    self.ax.annotate(
+                        "",
+                        xy=(bx, by),
+                        xytext=(bx + nx * h, by + ny * h),
+                        arrowprops=dict(arrowstyle="->", color="#9467bd", lw=2),
+                        zorder=5,
+                    )
             elif isinstance(ml, TrussTemperatureLoad):
                 labels.append(f"ΔT {ml.delta_T:+.3g}°")
             elif isinstance(ml, FrameTemperatureLoad):

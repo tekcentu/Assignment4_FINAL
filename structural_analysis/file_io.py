@@ -41,7 +41,7 @@ def read_input_file(filepath: str) -> StructuralModel:
     """
     model = StructuralModel()
 
-    with open(filepath, "r") as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         lines = [ln.strip() for ln in f.readlines()]
 
     # First pass: does this file declare a SECTIONS block? That decides

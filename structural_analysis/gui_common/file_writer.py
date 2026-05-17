@@ -164,5 +164,5 @@ def write_input_file(model: StructuralModel, path: str) -> None:
             out.append(f"{eid}  {_fmt(t.t_top)}  {_fmt(t.t_bottom)}")
         out.append("")
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out).rstrip() + "\n")

@@ -229,7 +229,8 @@ class ElementDialog(_ModalDialog):
                  existing_kind: str | None = None,
                  existing_section_id: int | None = None,
                  existing_release_i: bool = False,
-                 existing_release_j: bool = False):
+                 existing_release_j: bool = False,
+                 remember_default: bool = True):
         self._model = model
         if not model.sections:
             raise ValueError("No sections defined — add a section first.")
@@ -237,6 +238,7 @@ class ElementDialog(_ModalDialog):
         self._existing_sec = existing_section_id
         self._existing_ri = existing_release_i
         self._existing_rj = existing_release_j
+        self._remember_default = bool(remember_default)
         super().__init__(parent, "Element properties")
 
     def _build_body(self, body: QWidget) -> None:
@@ -273,6 +275,14 @@ class ElementDialog(_ModalDialog):
         self._cb_rj.setChecked(self._existing_rj)
         form.addRow(self._cb_ri)
         form.addRow(self._cb_rj)
+
+        self._cb_remember = QCheckBox(
+            "Remember and reuse these settings for subsequent elements",
+            body,
+        )
+        self._cb_remember.setChecked(self._remember_default)
+        form.addRow(self._cb_remember)
+
         self._refresh_release_state()
 
     def _refresh_release_state(self) -> None:
@@ -290,6 +300,7 @@ class ElementDialog(_ModalDialog):
             "section_id": int(section_id),
             "release_i": self._cb_ri.isChecked() if kind == "frame" else False,
             "release_j": self._cb_rj.isChecked() if kind == "frame" else False,
+            "remember": self._cb_remember.isChecked(),
         }
 
 
