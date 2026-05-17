@@ -140,6 +140,68 @@ def test_select_tool_highlights_and_reports_selection(qt_app):
     assert "Selection cleared" in w._status_label.text()
 
 
+def test_nodal_load_components_draw_separately(qt_app):
+    from structural_analysis.model import Node, NodalLoad
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0)}
+    w._model.nodal_loads = [NodalLoad(1, fx=10.0, fy=-5.0, mz=0.0)]
+    w.canvas.redraw()
+
+    labels = [text.get_text() for text in w.canvas.ax.texts]
+    assert "Fx=+10" in labels
+    assert "Fy=-5" in labels
+    assert "11.2 kN" not in labels
+
+
+def test_section_material_labels_can_be_drawn(qt_app):
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Material, Node, Section
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.materials = {1: Material(1, name="Steel", E=200e6)}
+    w._model.sections = {
+        1: Section(1, name="IPE200", material_id=1, A=0.01, I=1e-4)
+    }
+    w._model.elements = [
+        FrameElement2D(1, 1, 2, E=200e6, A=0.01, I=1e-4, section_id=1)
+    ]
+    w.canvas.show_section_labels = True
+    w.canvas.redraw()
+
+    labels = [text.get_text() for text in w.canvas.ax.texts]
+    assert "IPE200 / Steel" in labels
+
+
+def test_update_element_command_changes_section(qt_app):
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.gui_common.commands import UpdateElementCmd
+    from structural_analysis.model import Material, Node, Section
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.materials = {
+        1: Material(1, name="Steel", E=200e6),
+        2: Material(2, name="Concrete", E=30e6),
+    }
+    w._model.sections = {
+        1: Section(1, name="IPE200", material_id=1, A=0.01, I=1e-4),
+        2: Section(2, name="C30x30", material_id=2, A=0.09, I=6.75e-4),
+    }
+    w._model.elements = [
+        FrameElement2D(1, 1, 2, E=200e6, A=0.01, I=1e-4, section_id=1)
+    ]
+
+    cmd = UpdateElementCmd(elem_id=1, section_id=2, kind="frame")
+    cmd.do(w._model)
+
+    elem = w._model.elements[0]
+    assert elem.section_id == 2
+    assert elem.E == 30e6
+    assert elem.A == 0.09
+
+
 def test_all_dialogs_construct(qt_app):
     from structural_analysis.gui_qt.dialogs import (
         ElementDialog,

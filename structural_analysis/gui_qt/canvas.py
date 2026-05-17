@@ -65,6 +65,7 @@ class ModelCanvas(QWidget):
         self.show_deformed: bool = True
         self.show_reactions: bool = True
         self.show_diagrams: bool = False
+        self.show_section_labels: bool = False
         self.diagram_kind: str = "moment"
         self.deformed_scale: float = 1.0
         self.diagram_scale: float = 1.0
@@ -521,6 +522,22 @@ class ModelCanvas(QWidget):
             mx, my = (ni.x + nj.x) / 2, (ni.y + nj.y) / 2
             self.ax.annotate(f"e{elem.id}", (mx, my), color=color,
                              fontsize=8, ha="center", va="bottom", zorder=4)
+            if self.show_section_labels:
+                section = model.sections.get(getattr(elem, "section_id", None))
+                if section is not None:
+                    material = model.materials.get(section.material_id)
+                    sec_name = section.name or f"section {section.id}"
+                    mat_name = material.name if material and material.name else (
+                        f"material {section.material_id}"
+                    )
+                    self.ax.annotate(
+                        f"{sec_name} / {mat_name}", (mx, my),
+                        xytext=(0, -14), textcoords="offset points",
+                        fontsize=7, ha="center", va="top", color="#555555",
+                        bbox=dict(boxstyle="round,pad=0.18",
+                                  fc="white", ec="#dddddd", alpha=0.82),
+                        zorder=6,
+                    )
             if isinstance(elem, FrameElement2D):
                 if elem.release_i:
                     self.ax.plot(ni.x + 0.15 * (nj.x - ni.x),
@@ -578,19 +595,30 @@ class ModelCanvas(QWidget):
         # ``force_scale`` is "world-units of arrow length per kN" so
         # arrow length is directly proportional to the load magnitude
         # (set by _draw_model from the largest nodal load in the model).
-        if (ld.fx or ld.fy) and force_scale > 0:
-            mag = (ld.fx ** 2 + ld.fy ** 2) ** 0.5
-            if mag > 0:
+        if force_scale > 0:
+            if ld.fx:
                 dx = ld.fx * force_scale
+                self.ax.annotate(
+                    "",
+                    xy=(x, y),
+                    xytext=(x - dx, y),
+                    arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=2),
+                    zorder=5,
+                )
+                self.ax.annotate(f"Fx={ld.fx:+.3g}", (x - dx, y),
+                                 xytext=(0, 5), textcoords="offset points",
+                                 fontsize=7, color="#2ca02c", zorder=6)
+            if ld.fy:
                 dy = ld.fy * force_scale
                 self.ax.annotate(
                     "",
                     xy=(x, y),
-                    xytext=(x - dx, y - dy),
+                    xytext=(x, y - dy),
                     arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=2),
                     zorder=5,
                 )
-                self.ax.annotate(f"{mag:.3g} kN", (x - dx, y - dy),
+                self.ax.annotate(f"Fy={ld.fy:+.3g}", (x, y - dy),
+                                 xytext=(5, 0), textcoords="offset points",
                                  fontsize=7, color="#2ca02c", zorder=6)
         if ld.mz:
             self.ax.annotate(f"M={ld.mz:+.3g}", (x, y), xytext=(8, -8),

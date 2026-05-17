@@ -230,6 +230,65 @@ class DeleteElementCmd(Command):
         model.elements.insert(self._saved_index, self._saved)
 
 
+@dataclass
+class UpdateElementCmd(Command):
+    elem_id: int
+    section_id: int
+    kind: str
+    release_i: bool = False
+    release_j: bool = False
+    _saved: object | None = None
+    _saved_index: int = -1
+    description: str = "edit element"
+
+    def do(self, model: StructuralModel) -> None:
+        for idx, old in enumerate(model.elements):
+            if old.id == self.elem_id:
+                self._saved = old
+                self._saved_index = idx
+                break
+        else:
+            raise ValueError(f"Element {self.elem_id} does not exist.")
+        if self.section_id not in model.sections:
+            raise ValueError(f"Section {self.section_id} does not exist.")
+        section = model.sections[self.section_id]
+        if section.material_id not in model.materials:
+            raise ValueError(
+                f"Section {self.section_id} references material "
+                f"{section.material_id}, which does not exist."
+            )
+        kind = self.kind.lower()
+        if kind not in ("frame", "truss"):
+            raise ValueError(f"Element kind must be 'frame' or 'truss', got {self.kind!r}.")
+        old = self._saved
+        old_kind = getattr(old, "kind", "")
+        if old_kind and old_kind != kind and getattr(old, "member_loads", []):
+            raise ValueError(
+                "Clear member loads before changing an element between frame and truss."
+            )
+        mat = model.materials[section.material_id]
+        if kind == "truss":
+            elem = TrussElement2D(
+                id=self.elem_id, node_i=old.node_i, node_j=old.node_j,
+                E=mat.E, A=section.A, alpha=mat.alpha, depth=section.depth,
+                section_id=section.id,
+            )
+        else:
+            elem = FrameElement2D(
+                id=self.elem_id, node_i=old.node_i, node_j=old.node_j,
+                E=mat.E, A=section.A, I=section.I,
+                alpha=mat.alpha, depth=section.depth,
+                section_id=section.id,
+                release_i=self.release_i, release_j=self.release_j,
+            )
+        elem.member_loads = list(getattr(old, "member_loads", []))
+        model.elements[self._saved_index] = elem
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._saved is not None and self._saved_index >= 0:
+            model.elements[self._saved_index] = self._saved
+
+
 # ── materials ────────────────────────────────────────────────────────────
 
 
