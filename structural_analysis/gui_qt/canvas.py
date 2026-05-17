@@ -65,6 +65,7 @@ class ModelCanvas(QWidget):
         self.show_deformed: bool = True
         self.show_reactions: bool = True
         self.show_diagrams: bool = False
+        self.show_section_labels: bool = False
         self.diagram_kind: str = "moment"
         self.deformed_scale: float = 1.0
         self.diagram_scale: float = 1.0
@@ -74,6 +75,8 @@ class ModelCanvas(QWidget):
         self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
         self._element_preview: tuple[int, float, float, str] | None = None
+        self._selected_node_id: int | None = None
+        self._selected_element_id: int | None = None
         # Per-element max / min markers on the currently-drawn moment /
         # shear / axial diagram. Populated by _draw_diagrams and fed
         # into the snap engine so the cursor snaps to those points in
@@ -135,6 +138,18 @@ class ModelCanvas(QWidget):
 
     def clear_element_preview(self) -> None:
         self._element_preview = None
+
+    def select_node(self, node_id: int) -> None:
+        self._selected_node_id = int(node_id)
+        self._selected_element_id = None
+
+    def select_element(self, element_id: int) -> None:
+        self._selected_element_id = int(element_id)
+        self._selected_node_id = None
+
+    def clear_selection(self) -> None:
+        self._selected_node_id = None
+        self._selected_element_id = None
 
     def set_result(self, result) -> None:
         self._result = result
@@ -205,7 +220,9 @@ class ModelCanvas(QWidget):
             self._view_initialised = True
 
         self._draw_grid()
+        self._draw_origin_axes()
         self._draw_model()
+        self._draw_selection()
         self._draw_element_preview()
         if self._result is not None and self._result.status == "ok":
             if self.show_deformed:
@@ -361,6 +378,35 @@ class ModelCanvas(QWidget):
             self.ax.text(x1, ln.coord, f"  {ln.label}", color="#3060c0",
                          fontsize=8, va="center", ha="left", zorder=1)
 
+    def _draw_origin_axes(self) -> None:
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        if not (x0 <= 0.0 <= x1 and y0 <= 0.0 <= y1):
+            return
+        span = max(x1 - x0, y1 - y0, 1.0)
+        length = 0.08 * span
+        self.ax.plot(0.0, 0.0, marker="o", markersize=4,
+                     color="#222222", zorder=8)
+        self.ax.annotate(
+            "", xy=(length, 0.0), xytext=(0.0, 0.0),
+            arrowprops=dict(arrowstyle="->", color="#222222", lw=1.4),
+            zorder=8,
+        )
+        self.ax.annotate(
+            "", xy=(0.0, length), xytext=(0.0, 0.0),
+            arrowprops=dict(arrowstyle="->", color="#222222", lw=1.4),
+            zorder=8,
+        )
+        self.ax.annotate("0,0", (0.0, 0.0), xytext=(4, -14),
+                         textcoords="offset points", fontsize=8,
+                         color="#222222", zorder=9)
+        self.ax.annotate("X", (length, 0.0), xytext=(4, -2),
+                         textcoords="offset points", fontsize=8,
+                         color="#222222", zorder=9)
+        self.ax.annotate("Y", (0.0, length), xytext=(4, 2),
+                         textcoords="offset points", fontsize=8,
+                         color="#222222", zorder=9)
+
     def _draw_snap_marker(self) -> None:
         c = self._snap_marker
         if c is not None:
@@ -407,6 +453,33 @@ class ModelCanvas(QWidget):
             alpha=0.85, zorder=9,
         )
 
+    def _draw_selection(self) -> None:
+        model = self._model()
+        if self._selected_node_id is not None:
+            node = model.nodes.get(self._selected_node_id)
+            if node is not None:
+                self.ax.plot(
+                    node.x, node.y, marker="o", markersize=13,
+                    markerfacecolor="none", markeredgecolor="#ffbf00",
+                    markeredgewidth=2.4, zorder=11,
+                )
+            return
+        if self._selected_element_id is None:
+            return
+        elem = next((e for e in model.elements
+                     if e.id == self._selected_element_id), None)
+        if elem is None:
+            return
+        ni = model.nodes.get(elem.node_i)
+        nj = model.nodes.get(elem.node_j)
+        if ni is None or nj is None:
+            return
+        self.ax.plot(
+            [ni.x, nj.x], [ni.y, nj.y],
+            color="#ffbf00", linewidth=6.0, alpha=0.45,
+            solid_capstyle="round", zorder=1.5,
+        )
+
     def _draw_model(self) -> None:
         model = self._model()
         # Pre-compute the largest force/UDL/point-load magnitude in the
@@ -449,6 +522,22 @@ class ModelCanvas(QWidget):
             mx, my = (ni.x + nj.x) / 2, (ni.y + nj.y) / 2
             self.ax.annotate(f"e{elem.id}", (mx, my), color=color,
                              fontsize=8, ha="center", va="bottom", zorder=4)
+            if self.show_section_labels:
+                section = model.sections.get(getattr(elem, "section_id", None))
+                if section is not None:
+                    material = model.materials.get(section.material_id)
+                    sec_name = section.name or f"section {section.id}"
+                    mat_name = material.name if material and material.name else (
+                        f"material {section.material_id}"
+                    )
+                    self.ax.annotate(
+                        f"{sec_name} / {mat_name}", (mx, my),
+                        xytext=(0, -14), textcoords="offset points",
+                        fontsize=7, ha="center", va="top", color="#555555",
+                        bbox=dict(boxstyle="round,pad=0.18",
+                                  fc="white", ec="#dddddd", alpha=0.82),
+                        zorder=6,
+                    )
             if isinstance(elem, FrameElement2D):
                 if elem.release_i:
                     self.ax.plot(ni.x + 0.15 * (nj.x - ni.x),
@@ -506,19 +595,30 @@ class ModelCanvas(QWidget):
         # ``force_scale`` is "world-units of arrow length per kN" so
         # arrow length is directly proportional to the load magnitude
         # (set by _draw_model from the largest nodal load in the model).
-        if (ld.fx or ld.fy) and force_scale > 0:
-            mag = (ld.fx ** 2 + ld.fy ** 2) ** 0.5
-            if mag > 0:
+        if force_scale > 0:
+            if ld.fx:
                 dx = ld.fx * force_scale
+                self.ax.annotate(
+                    "",
+                    xy=(x, y),
+                    xytext=(x - dx, y),
+                    arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=2),
+                    zorder=5,
+                )
+                self.ax.annotate(f"Fx={ld.fx:+.3g}", (x - dx, y),
+                                 xytext=(0, 5), textcoords="offset points",
+                                 fontsize=7, color="#2ca02c", zorder=6)
+            if ld.fy:
                 dy = ld.fy * force_scale
                 self.ax.annotate(
                     "",
                     xy=(x, y),
-                    xytext=(x - dx, y - dy),
+                    xytext=(x, y - dy),
                     arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=2),
                     zorder=5,
                 )
-                self.ax.annotate(f"{mag:.3g} kN", (x - dx, y - dy),
+                self.ax.annotate(f"Fy={ld.fy:+.3g}", (x, y - dy),
+                                 xytext=(5, 0), textcoords="offset points",
                                  fontsize=7, color="#2ca02c", zorder=6)
         if ld.mz:
             self.ax.annotate(f"M={ld.mz:+.3g}", (x, y), xytext=(8, -8),
