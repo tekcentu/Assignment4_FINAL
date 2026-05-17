@@ -431,27 +431,39 @@ class MainWindow(QMainWindow):
             return
 
         # Sticky path: if a previous element-pair click checked "Remember",
-        # reuse those settings without re-opening the dialog. The setting
-        # is invalidated automatically if the remembered section no
-        # longer exists.
+        # reuse the remembered section + releases without re-opening the
+        # dialog. The active tool's kind (Frame vs Truss) always wins
+        # over the remembered kind — otherwise placing a frame via the
+        # Frame tool right after a remembered truss-click would silently
+        # produce another truss. Releases are frame-only, so they're
+        # cleared when the effective kind is "truss". The setting is
+        # invalidated automatically if the remembered section no longer
+        # exists.
         sticky = self._sticky_element
         if (
             sticky is not None
             and sticky.get("section_id") in self._model.sections
         ):
+            effective_kind = kind or sticky["kind"]
+            if effective_kind == "frame":
+                release_i = sticky["release_i"]
+                release_j = sticky["release_j"]
+            else:
+                release_i = False
+                release_j = False
             self.execute(AddElementCmd(
                 node_i=n_i, node_j=n_j,
                 section_id=sticky["section_id"],
-                kind=sticky["kind"],
-                release_i=sticky["release_i"],
-                release_j=sticky["release_j"],
+                kind=effective_kind,
+                release_i=release_i,
+                release_j=release_j,
             ))
             return
 
         try:
             d = ElementDialog(
                 self, model=self._model,
-                existing_kind=(sticky or {}).get("kind") or kind,
+                existing_kind=kind or (sticky or {}).get("kind"),
                 existing_section_id=(sticky or {}).get("section_id"),
             )
         except ValueError as e:
