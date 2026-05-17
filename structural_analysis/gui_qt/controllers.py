@@ -26,6 +26,9 @@ class _Host(Protocol):
     def set_element_preview(self, start_node_id: int, end_x: float,
                             end_y: float, kind: str) -> None: ...
     def clear_element_preview(self) -> None: ...
+    def select_node(self, node_id: int) -> None: ...
+    def select_element(self, element_id: int) -> None: ...
+    def clear_selection(self) -> None: ...
 
 
 class Tool:
@@ -58,6 +61,15 @@ class SelectTool(Tool):
                 self.host.show_node_menu(hit.node_id)
             elif hit.element_id is not None:
                 self.host.show_element_menu(hit.element_id)
+            return
+        if button != "left":
+            return
+        if hit.node_id is not None:
+            self.host.select_node(hit.node_id)
+        elif hit.element_id is not None:
+            self.host.select_element(hit.element_id)
+        else:
+            self.host.clear_selection()
 
 
 class NodeTool(Tool):

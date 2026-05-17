@@ -403,6 +403,47 @@ class MainWindow(QMainWindow):
         self.canvas.clear_element_preview()
         self.canvas.redraw()
 
+    def select_node(self, node_id: int) -> None:
+        node = self._model.nodes.get(node_id)
+        if node is None:
+            self.clear_selection()
+            return
+        self.canvas.select_node(node_id)
+        support = "support" if node_id in self._model.supports else "no support"
+        loads = [ld for ld in self._model.nodal_loads if ld.node_id == node_id]
+        load_text = f"{len(loads)} nodal load(s)" if loads else "no nodal load"
+        self.set_status(
+            f"Selected node {node_id}: x={node.x:.3f} m, y={node.y:.3f} m; "
+            f"{support}; {load_text}. Right-click for actions."
+        )
+        self.canvas.redraw()
+
+    def select_element(self, element_id: int) -> None:
+        elem = next((e for e in self._model.elements if e.id == element_id), None)
+        if elem is None:
+            self.clear_selection()
+            return
+        self.canvas.select_element(element_id)
+        ni = self._model.nodes.get(elem.node_i)
+        nj = self._model.nodes.get(elem.node_j)
+        length = ""
+        if ni is not None and nj is not None:
+            L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+            length = f", L={L:.3f} m"
+        kind = getattr(elem, "kind", elem.__class__.__name__).lower()
+        section = self._model.sections.get(getattr(elem, "section_id", None))
+        section_name = section.name if section and section.name else "unnamed section"
+        self.set_status(
+            f"Selected element {element_id}: {kind}, {section_name}, "
+            f"nodes {elem.node_i}-{elem.node_j}{length}. Right-click for actions."
+        )
+        self.canvas.redraw()
+
+    def clear_selection(self) -> None:
+        self.canvas.clear_selection()
+        self.set_status("Selection cleared. Click a node or element to inspect it.")
+        self.canvas.redraw()
+
     def execute(self, command: Command) -> None:
         try:
             command.do(self._model)

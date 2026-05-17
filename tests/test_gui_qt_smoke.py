@@ -97,6 +97,49 @@ def test_truss_tool_passes_truss_kind_to_element_dialog(qt_app):
     assert seen == [(1, 2, "truss")]
 
 
+def test_canvas_draws_origin_axes(qt_app):
+    w = MainWindow()
+    w.canvas.redraw()
+
+    labels = [text.get_text() for text in w.canvas.ax.texts]
+    assert "0,0" in labels
+    assert "X" in labels
+    assert "Y" in labels
+
+
+def test_select_tool_highlights_and_reports_selection(qt_app):
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 2.0, 0.0),
+    }
+    w._model.elements = [
+        FrameElement2D(
+            id=1, node_i=1, node_j=2,
+            E=2.0e8, A=0.01, I=1.0e-4,
+            section_id=1,
+        )
+    ]
+
+    w._select_tool("select")
+    w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
+    assert w.canvas._selected_node_id == 1
+    assert "Selected node 1" in w._status_label.text()
+
+    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=1), "left")
+    assert w.canvas._selected_element_id == 1
+    assert w.canvas._selected_node_id is None
+    assert "Selected element 1" in w._status_label.text()
+
+    w._on_canvas_click(HitResult(x=5.0, y=5.0), "left")
+    assert w.canvas._selected_element_id is None
+    assert w.canvas._selected_node_id is None
+    assert "Selection cleared" in w._status_label.text()
+
+
 def test_all_dialogs_construct(qt_app):
     from structural_analysis.gui_qt.dialogs import (
         ElementDialog,
