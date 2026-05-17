@@ -19,6 +19,8 @@ class _Host(Protocol):
     def model(self): ...
     def show_node_menu(self, node_id: int, action: Optional[str] = None) -> None: ...
     def show_element_menu(self, elem_id: int, action: Optional[str] = None) -> None: ...
+    def show_node_details(self, node_id: int) -> None: ...
+    def show_element_details(self, elem_id: int) -> None: ...
     def set_status(self, text: str) -> None: ...
     def open_element_dialog_for_pair(
         self, n_i: int, n_j: int, kind: str | None = None
@@ -50,7 +52,10 @@ class Tool:
 
 class SelectTool(Tool):
     name = "select"
-    description = "Select: click a node or element. Right-click for actions."
+    description = (
+        "Select: left-click a node or element to view its details. "
+        "Right-click for edit actions."
+    )
 
     def on_click(self, hit: HitResult, button: str) -> None:
         if button == "right":
@@ -58,6 +63,11 @@ class SelectTool(Tool):
                 self.host.show_node_menu(hit.node_id)
             elif hit.element_id is not None:
                 self.host.show_element_menu(hit.element_id)
+        elif button == "left":
+            if hit.node_id is not None:
+                self.host.show_node_details(hit.node_id)
+            elif hit.element_id is not None:
+                self.host.show_element_details(hit.element_id)
 
 
 class NodeTool(Tool):
