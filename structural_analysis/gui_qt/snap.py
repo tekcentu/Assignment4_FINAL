@@ -8,6 +8,7 @@ to anchor click positions.
 Snap kinds, in priority order (lower wins):
 
     EXISTING_NODE       0
+    DIAGRAM_EXTREME     0   (only available in post mode, ties with node)
     GRID_INTERSECTION   1
     ELEMENT_ENDPOINT    2
     ELEMENT_MIDPOINT    3
@@ -27,6 +28,9 @@ from dataclasses import dataclass
 
 # Priority constants — lower wins when two candidates tie within tolerance.
 NODE      = ("node",     0)
+DIAGRAM   = ("diagram",  0)   # ties with node; the candidate at smaller
+                              # pixel distance wins (so node still wins
+                              # when the cursor is exactly on the node).
 GRID      = ("grid",     1)
 ENDPOINT  = ("endpoint", 2)
 MIDPOINT  = ("midpoint", 3)
@@ -64,15 +68,27 @@ class SnapEngine:
 
     def __post_init__(self) -> None:
         if self.enabled_kinds is None:
-            self.enabled_kinds = {"node", "grid", "endpoint", "midpoint", "project"}
+            self.enabled_kinds = {
+                "node", "diagram", "grid",
+                "endpoint", "midpoint", "project",
+            }
 
     def find_snap(self, *, cursor_x: float, cursor_y: float,
                   px_per_dx: float, px_per_dy: float,
-                  model, grid=None) -> SnapCandidate | None:
+                  model, grid=None,
+                  diagram_points: list[dict] | None = None,
+                  ) -> SnapCandidate | None:
         """Return the best snap candidate or None if nothing is in range.
 
         ``model`` is the :class:`structural_analysis.model.StructuralModel`.
         ``grid`` is an optional :class:`structural_analysis.gui_qt.grid.GridSystem`.
+        ``diagram_points`` is an optional list of per-element diagram
+        max/min markers (currently produced by the canvas only when a
+        moment / shear / axial diagram is on screen). Each entry is a
+        dict with at least ``"x"``, ``"y"``, ``"value"``, ``"unit"``,
+        ``"kind"``, and ``"elem_id"``; the engine emits a "diagram"
+        snap candidate for each, labelled with the value so the
+        status bar can surface it.
 
         Pixel distance for a candidate at world ``(cx, cy)``:
             d_px = sqrt(((cursor_x - cx) * px_per_dx) ** 2 +
@@ -82,6 +98,24 @@ class SnapEngine:
             return None
 
         candidates: list[SnapCandidate] = []
+
+        if "diagram" in self.enabled_kinds and diagram_points:
+            for dp in diagram_points:
+                dpx = self._dpx(cursor_x, cursor_y,
+                                 float(dp["x"]), float(dp["y"]),
+                                 px_per_dx, px_per_dy)
+                if dpx <= self.tolerance_px:
+                    label = (
+                        f"{dp['kind']} {float(dp['value']):+.4g} "
+                        f"{dp['unit']} at e{dp['elem_id']}"
+                    )
+                    candidates.append(SnapCandidate(
+                        x=float(dp["x"]), y=float(dp["y"]),
+                        kind=DIAGRAM[0], priority=DIAGRAM[1],
+                        screen_distance_px=dpx,
+                        label=label,
+                        object_id=int(dp["elem_id"]),
+                    ))
 
         if "node" in self.enabled_kinds:
             for nid, n in model.nodes.items():

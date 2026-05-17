@@ -178,7 +178,7 @@ class SectionDialog(_ModalDialog):
         self._mat_combo = QComboBox(body)
         for mid in sorted(self._model.materials):
             m = self._model.materials[mid]
-            label = f"{mid} ({m.name})" if m.name else str(mid)
+            label = m.name if m.name else f"material {mid}"
             self._mat_combo.addItem(label, mid)
         form.addRow("Material", self._mat_combo)
 
@@ -263,8 +263,9 @@ class ElementDialog(_ModalDialog):
             s = self._model.sections[sid]
             mat = self._model.materials.get(s.material_id)
             mat_name = (mat.name if mat and mat.name
-                         else f"mat {s.material_id}")
-            label = f"{sid} — {s.name or 'unnamed'} / {mat_name}"
+                         else f"material {s.material_id}")
+            sec_name = s.name if s.name else f"section {sid}"
+            label = f"{sec_name} / {mat_name}"
             self._sec_combo.addItem(label, sid)
         if self._existing_sec is not None:
             idx = self._sec_combo.findData(self._existing_sec)
