@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 
 from ..file_io import read_input_file
 from ..main import run_analysis
-from ..model import AnalysisResult, StructuralModel
+from ..model import AnalysisResult, Material, Section, StructuralModel
 from ..gui_common.commands import (
     AddElementCmd,
     AddMemberLoadCmd,
@@ -126,6 +126,30 @@ def _validate_model_for_solve(model: StructuralModel) -> tuple[list[str], list[s
     return fatal, warnings
 
 
+def _build_starter_model() -> StructuralModel:
+    """Build an empty model pre-populated with two common Materials and
+    two matching Sections so the user can immediately draw elements
+    without first walking through the Materials / Sections dialogs.
+
+    Picked deliberately so the modal feature works out of the box:
+    both materials carry positive density (kg/m³).
+    """
+    m = StructuralModel(title="Untitled")
+    m.materials = {
+        1: Material(id=1, name="Steel_S275", E=2.10e8,
+                    alpha=1.20e-5, density=7850.0),
+        2: Material(id=2, name="Concrete_C30", E=3.30e7,
+                    alpha=1.00e-5, density=2500.0),
+    }
+    m.sections = {
+        1: Section(id=1, name="Steel_IPE200",   material_id=1,
+                   A=2.85e-3, I=1.94e-5, depth=0.200),
+        2: Section(id=2, name="Concrete_30x50", material_id=2,
+                   A=0.150,   I=3.125e-3, depth=0.500),
+    }
+    return m
+
+
 class MainWindow(QMainWindow):
     """The Qt main window."""
 
@@ -134,7 +158,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Structural Analysis — GUI (Qt)")
         self.resize(1200, 800)
 
-        self._model = StructuralModel(title="Untitled")
+        self._model = _build_starter_model()
         self._grid: GridSystem = GridSystem()
         self._undo: list[Command] = []
         self._redo: list[Command] = []
@@ -279,6 +303,8 @@ class MainWindow(QMainWindow):
         m_file = self.menuBar().addMenu("&File")
         m_file.addAction(self.act_new)
         m_file.addAction(self.act_open)
+        self._examples_menu = m_file.addMenu("Open &example…")
+        self._populate_examples_menu()
         m_file.addAction(self.act_save)
         m_file.addAction(self.act_save_as)
         m_file.addSeparator()
@@ -553,6 +579,56 @@ class MainWindow(QMainWindow):
         self.canvas.fit_to_view()
         self.set_status("View fitted to model.")
 
+    def _populate_examples_menu(self) -> None:
+        """Fill the File → Open example submenu from ``inputs/``."""
+        self._examples_menu.clear()
+        inputs_dir = self._examples_dir()
+        if not os.path.isdir(inputs_dir):
+            self._examples_menu.setEnabled(False)
+            return
+        entries = sorted(
+            f for f in os.listdir(inputs_dir)
+            if f.lower().endswith((".txt", ".spa.json"))
+            and not f.startswith(".")
+        )
+        if not entries:
+            self._examples_menu.setEnabled(False)
+            return
+        self._examples_menu.setEnabled(True)
+        for fname in entries:
+            full = os.path.join(inputs_dir, fname)
+            label = self._example_label(full, fname)
+            action = QAction(label, self)
+            action.triggered.connect(lambda _checked=False, p=full:
+                                     self._open_example(p))
+            self._examples_menu.addAction(action)
+
+    def _examples_dir(self) -> str:
+        # Repository-root/inputs/. structural_analysis/gui_qt/app.py is
+        # three levels deep, so ../../../inputs from this file.
+        here = os.path.dirname(os.path.abspath(__file__))
+        return os.path.normpath(os.path.join(here, "..", "..", "inputs"))
+
+    def _example_label(self, path: str, fallback: str) -> str:
+        # Use the TITLE line from a .txt model when present so the menu
+        # shows a human-readable name instead of just q2a_settlement.txt.
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [ln.rstrip() for ln in f.readlines()[:200]]
+        except OSError:
+            return fallback
+        for i, ln in enumerate(lines):
+            if ln.strip().upper() == "TITLE" and i + 1 < len(lines):
+                title = lines[i + 1].strip()
+                if title and not title.startswith("#"):
+                    return f"{fallback} — {title}"
+        return fallback
+
+    def _open_example(self, path: str) -> None:
+        if not self._confirm_discard():
+            return
+        self._open_path(path)
+
     def _set_grid_spacing(self) -> None:
         d = GridSpacingDialog(self, current=self.canvas.grid_spacing)
         if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
@@ -619,7 +695,7 @@ class MainWindow(QMainWindow):
     def _do_new(self) -> None:
         if not self._confirm_discard():
             return
-        self._model = StructuralModel(title="Untitled")
+        self._model = _build_starter_model()
         self._grid = GridSystem()
         self._undo.clear()
         self._redo.clear()
