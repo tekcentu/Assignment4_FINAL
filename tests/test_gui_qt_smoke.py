@@ -202,6 +202,53 @@ def test_update_element_command_changes_section(qt_app):
     assert elem.A == 0.09
 
 
+def test_sticky_truss_then_frame_tool_places_frame(qt_app):
+    """Bug fix: with sticky=truss remembered, switching to the Frame
+    tool and clicking two nodes must place a FrameElement2D — not
+    another truss as the sticky-path used to do unconditionally.
+    Releases live on the frame side only, so when an effective kind
+    is "truss" the releases are forced to False."""
+    from structural_analysis.element import FrameElement2D, TrussElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 2.0, 0.0),
+        3: Node(3, 4.0, 0.0),
+        4: Node(4, 6.0, 0.0),
+    }
+    # Pre-load sticky state as if the user just placed a truss with
+    # "Remember" checked, using starter Section 1 (Steel_IPE200).
+    w._sticky_element = {
+        "kind": "truss",
+        "section_id": 1,
+        "release_i": False,
+        "release_j": False,
+    }
+    # Frame tool now — must place a FrameElement2D, not a truss.
+    w._select_tool("frame")
+    w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
+    w._on_canvas_click(HitResult(x=2.0, y=0.0, node_id=2), "left")
+    assert len(w._model.elements) == 1
+    assert isinstance(w._model.elements[0], FrameElement2D)
+
+    # Now flip: sticky-frame with a release, click Truss → truss with
+    # release_i forced back to False (releases don't apply to trusses).
+    w._sticky_element = {
+        "kind": "frame",
+        "section_id": 1,
+        "release_i": True,
+        "release_j": False,
+    }
+    w._select_tool("truss")
+    w._on_canvas_click(HitResult(x=4.0, y=0.0, node_id=3), "left")
+    w._on_canvas_click(HitResult(x=6.0, y=0.0, node_id=4), "left")
+    assert len(w._model.elements) == 2
+    placed_truss = w._model.elements[1]
+    assert isinstance(placed_truss, TrussElement2D)
+
+
 def test_all_dialogs_construct(qt_app):
     from structural_analysis.gui_qt.dialogs import (
         ElementDialog,
