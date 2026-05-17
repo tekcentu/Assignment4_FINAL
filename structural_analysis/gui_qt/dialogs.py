@@ -881,7 +881,7 @@ def _support_summary(support: Support | None) -> str:
     settle = []
     for dof in ("ux", "uy", "rz"):
         v = getattr(support, f"settle_{dof}")
-        if v is not None and abs(v) > 0.0:
+        if v is not None and abs(v) > 1e-9:
             settle.append(f"Δ{dof}={v:g}")
     body = "  ".join(parts) + (f"  ·  settle: {', '.join(settle)}" if settle else "")
     return f"{kind}  ·  {body}"
@@ -894,7 +894,7 @@ def _nodal_load_summary(model: StructuralModel, node_id: int) -> str:
     return f"Fx = {load.fx:g} kN,  Fy = {load.fy:g} kN,  Mz = {load.mz:g} kN·m"
 
 
-def _member_loads_summary(elem) -> list[str]:
+def _member_loads_summary(elem: FrameElement2D | TrussElement2D) -> list[str]:
     loads = list(getattr(elem, "member_loads", []) or [])
     if not loads:
         return ["(none)"]
@@ -919,8 +919,8 @@ def _member_loads_summary(elem) -> list[str]:
 class NodePropertiesDialog(QDialog):
     """Read-only inspector for a node — opened by left-click in Select tool."""
 
-    def __init__(self, parent, model: StructuralModel, node_id: int,
-                 result=None) -> None:
+    def __init__(self, parent: QWidget | None, model: StructuralModel,
+                 node_id: int, result: Any = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Node {node_id} properties")
         self.setModal(True)
@@ -999,8 +999,8 @@ def _node_reaction(result, node_id: int) -> str | None:
 class ElementPropertiesDialog(QDialog):
     """Read-only inspector for an element — opened by left-click in Select tool."""
 
-    def __init__(self, parent, model: StructuralModel, elem_id: int,
-                 result=None) -> None:
+    def __init__(self, parent: QWidget | None, model: StructuralModel,
+                 elem_id: int, result: Any = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Element {elem_id} properties")
         self.setModal(True)
@@ -1009,16 +1009,15 @@ class ElementPropertiesDialog(QDialog):
         if elem is None:
             raise ValueError(f"Element {elem_id} does not exist.")
 
-        section = model.sections.get(getattr(elem, "section_id", None) or -1)
+        section_id = getattr(elem, "section_id", None)
+        section = model.sections.get(section_id if section_id is not None else -1)
         material = (model.materials.get(section.material_id)
                      if section is not None else None)
 
-        ni = model.nodes.get(elem.node_i)
-        nj = model.nodes.get(elem.node_j)
-        if ni is None or nj is None:
+        try:
+            length, _, _ = elem.length_cos_sin(model.nodes)
+        except Exception:
             length = 0.0
-        else:
-            length = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
