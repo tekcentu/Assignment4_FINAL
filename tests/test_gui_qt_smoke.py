@@ -202,6 +202,59 @@ def test_update_element_command_changes_section(qt_app):
     assert elem.A == 0.09
 
 
+def test_grid_dialog_accepts_numeric_lists_and_sorts(qt_app):
+    from structural_analysis.gui_qt.dialogs import GridDialog
+
+    w = MainWindow()
+    d = GridDialog(w, model=w._model)
+    d._x_entry.setText("12, 0, 6")
+    d._y_entry.setText("8, 0, 4")
+
+    grid = d._accept()
+
+    assert [(ln.label, ln.coord) for ln in grid.x_lines] == [
+        ("A", 0.0), ("B", 6.0), ("C", 12.0)
+    ]
+    assert [(ln.label, ln.coord) for ln in grid.y_lines] == [
+        ("1", 0.0), ("2", 4.0), ("3", 8.0)
+    ]
+    assert "X: A=0, B=6, C=12" in d._preview.text()
+
+
+def test_grid_dialog_fills_from_model_nodes(qt_app):
+    from structural_analysis.gui_qt.dialogs import GridDialog
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        1: Node(1, 6.0, 4.0),
+        2: Node(2, 0.0, 0.0),
+        3: Node(3, 6.0, 8.0),
+    }
+    d = GridDialog(w, model=w._model)
+
+    d._fill_from_model_nodes()
+
+    assert d._x_entry.text() == "0, 6"
+    assert d._y_entry.text() == "0, 4, 8"
+    grid = d._accept()
+    assert [(ln.label, ln.coord) for ln in grid.x_lines] == [("A", 0.0), ("B", 6.0)]
+    assert [(ln.label, ln.coord) for ln in grid.y_lines] == [
+        ("1", 0.0), ("2", 4.0), ("3", 8.0)
+    ]
+
+
+def test_grid_dialog_reports_invalid_token(qt_app):
+    from structural_analysis.gui_qt.dialogs import GridDialog
+
+    w = MainWindow()
+    d = GridDialog(w, model=w._model)
+    d._x_entry.setText("A=0, bad, C=12")
+
+    with pytest.raises(ValueError, match="X token 'bad' is invalid"):
+        d._accept()
+
+
 def test_all_dialogs_construct(qt_app):
     from structural_analysis.gui_qt.dialogs import (
         ElementDialog,

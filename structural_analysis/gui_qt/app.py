@@ -837,7 +837,11 @@ class MainWindow(QMainWindow):
     # ── grid / snap ──
 
     def _edit_grid_system(self) -> None:
-        d = GridDialog(self, current=self._grid if not self._grid.is_empty() else None)
+        d = GridDialog(
+            self,
+            current=self._grid if not self._grid.is_empty() else None,
+            model=self._model,
+        )
         if d.exec() == QDialog.DialogCode.Accepted and d.result_value is not None:
             # Route through SetGridSystemCmd so undo/redo works.
             new_grid = d.result_value
