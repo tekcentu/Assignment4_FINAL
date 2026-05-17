@@ -1,0 +1,41 @@
+TITLE
+Cantilever beam, 10 elements, modal verification
+
+NODES 11
+1  0.0  0.0
+2  0.4  0.0
+3  0.8  0.0
+4  1.2  0.0
+5  1.6  0.0
+6  2.0  0.0
+7  2.4  0.0
+8  2.8  0.0
+9  3.2  0.0
+10  3.6  0.0
+11  4.0  0.0
+
+MATERIALS 2
+1  210000000.0  1.2e-05  7850.0  Steel_S275
+2  33000000.0  1e-05  2500.0  Concrete_C30
+
+SECTIONS 3
+1  1  0.00285  1.94e-05  0.2  Steel_IPE200
+2  2  0.15  0.003125  0.5  Concrete_30x50
+3  2  0.09  0.000675  0.3  Concrete_30x30
+
+ELEMENTS 10
+1  1  2  1  FRAME
+2  2  3  1  FRAME
+3  3  4  1  FRAME
+4  4  5  1  FRAME
+5  5  6  1  FRAME
+6  6  7  1  FRAME
+7  7  8  1  FRAME
+8  8  9  1  FRAME
+9  9  10  1  FRAME
+10  10  11  1  FRAME
+
+SUPPORTS 1
+1  1  1  1
+
+LOADS 0

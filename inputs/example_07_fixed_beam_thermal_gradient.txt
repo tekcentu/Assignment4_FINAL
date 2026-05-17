@@ -1,0 +1,27 @@
+TITLE
+Fixed-fixed beam, 6 m, thermal gradient +20/-20 °C
+
+NODES 2
+1  0.0  0.0
+2  6.0  0.0
+
+MATERIALS 2
+1  210000000.0  1.2e-05  7850.0  Steel_S275
+2  33000000.0  1e-05  2500.0  Concrete_C30
+
+SECTIONS 3
+1  1  0.00285  1.94e-05  0.2  Steel_IPE200
+2  2  0.15  0.003125  0.5  Concrete_30x50
+3  2  0.09  0.000675  0.3  Concrete_30x30
+
+ELEMENTS 1
+1  1  2  2  FRAME
+
+SUPPORTS 2
+1  1  1  1
+2  1  1  1
+
+LOADS 0
+
+FRAME_TEMPERATURE 1
+1  20.0  -20.0

@@ -147,6 +147,8 @@ def _build_starter_model() -> StructuralModel:
                    A=2.85e-3, I=1.94e-5, depth=0.200),
         2: Section(id=2, name="Concrete_30x50", material_id=2,
                    A=0.150,   I=3.125e-3, depth=0.500),
+        3: Section(id=3, name="Concrete_30x30", material_id=2,
+                   A=0.090,   I=6.75e-4,  depth=0.300),
     }
     return m
 
