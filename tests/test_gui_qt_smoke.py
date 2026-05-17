@@ -55,6 +55,27 @@ def test_open_solve_undo(qt_app):
     assert len(w._model.nodes) == 6
 
 
+def test_frame_tool_shows_live_element_preview(qt_app):
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 2.0, 0.0),
+    }
+    w.canvas.redraw()
+
+    w._select_tool("frame")
+    w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
+    assert w.canvas._element_preview == (1, 0.0, 0.0, "frame")
+
+    w._on_canvas_motion(HitResult(x=1.5, y=0.5, snap_label="grid A-1"))
+    assert w.canvas._element_preview == (1, 1.5, 0.5, "frame")
+
+    w._select_tool("select")
+    assert w.canvas._element_preview is None
+
+
 def test_all_dialogs_construct(qt_app):
     from structural_analysis.gui_qt.dialogs import (
         ElementDialog,

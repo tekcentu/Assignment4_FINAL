@@ -21,6 +21,9 @@ class _Host(Protocol):
     def show_element_menu(self, elem_id: int, action: Optional[str] = None) -> None: ...
     def set_status(self, text: str) -> None: ...
     def open_element_dialog_for_pair(self, n_i: int, n_j: int) -> None: ...
+    def set_element_preview(self, start_node_id: int, end_x: float,
+                            end_y: float, kind: str) -> None: ...
+    def clear_element_preview(self) -> None: ...
 
 
 class Tool:
@@ -83,6 +86,7 @@ class _PairTool(Tool):
 
     def deactivate(self) -> None:
         self._first = None
+        self.host.clear_element_preview()
 
     def on_click(self, hit: HitResult, button: str) -> None:
         if button != "left":
@@ -95,13 +99,20 @@ class _PairTool(Tool):
             return
         if self._first is None:
             self._first = hit.node_id
+            self.host.set_element_preview(hit.node_id, hit.x, hit.y, self.kind)
             self.host.set_status(self.description)
             return
         if hit.node_id == self._first:
             self.host.set_status("Start and end nodes must differ.")
             return
+        self.host.clear_element_preview()
         self.host.open_element_dialog_for_pair(self._first, hit.node_id)
         self._first = None
+
+    def on_motion(self, hit: HitResult) -> None:
+        if self._first is None:
+            return
+        self.host.set_element_preview(self._first, hit.x, hit.y, self.kind)
 
 
 class FrameTool(_PairTool):

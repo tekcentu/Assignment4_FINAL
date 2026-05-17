@@ -73,6 +73,7 @@ class ModelCanvas(QWidget):
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
+        self._element_preview: tuple[int, float, float, str] | None = None
         # Fallback hover cursor when no snap candidate is active. This
         # is what the user sees when their cursor is over empty space
         # between grid lines — it marks the point a left-click would
@@ -118,6 +119,17 @@ class ModelCanvas(QWidget):
 
     def toggle_snap(self, enabled: bool) -> None:
         self.snap_enabled = bool(enabled)
+
+    def set_element_preview(
+        self, start_node_id: int, end_x: float, end_y: float, kind: str
+    ) -> None:
+        """Show a temporary member preview while placing a frame/truss."""
+        self._element_preview = (
+            int(start_node_id), float(end_x), float(end_y), str(kind)
+        )
+
+    def clear_element_preview(self) -> None:
+        self._element_preview = None
 
     def set_result(self, result) -> None:
         self._result = result
@@ -189,6 +201,7 @@ class ModelCanvas(QWidget):
 
         self._draw_grid()
         self._draw_model()
+        self._draw_element_preview()
         if self._result is not None and self._result.status == "ok":
             if self.show_deformed:
                 self._draw_deformed()
@@ -358,6 +371,27 @@ class ModelCanvas(QWidget):
         x, y = self._hover_xy
         self.ax.plot(x, y, marker="+", color="#888888", markersize=14,
                      markeredgewidth=1.5, alpha=0.7, zorder=10)
+
+    def _draw_element_preview(self) -> None:
+        if self._element_preview is None:
+            return
+        start_node_id, end_x, end_y, kind = self._element_preview
+        start = self._model().nodes.get(start_node_id)
+        if start is None:
+            return
+        is_frame = kind == "frame"
+        color = "#1f77b4" if is_frame else "#d62728"
+        linestyle = "-" if is_frame else "--"
+        self.ax.plot(
+            [start.x, end_x], [start.y, end_y],
+            color=color, linestyle=linestyle, linewidth=2.4,
+            alpha=0.55, zorder=3,
+        )
+        self.ax.plot(
+            end_x, end_y, marker="o", markersize=5,
+            markerfacecolor="white", markeredgecolor=color,
+            alpha=0.85, zorder=9,
+        )
 
     def _draw_model(self) -> None:
         model = self._model()

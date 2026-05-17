@@ -393,6 +393,16 @@ class MainWindow(QMainWindow):
     def set_status(self, text: str) -> None:
         self._status_label.setText(text)
 
+    def set_element_preview(
+        self, start_node_id: int, end_x: float, end_y: float, kind: str
+    ) -> None:
+        self.canvas.set_element_preview(start_node_id, end_x, end_y, kind)
+        self.canvas.redraw()
+
+    def clear_element_preview(self) -> None:
+        self.canvas.clear_element_preview()
+        self.canvas.redraw()
+
     def execute(self, command: Command) -> None:
         try:
             command.do(self._model)
