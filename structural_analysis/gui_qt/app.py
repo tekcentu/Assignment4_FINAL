@@ -674,6 +674,20 @@ class MainWindow(QMainWindow):
             parts.append(f"node {hit.node_id}")
         elif hit.element_id is not None:
             parts.append(f"elem {hit.element_id}")
+        # Post-mode bonus: when a static result is displayed with a
+        # diagram on screen, surface the moment / shear / axial value
+        # at the cursor's projected arc-length on the hovered element.
+        # The snap engine already pre-emits a "diagram" candidate at
+        # the labelled critical points (their snap_label carries the
+        # value text), so skip this extra read when the snap kind is
+        # already "diagram" to avoid duplicating the same number.
+        if (self._result is not None
+                and self.canvas.show_diagrams
+                and hit.element_id is not None
+                and hit.snap_kind != "diagram"):
+            value_text = self._diagram_value_text_for_hit(hit)
+            if value_text:
+                parts.append(value_text)
         self._coord_label.setText("  |  ".join(parts))
         # Repaint canvas if the snap marker changed.
         self.canvas.redraw()
@@ -681,6 +695,41 @@ class MainWindow(QMainWindow):
             self._active_tool.on_motion(hit)
         except Exception:
             pass
+
+    def _diagram_value_text_for_hit(self, hit: HitResult) -> str | None:
+        """Return a "Moment: +12.3 kN·m @ x=4.5 m" tail for the status
+        bar when the cursor is near an element and a result is loaded.
+        Returns ``None`` when no value is meaningful (truss + shear /
+        moment, or the kind doesn't apply)."""
+        from .canvas import _diagram_value, _DIAGRAM_UNITS
+        if self._result is None or not self._result.member_results:
+            return None
+        elem = next((e for e in self._model.elements
+                     if e.id == hit.element_id), None)
+        if elem is None:
+            return None
+        mr = self._result.member_results.get(elem.id)
+        if mr is None:
+            return None
+        ni = self._model.nodes.get(elem.node_i)
+        nj = self._model.nodes.get(elem.node_j)
+        if ni is None or nj is None:
+            return None
+        L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+        if L < 1e-12:
+            return None
+        # Project (hit.x, hit.y) onto the element axis to get arc-length.
+        t = ((hit.x - ni.x) * (nj.x - ni.x)
+             + (hit.y - ni.y) * (nj.y - ni.y)) / (L * L)
+        t = max(0.0, min(1.0, t))
+        x_loc = t * L
+        kind = self.canvas.diagram_kind
+        value = _diagram_value(elem, ni, nj, mr["f_local"], kind, x_loc)
+        if value is None:
+            return None
+        unit = _DIAGRAM_UNITS.get(kind, "")
+        label = {"moment": "M", "shear": "V", "axial": "N"}.get(kind, kind)
+        return f"{label}={value:+.4g} {unit} @ x={x_loc:.3f} m on e{elem.id}"
 
     # ── overlay toggles ──
 

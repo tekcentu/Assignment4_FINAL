@@ -73,6 +73,11 @@ class ModelCanvas(QWidget):
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
+        # Per-element max / min markers on the currently-drawn moment /
+        # shear / axial diagram. Populated by _draw_diagrams and fed
+        # into the snap engine so the cursor snaps to those points in
+        # post mode. Empty when no diagram is showing.
+        self._diagram_critical_points: list[dict] = []
         # Fallback hover cursor when no snap candidate is active. This
         # is what the user sees when their cursor is over empty space
         # between grid lines — it marks the point a left-click would
@@ -196,8 +201,14 @@ class ModelCanvas(QWidget):
                 self._draw_reactions()
             if self.show_diagrams:
                 self._draw_diagrams()
+            else:
+                # No diagram on screen → no critical-point snaps active.
+                self._diagram_critical_points = []
         elif self._modal_result is not None and self._modal_result.status == "ok":
+            self._diagram_critical_points = []
             self._draw_mode_shape()
+        else:
+            self._diagram_critical_points = []
         self._draw_snap_marker()
         self._mpl_canvas.draw_idle()
 
@@ -268,6 +279,7 @@ class ModelCanvas(QWidget):
                 cursor_x=event.xdata, cursor_y=event.ydata,
                 px_per_dx=px_per_dx, px_per_dy=px_per_dy,
                 model=model, grid=grid,
+                diagram_points=self._diagram_critical_points or None,
             )
         self._snap_marker = candidate
 
@@ -277,7 +289,8 @@ class ModelCanvas(QWidget):
                             snap_label=candidate.label)
             if candidate.kind == "node":
                 hit.node_id = candidate.object_id
-            elif candidate.kind in ("endpoint", "midpoint", "project"):
+            elif candidate.kind in ("endpoint", "midpoint", "project",
+                                     "diagram"):
                 hit.element_id = candidate.object_id
             return hit
 
@@ -340,6 +353,7 @@ class ModelCanvas(QWidget):
         if c is not None:
             marker_styles = {
                 "node":     ("o", "#ff7f0e"),  # filled circle, orange
+                "diagram":  ("*", "#d62728"),  # star, red — post mode
                 "grid":     ("s", "#1f77b4"),  # square, blue
                 "endpoint": ("^", "#9467bd"),  # triangle, purple
                 "midpoint": ("D", "#17becf"),  # diamond, cyan
@@ -681,6 +695,11 @@ class ModelCanvas(QWidget):
                 )
 
     def _draw_diagrams(self) -> None:
+        # _diagram_critical_points is consumed by _hit_test → the snap
+        # engine, so callers can snap the cursor onto the labelled
+        # max/min points. Always reset it before drawing so a stale
+        # set from a previous result kind doesn't survive.
+        self._diagram_critical_points = []
         result = self._result
         model = self._model()
         if not result.member_results:
@@ -696,7 +715,12 @@ class ModelCanvas(QWidget):
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
-            xs, ys = _diagram_ordinates(elem, ni, nj, mr["f_local"], self.diagram_kind)
+            # Sample densely so the critical-point search lands near
+            # the true extreme (21 samples can miss a peak between
+            # nodes by a couple of percent on a short element).
+            xs, ys = _diagram_ordinates(
+                elem, ni, nj, mr["f_local"], self.diagram_kind, n_samples=51,
+            )
             if xs is None:
                 continue
             per_elem.append((elem, ni, nj, xs, ys))
@@ -705,6 +729,8 @@ class ModelCanvas(QWidget):
             return
         scale = self.diagram_scale * 0.12 * span / max_ord
         color = {"moment": "#17becf", "shear": "#bcbd22", "axial": "#8c564b"}[self.diagram_kind]
+        unit = _DIAGRAM_UNITS[self.diagram_kind]
+
         for elem, ni, nj, xs, ys in per_elem:
             L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
             if L < 1e-12:
@@ -722,8 +748,63 @@ class ModelCanvas(QWidget):
             poly_y.append(nj.y)
             self.ax.fill(poly_x, poly_y, color=color, alpha=0.25, zorder=1)
             self.ax.plot(poly_x, poly_y, color=color, linewidth=1.0, zorder=2)
+
+            # Per-element critical points: argmax(ys) and argmin(ys).
+            # If the diagram is constant (axial), max == min — label
+            # only once at midspan. Skip near-zero peaks (clutter).
+            threshold = 0.05 * max_ord
+            i_max = max(range(len(ys)), key=lambda i: ys[i])
+            i_min = min(range(len(ys)), key=lambda i: ys[i])
+            picks: list[int] = []
+            if abs(ys[i_max] - ys[i_min]) < 1e-12 * max(max_ord, 1.0):
+                # Constant diagram — label once near the midspan.
+                picks = [len(xs) // 2]
+            else:
+                if abs(ys[i_max]) > threshold:
+                    picks.append(i_max)
+                if abs(ys[i_min]) > threshold and i_min != i_max:
+                    picks.append(i_min)
+            for i in picks:
+                xx = xs[i]
+                yy = ys[i]
+                # World-coords on the diagram polyline at this sample.
+                world_x = ni.x + xx * cx + scale * yy * nx
+                world_y = ni.y + xx * cy + scale * yy * ny
+                # World-coords of the matching point on the element
+                # axis itself — that's what the snap engine should
+                # snap to (so a left-click in modelling tools still
+                # lands on the member geometry, not on the offset
+                # diagram polyline).
+                axis_x = ni.x + xx * cx
+                axis_y = ni.y + xx * cy
+                # Marker on the diagram outline + annotation.
+                self.ax.plot(world_x, world_y, marker="o", color=color,
+                             markersize=6, markeredgecolor="#222",
+                             markeredgewidth=0.8, zorder=4)
+                self.ax.annotate(
+                    f"{yy:+.3g} {unit}",
+                    (world_x, world_y),
+                    xytext=(5, 5), textcoords="offset points",
+                    fontsize=8, color="#222", zorder=6,
+                    bbox=dict(boxstyle="round,pad=0.2",
+                              fc="#ffffffaa", ec=color, lw=0.5),
+                )
+                # Record a snap target at the element-axis position
+                # (not the offset polyline) so cursor snap places a
+                # cross/arrow exactly on the member.
+                self._diagram_critical_points.append({
+                    "x": axis_x,
+                    "y": axis_y,
+                    "value": yy,
+                    "unit": unit,
+                    "kind": self.diagram_kind,
+                    "elem_id": elem.id,
+                    "x_loc": xx,
+                    "L": L,
+                })
+
         self.ax.annotate(
-            f"{self.diagram_kind} diagram × {scale:.2g}",
+            f"{self.diagram_kind} diagram × {scale:.2g}  ·  max |·| = {max_ord:.3g} {unit}",
             (0.02, 0.94), xycoords="axes fraction",
             fontsize=8, color=color, va="top",
         )
@@ -773,12 +854,39 @@ def _point_segment_distance_px(px, py, x1, y1, x2, y2,
     return ((qx - cx) ** 2 + (qy - cy) ** 2) ** 0.5
 
 
-def _diagram_ordinates(elem, ni, nj, f_local, kind: str,
-                        n_samples: int = 21):
+def _diagram_evaluator(elem, ni, nj, f_local, kind: str):
+    """Build a single-x evaluator ``f(x_loc) -> value`` for ``kind`` on
+    this element. Returns ``(L, evaluator)``; ``evaluator`` is ``None``
+    when the requested kind doesn't apply (e.g. moment/shear on a truss
+    bar). Reused by both :func:`_diagram_ordinates` for drawing and by
+    the hover-status path for "value at the cursor's projected x_loc".
+
+    Sign convention. ``V_i`` and ``M_i`` are the local member-end
+    shear / moment at the i-end (``q_local = K·d − p_local`` entries
+    from :meth:`FrameElement2D.local_displacement_and_end_forces`).
+    ``w`` is the summed UDL intensity in +y_local. ``points`` are
+    in-span point loads with ``py`` in +y_local. The point-load terms
+    in ``shear`` and ``moment`` carry the **same** sign of ``py`` so
+    ``dM/dx = V`` holds across the discontinuity (regression in
+    ``tests/test_diagram_signs.py``).
+    """
     L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
     if L < 1e-12:
-        return None, None
+        return 0.0, None
     N_i, V_i, M_i, _N_j, _V_j, _M_j = (float(v) for v in f_local)
+
+    if kind == "axial":
+        # Axial: plot ``-N_i`` so compression reads positive on the
+        # page (the local-frame member-end axial force is positive in
+        # the +x_local direction, which is tension on the i-end;
+        # flipping the sign gives compression-positive).
+        n_value = -N_i
+        return L, (lambda _x, _v=n_value: _v)
+
+    if isinstance(elem, TrussElement2D):
+        # Truss elements don't carry shear or bending.
+        return L, None
+
     udls = []
     points = []
     for ml in getattr(elem, "member_loads", []):
@@ -786,46 +894,48 @@ def _diagram_ordinates(elem, ni, nj, f_local, kind: str,
             udls.append(ml.wy)
         elif isinstance(ml, PointLoad):
             points.append((ml.a, ml.py))
-    xs = [i * L / (n_samples - 1) for i in range(n_samples)]
-    if kind == "axial":
-        # Axial: plot ``-N_i`` so compression on the element reads positive
-        # on the page (the local-frame member-end axial force is positive in
-        # the +x_local direction, which is tension on the i-end; flipping
-        # the sign gives the conventional compression-positive diagram).
-        ys = [-N_i for _ in xs]
-        return xs, ys
-    if isinstance(elem, TrussElement2D):
-        return None, None
     w = sum(udls)
 
-    # Shear and moment from the left-of-cut free body. ``V_i`` and ``M_i``
-    # are the local member-end shear/moment at the i-end (see
-    # FrameElement2D.local_displacement_and_end_forces — they are the
-    # entries of ``q_local = K·d − p_local``). ``w`` is the summed UDL
-    # intensity in the element's +y_local direction (so ``wy < 0`` is a
-    # downward load on a horizontal beam), and ``points = [(a, py)]`` are
-    # in-span point loads with ``py`` in +y_local.
-    #
-    # The point-load contributions in ``shear`` and ``moment`` carry the
-    # **same** sign of ``py`` so the differential identity ``dM/dx = V``
-    # holds across the in-span discontinuity — see
-    # ``tests/test_diagram_signs.py`` for the regression.
-    def shear(x):
-        v = V_i - w * x
-        for a, py in points:
-            if x > a:
-                v += py
-        return v
-
-    def moment(x):
-        m = -M_i + V_i * x - 0.5 * w * x * x
-        for a, py in points:
-            if x > a:
-                m += py * (x - a)
-        return m
-
     if kind == "shear":
-        ys = [shear(x) for x in xs]
-    else:
-        ys = [moment(x) for x in xs]
+        def shear(x):
+            v = V_i - w * x
+            for a, py in points:
+                if x > a:
+                    v += py
+            return v
+        return L, shear
+
+    if kind == "moment":
+        def moment(x):
+            m = -M_i + V_i * x - 0.5 * w * x * x
+            for a, py in points:
+                if x > a:
+                    m += py * (x - a)
+            return m
+        return L, moment
+
+    return L, None
+
+
+def _diagram_ordinates(elem, ni, nj, f_local, kind: str,
+                        n_samples: int = 21):
+    L, fn = _diagram_evaluator(elem, ni, nj, f_local, kind)
+    if fn is None:
+        return None, None
+    xs = [i * L / (n_samples - 1) for i in range(n_samples)]
+    ys = [fn(x) for x in xs]
     return xs, ys
+
+
+def _diagram_value(elem, ni, nj, f_local, kind: str, x_loc: float):
+    """Return the diagram value at arc-length ``x_loc`` along the element,
+    or ``None`` if the kind doesn't apply to this element. Used by the
+    canvas hover handler to report the value at the projected cursor."""
+    L, fn = _diagram_evaluator(elem, ni, nj, f_local, kind)
+    if fn is None:
+        return None
+    x = max(0.0, min(L, float(x_loc)))
+    return float(fn(x))
+
+
+_DIAGRAM_UNITS = {"moment": "kN·m", "shear": "kN", "axial": "kN"}
