@@ -1,0 +1,168 @@
+"""Write a StructuralModel back to the text format consumed by file_io.read_input_file.
+
+Emits the **new** MATERIALS + SECTIONS shape (which carries no A/I/depth on
+materials and an explicit SECTIONS block referencing materials). Legacy
+inputs that lacked a SECTIONS block are still readable by file_io thanks
+to its backwards-compat shim, but the writer always produces the new
+shape so saved files are explicit about the material/section separation.
+"""
+
+from __future__ import annotations
+
+from ..element import FrameElement2D, TrussElement2D
+from ..model import (
+    FrameTemperatureLoad,
+    PointLoad,
+    StructuralModel,
+    TrussTemperatureLoad,
+    UniformDistributedLoad,
+)
+
+
+def _fmt(x: float) -> str:
+    if x == 0.0:
+        return "0.0"
+    # Use repr so that the value round-trips exactly through float(...).
+    return repr(float(x))
+
+
+def _check_name(kind: str, obj_id: int, name: str) -> None:
+    # The parser reads name as a single whitespace-delimited token, so any
+    # embedded whitespace would silently truncate on reload.
+    if name and any(ch.isspace() for ch in name):
+        raise ValueError(
+            f"{kind} {obj_id} name {name!r} contains whitespace; the "
+            "input-file format stores name as a single token. Rename "
+            "the entry (use underscores or hyphens) before saving."
+        )
+
+
+def write_input_file(model: StructuralModel, path: str) -> None:
+    """Serialize ``model`` to ``path`` in the text format used by read_input_file.
+
+    The format is round-trip compatible: open the file with read_input_file
+    and you get an equivalent model back (modulo internal id identity).
+
+    Raises:
+        ValueError: if an element cannot be matched to any Section + Material
+            combination in the model (e.g. element constructed with raw
+            properties that don't appear in the section table).
+    """
+    out: list[str] = []
+
+    out.append("TITLE")
+    out.append(model.title or "Untitled")
+    out.append("")
+
+    node_ids = sorted(model.nodes)
+    out.append(f"NODES {len(node_ids)}")
+    for nid in node_ids:
+        n = model.nodes[nid]
+        out.append(f"{nid}  {_fmt(n.x)}  {_fmt(n.y)}")
+    out.append("")
+
+    # MATERIALS (new shape): id  E  alpha  density  [name]
+    mat_ids = sorted(model.materials)
+    out.append(f"MATERIALS {len(mat_ids)}")
+    for mid in mat_ids:
+        m = model.materials[mid]
+        _check_name("Material", mid, m.name)
+        line = f"{mid}  {_fmt(m.E)}  {_fmt(m.alpha)}  {_fmt(m.density)}"
+        if m.name:
+            line += f"  {m.name}"
+        out.append(line)
+    out.append("")
+
+    # SECTIONS: id  material_id  A  I  depth  [name]
+    sec_ids = sorted(model.sections)
+    out.append(f"SECTIONS {len(sec_ids)}")
+    for sid in sec_ids:
+        s = model.sections[sid]
+        _check_name("Section", sid, s.name)
+        line = (f"{sid}  {s.material_id}  {_fmt(s.A)}  {_fmt(s.I)}"
+                f"  {_fmt(s.depth)}")
+        if s.name:
+            line += f"  {s.name}"
+        out.append(line)
+    out.append("")
+
+    out.append(f"ELEMENTS {len(model.elements)}")
+    for elem in model.elements:
+        kind = "TRUSS" if isinstance(elem, TrussElement2D) else "FRAME"
+        if elem.section_id is None:
+            raise ValueError(
+                f"Element {elem.id} has no section_id assigned — was it "
+                "constructed without going through the model layer "
+                "(file_io / AddElementCmd)? Cannot serialise."
+            )
+        if elem.section_id not in model.sections:
+            raise ValueError(
+                f"Element {elem.id} references section {elem.section_id}, "
+                "which is not in the model. Cannot serialise."
+            )
+        line = f"{elem.id}  {elem.node_i}  {elem.node_j}  {elem.section_id}  {kind}"
+        if isinstance(elem, FrameElement2D):
+            if elem.release_i and elem.release_j:
+                line += "  BOTH"
+            elif elem.release_i:
+                line += "  START"
+            elif elem.release_j:
+                line += "  END"
+        out.append(line)
+    out.append("")
+
+    if model.supports:
+        sup_items = sorted(model.supports.items())
+        out.append(f"SUPPORTS {len(sup_items)}")
+        for nid, s in sup_items:
+            line = f"{nid}  {int(s.ux)}  {int(s.uy)}  {int(s.rz)}"
+            if s.settle_ux or s.settle_uy or s.settle_rz:
+                line += (f"   {_fmt(s.settle_ux or 0.0)}"
+                         f"  {_fmt(s.settle_uy or 0.0)}"
+                         f"  {_fmt(s.settle_rz or 0.0)}")
+            out.append(line)
+        out.append("")
+
+    out.append(f"LOADS {len(model.nodal_loads)}")
+    for ld in model.nodal_loads:
+        out.append(f"{ld.node_id}  {_fmt(ld.fx)}  {_fmt(ld.fy)}  {_fmt(ld.mz)}")
+    out.append("")
+
+    udls: list[tuple[int, UniformDistributedLoad]] = []
+    points: list[tuple[int, PointLoad]] = []
+    truss_temps: list[tuple[int, TrussTemperatureLoad]] = []
+    frame_temps: list[tuple[int, FrameTemperatureLoad]] = []
+    for elem in model.elements:
+        for ml in elem.member_loads:
+            if isinstance(ml, UniformDistributedLoad):
+                udls.append((elem.id, ml))
+            elif isinstance(ml, PointLoad):
+                points.append((elem.id, ml))
+            elif isinstance(ml, TrussTemperatureLoad):
+                truss_temps.append((elem.id, ml))
+            elif isinstance(ml, FrameTemperatureLoad):
+                frame_temps.append((elem.id, ml))
+
+    if udls:
+        out.append(f"MEMBER_UDL {len(udls)}")
+        for eid, u in udls:
+            out.append(f"{eid}  0.0  {_fmt(u.wy)}")
+        out.append("")
+    if points:
+        out.append(f"MEMBER_POINT_LOADS {len(points)}")
+        for eid, p in points:
+            out.append(f"{eid}  {_fmt(p.a)}  0.0  {_fmt(p.py)}")
+        out.append("")
+    if truss_temps:
+        out.append(f"TRUSS_TEMPERATURE {len(truss_temps)}")
+        for eid, t in truss_temps:
+            out.append(f"{eid}  {_fmt(t.delta_T)}")
+        out.append("")
+    if frame_temps:
+        out.append(f"FRAME_TEMPERATURE {len(frame_temps)}")
+        for eid, t in frame_temps:
+            out.append(f"{eid}  {_fmt(t.t_top)}  {_fmt(t.t_bottom)}")
+        out.append("")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out).rstrip() + "\n")

@@ -17,7 +17,7 @@ from numpy.testing import assert_allclose
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from structural_analysis.model import (
-    StructuralModel, Node, Material, Support, NodalLoad,
+    StructuralModel, Node, Material, Section, Support, NodalLoad,
     UniformDistributedLoad, PointLoad,
     TrussTemperatureLoad, FrameTemperatureLoad,
 )
@@ -920,7 +920,8 @@ class TestA4IntegrationClampedThermalBar:
         E, A, alpha, dT, L = 2e8, 0.01, 1.2e-5, 50.0, 4.0
         m = StructuralModel(title="Clamped thermal bar")
         m.nodes = {1: Node(1, 0, 0), 2: Node(2, L, 0)}
-        m.materials = {1: Material(1, E, A, 1e-4, alpha=alpha)}
+        m.materials = {1: Material(id=1, E=E, alpha=alpha)}
+        m.sections = {1: Section(id=1, material_id=1, A=A, I=1e-4)}
         m.elements = [FrameElement2D(
             id=1, node_i=1, node_j=2, E=E, A=A, I=1e-4,
             alpha=alpha,

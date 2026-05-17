@@ -77,6 +77,11 @@ class Element2D:
         A: Cross-sectional area (m²).
         alpha: Coefficient of thermal expansion (1/°C). Default 0 (inert).
         depth: Section depth (m), used for frame thermal gradient. Default 0.
+        section_id: id of the :class:`Section` this element was assigned to
+            (None for elements built outside the model layer, e.g. raw unit
+            tests). Stiffness math ignores this — it's a back-reference used
+            by the writer and the GUI command propagation logic to find
+            elements that belong to a given Section/Material.
         member_loads: List of MemberLoad objects (UDL, PointLoad, thermal).
     """
 
@@ -87,6 +92,8 @@ class Element2D:
     A: float
     alpha: float = 0.0
     depth: float = 0.0
+    rho: float = 0.0
+    section_id: int | None = None
     member_loads: list[MemberLoad] = field(default_factory=list)
 
     @property
@@ -155,6 +162,22 @@ class Element2D:
         """
         return [0, 1, 2, 3, 4, 5]
 
+    def consistent_mass_local(self, nodes: dict) -> np.ndarray:
+        """Return the 6×6 consistent mass matrix in the local frame.
+
+        Implementations live on the concrete element subclasses.
+        Mass entries are emitted in the kN-m-s consistent system
+        (mass in Mg = kN·s²/m); the unit conversion from the
+        user-facing kg/m³ density is done here.
+
+        Args:
+            nodes: Dict mapping node IDs to Node objects.
+
+        Returns:
+            6×6 numpy array — element consistent mass matrix.
+        """
+        raise NotImplementedError
+
     def assembled_local_stiffness_and_load(self, nodes: dict) -> tuple[np.ndarray, np.ndarray]:
         """Return stiffness and load after any release condensation.
 
@@ -189,6 +212,14 @@ class Element2D:
         Returns:
             Tuple (d_local, q_local) where d_local is the 6-element local
             displacement vector and q_local is [N_i, V_i, M_i, N_j, V_j, M_j].
+
+        Sign convention: ``q_local = K·d − p_local`` is the action of the
+        nodes on the element in the element's local frame. ``+N_i`` is
+        tension at the i-end; ``+V_i`` is in the +y_local direction at the
+        i-end; ``+M_i`` is in the +z_local (out-of-plane CCW) direction at
+        the i-end. ``q_global = Rᵀ·q_local`` satisfies ``Σ q_global = applied``
+        at every free node (see :func:`postprocessor.equilibrium_check`),
+        i.e. q is the force the node applies to the element.
         """
         R = self.transformation_matrix(nodes)
         d_local = R @ u_global_elem
@@ -243,6 +274,45 @@ class FrameElement2D(Element2D):
             [-EA_L,       0,         0,     EA_L,        0,         0],
             [    0,-12*EI/L3, -6*EI/L2,        0,  12*EI/L3, -6*EI/L2],
             [    0,  6*EI/L2,  2*EI/L,         0,  -6*EI/L2,  4*EI/L ],
+        ])
+
+    def consistent_mass_local(self, nodes: dict) -> np.ndarray:
+        """Hermitian (energy-consistent) mass matrix for a 2D beam-column.
+
+        Local DOFs: [u_i, v_i, θ_i, u_j, v_j, θ_j].
+
+        Args:
+            nodes: Dict mapping node IDs to Node objects.
+
+        Returns:
+            6×6 numpy array — element consistent mass matrix in
+            kN·s²/m (i.e. Mg) units.
+
+        Notes:
+            Density on the element is stored as ``self.rho`` in kg/m³;
+            we convert to Mg/m³ (divide by 1000) so the resulting mass
+            entries are consistent with the kN-m static stiffness.
+            The full Hermitian form is used on both translational and
+            rotational DOFs — moment-release condensation is not applied
+            to mass (release DOFs are then simply unassembled by
+            :meth:`assembly_local_indices`).
+        """
+        L, _, _ = self.length_cos_sin(nodes)
+        rho_consistent = self.rho / 1000.0  # kg/m³ → Mg/m³
+        m_bar = rho_consistent * self.A      # Mg/m
+        if m_bar <= 0.0:
+            return np.zeros((6, 6))
+        coef = m_bar * L / 420.0
+        L2 = L * L
+        # Axial (Hermitian linear, 1/6·[2,1;1,2]·m̄L → 1/420·[140,70;70,140]·m̄L)
+        # Bending block uses Hermite cubic shape functions.
+        return coef * np.array([
+            [140.0,    0.0,     0.0,    70.0,    0.0,     0.0],
+            [  0.0,  156.0,   22.0*L,   0.0,    54.0,  -13.0*L],
+            [  0.0,  22.0*L,   4.0*L2,  0.0,    13.0*L, -3.0*L2],
+            [ 70.0,    0.0,     0.0,   140.0,    0.0,     0.0],
+            [  0.0,   54.0,    13.0*L,  0.0,   156.0,  -22.0*L],
+            [  0.0, -13.0*L,  -3.0*L2,  0.0,  -22.0*L,   4.0*L2],
         ])
 
     def local_consistent_load(self, nodes: dict) -> np.ndarray:
@@ -442,6 +512,35 @@ class TrussElement2D(Element2D):
             [0, 1, None, 3, 4, None] — DOFs 2 and 5 suppressed.
         """
         return [0, 1, None, 3, 4, None]
+
+    def consistent_mass_local(self, nodes: dict) -> np.ndarray:
+        """Consistent translational mass for a 2D truss bar.
+
+        Local DOFs: [u_i, v_i, _, u_j, v_j, _] (the rotational slots are
+        kept for shape compatibility; their mass entries are zero and
+        :meth:`assembly_local_indices` already skips them at assembly).
+
+        Args:
+            nodes: Dict mapping node IDs to Node objects.
+
+        Returns:
+            6×6 numpy array — translational consistent mass matrix
+            (m̄·L/6 · diag([2,2,*,1,1,*]) block form), in Mg units.
+        """
+        L, _, _ = self.length_cos_sin(nodes)
+        rho_consistent = self.rho / 1000.0
+        m_bar = rho_consistent * self.A
+        if m_bar <= 0.0:
+            return np.zeros((6, 6))
+        c = m_bar * L / 6.0
+        return c * np.array([
+            [2.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 2.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 2.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ])
 
     def local_consistent_load(self, nodes: dict) -> np.ndarray:
         """Compute thermal fixed-end forces for truss elements.
