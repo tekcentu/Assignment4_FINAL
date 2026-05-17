@@ -325,6 +325,6 @@ The reported Q2(b) solution uses the **standard centerline idealization**. The t
 
 The public repository for this assignment lives at:
 
-`https://github.com/tekcentu/Assignment4_FINAL`
+`https://github.com/tekcentu/StructureGUI`
 
 Update the report cover page accordingly.

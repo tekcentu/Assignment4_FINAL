@@ -207,5 +207,5 @@ implementation stage.
 
 ---
 
-**Repository:** `https://github.com/tekcentu/Assignment4_FINAL`
-(current working branch: `claude/add-solver-gui-pyqt`).
+**Repository:** `https://github.com/tekcentu/StructureGUI`
+(default branch: `main`).
