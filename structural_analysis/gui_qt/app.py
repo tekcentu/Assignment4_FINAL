@@ -420,7 +420,9 @@ class MainWindow(QMainWindow):
         self._update_title()
         self.canvas.redraw()
 
-    def open_element_dialog_for_pair(self, n_i: int, n_j: int) -> None:
+    def open_element_dialog_for_pair(
+        self, n_i: int, n_j: int, kind: str | None = None
+    ) -> None:
         if not self._model.materials:
             QMessageBox.warning(
                 self, "No materials defined",
@@ -447,9 +449,11 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            d = ElementDialog(self, model=self._model,
-                              existing_kind=(sticky or {}).get("kind"),
-                              existing_section_id=(sticky or {}).get("section_id"))
+            d = ElementDialog(
+                self, model=self._model,
+                existing_kind=(sticky or {}).get("kind") or kind,
+                existing_section_id=(sticky or {}).get("section_id"),
+            )
         except ValueError as e:
             QMessageBox.warning(self, "Cannot add element", str(e))
             return

@@ -76,6 +76,27 @@ def test_frame_tool_shows_live_element_preview(qt_app):
     assert w.canvas._element_preview is None
 
 
+def test_truss_tool_passes_truss_kind_to_element_dialog(qt_app):
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 2.0, 0.0),
+    }
+    seen: list[tuple[int, int, str | None]] = []
+
+    def fake_open(n_i, n_j, kind=None):
+        seen.append((n_i, n_j, kind))
+
+    w.open_element_dialog_for_pair = fake_open
+    w._select_tool("truss")
+    w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
+    w._on_canvas_click(HitResult(x=2.0, y=0.0, node_id=2), "left")
+
+    assert seen == [(1, 2, "truss")]
+
+
 def test_all_dialogs_construct(qt_app):
     from structural_analysis.gui_qt.dialogs import (
         ElementDialog,
