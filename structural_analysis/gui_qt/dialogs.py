@@ -512,24 +512,34 @@ class MemberLoadDialog(_ModalDialog):
 class GridDialog(_ModalDialog):
     """Define the X and Y grid lines (SAP2000-style)."""
 
-    def __init__(self, parent, *, current=None):
+    def __init__(self, parent, *, current=None, model: StructuralModel | None = None):
         # ``current`` is an optional GridSystem (None ⇒ blank).
         self._current = current
+        self._model = model
         super().__init__(parent, "Grid system")
 
     def _build_body(self, body: QWidget) -> None:
         v = QVBoxLayout(body)
         v.addWidget(QLabel(
-            "Enter labels and coordinates as comma-separated pairs.\n"
-            "Example: A=0, B=4, C=8, D=12  /  1=0, 2=3, 3=6",
+            "Enter label=coordinate pairs, or plain coordinates to auto-label.",
             body,
         ))
         form = QFormLayout()
         self._x_entry = QLineEdit(body)
         self._y_entry = QLineEdit(body)
+        self._x_entry.setPlaceholderText("A=0, B=6, C=12")
+        self._y_entry.setPlaceholderText("1=0, 2=4, 3=8")
         form.addRow("X lines:", self._x_entry)
         form.addRow("Y lines:", self._y_entry)
         v.addLayout(form)
+
+        self._preview = QLabel("", body)
+        self._preview.setWordWrap(True)
+        v.addWidget(self._preview)
+
+        fill = QPushButton("From model nodes", body)
+        fill.clicked.connect(self._fill_from_model_nodes)
+        v.addWidget(fill)
 
         if self._current is not None:
             self._x_entry.setText(", ".join(
@@ -537,24 +547,84 @@ class GridDialog(_ModalDialog):
             self._y_entry.setText(", ".join(
                 f"{ln.label}={ln.coord:g}" for ln in self._current.y_lines))
 
+        self._x_entry.textChanged.connect(self._update_preview)
+        self._y_entry.textChanged.connect(self._update_preview)
+        self._update_preview()
+
+    @staticmethod
+    def _auto_label(index: int, axis_name: str) -> str:
+        from .grid import _label
+        return _label(index, "numeric" if axis_name == "Y" else "alpha")
+
+    @staticmethod
+    def _format_axis(lines) -> str:
+        return ", ".join(f"{ln.label}={ln.coord:g}" for ln in lines)
+
     def _parse_axis(self, text: str, axis_name: str):
         from .grid import GridLine
+        parts = [part.strip() for part in text.split(",") if part.strip()]
+        if not parts:
+            return []
+        has_pairs = any("=" in part for part in parts)
         lines: list = []
-        for part in text.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "=" not in part:
-                raise ValueError(
-                    f"{axis_name} entry '{part}' is not in 'label=value' form."
-                )
-            label, coord_s = part.split("=", 1)
-            label = label.strip()
-            if not label:
-                raise ValueError(f"{axis_name} entry has empty label.")
-            coord = parse_float(coord_s.strip(), f"{axis_name} '{label}' coord")
-            lines.append(GridLine(label=label, coord=coord))
-        return lines
+        if has_pairs:
+            for part in parts:
+                if "=" not in part:
+                    raise ValueError(
+                        f"{axis_name} token '{part}' is invalid: use either "
+                        "all label=value pairs or all plain numbers."
+                    )
+                label, coord_s = part.split("=", 1)
+                label = label.strip()
+                if not label:
+                    raise ValueError(
+                        f"{axis_name} token '{part}' is invalid: label is empty."
+                    )
+                try:
+                    coord = parse_float(coord_s.strip(),
+                                        f"{axis_name} '{label}' coordinate")
+                except ValueError as e:
+                    raise ValueError(
+                        f"{axis_name} token '{part}' is invalid: {e}"
+                    ) from None
+                lines.append(GridLine(label=label, coord=coord))
+        else:
+            coords: set[float] = set()
+            for part in parts:
+                try:
+                    coord = parse_float(part, f"{axis_name} coordinate")
+                except ValueError as e:
+                    raise ValueError(
+                        f"{axis_name} token '{part}' is invalid: {e}"
+                    ) from None
+                coords.add(coord)
+            for idx, coord in enumerate(sorted(coords)):
+                lines.append(GridLine(label=self._auto_label(idx, axis_name),
+                                      coord=coord))
+        return sorted(lines, key=lambda ln: ln.coord)
+
+    def _fill_from_model_nodes(self) -> None:
+        if self._model is None or not self._model.nodes:
+            QMessageBox.information(
+                self, "No model nodes",
+                "Draw or open a model with nodes before using this shortcut.",
+            )
+            return
+        xs = sorted({float(n.x) for n in self._model.nodes.values()})
+        ys = sorted({float(n.y) for n in self._model.nodes.values()})
+        self._x_entry.setText(", ".join(f"{x:g}" for x in xs))
+        self._y_entry.setText(", ".join(f"{y:g}" for y in ys))
+
+    def _update_preview(self) -> None:
+        try:
+            x_lines = self._parse_axis(self._x_entry.text(), "X")
+            y_lines = self._parse_axis(self._y_entry.text(), "Y")
+        except ValueError as e:
+            self._preview.setText(f"Preview: {e}")
+            return
+        x_text = self._format_axis(x_lines) if x_lines else "(none)"
+        y_text = self._format_axis(y_lines) if y_lines else "(none)"
+        self._preview.setText(f"Preview: X: {x_text} | Y: {y_text}")
 
     def _accept(self):
         from .grid import GridSystem

@@ -202,9 +202,63 @@ def test_update_element_command_changes_section(qt_app):
     assert elem.A == 0.09
 
 
+
+def test_grid_dialog_accepts_numeric_lists_and_sorts(qt_app):
+    from structural_analysis.gui_qt.dialogs import GridDialog
+
+    w = MainWindow()
+    d = GridDialog(w, model=w._model)
+    d._x_entry.setText("12, 0, 6, 0")
+    d._y_entry.setText("8, 0, 4, 4")
+
+    grid = d._accept()
+
+    assert [(ln.label, ln.coord) for ln in grid.x_lines] == [
+        ("A", 0.0), ("B", 6.0), ("C", 12.0)
+    ]
+    assert [(ln.label, ln.coord) for ln in grid.y_lines] == [
+        ("1", 0.0), ("2", 4.0), ("3", 8.0)
+    ]
+    assert "X: A=0, B=6, C=12" in d._preview.text()
+
+
+def test_grid_dialog_fills_from_model_nodes(qt_app):
+    from structural_analysis.gui_qt.dialogs import GridDialog
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        1: Node(1, 6.0, 4.0),
+        2: Node(2, 0.0, 0.0),
+        3: Node(3, 6.0, 8.0),
+    }
+    d = GridDialog(w, model=w._model)
+
+    d._fill_from_model_nodes()
+
+    assert d._x_entry.text() == "0, 6"
+    assert d._y_entry.text() == "0, 4, 8"
+    grid = d._accept()
+    assert [(ln.label, ln.coord) for ln in grid.x_lines] == [("A", 0.0), ("B", 6.0)]
+    assert [(ln.label, ln.coord) for ln in grid.y_lines] == [
+        ("1", 0.0), ("2", 4.0), ("3", 8.0)
+    ]
+
+
+def test_grid_dialog_reports_invalid_token(qt_app):
+    from structural_analysis.gui_qt.dialogs import GridDialog
+
+    w = MainWindow()
+    d = GridDialog(w, model=w._model)
+    d._x_entry.setText("A=0, bad, C=12")
+
+    with pytest.raises(ValueError, match="X token 'bad' is invalid"):
+        d._accept()
+
+
 def test_sticky_truss_then_frame_tool_places_frame(qt_app):
     """Bug fix: with sticky=truss remembered, switching to the Frame
-    tool and clicking two nodes must place a FrameElement2D — not
+    tool and clicking two nodes must place a FrameElement2D - not
     another truss as the sticky-path used to do unconditionally.
     Releases live on the frame side only, so when an effective kind
     is "truss" the releases are forced to False."""
@@ -226,14 +280,14 @@ def test_sticky_truss_then_frame_tool_places_frame(qt_app):
         "release_i": False,
         "release_j": False,
     }
-    # Frame tool now — must place a FrameElement2D, not a truss.
+    # Frame tool now - must place a FrameElement2D, not a truss.
     w._select_tool("frame")
     w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
     w._on_canvas_click(HitResult(x=2.0, y=0.0, node_id=2), "left")
     assert len(w._model.elements) == 1
     assert isinstance(w._model.elements[0], FrameElement2D)
 
-    # Now flip: sticky-frame with a release, click Truss → truss with
+    # Now flip: sticky-frame with a release, click Truss -> truss with
     # release_i forced back to False (releases don't apply to trusses).
     w._sticky_element = {
         "kind": "frame",
