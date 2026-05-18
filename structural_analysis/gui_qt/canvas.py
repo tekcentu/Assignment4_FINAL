@@ -69,6 +69,13 @@ class ModelCanvas(QWidget):
         self.diagram_kind: str = "moment"
         self.deformed_scale: float = 1.0
         self.diagram_scale: float = 1.0
+        # Station points are post-processing samples per element, used to
+        # draw smooth deformed shapes (cubic-Hermite for frames) and
+        # internal-force diagrams. They are NOT model nodes and never
+        # affect connectivity, supports, or loads. 21 picks up the
+        # midspan exactly and gives smooth UDL / point-load diagrams.
+        self.deformed_stations: int = 21
+        self.diagram_stations: int = 21
         self._result = None
         self._modal_result = None    # ModalResult or None
         self._modal_mode_idx: int = 0
@@ -693,6 +700,57 @@ class ModelCanvas(QWidget):
         uy = float(D[emap["uy"]]) if emap["uy"] is not None else 0.0
         return ux, uy
 
+    def _node_rotation(self, nid: int) -> float:
+        """Return θ_z at ``nid`` from the global displacement vector, or
+        0.0 if the node has no rotational DOF (e.g. truss-only node)."""
+        result = self._result
+        if result is None or result.D is None:
+            return 0.0
+        emap = result.E_map.get(nid)
+        if emap is None or emap.get("rz") is None:
+            return 0.0
+        return float(result.D[emap["rz"]])
+
+    def _frame_deformed_points(
+        self, elem: FrameElement2D, scale: float,
+    ) -> tuple[list[float], list[float]]:
+        """Sample the frame element's deformed centreline.
+
+        Axial displacement is linearly interpolated; transverse
+        displacement uses cubic-Hermite shape functions of the local end
+        DOFs ``[v_i, θ_i, v_j, θ_j]``. The result is rotated back to
+        global so it overlays the original (undeformed) geometry. Pure
+        visualization — solver outputs are not modified.
+        """
+        nodes = self._model().nodes
+        ni = nodes[elem.node_i]
+        nj = nodes[elem.node_j]
+        L, c, s = elem.length_cos_sin(nodes)
+        uxi, uyi = self._node_displacement(elem.node_i)
+        uxj, uyj = self._node_displacement(elem.node_j)
+        thi = self._node_rotation(elem.node_i)
+        thj = self._node_rotation(elem.node_j)
+        ui_loc = c * uxi + s * uyi
+        vi_loc = -s * uxi + c * uyi
+        uj_loc = c * uxj + s * uyj
+        vj_loc = -s * uxj + c * uyj
+        n = max(2, int(self.deformed_stations))
+        Xs: list[float] = []
+        Ys: list[float] = []
+        for k in range(n):
+            r = k / (n - 1)
+            u_loc = (1.0 - r) * ui_loc + r * uj_loc
+            N1 = 1.0 - 3.0 * r * r + 2.0 * r * r * r
+            N2 = L * (r - 2.0 * r * r + r * r * r)
+            N3 = 3.0 * r * r - 2.0 * r * r * r
+            N4 = L * (-r * r + r * r * r)
+            v_loc = N1 * vi_loc + N2 * thi + N3 * vj_loc + N4 * thj
+            x_def = r * L + scale * u_loc
+            y_def = scale * v_loc
+            Xs.append(ni.x + c * x_def - s * y_def)
+            Ys.append(ni.y + s * x_def + c * y_def)
+        return Xs, Ys
+
     def _draw_deformed(self) -> None:
         result = self._result
         model = self._model()
@@ -715,11 +773,17 @@ class ModelCanvas(QWidget):
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
-            uxi, uyi = self._node_displacement(elem.node_i)
-            uxj, uyj = self._node_displacement(elem.node_j)
+            if isinstance(elem, FrameElement2D):
+                Xs, Ys = self._frame_deformed_points(elem, scale)
+            else:
+                # Truss bar stays straight between displaced endpoints —
+                # rotations don't contribute to a pin-jointed member.
+                uxi, uyi = self._node_displacement(elem.node_i)
+                uxj, uyj = self._node_displacement(elem.node_j)
+                Xs = [ni.x + scale * uxi, nj.x + scale * uxj]
+                Ys = [ni.y + scale * uyi, nj.y + scale * uyj]
             self.ax.plot(
-                [ni.x + scale * uxi, nj.x + scale * uxj],
-                [ni.y + scale * uyi, nj.y + scale * uyj],
+                Xs, Ys,
                 color="#ff7f0e", linestyle="-", linewidth=1.5, alpha=0.7,
                 zorder=3,
             )
@@ -849,11 +913,14 @@ class ModelCanvas(QWidget):
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
-            # Sample densely so the critical-point search lands near
-            # the true extreme (21 samples can miss a peak between
-            # nodes by a couple of percent on a short element).
+            # Sample density is configurable via View → Diagram stations.
+            # Lower counts give a coarser preview; the critical-point
+            # search below operates on the same xs / ys, so very low
+            # counts (e.g. 5) may miss the true peak between stations —
+            # surfaced to the user via the menu tooltip + status hint.
+            n = max(2, int(self.diagram_stations))
             xs, ys = _diagram_ordinates(
-                elem, ni, nj, mr["f_local"], self.diagram_kind, n_samples=51,
+                elem, ni, nj, mr["f_local"], self.diagram_kind, n_samples=n,
             )
             if xs is None:
                 continue

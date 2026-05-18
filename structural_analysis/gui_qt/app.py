@@ -290,6 +290,30 @@ class MainWindow(QMainWindow):
             a.triggered.connect(lambda _checked, k=kind: self._toggle_snap_kind(k))
             self._snap_actions[kind] = a
 
+        # Diagram station-count selector (post-processing samples per
+        # element). Pure visualization — changing it never re-runs the
+        # solver. Default 21 includes the midspan exactly.
+        self._station_tooltip = (
+            "Station points are for diagram drawing only. More stations "
+            "make diagrams smoother but do not change analysis results. "
+            "Very low station counts may miss visual peaks between stations."
+        )
+        self._station_actions: dict[int, QAction] = {}
+        station_group = QActionGroup(self)
+        station_group.setExclusive(True)
+        for n, label in (
+            (5,  "5 (coarse)"),
+            (11, "11 (simple)"),
+            (21, "21 (default)"),
+            (51, "51 (smooth)"),
+        ):
+            a = QAction(label, self, checkable=True, checked=(n == 21))
+            a.setToolTip(self._station_tooltip)
+            a.setStatusTip(self._station_tooltip)
+            a.triggered.connect(lambda _checked, k=n: self._set_diagram_stations(k))
+            station_group.addAction(a)
+            self._station_actions[n] = a
+
         self.act_solve = QAction("&Solve", self, shortcut="F5",
                                    triggered=self._do_solve)
         self.act_modal = QAction("&Modal analysis…", self, shortcut="F6",
@@ -347,6 +371,12 @@ class MainWindow(QMainWindow):
         m_view.addSeparator()
         for a in self._snap_actions.values():
             m_view.addAction(a)
+        m_view.addSeparator()
+        stations_menu = m_view.addMenu("Diagram &stations")
+        stations_menu.setToolTip(self._station_tooltip)
+        stations_menu.setStatusTip(self._station_tooltip)
+        for a in self._station_actions.values():
+            stations_menu.addAction(a)
 
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)
@@ -967,6 +997,29 @@ class MainWindow(QMainWindow):
 
     def _toggle_snap(self, checked: bool) -> None:
         self.canvas.toggle_snap(checked)
+
+    def _set_diagram_stations(self, n: int) -> None:
+        """Adjust station-count for diagrams + deformed-shape sampling.
+
+        Post-processing only — the solver is not rerun, only the canvas
+        is redrawn. A very coarse setting (5) gets a louder warning so
+        the demo audience knows the picture is approximate.
+        """
+        n = int(n)
+        self.canvas.diagram_stations = n
+        self.canvas.deformed_stations = n
+        # Keep the matching checkable QAction in sync (idempotent if the
+        # action triggered this call in the first place).
+        for k, action in self._station_actions.items():
+            action.setChecked(k == n)
+        self.canvas.redraw()
+        if n <= 5:
+            self.set_status(f"Using {n} stations: coarse diagram preview.")
+        else:
+            self.set_status(
+                f"Diagram stations: {n} per element. "
+                f"Solver was not rerun — redraw only."
+            )
 
     # ── undo / redo ──
 
