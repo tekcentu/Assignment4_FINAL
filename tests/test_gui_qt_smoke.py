@@ -522,11 +522,20 @@ def test_frame_hermite_deformed_curve_with_known_dofs(qt_app):
     )]
     # Three global DOFs per node: [ux, uy, rz]. Order: n1 ux, n1 uy,
     # n1 rz, n2 ux, n2 uy, n2 rz. Translations zero, rotations only.
+    # For a horizontal element (c=1, s=0) the local frame is identical to
+    # global, so d_local = [0, 0, +0.1, 0, 0, -0.1].
+    import numpy as np
     result = AnalysisResult(status="ok")
     result.D = [0.0, 0.0, +0.1, 0.0, 0.0, -0.1]
     result.E_map = {
         1: {"ux": 0, "uy": 1, "rz": 2},
         2: {"ux": 3, "uy": 4, "rz": 5},
+    }
+    result.member_results = {
+        1: {
+            "f_local": np.zeros(6),
+            "d_local": np.array([0.0, 0.0, +0.1, 0.0, 0.0, -0.1]),
+        },
     }
     w._result = result
     w.canvas._result = result
@@ -623,3 +632,77 @@ def test_station_actions_default_to_21(qt_app):
         )
     assert w.canvas.diagram_stations == 21
     assert w.canvas.deformed_stations == 21
+
+
+def test_draw_deformed_visible_for_rotation_only_case(qt_app):
+    """Regression for Bug 1: when all nodal ux=uy=0 but frame end
+    rotations are non-zero, _draw_deformed must still draw the Hermite
+    deformed shape (not silently return at the max_disp gate)."""
+    import numpy as np
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        AnalysisResult, Material, Node, Section,
+    )
+
+    w = MainWindow()
+    m = w._model
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    m.materials = {1: Material(id=1, name="m", E=2.1e8, alpha=0.0,
+                                density=7850.0)}
+    m.sections = {1: Section(id=1, name="s", material_id=1,
+                              A=1.0e-3, I=1.0e-5, depth=0.1)}
+    m.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=1.0e-3, I=1.0e-5,
+        alpha=0.0, depth=0.1, section_id=1,
+    )]
+    # All nodal translations zero; end rotations only.
+    # For a horizontal element, d_local equals the global DOF vector.
+    result = AnalysisResult(status="ok")
+    result.D = [0.0, 0.0, +0.01, 0.0, 0.0, -0.01]
+    result.E_map = {
+        1: {"ux": 0, "uy": 1, "rz": 2},
+        2: {"ux": 3, "uy": 4, "rz": 5},
+    }
+    result.member_results = {
+        1: {
+            "f_local": np.zeros(6),
+            "d_local": np.array([0.0, 0.0, +0.01, 0.0, 0.0, -0.01]),
+        },
+    }
+    w._result = result
+    w.canvas._result = result
+    w.canvas.show_deformed = True
+    w.canvas.redraw()
+    # At least one plotted Line2D must have more than 2 data points —
+    # that is the Hermite deformed-shape curve (21 stations by default).
+    # Without the fix the max_disp gate returns early and no such line exists.
+    multi_point_lines = [
+        l for l in w.canvas.ax.lines if len(l.get_xdata()) > 2
+    ]
+    assert multi_point_lines, (
+        "No multi-point line found after redraw() with rotation-only DOFs — "
+        "the max_disp gate silenced the deformed shape."
+    )
+
+
+def test_deformed_scale_setting_updates_canvas_and_does_not_resolve(qt_app):
+    """View → Deformed scale updates canvas.deformed_scale and redraws
+    without re-running the solver."""
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    cached = w._result
+    assert cached is not None and cached.status == "ok"
+
+    w._set_deformed_scale(5.0)
+    assert w.canvas.deformed_scale == 5.0
+    assert w._result is cached, (
+        "_set_deformed_scale must redraw only, never re-solve."
+    )
+    assert w._deformed_scale_actions[5.0].isChecked()
+    assert not w._deformed_scale_actions[1.0].isChecked()
+
+    w._set_deformed_scale(1.0)
+    assert w.canvas.deformed_scale == 1.0
+    assert w._result is cached
+    assert w._deformed_scale_actions[1.0].isChecked()
