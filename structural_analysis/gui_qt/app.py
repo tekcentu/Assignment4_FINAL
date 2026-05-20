@@ -314,6 +314,28 @@ class MainWindow(QMainWindow):
             station_group.addAction(a)
             self._station_actions[n] = a
 
+        # Deformed shape visual amplification scale.
+        self._deformed_scale_tooltip = (
+            "Visually amplifies the deformed shape. "
+            "Does not change analysis results and does not re-run the solver."
+        )
+        self._deformed_scale_actions: dict[float, QAction] = {}
+        deformed_scale_group = QActionGroup(self)
+        deformed_scale_group.setExclusive(True)
+        for v, label in (
+            (0.5,  "0.5× (reduced)"),
+            (1.0,  "1× (default)"),
+            (2.0,  "2×"),
+            (5.0,  "5×"),
+            (10.0, "10× (amplified)"),
+        ):
+            a = QAction(label, self, checkable=True, checked=(v == 1.0))
+            a.setToolTip(self._deformed_scale_tooltip)
+            a.setStatusTip(self._deformed_scale_tooltip)
+            a.triggered.connect(lambda _checked, k=v: self._set_deformed_scale(k))
+            deformed_scale_group.addAction(a)
+            self._deformed_scale_actions[v] = a
+
         self.act_solve = QAction("&Solve", self, shortcut="F5",
                                    triggered=self._do_solve)
         self.act_modal = QAction("&Modal analysis…", self, shortcut="F6",
@@ -377,6 +399,11 @@ class MainWindow(QMainWindow):
         stations_menu.setStatusTip(self._station_tooltip)
         for a in self._station_actions.values():
             stations_menu.addAction(a)
+        deformed_scale_menu = m_view.addMenu("Deformed &scale")
+        deformed_scale_menu.setToolTip(self._deformed_scale_tooltip)
+        deformed_scale_menu.setStatusTip(self._deformed_scale_tooltip)
+        for a in self._deformed_scale_actions.values():
+            deformed_scale_menu.addAction(a)
 
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)
@@ -1020,6 +1047,20 @@ class MainWindow(QMainWindow):
                 f"Diagram stations: {n} per element. "
                 f"Solver was not rerun — redraw only."
             )
+
+    def _set_deformed_scale(self, v: float) -> None:
+        """Set the visual amplification factor for the deformed shape.
+
+        Redraw only — the solver is not rerun and the cached result is kept.
+        """
+        v = float(v)
+        self.canvas.deformed_scale = v
+        for k, action in self._deformed_scale_actions.items():
+            action.setChecked(k == v)
+        self.canvas.redraw()
+        self.set_status(
+            f"Deformed scale: {v}× — visual amplification only, no re-solve."
+        )
 
     # ── undo / redo ──
 

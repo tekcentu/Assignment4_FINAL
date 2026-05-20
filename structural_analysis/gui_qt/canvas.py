@@ -101,6 +101,11 @@ class ModelCanvas(QWidget):
         # zoom level.
         self._view_initialised: bool = False
 
+        # Middle-mouse-drag pan state (display coordinates at drag start).
+        self._pan_origin: tuple[float, float] | None = None
+        self._pan_xlim0: tuple[float, float] = (0.0, 1.0)
+        self._pan_ylim0: tuple[float, float] = (0.0, 1.0)
+
         self.on_click: Callable[[HitResult, str], None] | None = None
         self.on_motion: Callable[[HitResult], None] | None = None
 
@@ -122,7 +127,9 @@ class ModelCanvas(QWidget):
         self.setLayout(layout)
 
         self._mpl_canvas.mpl_connect("button_press_event", self._handle_click)
+        self._mpl_canvas.mpl_connect("button_release_event", self._handle_release)
         self._mpl_canvas.mpl_connect("motion_notify_event", self._handle_motion)
+        self._mpl_canvas.mpl_connect("scroll_event", self._handle_scroll)
 
     # ── public API ──
 
@@ -252,7 +259,15 @@ class ModelCanvas(QWidget):
     # ── event forwarding ──
 
     def _handle_click(self, event) -> None:
-        if self.on_click is None or event.inaxes is not self.ax:
+        if event.inaxes is not self.ax:
+            return
+        if event.button == 2 and not self.toolbar.mode:
+            # Middle-button drag — start pan.
+            self._pan_origin = (event.x, event.y)
+            self._pan_xlim0 = tuple(self.ax.get_xlim())
+            self._pan_ylim0 = tuple(self.ax.get_ylim())
+            return
+        if self.on_click is None:
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -273,6 +288,18 @@ class ModelCanvas(QWidget):
         self.on_click(hit, button_name)
 
     def _handle_motion(self, event) -> None:
+        if self._pan_origin is not None:
+            # Middle-mouse drag in progress — pan without redrawing the model.
+            inv = self.ax.transData.inverted()
+            x0d, y0d = inv.transform(self._pan_origin)
+            xcd, ycd = inv.transform((event.x, event.y))
+            dx, dy = xcd - x0d, ycd - y0d
+            xl, xr = self._pan_xlim0
+            yb, yt = self._pan_ylim0
+            self.ax.set_xlim(xl - dx, xr - dx)
+            self.ax.set_ylim(yb - dy, yt - dy)
+            self._mpl_canvas.draw_idle()
+            return
         if self.on_motion is None or event.inaxes is not self.ax:
             # Cursor left the axes — drop the hover marker.
             if self._hover_xy is not None:
@@ -290,6 +317,24 @@ class ModelCanvas(QWidget):
             self.on_motion(hit)
         except Exception:
             pass
+
+    def _handle_release(self, event) -> None:
+        if event.button == 2:
+            self._pan_origin = None
+
+    def _handle_scroll(self, event) -> None:
+        if event.inaxes is not self.ax or self.toolbar.mode:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        # Scroll up → zoom in (shrink the visible range); scroll down → zoom out.
+        factor = 1.0 / 1.15 if event.button == "up" else 1.15
+        xl, xr = self.ax.get_xlim()
+        yb, yt = self.ax.get_ylim()
+        xd, yd = event.xdata, event.ydata
+        self.ax.set_xlim(xd - (xd - xl) * factor, xd + (xr - xd) * factor)
+        self.ax.set_ylim(yd - (yd - yb) * factor, yd + (yt - yd) * factor)
+        self._mpl_canvas.draw_idle()
 
     # ── geometry / hit-test ──
 
@@ -711,40 +756,49 @@ class ModelCanvas(QWidget):
             return 0.0
         return float(result.D[emap["rz"]])
 
+    @staticmethod
+    def _hermite_v(
+        r: float, L: float, vi: float, thi: float, vj: float, thj: float,
+    ) -> float:
+        """Cubic-Hermite transverse interpolation in local frame.
+
+        ``r`` is the dimensionless position 0..1 along the element. Returns
+        the transverse displacement v(r) for end DOFs ``[vi, thi, vj, thj]``.
+        """
+        N1 = 1.0 - 3.0 * r * r + 2.0 * r * r * r
+        N2 = L * (r - 2.0 * r * r + r * r * r)
+        N3 = 3.0 * r * r - 2.0 * r * r * r
+        N4 = L * (-r * r + r * r * r)
+        return N1 * vi + N2 * thi + N3 * vj + N4 * thj
+
     def _frame_deformed_points(
         self, elem: FrameElement2D, scale: float,
     ) -> tuple[list[float], list[float]]:
         """Sample the frame element's deformed centreline.
 
-        Axial displacement is linearly interpolated; transverse
-        displacement uses cubic-Hermite shape functions of the local end
-        DOFs ``[v_i, θ_i, v_j, θ_j]``. The result is rotated back to
-        global so it overlays the original (undeformed) geometry. Pure
-        visualization — solver outputs are not modified.
+        Reads ``d_local`` from ``member_results`` — already in the element's
+        local frame and, for moment-released ends, back-calculated via static
+        condensation — so the Hermite curve is correct even at hinge joints.
+        Pure visualization; solver outputs are not modified.
         """
         nodes = self._model().nodes
         ni = nodes[elem.node_i]
         nj = nodes[elem.node_j]
         L, c, s = elem.length_cos_sin(nodes)
-        uxi, uyi = self._node_displacement(elem.node_i)
-        uxj, uyj = self._node_displacement(elem.node_j)
-        thi = self._node_rotation(elem.node_i)
-        thj = self._node_rotation(elem.node_j)
-        ui_loc = c * uxi + s * uyi
-        vi_loc = -s * uxi + c * uyi
-        uj_loc = c * uxj + s * uyj
-        vj_loc = -s * uxj + c * uyj
+        result = self._result
+        mr = result.member_results.get(elem.id) if result else None
+        if mr is None or "d_local" not in mr:
+            return [ni.x, nj.x], [ni.y, nj.y]
+        d = mr["d_local"]
+        ui_loc, vi_loc, thi = float(d[0]), float(d[1]), float(d[2])
+        uj_loc, vj_loc, thj = float(d[3]), float(d[4]), float(d[5])
         n = max(2, int(self.deformed_stations))
         Xs: list[float] = []
         Ys: list[float] = []
         for k in range(n):
             r = k / (n - 1)
             u_loc = (1.0 - r) * ui_loc + r * uj_loc
-            N1 = 1.0 - 3.0 * r * r + 2.0 * r * r * r
-            N2 = L * (r - 2.0 * r * r + r * r * r)
-            N3 = 3.0 * r * r - 2.0 * r * r * r
-            N4 = L * (-r * r + r * r * r)
-            v_loc = N1 * vi_loc + N2 * thi + N3 * vj_loc + N4 * thj
+            v_loc = self._hermite_v(r, L, vi_loc, thi, vj_loc, thj)
             x_def = r * L + scale * u_loc
             y_def = scale * v_loc
             Xs.append(ni.x + c * x_def - s * y_def)
@@ -765,6 +819,23 @@ class ModelCanvas(QWidget):
             max_disp,
             max((abs(self._node_displacement(nid)[1]) for nid in model.nodes), default=0.0),
         )
+        # Extend max_disp to include Hermite transverse amplitudes for frame
+        # elements. Without this, a horizontal SS beam (all nodal ux=uy=0)
+        # would have max_disp=0 and the deformed shape would be silenced.
+        for elem in model.elements:
+            if not isinstance(elem, FrameElement2D):
+                continue
+            mr = result.member_results.get(elem.id)
+            if mr is None or "d_local" not in mr:
+                continue
+            d = mr["d_local"]
+            try:
+                L, _c, _s = elem.length_cos_sin(model.nodes)
+            except (ValueError, ZeroDivisionError):
+                continue
+            vi, thi, vj, thj = float(d[1]), float(d[2]), float(d[4]), float(d[5])
+            for rk in (0.25, 0.5, 0.75):
+                max_disp = max(max_disp, abs(self._hermite_v(rk, L, vi, thi, vj, thj)))
         if max_disp <= 0:
             return
         scale = self.deformed_scale * 0.10 * span / max_disp
@@ -774,7 +845,10 @@ class ModelCanvas(QWidget):
             if ni is None or nj is None:
                 continue
             if isinstance(elem, FrameElement2D):
-                Xs, Ys = self._frame_deformed_points(elem, scale)
+                try:
+                    Xs, Ys = self._frame_deformed_points(elem, scale)
+                except (ValueError, ZeroDivisionError):
+                    continue
             else:
                 # Truss bar stays straight between displaced endpoints —
                 # rotations don't contribute to a pin-jointed member.
