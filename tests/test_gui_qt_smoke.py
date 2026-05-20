@@ -685,6 +685,100 @@ def test_draw_deformed_visible_for_rotation_only_case(qt_app):
     )
 
 
+def test_scroll_event_zooms_centered_on_cursor(qt_app):
+    """Scroll up shrinks the visible range (zoom in); scroll down expands it
+    (zoom out). Both stay centered on the cursor position."""
+    from types import SimpleNamespace
+
+    w = MainWindow()
+    qt_app.processEvents()
+    w.canvas.ax.set_xlim(0.0, 10.0)
+    w.canvas.ax.set_ylim(0.0, 10.0)
+    # Force toolbar.mode to falsy so the gate doesn't block us.
+    w.canvas.toolbar.mode = ""
+
+    # Scroll up at (5, 5) → zoom in → narrower range, still centered on 5.
+    evt = SimpleNamespace(inaxes=w.canvas.ax, button="up",
+                          xdata=5.0, ydata=5.0, x=0, y=0)
+    w.canvas._handle_scroll(evt)
+    xl, xr = w.canvas.ax.get_xlim()
+    yb, yt = w.canvas.ax.get_ylim()
+    assert (xr - xl) < 10.0, f"Scroll-up did not zoom in: width={xr - xl}"
+    assert (yt - yb) < 10.0
+    assert abs(0.5 * (xl + xr) - 5.0) < 1e-9   # centered
+    assert abs(0.5 * (yb + yt) - 5.0) < 1e-9
+
+    # Scroll down at the same point → zoom out → exactly back to (0, 10).
+    evt = SimpleNamespace(inaxes=w.canvas.ax, button="down",
+                          xdata=5.0, ydata=5.0, x=0, y=0)
+    w.canvas._handle_scroll(evt)
+    xl, xr = w.canvas.ax.get_xlim()
+    assert abs(xl - 0.0) < 1e-9 and abs(xr - 10.0) < 1e-9
+
+
+def test_scroll_event_blocked_when_toolbar_active(qt_app):
+    """When the matplotlib nav toolbar is in pan or zoom mode, the custom
+    scroll handler must not modify the axes limits."""
+    from types import SimpleNamespace
+
+    w = MainWindow()
+    qt_app.processEvents()
+    w.canvas.ax.set_xlim(0.0, 10.0)
+    w.canvas.ax.set_ylim(0.0, 10.0)
+    w.canvas.toolbar.mode = "zoom rect"   # non-empty → toolbar active
+
+    evt = SimpleNamespace(inaxes=w.canvas.ax, button="up",
+                          xdata=5.0, ydata=5.0, x=0, y=0)
+    w.canvas._handle_scroll(evt)
+    assert w.canvas.ax.get_xlim() == (0.0, 10.0)
+    assert w.canvas.ax.get_ylim() == (0.0, 10.0)
+
+
+def test_middle_button_drag_pans_canvas(qt_app):
+    """Middle-mouse-button press starts a pan; motion shifts xlim/ylim by the
+    cursor delta; release clears the pan state."""
+    from types import SimpleNamespace
+
+    w = MainWindow()
+    qt_app.processEvents()
+    w.canvas.ax.set_xlim(0.0, 10.0)
+    w.canvas.ax.set_ylim(0.0, 10.0)
+    w.canvas.toolbar.mode = ""
+
+    # transData.inverted() depends on the figure being drawn at least once,
+    # so render before synthesizing events.
+    w.canvas._mpl_canvas.draw()
+
+    # Capture the data coords corresponding to two display points.
+    tr = w.canvas.ax.transData
+    x0_disp, y0_disp = tr.transform((2.0, 2.0))
+    x1_disp, y1_disp = tr.transform((3.0, 4.0))
+    inv = tr.inverted()
+    dx_data, dy_data = (3.0 - 2.0, 4.0 - 2.0)
+
+    # Middle-button press at display (x0, y0) → pan start.
+    press = SimpleNamespace(inaxes=w.canvas.ax, button=2,
+                            xdata=2.0, ydata=2.0, x=x0_disp, y=y0_disp)
+    w.canvas._handle_click(press)
+    assert w.canvas._pan_origin == (x0_disp, y0_disp)
+
+    # Motion at display (x1, y1) → axes shift by -(dx_data, dy_data).
+    move = SimpleNamespace(inaxes=w.canvas.ax, button=2,
+                           xdata=3.0, ydata=4.0, x=x1_disp, y=y1_disp)
+    w.canvas._handle_motion(move)
+    xl, xr = w.canvas.ax.get_xlim()
+    yb, yt = w.canvas.ax.get_ylim()
+    assert abs(xl - (0.0 - dx_data)) < 1e-6
+    assert abs(xr - (10.0 - dx_data)) < 1e-6
+    assert abs(yb - (0.0 - dy_data)) < 1e-6
+    assert abs(yt - (10.0 - dy_data)) < 1e-6
+
+    # Release clears pan state.
+    release = SimpleNamespace(button=2)
+    w.canvas._handle_release(release)
+    assert w.canvas._pan_origin is None
+
+
 def test_deformed_scale_setting_updates_canvas_and_does_not_resolve(qt_app):
     """View → Deformed scale updates canvas.deformed_scale and redraws
     without re-running the solver."""

@@ -327,7 +327,8 @@ class ModelCanvas(QWidget):
             return
         if event.xdata is None or event.ydata is None:
             return
-        factor = 1.15 if event.button == "up" else 1.0 / 1.15
+        # Scroll up → zoom in (shrink the visible range); scroll down → zoom out.
+        factor = 1.0 / 1.15 if event.button == "up" else 1.15
         xl, xr = self.ax.get_xlim()
         yb, yt = self.ax.get_ylim()
         xd, yd = event.xdata, event.ydata
@@ -755,6 +756,21 @@ class ModelCanvas(QWidget):
             return 0.0
         return float(result.D[emap["rz"]])
 
+    @staticmethod
+    def _hermite_v(
+        r: float, L: float, vi: float, thi: float, vj: float, thj: float,
+    ) -> float:
+        """Cubic-Hermite transverse interpolation in local frame.
+
+        ``r`` is the dimensionless position 0..1 along the element. Returns
+        the transverse displacement v(r) for end DOFs ``[vi, thi, vj, thj]``.
+        """
+        N1 = 1.0 - 3.0 * r * r + 2.0 * r * r * r
+        N2 = L * (r - 2.0 * r * r + r * r * r)
+        N3 = 3.0 * r * r - 2.0 * r * r * r
+        N4 = L * (-r * r + r * r * r)
+        return N1 * vi + N2 * thi + N3 * vj + N4 * thj
+
     def _frame_deformed_points(
         self, elem: FrameElement2D, scale: float,
     ) -> tuple[list[float], list[float]]:
@@ -782,11 +798,7 @@ class ModelCanvas(QWidget):
         for k in range(n):
             r = k / (n - 1)
             u_loc = (1.0 - r) * ui_loc + r * uj_loc
-            N1 = 1.0 - 3.0 * r * r + 2.0 * r * r * r
-            N2 = L * (r - 2.0 * r * r + r * r * r)
-            N3 = 3.0 * r * r - 2.0 * r * r * r
-            N4 = L * (-r * r + r * r * r)
-            v_loc = N1 * vi_loc + N2 * thi + N3 * vj_loc + N4 * thj
+            v_loc = self._hermite_v(r, L, vi_loc, thi, vj_loc, thj)
             x_def = r * L + scale * u_loc
             y_def = scale * v_loc
             Xs.append(ni.x + c * x_def - s * y_def)
@@ -823,11 +835,7 @@ class ModelCanvas(QWidget):
                 continue
             vi, thi, vj, thj = float(d[1]), float(d[2]), float(d[4]), float(d[5])
             for rk in (0.25, 0.5, 0.75):
-                N1 = 1.0 - 3.0 * rk * rk + 2.0 * rk * rk * rk
-                N2 = L * (rk - 2.0 * rk * rk + rk * rk * rk)
-                N3 = 3.0 * rk * rk - 2.0 * rk * rk * rk
-                N4 = L * (-rk * rk + rk * rk * rk)
-                max_disp = max(max_disp, abs(N1 * vi + N2 * thi + N3 * vj + N4 * thj))
+                max_disp = max(max_disp, abs(self._hermite_v(rk, L, vi, thi, vj, thj)))
         if max_disp <= 0:
             return
         scale = self.deformed_scale * 0.10 * span / max_disp
@@ -838,12 +846,9 @@ class ModelCanvas(QWidget):
                 continue
             if isinstance(elem, FrameElement2D):
                 try:
-                    L, _c, _s = elem.length_cos_sin(model.nodes)
+                    Xs, Ys = self._frame_deformed_points(elem, scale)
                 except (ValueError, ZeroDivisionError):
                     continue
-                if L < 1e-12:
-                    continue
-                Xs, Ys = self._frame_deformed_points(elem, scale)
             else:
                 # Truss bar stays straight between displaced endpoints —
                 # rotations don't contribute to a pin-jointed member.
