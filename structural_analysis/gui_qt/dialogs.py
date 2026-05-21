@@ -47,6 +47,13 @@ from ..model import (
     TrussTemperatureLoad,
     UniformDistributedLoad,
 )
+from ..profiles import (
+    MATERIAL_TEMPLATES,
+    SECTION_SHAPES,
+    properties_for_shape,
+)
+
+from PyQt6.QtWidgets import QStackedWidget
 
 
 def parse_float(text: str, name: str, *, allow_blank: bool = False) -> Optional[float]:
@@ -112,8 +119,13 @@ class _ModalDialog(QDialog):
 
 
 class MaterialDialog(_ModalDialog):
-    """Edit a single Material (id, name, E, α). Section properties are
-    edited separately via :class:`SectionDialog`."""
+    """Edit a single Material.
+
+    Adds a "Template" combo that fills E/α/ρ/ν from
+    :data:`structural_analysis.profiles.MATERIAL_TEMPLATES`, a ν
+    (Poisson) field validated to ``0 ≤ ν < 0.5``, and a read-only
+    derived G display (``G = E / (2·(1+ν))``).
+    """
 
     def __init__(self, parent, *, existing: Material | None, default_id: int):
         self._existing = existing
@@ -122,13 +134,31 @@ class MaterialDialog(_ModalDialog):
 
     def _build_body(self, body: QWidget) -> None:
         form = QFormLayout(body)
+
+        # Template combo
+        self._template_combo = QComboBox(body)
+        self._template_combo.addItem("(custom)", "")
+        for key in MATERIAL_TEMPLATES:
+            self._template_combo.addItem(key, key)
+        form.addRow("Template", self._template_combo)
+
         self._entries: dict[str, QLineEdit] = {}
         for label, key in [("ID", "id"), ("Name", "name"),
                            ("E (kN/m²)", "E"), ("α (1/°C)", "alpha"),
-                           ("density (kg/m³)", "density")]:
+                           ("density (kg/m³)", "density"),
+                           ("ν (Poisson)", "nu")]:
             e = QLineEdit(body)
             form.addRow(label, e)
             self._entries[key] = e
+
+        # Read-only derived G
+        self._g_label = QLabel("—", body)
+        form.addRow("G (kN/m²) [derived]", self._g_label)
+
+        # Inline validation message for ν
+        self._nu_status = QLabel("", body)
+        self._nu_status.setStyleSheet("color: #b00;")
+        form.addRow("", self._nu_status)
 
         if self._existing:
             m = self._existing
@@ -138,10 +168,65 @@ class MaterialDialog(_ModalDialog):
             self._entries["E"].setText(repr(m.E))
             self._entries["alpha"].setText(repr(m.alpha))
             self._entries["density"].setText(repr(m.density))
+            self._entries["nu"].setText(repr(m.nu))
+            if m.template:
+                idx = self._template_combo.findData(m.template)
+                if idx >= 0:
+                    self._template_combo.setCurrentIndex(idx)
         else:
             self._entries["id"].setText(str(self._default_id))
             self._entries["alpha"].setText("0.0")
             self._entries["density"].setText("0.0")
+            self._entries["nu"].setText("0.0")
+
+        # Wire updates
+        self._template_combo.currentIndexChanged.connect(self._on_template_changed)
+        self._entries["E"].textChanged.connect(self._refresh_derived)
+        self._entries["nu"].textChanged.connect(self._refresh_derived)
+        self._refresh_derived()
+
+    def _on_template_changed(self) -> None:
+        key = self._template_combo.currentData()
+        if not key:
+            return
+        preset = MATERIAL_TEMPLATES[key]
+        self._entries["name"].setText(str(preset.get("name", key)))
+        self._entries["E"].setText(repr(float(preset["E"])))
+        self._entries["alpha"].setText(repr(float(preset["alpha"])))
+        self._entries["density"].setText(repr(float(preset["density"])))
+        self._entries["nu"].setText(repr(float(preset["nu"])))
+
+    def _refresh_derived(self) -> None:
+        # Compute and display G; also surface ν-range validation.
+        try:
+            E = float(self._entries["E"].text())
+        except ValueError:
+            E = None
+        try:
+            nu = float(self._entries["nu"].text())
+        except ValueError:
+            nu = None
+
+        ok = self._ok_button()
+        if nu is not None and not (0.0 <= nu < 0.5):
+            self._nu_status.setText("ν must be in [0, 0.5).")
+            if ok is not None:
+                ok.setEnabled(False)
+        else:
+            self._nu_status.setText("")
+            if ok is not None:
+                ok.setEnabled(True)
+
+        if E is not None and nu is not None and 0.0 <= nu < 0.5:
+            G = E / (2.0 * (1.0 + nu))
+            self._g_label.setText(f"{G:g}")
+        else:
+            self._g_label.setText("—")
+
+    def _ok_button(self):
+        for child in self.findChildren(QDialogButtonBox):
+            return child.button(QDialogButtonBox.StandardButton.Ok)
+        return None
 
     def _accept(self) -> Material:
         mid = parse_int(self._entries["id"].text(), "Material ID")
@@ -150,15 +235,33 @@ class MaterialDialog(_ModalDialog):
         alpha = parse_float(self._entries["alpha"].text(), "α", allow_blank=True) or 0.0
         density = parse_float(self._entries["density"].text(), "density",
                               allow_blank=True) or 0.0
+        nu = parse_float(self._entries["nu"].text(), "ν", allow_blank=True) or 0.0
         if E <= 0:
             raise ValueError("E must be > 0.")
         if density < 0:
             raise ValueError("density cannot be negative.")
-        return Material(id=mid, name=name, E=E, alpha=alpha, density=density)
+        if not (0.0 <= nu < 0.5):
+            raise ValueError("Poisson's ratio must be in [0, 0.5).")
+        template = self._template_combo.currentData() or ""
+        return Material(id=mid, name=name, E=E, alpha=alpha,
+                        density=density, nu=nu, template=template)
 
 
 class SectionDialog(_ModalDialog):
-    """Edit a single Section (id, name, material_id, A, I, depth)."""
+    """Edit a single Section with a shape wizard.
+
+    The "Shape" combo switches a stacked widget between dimension
+    inputs:
+
+      - manual: A, I, depth, width — user types raw values.
+      - rectangle: b, h drive A/I/depth/width (read-only previews).
+      - square: h drives the rest.
+      - i_section: h/b/tf/tw drive A/I/J/depth/width.
+
+    A "Manual override" button on the shape pages copies the computed
+    values to the manual page and switches the combo, so the user can
+    deviate from the calculator when needed.
+    """
 
     def __init__(self, parent, *,
                  model: StructuralModel,
@@ -185,13 +288,41 @@ class SectionDialog(_ModalDialog):
             self._mat_combo.addItem(label, mid)
         form.addRow("Material", self._mat_combo)
 
-        self._a_entry = QLineEdit(body)
-        self._i_entry = QLineEdit(body)
-        self._d_entry = QLineEdit(body)
-        form.addRow("A (m²)", self._a_entry)
-        form.addRow("I (m⁴)", self._i_entry)
-        form.addRow("depth (m)", self._d_entry)
+        # Shape combo + stacked pages
+        self._shape_combo = QComboBox(body)
+        for s in SECTION_SHAPES:
+            self._shape_combo.addItem(s, s)
+        form.addRow("Shape", self._shape_combo)
 
+        self._stack = QStackedWidget(body)
+        self._page_manual = self._build_manual_page()
+        self._page_rect = self._build_rect_page()
+        self._page_square = self._build_square_page()
+        self._page_i = self._build_i_page()
+        self._stack.addWidget(self._page_manual)   # index 0 — manual
+        self._stack.addWidget(self._page_rect)     # index 1 — rectangle
+        self._stack.addWidget(self._page_square)   # index 2 — square
+        self._stack.addWidget(self._page_i)        # index 3 — i_section
+        form.addRow(self._stack)
+
+        # Storage-only J note
+        note = QLabel(
+            "J (torsion constant) is storage-only — the current 2D "
+            "solver does not use it. Rectangle and square shapes leave "
+            "J = 0; I-section provides an approximate thin-walled value "
+            "for future 3D / reporting use.",
+            body,
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555; font-size: 10px;")
+        form.addRow(note)
+
+        # Status label for live calculator validation errors
+        self._status = QLabel("", body)
+        self._status.setStyleSheet("color: #b00;")
+        form.addRow(self._status)
+
+        # Initialise from existing section if any
         if self._existing:
             s = self._existing
             self._id_entry.setText(str(s.id))
@@ -200,12 +331,176 @@ class SectionDialog(_ModalDialog):
             idx = self._mat_combo.findData(s.material_id)
             if idx >= 0:
                 self._mat_combo.setCurrentIndex(idx)
+            shape_idx = self._shape_combo.findData(s.shape_type or "manual")
+            if shape_idx >= 0:
+                self._shape_combo.setCurrentIndex(shape_idx)
+            self._stack.setCurrentIndex(shape_idx if shape_idx >= 0 else 0)
+            # Populate the relevant page
             self._a_entry.setText(repr(s.A))
             self._i_entry.setText(repr(s.I))
             self._d_entry.setText(repr(s.depth))
+            self._w_entry.setText(repr(s.width))
+            self._rect_b.setText(repr(s.b or 0.0))
+            self._rect_h.setText(repr(s.h or 0.0))
+            self._sq_h.setText(repr(s.h or 0.0))
+            self._i_h.setText(repr(s.h or 0.0))
+            self._i_b.setText(repr(s.b or 0.0))
+            self._i_tf.setText(repr(s.tf or 0.0))
+            self._i_tw.setText(repr(s.tw or 0.0))
         else:
             self._id_entry.setText(str(self._default_id))
             self._d_entry.setText("0.0")
+            self._w_entry.setText("0.0")
+
+        self._shape_combo.currentIndexChanged.connect(self._on_shape_changed)
+        self._refresh_preview()
+
+    # ── page builders ──
+
+    def _build_manual_page(self) -> QWidget:
+        page = QWidget()
+        form = QFormLayout(page)
+        self._a_entry = QLineEdit(page)
+        self._i_entry = QLineEdit(page)
+        self._d_entry = QLineEdit(page)
+        self._w_entry = QLineEdit(page)
+        form.addRow("A (m²)", self._a_entry)
+        form.addRow("I (m⁴)", self._i_entry)
+        form.addRow("depth (m)", self._d_entry)
+        form.addRow("width (m)", self._w_entry)
+        return page
+
+    def _build_rect_page(self) -> QWidget:
+        page = QWidget()
+        form = QFormLayout(page)
+        self._rect_b = QLineEdit(page)
+        self._rect_h = QLineEdit(page)
+        form.addRow("b — width (m)", self._rect_b)
+        form.addRow("h — depth (m)", self._rect_h)
+        self._rect_preview = QLabel("—", page)
+        form.addRow("Derived", self._rect_preview)
+        btn = QPushButton("↻ Manual override", page)
+        btn.clicked.connect(self._copy_to_manual)
+        form.addRow(btn)
+        self._rect_b.textChanged.connect(self._refresh_preview)
+        self._rect_h.textChanged.connect(self._refresh_preview)
+        return page
+
+    def _build_square_page(self) -> QWidget:
+        page = QWidget()
+        form = QFormLayout(page)
+        self._sq_h = QLineEdit(page)
+        form.addRow("h — side (m)", self._sq_h)
+        self._sq_preview = QLabel("—", page)
+        form.addRow("Derived", self._sq_preview)
+        btn = QPushButton("↻ Manual override", page)
+        btn.clicked.connect(self._copy_to_manual)
+        form.addRow(btn)
+        self._sq_h.textChanged.connect(self._refresh_preview)
+        return page
+
+    def _build_i_page(self) -> QWidget:
+        page = QWidget()
+        form = QFormLayout(page)
+        self._i_h = QLineEdit(page)
+        self._i_b = QLineEdit(page)
+        self._i_tf = QLineEdit(page)
+        self._i_tw = QLineEdit(page)
+        form.addRow("h — depth (m)", self._i_h)
+        form.addRow("b — flange width (m)", self._i_b)
+        form.addRow("tf — flange thickness (m)", self._i_tf)
+        form.addRow("tw — web thickness (m)", self._i_tw)
+        self._i_preview = QLabel("—", page)
+        form.addRow("Derived", self._i_preview)
+        btn = QPushButton("↻ Manual override", page)
+        btn.clicked.connect(self._copy_to_manual)
+        form.addRow(btn)
+        for w in (self._i_h, self._i_b, self._i_tf, self._i_tw):
+            w.textChanged.connect(self._refresh_preview)
+        return page
+
+    # ── interaction ──
+
+    def _on_shape_changed(self) -> None:
+        self._stack.setCurrentIndex(self._shape_combo.currentIndex())
+        self._refresh_preview()
+
+    def _current_shape(self) -> str:
+        return self._shape_combo.currentData() or "manual"
+
+    def _ok_button(self):
+        for child in self.findChildren(QDialogButtonBox):
+            return child.button(QDialogButtonBox.StandardButton.Ok)
+        return None
+
+    def _compute_derived(self) -> dict[str, float] | None:
+        """Try to compute A/I/depth/width(/J) for the selected shape.
+
+        Returns the dict on success, None when input is incomplete or
+        invalid. Side-effect: updates self._status with the error
+        message (cleared on success).
+        """
+        shape = self._current_shape()
+        try:
+            if shape == "rectangle":
+                b = float(self._rect_b.text() or "0")
+                h = float(self._rect_h.text() or "0")
+                return properties_for_shape("rectangle", b=b, h=h)
+            if shape == "square":
+                h = float(self._sq_h.text() or "0")
+                return properties_for_shape("square", h=h)
+            if shape == "i_section":
+                h = float(self._i_h.text() or "0")
+                b = float(self._i_b.text() or "0")
+                tf = float(self._i_tf.text() or "0")
+                tw = float(self._i_tw.text() or "0")
+                return properties_for_shape(
+                    "i_section", h=h, b=b, tf=tf, tw=tw,
+                )
+        except ValueError as e:
+            self._status.setText(str(e))
+            return None
+        return None
+
+    def _refresh_preview(self) -> None:
+        shape = self._current_shape()
+        ok = self._ok_button()
+        if shape == "manual":
+            self._status.setText("")
+            if ok is not None:
+                ok.setEnabled(True)
+            return
+        derived = self._compute_derived()
+        if derived is None:
+            if ok is not None:
+                ok.setEnabled(False)
+            return
+        self._status.setText("")
+        if ok is not None:
+            ok.setEnabled(True)
+        text = (f"A = {derived['A']:g}  I = {derived['I']:g}\n"
+                f"depth = {derived['depth']:g}  width = {derived['width']:g}"
+                f"  J = {derived.get('J', 0.0):g}")
+        if shape == "rectangle":
+            self._rect_preview.setText(text)
+        elif shape == "square":
+            self._sq_preview.setText(text)
+        elif shape == "i_section":
+            self._i_preview.setText(text)
+
+    def _copy_to_manual(self) -> None:
+        derived = self._compute_derived()
+        if derived is None:
+            return
+        self._a_entry.setText(repr(derived["A"]))
+        self._i_entry.setText(repr(derived["I"]))
+        self._d_entry.setText(repr(derived["depth"]))
+        self._w_entry.setText(repr(derived["width"]))
+        idx = self._shape_combo.findData("manual")
+        if idx >= 0:
+            self._shape_combo.setCurrentIndex(idx)
+
+    # ── accept ──
 
     def _accept(self) -> Section:
         sid = parse_int(self._id_entry.text(), "Section ID")
@@ -213,15 +508,52 @@ class SectionDialog(_ModalDialog):
         material_id = self._mat_combo.currentData()
         if material_id not in self._model.materials:
             raise ValueError(f"Material {material_id} does not exist.")
-        A = parse_float(self._a_entry.text(), "A")
-        I = parse_float(self._i_entry.text(), "I")
-        depth = parse_float(self._d_entry.text(), "depth", allow_blank=True) or 0.0
-        if A <= 0:
-            raise ValueError("A must be > 0.")
-        if I < 0:
-            raise ValueError("I cannot be negative.")
-        return Section(id=sid, name=name, material_id=int(material_id),
-                       A=A, I=I, depth=depth)
+        shape = self._current_shape()
+
+        if shape == "manual":
+            A = parse_float(self._a_entry.text(), "A")
+            I = parse_float(self._i_entry.text(), "I")
+            depth = parse_float(self._d_entry.text(), "depth",
+                                 allow_blank=True) or 0.0
+            width = parse_float(self._w_entry.text(), "width",
+                                 allow_blank=True) or 0.0
+            if A <= 0:
+                raise ValueError("A must be > 0.")
+            if I < 0:
+                raise ValueError("I cannot be negative.")
+            return Section(
+                id=sid, name=name, material_id=int(material_id),
+                A=A, I=I, depth=depth, width=width,
+                J=0.0, shape_type="manual",
+            )
+
+        # Shape-driven path
+        derived = self._compute_derived()
+        if derived is None:
+            raise ValueError(
+                "Cross-section dimensions are incomplete or invalid; "
+                "see the preview area."
+            )
+        b = h = tf = tw = 0.0
+        if shape == "rectangle":
+            b = float(self._rect_b.text() or "0")
+            h = float(self._rect_h.text() or "0")
+        elif shape == "square":
+            h = float(self._sq_h.text() or "0")
+            b = h
+        elif shape == "i_section":
+            h = float(self._i_h.text() or "0")
+            b = float(self._i_b.text() or "0")
+            tf = float(self._i_tf.text() or "0")
+            tw = float(self._i_tw.text() or "0")
+        return Section(
+            id=sid, name=name, material_id=int(material_id),
+            A=derived["A"], I=derived["I"],
+            depth=derived["depth"], width=derived["width"],
+            J=derived.get("J", 0.0),
+            shape_type=shape,
+            b=b, h=h, tf=tf, tw=tw,
+        )
 
 
 # ── element properties ──
@@ -693,7 +1025,8 @@ class MaterialListDialog(_ModalDialog):
         ml = QVBoxLayout(mat_page)
         self._mat_tree = QTreeWidget(mat_page)
         self._mat_tree.setHeaderLabels(
-            ["id", "name", "E (kN/m²)", "α (1/°C)", "ρ (kg/m³)"]
+            ["id", "name", "E (kN/m²)", "α (1/°C)", "ρ (kg/m³)",
+             "ν", "G (derived)"]
         )
         self._mat_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         ml.addWidget(self._mat_tree)
@@ -713,7 +1046,8 @@ class MaterialListDialog(_ModalDialog):
         sl = QVBoxLayout(sec_page)
         self._sec_tree = QTreeWidget(sec_page)
         self._sec_tree.setHeaderLabels(
-            ["id", "name", "material", "A (m²)", "I (m⁴)", "depth (m)"]
+            ["id", "name", "material", "A (m²)", "I (m⁴)", "depth (m)",
+             "width (m)", "shape"]
         )
         self._sec_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         sl.addWidget(self._sec_tree)
@@ -736,7 +1070,7 @@ class MaterialListDialog(_ModalDialog):
             m = self._model.materials[mid]
             QTreeWidgetItem(self._mat_tree, [
                 str(m.id), m.name, f"{m.E:g}", f"{m.alpha:g}",
-                f"{m.density:g}",
+                f"{m.density:g}", f"{m.nu:g}", f"{m.G:g}",
             ])
         self._sec_tree.clear()
         for sid in sorted(self._model.sections):
@@ -744,6 +1078,7 @@ class MaterialListDialog(_ModalDialog):
             QTreeWidgetItem(self._sec_tree, [
                 str(s.id), s.name, str(s.material_id),
                 f"{s.A:g}", f"{s.I:g}", f"{s.depth:g}",
+                f"{s.width:g}", s.shape_type,
             ])
 
     def _selected_id(self, tree: QTreeWidget) -> int | None:

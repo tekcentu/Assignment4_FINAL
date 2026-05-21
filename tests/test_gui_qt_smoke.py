@@ -638,3 +638,79 @@ def test_canvas_middle_click_does_not_trigger_tools(qt_app):
     )
     w.canvas._handle_click(ev)
     assert received == []
+
+
+# ── Section/profile dialog wizard ──────────────────────────────
+
+
+def test_material_dialog_template_populates_fields(qt_app):
+    """Picking a non-custom template fills E, α, ρ, ν from the preset."""
+    from structural_analysis.gui_qt.dialogs import MaterialDialog
+    from structural_analysis.profiles import MATERIAL_TEMPLATES
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = MaterialDialog(w, existing=None, default_id=1)
+    idx = d._template_combo.findData("Steel_S275")
+    assert idx > 0, "Steel_S275 should be selectable"
+    d._template_combo.setCurrentIndex(idx)
+
+    preset = MATERIAL_TEMPLATES["Steel_S275"]
+    assert float(d._entries["E"].text()) == pytest.approx(preset["E"])
+    assert float(d._entries["alpha"].text()) == pytest.approx(preset["alpha"])
+    assert float(d._entries["density"].text()) == pytest.approx(preset["density"])
+    assert float(d._entries["nu"].text()) == pytest.approx(preset["nu"])
+    # The derived-G label refreshes immediately.
+    assert d._g_label.text() != "—"
+
+
+def test_section_dialog_rectangle_computes_properties(qt_app):
+    """Selecting rectangle and entering b/h yields a Section with the
+    expected A, I, depth, width, and shape_type."""
+    from structural_analysis.gui_qt.dialogs import SectionDialog
+    from structural_analysis.model import Material, StructuralModel
+
+    model = StructuralModel()
+    model.materials[1] = Material(id=1, name="Steel", E=2.10e8)
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = SectionDialog(w, model=model, existing=None, default_id=1)
+    idx = d._shape_combo.findData("rectangle")
+    d._shape_combo.setCurrentIndex(idx)
+    d._rect_b.setText("0.3")
+    d._rect_h.setText("0.5")
+
+    section = d._accept()
+    assert section.shape_type == "rectangle"
+    assert section.A == pytest.approx(0.15)
+    assert section.I == pytest.approx(0.3 * 0.5 ** 3 / 12.0)
+    assert section.depth == pytest.approx(0.5)
+    assert section.width == pytest.approx(0.3)
+    assert section.b == pytest.approx(0.3)
+    assert section.h == pytest.approx(0.5)
+
+
+def test_section_dialog_i_section_validation_disables_ok(qt_app):
+    """An invalid I-section (h ≤ 2·tf) disables OK and shows a status
+    message — the dialog never lets the user accept a broken shape."""
+    from structural_analysis.gui_qt.dialogs import SectionDialog
+    from structural_analysis.model import Material, StructuralModel
+
+    model = StructuralModel()
+    model.materials[1] = Material(id=1, name="Steel", E=2.10e8)
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = SectionDialog(w, model=model, existing=None, default_id=1)
+    idx = d._shape_combo.findData("i_section")
+    d._shape_combo.setCurrentIndex(idx)
+    # h <= 2·tf → calculator raises, OK disabled
+    d._i_h.setText("0.01")
+    d._i_b.setText("0.1")
+    d._i_tf.setText("0.02")
+    d._i_tw.setText("0.005")
+
+    ok = d._ok_button()
+    assert ok is not None and not ok.isEnabled()
+    assert d._status.text(), "status label should describe the error"
