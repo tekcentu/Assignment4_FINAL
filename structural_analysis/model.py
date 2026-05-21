@@ -50,6 +50,11 @@ class Material:
             for elements whose material carries density = 0). The unit
             conversion to the kN-m-s consistent system used by the static
             solver is done inside :mod:`structural_analysis.mass`.
+        nu: Poisson's ratio. Default 0.0. Used to derive G via the standard
+            isotropic identity ``G = E / (2 * (1 + nu))``. Not consumed by
+            the 2D solver yet — stored for future 3D / torsion features.
+        template: Optional name of the preset (e.g. ``"Steel_S275"``) that
+            populated this material's defaults. Free-form string.
     """
 
     id: int
@@ -57,11 +62,28 @@ class Material:
     E: float = 0.0
     alpha: float = 0.0
     density: float = 0.0
+    nu: float = 0.0
+    template: str = ""
+
+    @property
+    def G(self) -> float:
+        """Shear modulus, derived from E and ν.
+
+        Computed always — when ν = 0 this returns ``E / 2`` (the correct
+        isotropic identity at ν = 0, not a special case).
+        """
+        return self.E / (2.0 * (1.0 + self.nu))
 
 
 @dataclass(frozen=True)
 class Section:
     """Cross-section properties, pointing back to a material.
+
+    The original 2D solver only needs ``A``, ``I``, and ``depth`` (for
+    thermal-gradient curvature). The remaining fields (``width``, ``J``,
+    and the shape wizard data) are stored so that a section can record
+    *how* its A and I were derived (e.g. "this is a 300 × 500 mm
+    rectangle"). They are not consumed by the current solver.
 
     Attributes:
         id: Section identifier.
@@ -71,6 +93,21 @@ class Section:
         I: Moment of inertia (m⁴).
         depth: Section depth (m), used for frame thermal-gradient curvature.
             Default 0 (required only if a thermal gradient is applied).
+        width: Section width (m). Storage-only for now.
+        J: Torsion constant (m⁴). Storage-only — the 2D solver does not
+            consume it. Rectangle / square shapes leave this at 0 by
+            design; I-section provides an approximate thin-walled value
+            for future 3D / reporting use.
+        shape_type: One of ``"manual"``, ``"rectangle"``, ``"square"``,
+            ``"i_section"``. Records which dialog page produced the
+            section. ``"manual"`` means the user entered A/I/depth/width
+            directly without going through a shape calculator.
+        b, h, tf, tw: Raw dimensions used by the shape calculator (m).
+            Their meaning depends on ``shape_type``:
+              - rectangle/square: b = width, h = depth
+              - i_section: b = flange width, h = overall depth,
+                tf = flange thickness, tw = web thickness
+            All default to 0.0 for ``shape_type="manual"``.
     """
 
     id: int
@@ -79,6 +116,13 @@ class Section:
     A: float = 0.0
     I: float = 0.0
     depth: float = 0.0
+    width: float = 0.0
+    J: float = 0.0
+    shape_type: str = "manual"
+    b: float = 0.0
+    h: float = 0.0
+    tf: float = 0.0
+    tw: float = 0.0
 
 
 # ── Supports ───────────────────────────────────────────────────
