@@ -194,36 +194,57 @@ class MaterialDialog(_ModalDialog):
         self._entries["nu"].setText(repr(float(preset["nu"])))
 
     def _refresh_derived(self) -> None:
-        # Compute and display G; also surface ν-range validation.
+        # Compute G and gate the OK button. Rules:
+        #   - E must parse and be > 0 to enable OK.
+        #   - ν empty is fine (defaults to 0 on _accept); a non-empty ν
+        #     must parse AND lie in [0, 0.5).
+        e_text = self._entries["E"].text().strip()
+        nu_text = self._entries["nu"].text().strip()
+
+        E: float | None
         try:
-            E = float(self._entries["E"].text())
+            E = float(e_text) if e_text else None
         except ValueError:
             E = None
-        try:
-            nu = float(self._entries["nu"].text())
-        except ValueError:
-            nu = None
+        e_ok = E is not None and E > 0.0
 
-        ok = self._ok_button()
-        if nu is not None and not (0.0 <= nu < 0.5):
+        nu: float | None
+        if not nu_text:
+            nu = 0.0
+            nu_ok = True
+        else:
+            try:
+                nu = float(nu_text)
+            except ValueError:
+                nu = None
+                nu_ok = False
+            else:
+                nu_ok = 0.0 <= nu < 0.5
+
+        if not nu_ok and nu_text:
             self._nu_status.setText("ν must be in [0, 0.5).")
-            if ok is not None:
-                ok.setEnabled(False)
         else:
             self._nu_status.setText("")
-            if ok is not None:
-                ok.setEnabled(True)
 
-        if E is not None and nu is not None and 0.0 <= nu < 0.5:
-            G = E / (2.0 * (1.0 + nu))
-            self._g_label.setText(f"{G:g}")
+        ok = self._ok_button()
+        if ok is not None:
+            ok.setEnabled(e_ok and nu_ok)
+
+        if e_ok and nu_ok and nu is not None:
+            self._g_label.setText(f"{E / (2.0 * (1.0 + nu)):g}")
         else:
             self._g_label.setText("—")
 
     def _ok_button(self):
-        for child in self.findChildren(QDialogButtonBox):
-            return child.button(QDialogButtonBox.StandardButton.Ok)
-        return None
+        # findChildren walks the widget tree; cache the result since
+        # _refresh_derived runs on every keystroke in E or ν.
+        if not hasattr(self, "_cached_ok_button"):
+            cached = None
+            for child in self.findChildren(QDialogButtonBox):
+                cached = child.button(QDialogButtonBox.StandardButton.Ok)
+                break
+            self._cached_ok_button = cached
+        return self._cached_ok_button
 
     def _accept(self) -> Material:
         mid = parse_int(self._entries["id"].text(), "Material ID")
@@ -292,14 +313,22 @@ class SectionDialog(_ModalDialog):
         form.addRow("Shape", self._shape_combo)
 
         self._stack = QStackedWidget(body)
-        self._page_manual = self._build_manual_page()
-        self._page_rect = self._build_rect_page()
-        self._page_square = self._build_square_page()
-        self._page_i = self._build_i_page()
-        self._stack.addWidget(self._page_manual)   # index 0 — manual
-        self._stack.addWidget(self._page_rect)     # index 1 — rectangle
-        self._stack.addWidget(self._page_square)   # index 2 — square
-        self._stack.addWidget(self._page_i)        # index 3 — i_section
+        # Explicit shape_type → stack-page-index map so the dialog
+        # doesn't silently break if SECTION_SHAPES is reordered or a
+        # new shape is appended in a different position.
+        self._page_index: dict[str, int] = {}
+        self._page_index["manual"] = self._stack.addWidget(
+            self._build_manual_page()
+        )
+        self._page_index["rectangle"] = self._stack.addWidget(
+            self._build_rect_page()
+        )
+        self._page_index["square"] = self._stack.addWidget(
+            self._build_square_page()
+        )
+        self._page_index["i_section"] = self._stack.addWidget(
+            self._build_i_page()
+        )
         form.addRow(self._stack)
 
         # Storage-only J note
@@ -328,10 +357,11 @@ class SectionDialog(_ModalDialog):
             idx = self._mat_combo.findData(s.material_id)
             if idx >= 0:
                 self._mat_combo.setCurrentIndex(idx)
-            shape_idx = self._shape_combo.findData(s.shape_type or "manual")
+            shape_key = s.shape_type or "manual"
+            shape_idx = self._shape_combo.findData(shape_key)
             if shape_idx >= 0:
                 self._shape_combo.setCurrentIndex(shape_idx)
-            self._stack.setCurrentIndex(shape_idx if shape_idx >= 0 else 0)
+            self._stack.setCurrentIndex(self._page_index.get(shape_key, 0))
             # Populate the relevant page
             self._a_entry.setText(repr(s.A))
             self._i_entry.setText(repr(s.I))
@@ -419,15 +449,25 @@ class SectionDialog(_ModalDialog):
     # ── interaction ──
 
     def _on_shape_changed(self) -> None:
-        self._stack.setCurrentIndex(self._shape_combo.currentIndex())
+        shape = self._current_shape()
+        self._stack.setCurrentIndex(self._page_index.get(shape, 0))
         self._refresh_preview()
 
     def _current_shape(self) -> str:
         return self._shape_combo.currentData() or "manual"
 
     def _ok_button(self):
+        # Cache once found. The button box is added AFTER _build_body
+        # runs, so the first calls (during construction) return None;
+        # cache only positive lookups so we re-search until it exists.
+        cached = getattr(self, "_cached_ok_button", None)
+        if cached is not None:
+            return cached
         for child in self.findChildren(QDialogButtonBox):
-            return child.button(QDialogButtonBox.StandardButton.Ok)
+            btn = child.button(QDialogButtonBox.StandardButton.Ok)
+            if btn is not None:
+                self._cached_ok_button = btn
+                return btn
         return None
 
     def _compute_derived(self) -> dict[str, float] | None:
@@ -533,16 +573,16 @@ class SectionDialog(_ModalDialog):
             )
         b = h = tf = tw = 0.0
         if shape == "rectangle":
-            b = float(self._rect_b.text() or "0")
-            h = float(self._rect_h.text() or "0")
+            b = parse_float(self._rect_b.text(), "b", allow_blank=True) or 0.0
+            h = parse_float(self._rect_h.text(), "h", allow_blank=True) or 0.0
         elif shape == "square":
-            h = float(self._sq_h.text() or "0")
+            h = parse_float(self._sq_h.text(), "h", allow_blank=True) or 0.0
             b = h
         elif shape == "i_section":
-            h = float(self._i_h.text() or "0")
-            b = float(self._i_b.text() or "0")
-            tf = float(self._i_tf.text() or "0")
-            tw = float(self._i_tw.text() or "0")
+            h = parse_float(self._i_h.text(), "h", allow_blank=True) or 0.0
+            b = parse_float(self._i_b.text(), "b", allow_blank=True) or 0.0
+            tf = parse_float(self._i_tf.text(), "tf", allow_blank=True) or 0.0
+            tw = parse_float(self._i_tw.text(), "tw", allow_blank=True) or 0.0
         return Section(
             id=sid, name=name, material_id=int(material_id),
             A=derived["A"], I=derived["I"],

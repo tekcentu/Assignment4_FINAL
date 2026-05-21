@@ -203,11 +203,35 @@ def test_round_trip_txt_legacy_unchanged_when_no_new_fields(tmp_path):
     p = tmp_path / "plain.txt"
     write_input_file(m, str(p))
     text = p.read_text()
-    # No "key=value" tokens should appear on MATERIALS/SECTIONS rows
-    # when all new fields are at default.
+    # No "key=value" tokens should appear on MATERIALS / SECTIONS rows
+    # when all new fields are at default. Identify rows structurally:
+    # walk the file, remember the current block header, and assert no
+    # data row inside MATERIALS or SECTIONS contains an '=' token.
+    block: str | None = None
+    data_rows_seen = 0
     for line in text.splitlines():
-        if line.startswith(("1  2.1e+08", "1  1  0.15")):
-            assert "=" not in line, f"unexpected kwarg in: {line!r}"
+        stripped = line.strip()
+        if not stripped:
+            block = None
+            continue
+        header = stripped.split()[0].upper()
+        if header in ("MATERIALS", "SECTIONS"):
+            block = header
+            continue
+        if header in ("TITLE", "NODES", "ELEMENTS", "SUPPORTS", "LOADS",
+                      "MEMBER_UDL", "MEMBER_POINT_LOADS",
+                      "TRUSS_TEMPERATURE", "FRAME_TEMPERATURE"):
+            block = None
+            continue
+        if block in ("MATERIALS", "SECTIONS"):
+            data_rows_seen += 1
+            assert "=" not in line, (
+                f"{block} row unexpectedly carries kwargs: {line!r}"
+            )
+    assert data_rows_seen >= 2, (
+        "regression guard didn't find any MATERIALS or SECTIONS rows — "
+        "the assertion would silently pass; file was:\n" + text
+    )
 
 
 def test_unknown_kwarg_raises(tmp_path):
@@ -223,6 +247,54 @@ def test_unknown_kwarg_raises(tmp_path):
     )
     with pytest.raises(ValueError, match="bogus"):
         read_input_file(str(p))
+
+
+def test_loaded_nu_out_of_range_raises(tmp_path):
+    """A file with nu outside [0, 0.5) must fail to load — the same
+    invariant the GUI enforces."""
+    from structural_analysis.file_io import read_input_file
+
+    p = tmp_path / "bad_nu.txt"
+    p.write_text(
+        "TITLE\nT\n\n"
+        "NODES 2\n1 0 0\n2 1 0\n\n"
+        "MATERIALS 1\n1 2.1e8 1.2e-5 0 Steel nu=-0.1\n\n"
+        "SECTIONS 1\n1 1 0.1 1e-4 0.2 Name\n\n"
+        "ELEMENTS 1\n1 1 2 1 FRAME\n"
+    )
+    with pytest.raises(ValueError, match=r"nu"):
+        read_input_file(str(p))
+
+
+def test_material_G_rejects_invalid_nu():
+    """Material.G must raise (not silently divide by zero) when nu has
+    been pushed outside the allowed range by something bypassing the
+    normal validation paths."""
+    m = Material(id=1, E=2.10e8, nu=-1.0)
+    with pytest.raises(ValueError, match=r"\[0, 0\.5\)"):
+        _ = m.G
+
+
+def test_writer_rejects_template_with_whitespace(tmp_path):
+    """Template is stored as a single whitespace-delimited token; the
+    writer must refuse to emit a value that would split on reload."""
+    from structural_analysis.gui_common.file_writer import write_input_file
+    from structural_analysis.model import StructuralModel, Node
+    from structural_analysis.element import FrameElement2D
+
+    m = StructuralModel()
+    m.title = "T"
+    m.nodes[1] = Node(1, 0.0, 0.0)
+    m.nodes[2] = Node(2, 1.0, 0.0)
+    m.materials[1] = Material(
+        id=1, name="Steel", E=2.10e8, template="Has Whitespace",
+    )
+    m.sections[1] = Section(id=1, material_id=1, A=0.1, I=1e-4, depth=0.2)
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.10e8, A=0.1, I=1e-4, section_id=1,
+    ))
+    with pytest.raises(ValueError, match="template"):
+        write_input_file(m, str(tmp_path / "bad.txt"))
 
 
 def test_round_trip_spa_json_with_new_fields(tmp_path):
