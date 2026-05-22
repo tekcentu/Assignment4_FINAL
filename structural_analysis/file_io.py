@@ -7,12 +7,83 @@ Creates Element2D subclass instances (FrameElement2D / TrussElement2D).
 
 from __future__ import annotations
 
+import dataclasses
+
 from .model import (
     StructuralModel, Node, Material, Section, Support, NodalLoad,
     UniformDistributedLoad, PointLoad,
     TrussTemperatureLoad, FrameTemperatureLoad,
 )
 from .element import FrameElement2D, TrussElement2D
+
+
+# Whitelisted trailing key=value tokens on MATERIALS / SECTIONS rows.
+# Anything outside these maps raises ValueError so typos surface.
+_MATERIAL_KWARG_TYPES: dict[str, type] = {"nu": float, "template": str}
+_SECTION_KWARG_TYPES: dict[str, type] = {
+    "width": float, "J": float,
+    "shape": str,        # alias → shape_type
+    "shape_type": str,
+    "b": float, "h": float, "tf": float, "tw": float,
+}
+
+
+def _split_kwargs(parts: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Separate positional tokens from trailing ``key=value`` tokens.
+
+    A ``key=value`` token is any token that contains ``=`` and starts
+    with an ASCII letter (matches ``str.isalpha`` on the first char).
+    Underscore-prefixed keys are intentionally not accepted — every
+    whitelisted kwarg starts with a letter. Positional ordering of
+    non-kwarg tokens is preserved.
+    """
+    positional: list[str] = []
+    kwargs: dict[str, str] = {}
+    for tok in parts:
+        if "=" in tok and tok[:1].isalpha():
+            key, _, value = tok.partition("=")
+            kwargs[key] = value
+        else:
+            positional.append(tok)
+    return positional, kwargs
+
+
+def _typed_kwargs(
+    raw: dict[str, str],
+    whitelist: dict[str, type],
+    row_kind: str,
+    obj_id: int,
+) -> dict[str, object]:
+    """Coerce raw string kwargs to declared types; reject unknown keys."""
+    typed: dict[str, object] = {}
+    for k, v in raw.items():
+        if k not in whitelist:
+            raise ValueError(
+                f"Unknown key {k!r} in {row_kind} row for id {obj_id}. "
+                f"Allowed: {sorted(whitelist)}."
+            )
+        caster = whitelist[k]
+        try:
+            typed[k] = caster(v)
+        except ValueError:
+            raise ValueError(
+                f"{row_kind} row for id {obj_id}: cannot parse "
+                f"{k}={v!r} as {caster.__name__}."
+            )
+    # Alias: "shape" → "shape_type"
+    if "shape" in typed:
+        typed["shape_type"] = typed.pop("shape")
+    # Material.G = E / (2 * (1 + nu)) — reject nu values that would make
+    # the formula undefined or unphysical. Match the GUI invariant so a
+    # hand-edited file can't slip past validation.
+    if row_kind == "MATERIALS" and "nu" in typed:
+        nu = typed["nu"]
+        if not (0.0 <= nu < 0.5):
+            raise ValueError(
+                f"MATERIALS row for id {obj_id}: nu={nu!r} is outside "
+                "the allowed range [0, 0.5)."
+            )
+    return typed
 
 
 def read_input_file(filepath: str) -> StructuralModel:
@@ -83,6 +154,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                 while i < len(lines) and (not lines[i] or lines[i].startswith("#")):
                     i += 1
                 parts = lines[i].split("#")[0].split()
+                parts, mat_kwargs = _split_kwargs(parts)
                 mid = int(parts[0])
                 if has_sections_block:
                     # New shape: id  E  <alpha>  <density>  [name]
@@ -117,9 +189,16 @@ def read_input_file(filepath: str) -> StructuralModel:
                             density = 0.0
                             name_start = 3
                     name = parts[name_start] if len(parts) > name_start else ""
-                    model.materials[mid] = Material(id=mid, name=name,
-                                                    E=E_val, alpha=alpha,
-                                                    density=density)
+                    mat = Material(id=mid, name=name,
+                                    E=E_val, alpha=alpha,
+                                    density=density)
+                    if mat_kwargs:
+                        mat = dataclasses.replace(
+                            mat,
+                            **_typed_kwargs(mat_kwargs, _MATERIAL_KWARG_TYPES,
+                                            "MATERIALS", mid),
+                        )
+                    model.materials[mid] = mat
                 else:
                     # Legacy shape: id  A  I  E  [alpha]  [depth]
                     # Synthesise a 1:1 Material+Section pair so existing
@@ -129,7 +208,14 @@ def read_input_file(filepath: str) -> StructuralModel:
                     E_val = float(parts[3])
                     alpha = float(parts[4]) if len(parts) > 4 else 0.0
                     depth = float(parts[5]) if len(parts) > 5 else 0.0
-                    model.materials[mid] = Material(id=mid, E=E_val, alpha=alpha)
+                    mat = Material(id=mid, E=E_val, alpha=alpha)
+                    if mat_kwargs:
+                        mat = dataclasses.replace(
+                            mat,
+                            **_typed_kwargs(mat_kwargs, _MATERIAL_KWARG_TYPES,
+                                            "MATERIALS", mid),
+                        )
+                    model.materials[mid] = mat
                     model.sections[mid] = Section(
                         id=mid, material_id=mid,
                         A=A_val, I=I_val, depth=depth,
@@ -142,16 +228,24 @@ def read_input_file(filepath: str) -> StructuralModel:
                 while i < len(lines) and (not lines[i] or lines[i].startswith("#")):
                     i += 1
                 parts = lines[i].split("#")[0].split()
+                parts, sec_kwargs = _split_kwargs(parts)
                 sid = int(parts[0])
                 material_id = int(parts[1])
                 A_val = float(parts[2])
                 I_val = float(parts[3])
                 depth = float(parts[4]) if len(parts) > 4 else 0.0
                 name = parts[5] if len(parts) > 5 else ""
-                model.sections[sid] = Section(
+                sec = Section(
                     id=sid, name=name, material_id=material_id,
                     A=A_val, I=I_val, depth=depth,
                 )
+                if sec_kwargs:
+                    sec = dataclasses.replace(
+                        sec,
+                        **_typed_kwargs(sec_kwargs, _SECTION_KWARG_TYPES,
+                                        "SECTIONS", sid),
+                    )
+                model.sections[sid] = sec
 
         elif keyword == "ELEMENTS":
             count = int(tokens[1])

@@ -61,7 +61,7 @@ def write_input_file(model: StructuralModel, path: str) -> None:
         out.append(f"{nid}  {_fmt(n.x)}  {_fmt(n.y)}")
     out.append("")
 
-    # MATERIALS (new shape): id  E  alpha  density  [name]
+    # MATERIALS (new shape): id  E  alpha  density  [name]  [key=value ...]
     mat_ids = sorted(model.materials)
     out.append(f"MATERIALS {len(mat_ids)}")
     for mid in mat_ids:
@@ -70,10 +70,26 @@ def write_input_file(model: StructuralModel, path: str) -> None:
         line = f"{mid}  {_fmt(m.E)}  {_fmt(m.alpha)}  {_fmt(m.density)}"
         if m.name:
             line += f"  {m.name}"
+        # Trailing key=value tokens. Only emitted when non-default so
+        # legacy round-trips stay byte-identical.
+        if m.nu != 0.0:
+            line += f"  nu={_fmt(m.nu)}"
+        if m.template:
+            # Template is stored unquoted as a single whitespace-delimited
+            # token; reject embedded whitespace so the reload can't split
+            # the value across multiple positional tokens.
+            if any(ch.isspace() for ch in m.template):
+                raise ValueError(
+                    f"Material {mid} template {m.template!r} contains "
+                    "whitespace; the input-file format stores it as a "
+                    "single token. Rename the template (underscores or "
+                    "hyphens) before saving."
+                )
+            line += f"  template={m.template}"
         out.append(line)
     out.append("")
 
-    # SECTIONS: id  material_id  A  I  depth  [name]
+    # SECTIONS: id  material_id  A  I  depth  [name]  [key=value ...]
     sec_ids = sorted(model.sections)
     out.append(f"SECTIONS {len(sec_ids)}")
     for sid in sec_ids:
@@ -83,6 +99,22 @@ def write_input_file(model: StructuralModel, path: str) -> None:
                 f"  {_fmt(s.depth)}")
         if s.name:
             line += f"  {s.name}"
+        # Non-default shape data. shape_type="manual" is the default and
+        # is omitted; the manual default also implies b=h=tf=tw=0.
+        if s.width != 0.0:
+            line += f"  width={_fmt(s.width)}"
+        if s.J != 0.0:
+            line += f"  J={_fmt(s.J)}"
+        if s.shape_type and s.shape_type != "manual":
+            line += f"  shape={s.shape_type}"
+        if s.b != 0.0:
+            line += f"  b={_fmt(s.b)}"
+        if s.h != 0.0:
+            line += f"  h={_fmt(s.h)}"
+        if s.tf != 0.0:
+            line += f"  tf={_fmt(s.tf)}"
+        if s.tw != 0.0:
+            line += f"  tw={_fmt(s.tw)}"
         out.append(line)
     out.append("")
 
