@@ -11,7 +11,10 @@ import os
 from typing import Optional
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
+from PyQt6.QtGui import (
+    QAction, QActionGroup, QColor, QIcon, QKeySequence,
+    QPainter, QPen, QPixmap,
+)
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -47,6 +50,7 @@ from ..gui_common.commands import (
     DeleteMaterialCmd,
     DeleteNodeCmd,
     DeleteSectionCmd,
+    ReplaceModelCmd,
     SetGridSystemCmd,
     SetNodalLoadCmd,
     SetSupportCmd,
@@ -68,6 +72,7 @@ from .controllers import (
     TrussTool,
 )
 from .dialogs import (
+    BuildingWizardDialog,
     ElementDialog,
     ElementPropertiesDialog,
     FineNodeDialog,
@@ -80,6 +85,23 @@ from .dialogs import (
     SupportDialog,
 )
 from .grid import GridSystem
+
+
+def _make_building_icon() -> QIcon:
+    """Paint a small office-building silhouette for the wizard action."""
+    pm = QPixmap(24, 24)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.setPen(QPen(QColor("#1f3a5f"), 1.5))
+    p.setBrush(QColor("#9ec5e8"))
+    p.drawRect(4, 6, 16, 16)
+    p.setBrush(QColor("#ffffff"))
+    for r in range(3):
+        for c in range(3):
+            p.drawRect(6 + c * 5, 8 + r * 5, 3, 3)
+    p.end()
+    return QIcon(pm)
 
 
 def _validate_model_for_solve(model: StructuralModel) -> tuple[list[str], list[str]]:
@@ -261,6 +283,14 @@ class MainWindow(QMainWindow):
                                  triggered=self._do_redo)
         self.act_materials = QAction("&Materials…", self,
                                        triggered=self._open_material_list)
+        self.act_building_wizard = QAction(
+            _make_building_icon(),
+            "&Building wizard…", self,
+            shortcut="Ctrl+B",
+            statusTip="Generate a portal-frame building from typed stories, "
+                       "bays, and dimensions (Ctrl+B).",
+            triggered=self._do_building_wizard,
+        )
         self.act_add_node_coords = QAction(
             "Add node at &coordinates…", self,
             shortcut="Shift+N",
@@ -387,6 +417,7 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_undo)
         m_edit.addAction(self.act_redo)
         m_edit.addSeparator()
+        m_edit.addAction(self.act_building_wizard)
         m_edit.addAction(self.act_add_node_coords)
         m_edit.addAction(self.act_materials)
         m_edit.addAction(self.act_forget_elem_defaults)
@@ -442,6 +473,7 @@ class MainWindow(QMainWindow):
                      "support", "nodal_load", "member_load", "delete"):
             tb.addAction(self._tool_actions[name])
         tb.addSeparator()
+        tb.addAction(self.act_building_wizard)
         tb.addAction(self.act_solve)
         tb.addAction(self.act_materials)
         tb.addSeparator()
@@ -1064,6 +1096,32 @@ class MainWindow(QMainWindow):
             return
         x, y = d.result_value
         self.execute(AddNodeCmd(x=x, y=y))
+
+    def _do_building_wizard(self) -> None:
+        try:
+            d = BuildingWizardDialog(self, model=self._model)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Building wizard", str(exc))
+            return
+        if self._model.nodes or self._model.elements:
+            ans = QMessageBox.question(
+                self, "Replace model?",
+                "The building wizard will replace the current model "
+                "(materials and sections are kept). Use Undo to restore.\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
+            return
+        self.execute(ReplaceModelCmd(new_model=d.result_value))
+        self.canvas.fit_to_view()
+        self.set_status(
+            f"Building wizard: created {len(self._model.nodes)} nodes, "
+            f"{len(self._model.elements)} elements."
+        )
 
     def _toggle_snap(self, checked: bool) -> None:
         self.canvas.toggle_snap(checked)

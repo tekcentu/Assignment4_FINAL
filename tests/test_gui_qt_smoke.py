@@ -947,3 +947,58 @@ def test_view3d_manual_section_uses_sqrt_A_and_shows_banner(qt_app):
     assert not w._view3d_window._banner.isVisible(), (
         "banner must clear once every section has a real shape"
     )
+
+
+# ── Building wizard ─────────────────────────────────────────────
+
+
+def test_building_wizard_creates_model(qt_app):
+    """The wizard generates a portal frame and routes through ReplaceModelCmd
+    so a single Undo restores the previous model."""
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+
+    w = MainWindow()
+    qt_app.processEvents()
+
+    # Starter model has sections, so the wizard dialog should construct.
+    d = BuildingWizardDialog(w, model=w._model)
+    d._stories.setValue(2)
+    d._story_h.setValue(3.0)
+    d._bays.setValue(2)
+    d._bay_w.setValue(4.0)
+    d._fixed_base.setChecked(True)
+    new_model = d._accept()
+    assert len(new_model.nodes) == 9
+    assert len(new_model.elements) == 10
+    assert len(new_model.supports) == 3
+    assert new_model.materials == w._model.materials
+    assert new_model.sections == w._model.sections
+
+
+def test_building_wizard_action_undoable(qt_app):
+    """Driving the wizard handler through a stubbed dialog must apply
+    ReplaceModelCmd; one Undo must restore the previous (empty) model."""
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+
+    w = MainWindow()
+    qt_app.processEvents()
+    original_exec = BuildingWizardDialog.exec
+
+    def fake_exec(self):
+        from PyQt6.QtWidgets import QDialog as _QD
+        self._stories.setValue(1)
+        self._bays.setValue(1)
+        self.result_value = self._accept()
+        return _QD.DialogCode.Accepted
+
+    BuildingWizardDialog.exec = fake_exec
+    try:
+        w._do_building_wizard()
+    finally:
+        BuildingWizardDialog.exec = original_exec
+
+    assert len(w._model.nodes) == 4
+    assert len(w._model.elements) == 3
+    w._do_undo()
+    assert len(w._model.nodes) == 0
+    assert len(w._model.elements) == 0
