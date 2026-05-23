@@ -18,6 +18,7 @@ from structural_analysis.profiles import (
     i_section_properties,
     properties_for_shape,
     rectangle_properties,
+    section_outline,
     square_properties,
 )
 
@@ -244,6 +245,59 @@ def test_round_trip_spa_json_with_new_fields(tmp_path):
     s1 = reloaded.sections[1]
     assert s1.shape_type == "rectangle"
     assert s1.b == pytest.approx(0.3) and s1.h == pytest.approx(0.5)
+
+
+# ── section_outline (3D viewer feed) ───────────────────────────
+
+
+def test_section_outline_rectangle_has_4_vertices():
+    s = Section(id=1, shape_type="rectangle", b=0.3, h=0.5)
+    pts = section_outline(s)
+    assert len(pts) == 4
+    ys = [p[0] for p in pts]
+    zs = [p[1] for p in pts]
+    # depth along y, width along z
+    assert max(ys) - min(ys) == pytest.approx(0.5)
+    assert max(zs) - min(zs) == pytest.approx(0.3)
+
+
+def test_section_outline_i_section_has_12_vertices():
+    s = Section(
+        id=1, shape_type="i_section",
+        b=0.100, h=0.200, tf=0.0085, tw=0.0056,
+    )
+    pts = section_outline(s)
+    # Standard I outline traces all 12 corners.
+    assert len(pts) == 12
+    ys = [p[0] for p in pts]
+    zs = [p[1] for p in pts]
+    assert max(ys) - min(ys) == pytest.approx(0.200)
+    assert max(zs) - min(zs) == pytest.approx(0.100)
+
+
+def test_section_outline_manual_uses_sqrt_A():
+    s = Section(id=1, shape_type="manual", A=0.16)
+    pts = section_outline(s)
+    assert len(pts) == 4
+    side_y = max(p[0] for p in pts) - min(p[0] for p in pts)
+    side_z = max(p[1] for p in pts) - min(p[1] for p in pts)
+    # √0.16 = 0.4 m square area-equivalent.
+    assert side_y == pytest.approx(0.4)
+    assert side_z == pytest.approx(0.4)
+
+
+def test_section_outline_manual_with_zero_area_uses_fallback():
+    s = Section(id=1, shape_type="manual", A=0.0)
+    pts = section_outline(s, fallback_size=0.05)
+    assert len(pts) == 4
+    side = max(p[0] for p in pts) - min(p[0] for p in pts)
+    assert side == pytest.approx(0.05)
+
+
+def test_section_outline_unknown_shape_raises():
+    s = Section(id=1, shape_type="hexagon", A=0.1)
+    with pytest.raises(ValueError, match="Unknown shape_type"):
+        section_outline(s)
 
 
 def test_round_trip_example_file_unchanged(tmp_path):
