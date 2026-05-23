@@ -876,3 +876,74 @@ def test_section_dialog_i_section_validation_disables_ok(qt_app):
     ok = d._ok_button()
     assert ok is not None and not ok.isEnabled()
     assert d._status.text(), "status label should describe the error"
+
+
+# ── 3D extruded viewer ─────────────────────────────────────────
+
+
+def test_view3d_window_opens_and_holds_singleton(qt_app):
+    """View → Open 3D viewer must construct a separate non-modal
+    window and re-use the same instance on subsequent invocations."""
+    w = MainWindow(initial_path="inputs/example_01_cantilever_tip_load.txt")
+    qt_app.processEvents()
+
+    assert w._view3d_window is None
+    w._open_view3d()
+    first = w._view3d_window
+    assert first is not None
+    assert first.isVisible()
+    assert not first.isModal()
+    w._open_view3d()
+    assert w._view3d_window is first
+
+
+def test_view3d_window_builds_one_mesh_per_element(qt_app):
+    """Each frame/truss element should land as exactly one
+    Poly3DCollection, keyed by element id so future stress overlays
+    can look up the mesh per element without re-meshing."""
+    w = MainWindow(initial_path="inputs/example_01_cantilever_tip_load.txt")
+    qt_app.processEvents()
+    w._open_view3d()
+    qt_app.processEvents()
+    view = w._view3d_window
+    elem_ids = {e.id for e in w._model.elements}
+    assert set(view._element_meshes) == elem_ids
+    view.refresh()
+    assert set(view._element_meshes) == elem_ids
+
+
+def test_view3d_manual_section_uses_sqrt_A_and_shows_banner(qt_app):
+    """A model containing a manual section must show the approximation
+    banner; updating every manual section to a real shape via the real
+    AddOrUpdateSectionCmd clears the banner on refresh."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.gui_common.commands import AddOrUpdateSectionCmd
+    from structural_analysis.model import Material, Node, Section
+
+    w = MainWindow()
+    w._model.materials = {1: Material(id=1, name="Steel", E=2.10e8)}
+    w._model.sections = {
+        1: Section(id=1, name="manual_1", material_id=1, A=0.01, I=1e-4),
+    }
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.10e8, A=0.01, I=1e-4, section_id=1,
+    )]
+    qt_app.processEvents()
+
+    w._open_view3d()
+    qt_app.processEvents()
+    assert w._view3d_window._banner.isVisible(), (
+        "manual sections must surface the sqrt(A) approximation banner"
+    )
+
+    w.execute(AddOrUpdateSectionCmd(section=Section(
+        id=1, name="manual_1", material_id=1,
+        A=0.15, I=3.125e-3, depth=0.5, width=0.3,
+        shape_type="rectangle", b=0.3, h=0.5,
+    )))
+    w._view3d_window.refresh()
+    qt_app.processEvents()
+    assert not w._view3d_window._banner.isVisible(), (
+        "banner must clear once every section has a real shape"
+    )

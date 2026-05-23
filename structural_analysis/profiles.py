@@ -7,7 +7,9 @@ source of truth** for:
   MaterialDialog "Template" combobox;
 - section-shape names (``SECTION_SHAPES``);
 - pure-function calculators that turn raw dimensions (b, h, tf, tw)
-  into the A / I / depth / width / J that go onto a :class:`Section`.
+  into the A / I / depth / width / J that go onto a :class:`Section`;
+- the 2D cross-section outline (``section_outline``) used by the 3D
+  viewer to extrude each element into a prism.
 
 The calculators return a dict whose keys match Section field names so
 the dialog can splat them straight into ``dataclasses.replace`` /
@@ -17,6 +19,12 @@ with the 2D solver ignoring J.
 """
 
 from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .model import Section
 
 
 MATERIAL_TEMPLATES: dict[str, dict[str, float | str]] = {
@@ -109,3 +117,61 @@ def properties_for_shape(shape_type: str, **dims: float) -> dict[str, float]:
     raise ValueError(
         f"Unknown shape_type {shape_type!r}; expected one of {SECTION_SHAPES}."
     )
+
+
+# ── outline polygons used by the 3D viewer ────────────────────
+
+
+def section_outline(
+    section: "Section", *, fallback_size: float = 0.1,
+) -> list[tuple[float, float]]:
+    """Return ``(y, z)`` vertices tracing the section's cross-section
+    outline once in the element's local frame.
+
+    Convention: depth (h) lies along local y (the in-plane axis),
+    width (b) lies along local z (out of the 2D plane).
+
+    For ``shape_type="manual"`` no real geometry is known; the viewer
+    falls back to a square area-equivalent prism with side ``√A``. If
+    A is also zero, the caller's ``fallback_size`` is used so the
+    element is still visible.
+    """
+    shape = section.shape_type
+    if shape == "rectangle":
+        b, h = section.b, section.h
+    elif shape == "square":
+        b = h = section.h
+    elif shape == "i_section":
+        b, h, tf, tw = section.b, section.h, section.tf, section.tw
+        hy = h / 2.0
+        bz = b / 2.0
+        twz = tw / 2.0
+        wy = hy - tf  # web top/bottom y
+        return [
+            ( hy,  bz),
+            ( hy, -bz),
+            ( wy, -bz),
+            ( wy, -twz),
+            (-wy, -twz),
+            (-wy, -bz),
+            (-hy, -bz),
+            (-hy,  bz),
+            (-wy,  bz),
+            (-wy,  twz),
+            ( wy,  twz),
+            ( wy,  bz),
+        ]
+    elif shape == "manual":
+        if section.A > 0.0:
+            side = math.sqrt(section.A)
+        else:
+            side = fallback_size
+        b = h = side
+    else:
+        raise ValueError(
+            f"Unknown shape_type {shape!r}; expected one of {SECTION_SHAPES}."
+        )
+
+    hy = h / 2.0
+    bz = b / 2.0
+    return [( hy,  bz), ( hy, -bz), (-hy, -bz), (-hy,  bz)]

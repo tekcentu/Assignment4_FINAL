@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 from ..file_io import read_input_file
 from ..main import run_analysis
 from ..model import AnalysisResult, Material, Section, StructuralModel
+from .. import __version__, __what_is_new__
 from ..gui_common.commands import (
     AddElementCmd,
     AddMemberLoadCmd,
@@ -172,6 +173,7 @@ class MainWindow(QMainWindow):
         self._result: Optional[AnalysisResult] = None
         self._modal_result = None
         self._modal_results_dialog = None
+        self._view3d_window = None
         # Sticky element-creation defaults (None = ask the user on the
         # next pair-click). When the ElementDialog's "Remember" box is
         # checked these are saved and applied silently for subsequent
@@ -264,13 +266,18 @@ class MainWindow(QMainWindow):
             shortcut="Shift+N",
             triggered=self._do_add_node_at_coords,
         )
-
         self.act_grid_spacing = QAction("&Grid spacing…", self,
                                           triggered=self._set_grid_spacing)
         self.act_grid_system = QAction("Grid s&ystem…", self,
                                          triggered=self._edit_grid_system)
         self.act_fit_view = QAction("&Fit to view", self, shortcut="Home",
                                       triggered=self._do_fit_view)
+        self.act_open_view3d = QAction(
+            "Open &3D viewer", self,
+            statusTip="Open a separate 3D window with each element "
+                       "extruded along its section profile.",
+            triggered=self._open_view3d,
+        )
         self.act_forget_elem_defaults = QAction(
             "Forget element defaults", self,
             triggered=self._forget_element_defaults,
@@ -384,8 +391,25 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_materials)
         m_edit.addAction(self.act_forget_elem_defaults)
 
+        # Top-right corner of the menu bar: version + what's-new summary
+        # so the user always sees which features ship in this build.
+        self._version_label = QLabel(
+            f"  v{__version__} · {__what_is_new__}  ", self,
+        )
+        self._version_label.setStyleSheet(
+            "color: #555; font-size: 9pt; padding-right: 6px;"
+        )
+        self._version_label.setToolTip(
+            f"Structural Analysis GUI v{__version__}\n"
+            f"This release: {__what_is_new__}"
+        )
+        self.menuBar().setCornerWidget(
+            self._version_label, Qt.Corner.TopRightCorner,
+        )
+
         m_view = self.menuBar().addMenu("&View")
         m_view.addAction(self.act_fit_view)
+        m_view.addAction(self.act_open_view3d)
         m_view.addSeparator()
         m_view.addAction(self.act_grid_system)
         m_view.addAction(self.act_grid_spacing)
@@ -956,6 +980,25 @@ class MainWindow(QMainWindow):
         """Re-fit the canvas axes to enclose the model and grid extent."""
         self.canvas.fit_to_view()
         self.set_status("View fitted to model.")
+
+    def _open_view3d(self) -> None:
+        """Open the non-modal 3D viewer, or raise it if already open.
+
+        A single instance is kept on ``self._view3d_window`` so repeated
+        clicks don't pile windows up. The viewer reads the model on
+        construction and on its Refresh button — it is read-only and
+        holds no references back into the model.
+        """
+        from .view3d import View3DWindow
+
+        if self._view3d_window is None:
+            self._view3d_window = View3DWindow(self, lambda: self._model)
+        else:
+            # Re-sync after any edits since the window was last shown.
+            self._view3d_window.refresh()
+        self._view3d_window.show()
+        self._view3d_window.raise_()
+        self._view3d_window.activateWindow()
 
     def _populate_examples_menu(self) -> None:
         """Fill the File → Open example submenu from ``inputs/``."""
