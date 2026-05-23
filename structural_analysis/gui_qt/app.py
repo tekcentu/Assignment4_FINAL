@@ -11,10 +11,7 @@ import os
 from typing import Optional
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import (
-    QAction, QActionGroup, QColor, QIcon, QKeySequence,
-    QPainter, QPen, QPixmap,
-)
+from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -50,7 +47,6 @@ from ..gui_common.commands import (
     DeleteMaterialCmd,
     DeleteNodeCmd,
     DeleteSectionCmd,
-    ReplaceModelCmd,
     SetGridSystemCmd,
     SetNodalLoadCmd,
     SetSupportCmd,
@@ -72,7 +68,6 @@ from .controllers import (
     TrussTool,
 )
 from .dialogs import (
-    BuildingWizardDialog,
     ElementDialog,
     ElementPropertiesDialog,
     FineNodeDialog,
@@ -85,23 +80,6 @@ from .dialogs import (
     SupportDialog,
 )
 from .grid import GridSystem
-
-
-def _make_building_icon() -> QIcon:
-    """Paint a small office-building silhouette for the wizard action."""
-    pm = QPixmap(24, 24)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    p.setPen(QPen(QColor("#1f3a5f"), 1.5))
-    p.setBrush(QColor("#9ec5e8"))
-    p.drawRect(4, 6, 16, 16)            # building outline
-    p.setBrush(QColor("#ffffff"))
-    for r in range(3):                  # 3×3 windows
-        for c in range(3):
-            p.drawRect(6 + c * 5, 8 + r * 5, 3, 3)
-    p.end()
-    return QIcon(pm)
 
 
 def _validate_model_for_solve(model: StructuralModel) -> tuple[list[str], list[str]]:
@@ -288,15 +266,6 @@ class MainWindow(QMainWindow):
             shortcut="Shift+N",
             triggered=self._do_add_node_at_coords,
         )
-        self.act_building_wizard = QAction(
-            _make_building_icon(),
-            "&Building wizard…", self,
-            shortcut="Ctrl+B",
-            statusTip="Generate a portal-frame building from typed stories, "
-                       "bays, and dimensions (Ctrl+B).",
-            triggered=self._do_building_wizard,
-        )
-
         self.act_grid_spacing = QAction("&Grid spacing…", self,
                                           triggered=self._set_grid_spacing)
         self.act_grid_system = QAction("Grid s&ystem…", self,
@@ -327,6 +296,52 @@ class MainWindow(QMainWindow):
             a = QAction(label, self, checkable=True, checked=True)
             a.triggered.connect(lambda _checked, k=kind: self._toggle_snap_kind(k))
             self._snap_actions[kind] = a
+
+        # Diagram station-count selector (post-processing samples per
+        # element). Pure visualization — changing it never re-runs the
+        # solver. Default 21 includes the midspan exactly.
+        self._station_tooltip = (
+            "Station points are for diagram drawing only. More stations "
+            "make diagrams smoother but do not change analysis results. "
+            "Very low station counts may miss visual peaks between stations."
+        )
+        self._station_actions: dict[int, QAction] = {}
+        station_group = QActionGroup(self)
+        station_group.setExclusive(True)
+        for n, label in (
+            (5,  "5 (coarse)"),
+            (11, "11 (simple)"),
+            (21, "21 (default)"),
+            (51, "51 (smooth)"),
+        ):
+            a = QAction(label, self, checkable=True, checked=(n == 21))
+            a.setToolTip(self._station_tooltip)
+            a.setStatusTip(self._station_tooltip)
+            a.triggered.connect(lambda _checked, k=n: self._set_diagram_stations(k))
+            station_group.addAction(a)
+            self._station_actions[n] = a
+
+        # Deformed shape visual amplification scale.
+        self._deformed_scale_tooltip = (
+            "Visually amplifies the deformed shape. "
+            "Does not change analysis results and does not re-run the solver."
+        )
+        self._deformed_scale_actions: dict[float, QAction] = {}
+        deformed_scale_group = QActionGroup(self)
+        deformed_scale_group.setExclusive(True)
+        for v, label in (
+            (0.5,  "0.5× (reduced)"),
+            (1.0,  "1× (default)"),
+            (2.0,  "2×"),
+            (5.0,  "5×"),
+            (10.0, "10× (amplified)"),
+        ):
+            a = QAction(label, self, checkable=True, checked=(v == 1.0))
+            a.setToolTip(self._deformed_scale_tooltip)
+            a.setStatusTip(self._deformed_scale_tooltip)
+            a.triggered.connect(lambda _checked, k=v: self._set_deformed_scale(k))
+            deformed_scale_group.addAction(a)
+            self._deformed_scale_actions[v] = a
 
         self.act_solve = QAction("&Solve", self, shortcut="F5",
                                    triggered=self._do_solve)
@@ -372,7 +387,6 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_undo)
         m_edit.addAction(self.act_redo)
         m_edit.addSeparator()
-        m_edit.addAction(self.act_building_wizard)
         m_edit.addAction(self.act_add_node_coords)
         m_edit.addAction(self.act_materials)
         m_edit.addAction(self.act_forget_elem_defaults)
@@ -403,6 +417,17 @@ class MainWindow(QMainWindow):
         m_view.addSeparator()
         for a in self._snap_actions.values():
             m_view.addAction(a)
+        m_view.addSeparator()
+        stations_menu = m_view.addMenu("Diagram &stations")
+        stations_menu.setToolTip(self._station_tooltip)
+        stations_menu.setStatusTip(self._station_tooltip)
+        for a in self._station_actions.values():
+            stations_menu.addAction(a)
+        deformed_scale_menu = m_view.addMenu("Deformed &scale")
+        deformed_scale_menu.setToolTip(self._deformed_scale_tooltip)
+        deformed_scale_menu.setStatusTip(self._deformed_scale_tooltip)
+        for a in self._deformed_scale_actions.values():
+            deformed_scale_menu.addAction(a)
 
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)
@@ -417,7 +442,6 @@ class MainWindow(QMainWindow):
                      "support", "nodal_load", "member_load", "delete"):
             tb.addAction(self._tool_actions[name])
         tb.addSeparator()
-        tb.addAction(self.act_building_wizard)
         tb.addAction(self.act_solve)
         tb.addAction(self.act_materials)
         tb.addSeparator()
@@ -1041,36 +1065,45 @@ class MainWindow(QMainWindow):
         x, y = d.result_value
         self.execute(AddNodeCmd(x=x, y=y))
 
-    def _do_building_wizard(self) -> None:
-        try:
-            d = BuildingWizardDialog(self, model=self._model)
-        except ValueError as exc:
-            QMessageBox.warning(self, "Building wizard", str(exc))
-            return
-        if self._model.nodes or self._model.elements:
-            ans = QMessageBox.question(
-                self, "Replace model?",
-                "The building wizard will replace the current model "
-                "(materials and sections are kept). Use Undo to restore.\n\n"
-                "Continue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if ans != QMessageBox.StandardButton.Yes:
-                return
-        if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
-            return
-        self.execute(ReplaceModelCmd(new_model=d.result_value))
-        # The new building can be far from the previously fit viewport;
-        # reset the view so the whole thing is visible at once.
-        self.canvas.fit_to_view()
-        self.set_status(
-            f"Building wizard: created {len(self._model.nodes)} nodes, "
-            f"{len(self._model.elements)} elements."
-        )
-
     def _toggle_snap(self, checked: bool) -> None:
         self.canvas.toggle_snap(checked)
+
+    def _set_diagram_stations(self, n: int) -> None:
+        """Adjust station-count for diagrams + deformed-shape sampling.
+
+        Post-processing only — the solver is not rerun, only the canvas
+        is redrawn. A very coarse setting (5) gets a louder warning so
+        the demo audience knows the picture is approximate.
+        """
+        n = int(n)
+        self.canvas.diagram_stations = n
+        self.canvas.deformed_stations = n
+        # Keep the matching checkable QAction in sync (idempotent if the
+        # action triggered this call in the first place).
+        for k, action in self._station_actions.items():
+            action.setChecked(k == n)
+        self.canvas.redraw()
+        if n <= 5:
+            self.set_status(f"Using {n} stations: coarse diagram preview.")
+        else:
+            self.set_status(
+                f"Diagram stations: {n} per element. "
+                f"Solver was not rerun — redraw only."
+            )
+
+    def _set_deformed_scale(self, v: float) -> None:
+        """Set the visual amplification factor for the deformed shape.
+
+        Redraw only — the solver is not rerun and the cached result is kept.
+        """
+        v = float(v)
+        self.canvas.deformed_scale = v
+        for k, action in self._deformed_scale_actions.items():
+            action.setChecked(k == v)
+        self.canvas.redraw()
+        self.set_status(
+            f"Deformed scale: {v}× — visual amplification only, no re-solve."
+        )
 
     # ── undo / redo ──
 

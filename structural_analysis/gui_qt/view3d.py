@@ -17,8 +17,6 @@ from __future__ import annotations
 
 from typing import Callable
 
-import matplotlib
-matplotlib.use("QtAgg")  # noqa: E402 — must precede pyplot
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT,

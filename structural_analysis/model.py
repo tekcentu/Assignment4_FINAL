@@ -70,8 +70,17 @@ class Material:
         """Shear modulus, derived from E and ν.
 
         Computed always — when ν = 0 this returns ``E / 2`` (the correct
-        isotropic identity at ν = 0, not a special case).
+        isotropic identity at ν = 0, not a special case). Raises
+        :class:`ValueError` if ν is outside ``[0, 0.5)`` so a stray
+        invalid Material (e.g. constructed in a test) surfaces the
+        problem clearly instead of yielding ``ZeroDivisionError`` or a
+        physically meaningless negative G.
         """
+        if not (0.0 <= self.nu < 0.5):
+            raise ValueError(
+                f"Material {self.id}: nu={self.nu!r} is outside the "
+                "allowed range [0, 0.5); G is undefined."
+            )
         return self.E / (2.0 * (1.0 + self.nu))
 
 

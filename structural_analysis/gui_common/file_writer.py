@@ -75,6 +75,16 @@ def write_input_file(model: StructuralModel, path: str) -> None:
         if m.nu != 0.0:
             line += f"  nu={_fmt(m.nu)}"
         if m.template:
+            # Template is stored unquoted as a single whitespace-delimited
+            # token; reject embedded whitespace so the reload can't split
+            # the value across multiple positional tokens.
+            if any(ch.isspace() for ch in m.template):
+                raise ValueError(
+                    f"Material {mid} template {m.template!r} contains "
+                    "whitespace; the input-file format stores it as a "
+                    "single token. Rename the template (underscores or "
+                    "hyphens) before saving."
+                )
             line += f"  template={m.template}"
         out.append(line)
     out.append("")

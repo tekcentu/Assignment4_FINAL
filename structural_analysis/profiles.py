@@ -147,7 +147,6 @@ def section_outline(
         bz = b / 2.0
         twz = tw / 2.0
         wy = hy - tf  # web top/bottom y
-        # CCW starting at top-right corner of top flange.
         return [
             ( hy,  bz),
             ( hy, -bz),

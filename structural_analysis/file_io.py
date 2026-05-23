@@ -32,8 +32,10 @@ def _split_kwargs(parts: list[str]) -> tuple[list[str], dict[str, str]]:
     """Separate positional tokens from trailing ``key=value`` tokens.
 
     A ``key=value`` token is any token that contains ``=`` and starts
-    with a letter or underscore. Positional ordering of non-kwarg tokens
-    is preserved.
+    with an ASCII letter (matches ``str.isalpha`` on the first char).
+    Underscore-prefixed keys are intentionally not accepted — every
+    whitelisted kwarg starts with a letter. Positional ordering of
+    non-kwarg tokens is preserved.
     """
     positional: list[str] = []
     kwargs: dict[str, str] = {}
@@ -71,6 +73,16 @@ def _typed_kwargs(
     # Alias: "shape" → "shape_type"
     if "shape" in typed:
         typed["shape_type"] = typed.pop("shape")
+    # Material.G = E / (2 * (1 + nu)) — reject nu values that would make
+    # the formula undefined or unphysical. Match the GUI invariant so a
+    # hand-edited file can't slip past validation.
+    if row_kind == "MATERIALS" and "nu" in typed:
+        nu = typed["nu"]
+        if not (0.0 <= nu < 0.5):
+            raise ValueError(
+                f"MATERIALS row for id {obj_id}: nu={nu!r} is outside "
+                "the allowed range [0, 0.5)."
+            )
     return typed
 
 

@@ -1,9 +1,11 @@
-"""One-shot script to render docs/proposal.md to docs/proposal.pdf.
+"""Render a proposal Markdown file to PDF.
 
 Uses python-markdown + WeasyPrint so no LaTeX or pandoc install is needed.
-Run from the repository root:
+Defaults to ``docs/proposal.md`` → ``docs/proposal.pdf``. Pass an alternate
+stem (without extension) to render a sibling file:
 
-    python docs/render_proposal_pdf.py
+    python docs/render_proposal_pdf.py                       # proposal
+    python docs/render_proposal_pdf.py proposal_submission   # submission
 """
 
 from __future__ import annotations
@@ -16,8 +18,6 @@ from weasyprint import HTML, CSS
 
 
 HERE = Path(__file__).resolve().parent
-SRC = HERE / "proposal.md"
-OUT = HERE / "proposal.pdf"
 
 CSS_TEXT = """
 @page {
@@ -108,11 +108,15 @@ h1 + p { color: #444; margin-top: 2pt; }
 """
 
 
-def main() -> int:
-    if not SRC.exists():
-        print(f"ERROR: {SRC} not found", file=sys.stderr)
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    stem = args[0] if args else "proposal"
+    src = HERE / f"{stem}.md"
+    out = HERE / f"{stem}.pdf"
+    if not src.exists():
+        print(f"ERROR: {src} not found", file=sys.stderr)
         return 1
-    text = SRC.read_text(encoding="utf-8")
+    text = src.read_text(encoding="utf-8")
     html_body = markdown.markdown(
         text,
         extensions=["tables", "fenced_code", "sane_lists"],
@@ -127,10 +131,10 @@ def main() -> int:
 </html>
 """
     HTML(string=html_doc, base_url=str(HERE)).write_pdf(
-        target=str(OUT),
+        target=str(out),
         stylesheets=[CSS(string=CSS_TEXT)],
     )
-    print(f"Wrote {OUT}")
+    print(f"Wrote {out}")
     return 0
 
 

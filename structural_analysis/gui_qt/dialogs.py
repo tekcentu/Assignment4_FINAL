@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
     QHBoxLayout,
@@ -25,7 +24,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
-    QSpinBox,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -39,7 +37,6 @@ from ..model import (
     FrameTemperatureLoad,
     Material,
     NodalLoad,
-    Node,
     PointLoad,
     Section,
     StructuralModel,
@@ -197,36 +194,57 @@ class MaterialDialog(_ModalDialog):
         self._entries["nu"].setText(repr(float(preset["nu"])))
 
     def _refresh_derived(self) -> None:
-        # Compute and display G; also surface ν-range validation.
+        # Compute G and gate the OK button. Rules:
+        #   - E must parse and be > 0 to enable OK.
+        #   - ν empty is fine (defaults to 0 on _accept); a non-empty ν
+        #     must parse AND lie in [0, 0.5).
+        e_text = self._entries["E"].text().strip()
+        nu_text = self._entries["nu"].text().strip()
+
+        E: float | None
         try:
-            E = float(self._entries["E"].text())
+            E = float(e_text) if e_text else None
         except ValueError:
             E = None
-        try:
-            nu = float(self._entries["nu"].text())
-        except ValueError:
-            nu = None
+        e_ok = E is not None and E > 0.0
 
-        ok = self._ok_button()
-        if nu is not None and not (0.0 <= nu < 0.5):
+        nu: float | None
+        if not nu_text:
+            nu = 0.0
+            nu_ok = True
+        else:
+            try:
+                nu = float(nu_text)
+            except ValueError:
+                nu = None
+                nu_ok = False
+            else:
+                nu_ok = 0.0 <= nu < 0.5
+
+        if not nu_ok and nu_text:
             self._nu_status.setText("ν must be in [0, 0.5).")
-            if ok is not None:
-                ok.setEnabled(False)
         else:
             self._nu_status.setText("")
-            if ok is not None:
-                ok.setEnabled(True)
 
-        if E is not None and nu is not None and 0.0 <= nu < 0.5:
-            G = E / (2.0 * (1.0 + nu))
-            self._g_label.setText(f"{G:g}")
+        ok = self._ok_button()
+        if ok is not None:
+            ok.setEnabled(e_ok and nu_ok)
+
+        if e_ok and nu_ok and nu is not None:
+            self._g_label.setText(f"{E / (2.0 * (1.0 + nu)):g}")
         else:
             self._g_label.setText("—")
 
     def _ok_button(self):
-        for child in self.findChildren(QDialogButtonBox):
-            return child.button(QDialogButtonBox.StandardButton.Ok)
-        return None
+        # findChildren walks the widget tree; cache the result since
+        # _refresh_derived runs on every keystroke in E or ν.
+        if not hasattr(self, "_cached_ok_button"):
+            cached = None
+            for child in self.findChildren(QDialogButtonBox):
+                cached = child.button(QDialogButtonBox.StandardButton.Ok)
+                break
+            self._cached_ok_button = cached
+        return self._cached_ok_button
 
     def _accept(self) -> Material:
         mid = parse_int(self._entries["id"].text(), "Material ID")
@@ -295,14 +313,22 @@ class SectionDialog(_ModalDialog):
         form.addRow("Shape", self._shape_combo)
 
         self._stack = QStackedWidget(body)
-        self._page_manual = self._build_manual_page()
-        self._page_rect = self._build_rect_page()
-        self._page_square = self._build_square_page()
-        self._page_i = self._build_i_page()
-        self._stack.addWidget(self._page_manual)   # index 0 — manual
-        self._stack.addWidget(self._page_rect)     # index 1 — rectangle
-        self._stack.addWidget(self._page_square)   # index 2 — square
-        self._stack.addWidget(self._page_i)        # index 3 — i_section
+        # Explicit shape_type → stack-page-index map so the dialog
+        # doesn't silently break if SECTION_SHAPES is reordered or a
+        # new shape is appended in a different position.
+        self._page_index: dict[str, int] = {}
+        self._page_index["manual"] = self._stack.addWidget(
+            self._build_manual_page()
+        )
+        self._page_index["rectangle"] = self._stack.addWidget(
+            self._build_rect_page()
+        )
+        self._page_index["square"] = self._stack.addWidget(
+            self._build_square_page()
+        )
+        self._page_index["i_section"] = self._stack.addWidget(
+            self._build_i_page()
+        )
         form.addRow(self._stack)
 
         # Storage-only J note
@@ -331,10 +357,11 @@ class SectionDialog(_ModalDialog):
             idx = self._mat_combo.findData(s.material_id)
             if idx >= 0:
                 self._mat_combo.setCurrentIndex(idx)
-            shape_idx = self._shape_combo.findData(s.shape_type or "manual")
+            shape_key = s.shape_type or "manual"
+            shape_idx = self._shape_combo.findData(shape_key)
             if shape_idx >= 0:
                 self._shape_combo.setCurrentIndex(shape_idx)
-            self._stack.setCurrentIndex(shape_idx if shape_idx >= 0 else 0)
+            self._stack.setCurrentIndex(self._page_index.get(shape_key, 0))
             # Populate the relevant page
             self._a_entry.setText(repr(s.A))
             self._i_entry.setText(repr(s.I))
@@ -422,15 +449,25 @@ class SectionDialog(_ModalDialog):
     # ── interaction ──
 
     def _on_shape_changed(self) -> None:
-        self._stack.setCurrentIndex(self._shape_combo.currentIndex())
+        shape = self._current_shape()
+        self._stack.setCurrentIndex(self._page_index.get(shape, 0))
         self._refresh_preview()
 
     def _current_shape(self) -> str:
         return self._shape_combo.currentData() or "manual"
 
     def _ok_button(self):
+        # Cache once found. The button box is added AFTER _build_body
+        # runs, so the first calls (during construction) return None;
+        # cache only positive lookups so we re-search until it exists.
+        cached = getattr(self, "_cached_ok_button", None)
+        if cached is not None:
+            return cached
         for child in self.findChildren(QDialogButtonBox):
-            return child.button(QDialogButtonBox.StandardButton.Ok)
+            btn = child.button(QDialogButtonBox.StandardButton.Ok)
+            if btn is not None:
+                self._cached_ok_button = btn
+                return btn
         return None
 
     def _compute_derived(self) -> dict[str, float] | None:
@@ -536,16 +573,16 @@ class SectionDialog(_ModalDialog):
             )
         b = h = tf = tw = 0.0
         if shape == "rectangle":
-            b = float(self._rect_b.text() or "0")
-            h = float(self._rect_h.text() or "0")
+            b = parse_float(self._rect_b.text(), "b", allow_blank=True) or 0.0
+            h = parse_float(self._rect_h.text(), "h", allow_blank=True) or 0.0
         elif shape == "square":
-            h = float(self._sq_h.text() or "0")
+            h = parse_float(self._sq_h.text(), "h", allow_blank=True) or 0.0
             b = h
         elif shape == "i_section":
-            h = float(self._i_h.text() or "0")
-            b = float(self._i_b.text() or "0")
-            tf = float(self._i_tf.text() or "0")
-            tw = float(self._i_tw.text() or "0")
+            h = parse_float(self._i_h.text(), "h", allow_blank=True) or 0.0
+            b = parse_float(self._i_b.text(), "b", allow_blank=True) or 0.0
+            tf = parse_float(self._i_tf.text(), "tf", allow_blank=True) or 0.0
+            tw = parse_float(self._i_tw.text(), "tw", allow_blank=True) or 0.0
         return Section(
             id=sid, name=name, material_id=int(material_id),
             A=derived["A"], I=derived["I"],
@@ -1216,7 +1253,7 @@ def _support_summary(support: Support | None) -> str:
     settle = []
     for dof in ("ux", "uy", "rz"):
         v = getattr(support, f"settle_{dof}")
-        if v is not None and abs(v) > 1e-9:
+        if v is not None and abs(v) > 0.0:
             settle.append(f"Δ{dof}={v:g}")
     body = "  ".join(parts) + (f"  ·  settle: {', '.join(settle)}" if settle else "")
     return f"{kind}  ·  {body}"
@@ -1229,7 +1266,7 @@ def _nodal_load_summary(model: StructuralModel, node_id: int) -> str:
     return f"Fx = {load.fx:g} kN,  Fy = {load.fy:g} kN,  Mz = {load.mz:g} kN·m"
 
 
-def _member_loads_summary(elem: FrameElement2D | TrussElement2D) -> list[str]:
+def _member_loads_summary(elem) -> list[str]:
     loads = list(getattr(elem, "member_loads", []) or [])
     if not loads:
         return ["(none)"]
@@ -1254,8 +1291,8 @@ def _member_loads_summary(elem: FrameElement2D | TrussElement2D) -> list[str]:
 class NodePropertiesDialog(QDialog):
     """Read-only inspector for a node — opened by left-click in Select tool."""
 
-    def __init__(self, parent: QWidget | None, model: StructuralModel,
-                 node_id: int, result: Any = None) -> None:
+    def __init__(self, parent, model: StructuralModel, node_id: int,
+                 result=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Node {node_id} properties")
         self.setModal(True)
@@ -1334,8 +1371,8 @@ def _node_reaction(result, node_id: int) -> str | None:
 class ElementPropertiesDialog(QDialog):
     """Read-only inspector for an element — opened by left-click in Select tool."""
 
-    def __init__(self, parent: QWidget | None, model: StructuralModel,
-                 elem_id: int, result: Any = None) -> None:
+    def __init__(self, parent, model: StructuralModel, elem_id: int,
+                 result=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Element {elem_id} properties")
         self.setModal(True)
@@ -1344,15 +1381,16 @@ class ElementPropertiesDialog(QDialog):
         if elem is None:
             raise ValueError(f"Element {elem_id} does not exist.")
 
-        section_id = getattr(elem, "section_id", None)
-        section = model.sections.get(section_id if section_id is not None else -1)
+        section = model.sections.get(getattr(elem, "section_id", None) or -1)
         material = (model.materials.get(section.material_id)
                      if section is not None else None)
 
-        try:
-            length, _, _ = elem.length_cos_sin(model.nodes)
-        except Exception:
+        ni = model.nodes.get(elem.node_i)
+        nj = model.nodes.get(elem.node_j)
+        if ni is None or nj is None:
             length = 0.0
+        else:
+            length = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -1461,146 +1499,3 @@ class FineNodeDialog(_ModalDialog):
         x = parse_float(self._x_entry.text(), "X")
         y = parse_float(self._y_entry.text(), "Y")
         return (x, y)
-
-
-class BuildingWizardDialog(_ModalDialog):
-    """Generate a 2D portal-frame building from typed dimensions.
-
-    On accept, returns a fresh :class:`StructuralModel` containing the new
-    geometry — materials and sections are copied from the source model so
-    the user's section/material library is preserved. The host applies it
-    via ``ReplaceModelCmd`` so the whole wizard is undoable in one step.
-    """
-
-    def __init__(self, parent, *, model: StructuralModel) -> None:
-        self._source_model = model
-        if not model.sections:
-            raise ValueError(
-                "No sections defined — add a section before running the "
-                "building wizard."
-            )
-        super().__init__(parent, "Building wizard")
-
-    def _build_body(self, body: QWidget) -> None:
-        form = QFormLayout(body)
-
-        self._stories = QSpinBox(body)
-        self._stories.setRange(1, 30)
-        self._stories.setValue(3)
-
-        self._story_h = QDoubleSpinBox(body)
-        self._story_h.setRange(0.5, 50.0)
-        self._story_h.setDecimals(2)
-        self._story_h.setSingleStep(0.5)
-        self._story_h.setSuffix(" m")
-        self._story_h.setValue(3.0)
-
-        self._bays = QSpinBox(body)
-        self._bays.setRange(1, 30)
-        self._bays.setValue(3)
-
-        self._bay_w = QDoubleSpinBox(body)
-        self._bay_w.setRange(0.5, 50.0)
-        self._bay_w.setDecimals(2)
-        self._bay_w.setSingleStep(0.5)
-        self._bay_w.setSuffix(" m")
-        self._bay_w.setValue(5.0)
-
-        self._sec_combo = QComboBox(body)
-        for sid in sorted(self._source_model.sections):
-            s = self._source_model.sections[sid]
-            mat = self._source_model.materials.get(s.material_id)
-            mat_name = (
-                mat.name if (mat and mat.name) else f"mat {s.material_id}"
-            )
-            label = f"{s.name or 'unnamed'} / {mat_name}"
-            self._sec_combo.addItem(label, sid)
-
-        self._fixed_base = QCheckBox(
-            "Fixed (ux, uy, rz) supports at every ground node", body,
-        )
-        self._fixed_base.setChecked(True)
-
-        form.addRow("Stories:", self._stories)
-        form.addRow("Story height:", self._story_h)
-        form.addRow("Bays (X direction):", self._bays)
-        form.addRow("Bay width:", self._bay_w)
-        form.addRow("Section (cols & beams):", self._sec_combo)
-        form.addRow("", self._fixed_base)
-
-        hint = QLabel(
-            "Generates a planar moment-frame: vertical columns at each "
-            "column line, horizontal beams at every floor above ground. "
-            "Replaces the current model — materials and sections are "
-            "preserved. Use Undo (Ctrl+Z) to restore.",
-            body,
-        )
-        hint.setWordWrap(True)
-        form.addRow(hint)
-
-    def _accept(self) -> StructuralModel:
-        stories = int(self._stories.value())
-        h = float(self._story_h.value())
-        bays = int(self._bays.value())
-        bw = float(self._bay_w.value())
-        sid = self._sec_combo.currentData()
-        if sid is None or sid not in self._source_model.sections:
-            raise ValueError("No valid section selected.")
-
-        section = self._source_model.sections[sid]
-        mat = self._source_model.materials.get(section.material_id)
-        if mat is None:
-            raise ValueError(
-                f"Section {sid} references missing material "
-                f"{section.material_id}."
-            )
-
-        m = StructuralModel(title=f"Building {stories}s × {bays}b")
-        m.materials = dict(self._source_model.materials)
-        m.sections = dict(self._source_model.sections)
-
-        # (bays+1) × (stories+1) node grid: node_grid[j][i] is the node id
-        # at column line i (0..bays) on floor j (0..stories, j=0 is ground).
-        node_grid: list[list[int]] = []
-        nid = 1
-        for j in range(stories + 1):
-            row: list[int] = []
-            for i in range(bays + 1):
-                m.nodes[nid] = Node(nid, i * bw, j * h)
-                row.append(nid)
-                nid += 1
-            node_grid.append(row)
-
-        eid = 1
-        # Columns: each column line, each story.
-        for i in range(bays + 1):
-            for j in range(stories):
-                m.elements.append(FrameElement2D(
-                    id=eid,
-                    node_i=node_grid[j][i],
-                    node_j=node_grid[j + 1][i],
-                    E=mat.E, A=section.A, I=section.I,
-                    alpha=mat.alpha, depth=section.depth,
-                    section_id=section.id,
-                ))
-                eid += 1
-        # Beams: every floor above ground, between adjacent columns.
-        for j in range(1, stories + 1):
-            for i in range(bays):
-                m.elements.append(FrameElement2D(
-                    id=eid,
-                    node_i=node_grid[j][i],
-                    node_j=node_grid[j][i + 1],
-                    E=mat.E, A=section.A, I=section.I,
-                    alpha=mat.alpha, depth=section.depth,
-                    section_id=section.id,
-                ))
-                eid += 1
-
-        if self._fixed_base.isChecked():
-            for nid_base in node_grid[0]:
-                m.supports[nid_base] = Support(
-                    nid_base, ux=True, uy=True, rz=True,
-                )
-
-        return m

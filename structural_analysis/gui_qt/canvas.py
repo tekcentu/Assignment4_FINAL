@@ -69,6 +69,13 @@ class ModelCanvas(QWidget):
         self.diagram_kind: str = "moment"
         self.deformed_scale: float = 1.0
         self.diagram_scale: float = 1.0
+        # Station points are post-processing samples per element, used to
+        # draw smooth deformed shapes (cubic-Hermite for frames) and
+        # internal-force diagrams. They are NOT model nodes and never
+        # affect connectivity, supports, or loads. 21 picks up the
+        # midspan exactly and gives smooth UDL / point-load diagrams.
+        self.deformed_stations: int = 21
+        self.diagram_stations: int = 21
         self._result = None
         self._modal_result = None    # ModalResult or None
         self._modal_mode_idx: int = 0
@@ -94,6 +101,11 @@ class ModelCanvas(QWidget):
         # zoom level.
         self._view_initialised: bool = False
 
+        # Middle-mouse-drag pan state (display coordinates at drag start).
+        self._pan_origin: tuple[float, float] | None = None
+        self._pan_xlim0: tuple[float, float] = (0.0, 1.0)
+        self._pan_ylim0: tuple[float, float] = (0.0, 1.0)
+
         self.on_click: Callable[[HitResult, str], None] | None = None
         self.on_motion: Callable[[HitResult], None] | None = None
 
@@ -115,16 +127,9 @@ class ModelCanvas(QWidget):
         self.setLayout(layout)
 
         self._mpl_canvas.mpl_connect("button_press_event", self._handle_click)
+        self._mpl_canvas.mpl_connect("button_release_event", self._handle_release)
         self._mpl_canvas.mpl_connect("motion_notify_event", self._handle_motion)
-        # Scroll-wheel zoom and middle-button (wheel-press) pan run
-        # independently of matplotlib's navigation toolbar — users get
-        # SAP/AutoCAD-style navigation without needing to toggle a tool.
         self._mpl_canvas.mpl_connect("scroll_event", self._handle_scroll)
-        self._mpl_canvas.mpl_connect("button_press_event", self._handle_pan_press)
-        self._mpl_canvas.mpl_connect("button_release_event",
-                                       self._handle_pan_release)
-        self._mpl_canvas.mpl_connect("motion_notify_event", self._handle_pan_motion)
-        self._pan_state: tuple[float, float, tuple, tuple] | None = None
 
     # ── public API ──
 
@@ -254,11 +259,15 @@ class ModelCanvas(QWidget):
     # ── event forwarding ──
 
     def _handle_click(self, event) -> None:
-        # Middle button is reserved for panning the canvas (see
-        # _handle_pan_press) — never forward it to the active tool.
-        if event.button == 2:
+        if event.inaxes is not self.ax:
             return
-        if self.on_click is None or event.inaxes is not self.ax:
+        if event.button == 2 and not self.toolbar.mode:
+            # Middle-button drag — start pan.
+            self._pan_origin = (event.x, event.y)
+            self._pan_xlim0 = tuple(self.ax.get_xlim())
+            self._pan_ylim0 = tuple(self.ax.get_ylim())
+            return
+        if self.on_click is None:
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -279,9 +288,17 @@ class ModelCanvas(QWidget):
         self.on_click(hit, button_name)
 
     def _handle_motion(self, event) -> None:
-        if self._pan_state is not None:
-            # A pan drag is in progress — suppress snap/hover updates so
-            # the canvas doesn't flicker between snap and pan redraws.
+        if self._pan_origin is not None:
+            # Middle-mouse drag in progress — pan without redrawing the model.
+            inv = self.ax.transData.inverted()
+            x0d, y0d = inv.transform(self._pan_origin)
+            xcd, ycd = inv.transform((event.x, event.y))
+            dx, dy = xcd - x0d, ycd - y0d
+            xl, xr = self._pan_xlim0
+            yb, yt = self._pan_ylim0
+            self.ax.set_xlim(xl - dx, xr - dx)
+            self.ax.set_ylim(yb - dy, yt - dy)
+            self._mpl_canvas.draw_idle()
             return
         if self.on_motion is None or event.inaxes is not self.ax:
             # Cursor left the axes — drop the hover marker.
@@ -301,54 +318,23 @@ class ModelCanvas(QWidget):
         except Exception:
             pass
 
-    # ── navigation (scroll-zoom + middle-button pan) ──
+    def _handle_release(self, event) -> None:
+        if event.button == 2:
+            self._pan_origin = None
 
     def _handle_scroll(self, event) -> None:
-        if event.inaxes is not self.ax:
+        if event.inaxes is not self.ax or self.toolbar.mode:
             return
         if event.xdata is None or event.ydata is None:
             return
-        # Zoom factor 1.2 per notch (zoom in on scroll-up).
-        base = 1.2
-        factor = 1.0 / base if event.button == "up" else base
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
-        cx, cy = event.xdata, event.ydata
-        self.ax.set_xlim(cx + (x0 - cx) * factor, cx + (x1 - cx) * factor)
-        self.ax.set_ylim(cy + (y0 - cy) * factor, cy + (y1 - cy) * factor)
-        self._view_initialised = True
+        # Scroll up → zoom in (shrink the visible range); scroll down → zoom out.
+        factor = 1.0 / 1.15 if event.button == "up" else 1.15
+        xl, xr = self.ax.get_xlim()
+        yb, yt = self.ax.get_ylim()
+        xd, yd = event.xdata, event.ydata
+        self.ax.set_xlim(xd - (xd - xl) * factor, xd + (xr - xd) * factor)
+        self.ax.set_ylim(yd - (yd - yb) * factor, yd + (yt - yd) * factor)
         self._mpl_canvas.draw_idle()
-
-    def _handle_pan_press(self, event) -> None:
-        if event.button != 2:                       # middle button only
-            return
-        if event.inaxes is not self.ax:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        self._pan_state = (
-            float(event.xdata), float(event.ydata),
-            self.ax.get_xlim(), self.ax.get_ylim(),
-        )
-
-    def _handle_pan_motion(self, event) -> None:
-        if self._pan_state is None:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        x0, y0, xlim0, ylim0 = self._pan_state
-        # Convert pixel delta to data delta using the *frozen* axes
-        # transform from press time, otherwise the pan grows quadratically.
-        dx_data = float(event.xdata) - x0
-        dy_data = float(event.ydata) - y0
-        self.ax.set_xlim(xlim0[0] - dx_data, xlim0[1] - dx_data)
-        self.ax.set_ylim(ylim0[0] - dy_data, ylim0[1] - dy_data)
-        self._view_initialised = True
-        self._mpl_canvas.draw_idle()
-
-    def _handle_pan_release(self, event) -> None:
-        if event.button == 2:
-            self._pan_state = None
 
     # ── geometry / hit-test ──
 
@@ -759,6 +745,66 @@ class ModelCanvas(QWidget):
         uy = float(D[emap["uy"]]) if emap["uy"] is not None else 0.0
         return ux, uy
 
+    def _node_rotation(self, nid: int) -> float:
+        """Return θ_z at ``nid`` from the global displacement vector, or
+        0.0 if the node has no rotational DOF (e.g. truss-only node)."""
+        result = self._result
+        if result is None or result.D is None:
+            return 0.0
+        emap = result.E_map.get(nid)
+        if emap is None or emap.get("rz") is None:
+            return 0.0
+        return float(result.D[emap["rz"]])
+
+    @staticmethod
+    def _hermite_v(
+        r: float, L: float, vi: float, thi: float, vj: float, thj: float,
+    ) -> float:
+        """Cubic-Hermite transverse interpolation in local frame.
+
+        ``r`` is the dimensionless position 0..1 along the element. Returns
+        the transverse displacement v(r) for end DOFs ``[vi, thi, vj, thj]``.
+        """
+        N1 = 1.0 - 3.0 * r * r + 2.0 * r * r * r
+        N2 = L * (r - 2.0 * r * r + r * r * r)
+        N3 = 3.0 * r * r - 2.0 * r * r * r
+        N4 = L * (-r * r + r * r * r)
+        return N1 * vi + N2 * thi + N3 * vj + N4 * thj
+
+    def _frame_deformed_points(
+        self, elem: FrameElement2D, scale: float,
+    ) -> tuple[list[float], list[float]]:
+        """Sample the frame element's deformed centreline.
+
+        Reads ``d_local`` from ``member_results`` — already in the element's
+        local frame and, for moment-released ends, back-calculated via static
+        condensation — so the Hermite curve is correct even at hinge joints.
+        Pure visualization; solver outputs are not modified.
+        """
+        nodes = self._model().nodes
+        ni = nodes[elem.node_i]
+        nj = nodes[elem.node_j]
+        L, c, s = elem.length_cos_sin(nodes)
+        result = self._result
+        mr = result.member_results.get(elem.id) if result else None
+        if mr is None or "d_local" not in mr:
+            return [ni.x, nj.x], [ni.y, nj.y]
+        d = mr["d_local"]
+        ui_loc, vi_loc, thi = float(d[0]), float(d[1]), float(d[2])
+        uj_loc, vj_loc, thj = float(d[3]), float(d[4]), float(d[5])
+        n = max(2, int(self.deformed_stations))
+        Xs: list[float] = []
+        Ys: list[float] = []
+        for k in range(n):
+            r = k / (n - 1)
+            u_loc = (1.0 - r) * ui_loc + r * uj_loc
+            v_loc = self._hermite_v(r, L, vi_loc, thi, vj_loc, thj)
+            x_def = r * L + scale * u_loc
+            y_def = scale * v_loc
+            Xs.append(ni.x + c * x_def - s * y_def)
+            Ys.append(ni.y + s * x_def + c * y_def)
+        return Xs, Ys
+
     def _draw_deformed(self) -> None:
         result = self._result
         model = self._model()
@@ -773,6 +819,23 @@ class ModelCanvas(QWidget):
             max_disp,
             max((abs(self._node_displacement(nid)[1]) for nid in model.nodes), default=0.0),
         )
+        # Extend max_disp to include Hermite transverse amplitudes for frame
+        # elements. Without this, a horizontal SS beam (all nodal ux=uy=0)
+        # would have max_disp=0 and the deformed shape would be silenced.
+        for elem in model.elements:
+            if not isinstance(elem, FrameElement2D):
+                continue
+            mr = result.member_results.get(elem.id)
+            if mr is None or "d_local" not in mr:
+                continue
+            d = mr["d_local"]
+            try:
+                L, _c, _s = elem.length_cos_sin(model.nodes)
+            except (ValueError, ZeroDivisionError):
+                continue
+            vi, thi, vj, thj = float(d[1]), float(d[2]), float(d[4]), float(d[5])
+            for rk in (0.25, 0.5, 0.75):
+                max_disp = max(max_disp, abs(self._hermite_v(rk, L, vi, thi, vj, thj)))
         if max_disp <= 0:
             return
         scale = self.deformed_scale * 0.10 * span / max_disp
@@ -781,11 +844,20 @@ class ModelCanvas(QWidget):
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
-            uxi, uyi = self._node_displacement(elem.node_i)
-            uxj, uyj = self._node_displacement(elem.node_j)
+            if isinstance(elem, FrameElement2D):
+                try:
+                    Xs, Ys = self._frame_deformed_points(elem, scale)
+                except (ValueError, ZeroDivisionError):
+                    continue
+            else:
+                # Truss bar stays straight between displaced endpoints —
+                # rotations don't contribute to a pin-jointed member.
+                uxi, uyi = self._node_displacement(elem.node_i)
+                uxj, uyj = self._node_displacement(elem.node_j)
+                Xs = [ni.x + scale * uxi, nj.x + scale * uxj]
+                Ys = [ni.y + scale * uyi, nj.y + scale * uyj]
             self.ax.plot(
-                [ni.x + scale * uxi, nj.x + scale * uxj],
-                [ni.y + scale * uyi, nj.y + scale * uyj],
+                Xs, Ys,
                 color="#ff7f0e", linestyle="-", linewidth=1.5, alpha=0.7,
                 zorder=3,
             )
@@ -915,11 +987,14 @@ class ModelCanvas(QWidget):
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
-            # Sample densely so the critical-point search lands near
-            # the true extreme (21 samples can miss a peak between
-            # nodes by a couple of percent on a short element).
+            # Sample density is configurable via View → Diagram stations.
+            # Lower counts give a coarser preview; the critical-point
+            # search below operates on the same xs / ys, so very low
+            # counts (e.g. 5) may miss the true peak between stations —
+            # surfaced to the user via the menu tooltip + status hint.
+            n = max(2, int(self.diagram_stations))
             xs, ys = _diagram_ordinates(
-                elem, ni, nj, mr["f_local"], self.diagram_kind, n_samples=51,
+                elem, ni, nj, mr["f_local"], self.diagram_kind, n_samples=n,
             )
             if xs is None:
                 continue
