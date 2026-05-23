@@ -739,18 +739,18 @@ def test_view3d_window_opens_and_holds_singleton(qt_app):
 
 def test_view3d_window_builds_one_mesh_per_element(qt_app):
     """Each frame/truss element should land as exactly one
-    Poly3DCollection so future stress overlays can recolour faces
-    per-element without re-meshing."""
+    Poly3DCollection, keyed by element id so future stress overlays
+    can look up the mesh per element without re-meshing."""
     w = MainWindow(initial_path="inputs/example_01_cantilever_tip_load.txt")
     qt_app.processEvents()
     w._open_view3d()
     qt_app.processEvents()
     view = w._view3d_window
-    n_elems = len(w._model.elements)
-    assert len(view._element_meshes) == n_elems
-    # Refresh re-builds in place; count must still match.
+    elem_ids = {e.id for e in w._model.elements}
+    assert set(view._element_meshes) == elem_ids
+    # Refresh re-builds in place; set must still match.
     view.refresh()
-    assert len(view._element_meshes) == n_elems
+    assert set(view._element_meshes) == elem_ids
 
 
 def test_view3d_manual_section_uses_sqrt_A_and_shows_banner(qt_app):

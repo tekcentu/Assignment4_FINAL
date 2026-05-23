@@ -1,10 +1,11 @@
 """Stage-3 3D viewer — extrudes each element along its local axis.
 
 A read-only, geometry-only view. Each element is rendered as a single
-:class:`mpl_toolkits.mplot3d.art3d.Poly3DCollection` (one mesh per
-element). Future branches will colour those meshes per face from a
-force / stress field — keep the one-mesh-per-element invariant so
-that swap is a single attribute change rather than a re-architecture.
+:class:`mpl_toolkits.mplot3d.art3d.Poly3DCollection` keyed by element
+id in ``_element_meshes``. Future branches will colour those meshes
+per face from a force / stress field — the one-mesh-per-element
+invariant + the id → mesh mapping are the only forward affordance;
+no stub APIs exist yet.
 
 The 2D canvas remains the editing surface; this window has no model
 mutations, no solver hooks, and no overlays beyond the undeformed
@@ -141,7 +142,10 @@ class View3DWindow(QMainWindow):
         self.resize(900, 700)
 
         self._model_provider = model_provider
-        self._element_meshes: list[Poly3DCollection] = []
+        # element id → its Poly3DCollection. Future overlays will look
+        # up the mesh by element id to recolour faces — keep this
+        # mapping as the public-facing invariant.
+        self._element_meshes: dict[int, Poly3DCollection] = {}
 
         self._build_ui()
         self.refresh()
@@ -187,7 +191,7 @@ class View3DWindow(QMainWindow):
         """Rebuild the scene from the current model."""
         model = self._model_provider()
         self.ax.clear()
-        self._element_meshes = []
+        self._element_meshes = {}
 
         has_manual = any(
             s.shape_type == "manual" for s in model.sections.values()
@@ -228,7 +232,7 @@ class View3DWindow(QMainWindow):
                 linewidths=0.4, alpha=0.92,
             )
             self.ax.add_collection3d(mesh)
-            self._element_meshes.append(mesh)
+            self._element_meshes[elem.id] = mesh
 
         self.ax.set_xlabel("X (m)")
         self.ax.set_ylabel("Y (m)")
