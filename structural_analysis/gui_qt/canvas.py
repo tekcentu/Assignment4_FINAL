@@ -100,6 +100,13 @@ class ModelCanvas(QWidget):
         # placing a node or moving the mouse no longer collapses the
         # zoom level.
         self._view_initialised: bool = False
+        # Tracks whether the user has manually adjusted the view (scroll
+        # zoom, middle-button pan). While False, a window resize is free
+        # to re-fit the data limits to match the new widget aspect so
+        # the grid fills the canvas. Once True, the user owns the
+        # viewport — resize keeps the current limits and only fit_to_view
+        # (View → Fit) takes the wheel back.
+        self._user_view_dirty: bool = False
 
         # Middle-mouse-drag pan state (display coordinates at drag start).
         self._pan_origin: tuple[float, float] | None = None
@@ -209,6 +216,7 @@ class ModelCanvas(QWidget):
         after loading a file or via the View → Fit action).
         """
         self._view_initialised = False
+        self._user_view_dirty = False
         self.redraw()
 
     def redraw(self) -> None:
@@ -256,6 +264,28 @@ class ModelCanvas(QWidget):
         self._draw_snap_marker()
         self._mpl_canvas.draw_idle()
 
+    # ── Qt resize → re-fit while the user hasn't taken the wheel ──
+
+    def resizeEvent(self, event) -> None:
+        """When the widget is resized and the user hasn't manually
+        panned or zoomed yet, re-fit the data limits so the data box's
+        aspect matches the new widget aspect — i.e. the grid keeps
+        filling the canvas instead of collapsing to a centred square.
+
+        Once the user pans or scroll-zooms, ``_user_view_dirty`` is
+        True and we leave the limits alone. ``fit_to_view`` (View →
+        Fit) resets the flag and re-engages auto-fit.
+        """
+        super().resizeEvent(event)
+        if self._user_view_dirty:
+            return
+        if not self._view_initialised:
+            # First-ever paint hasn't happened yet; redraw() will set
+            # the limits using the new widget size.
+            return
+        self._set_axes_limits()
+        self._mpl_canvas.draw_idle()
+
     # ── event forwarding ──
 
     def _handle_click(self, event) -> None:
@@ -298,6 +328,7 @@ class ModelCanvas(QWidget):
             yb, yt = self._pan_ylim0
             self.ax.set_xlim(xl - dx, xr - dx)
             self.ax.set_ylim(yb - dy, yt - dy)
+            self._user_view_dirty = True
             self._mpl_canvas.draw_idle()
             return
         if self.on_motion is None or event.inaxes is not self.ax:
@@ -334,6 +365,7 @@ class ModelCanvas(QWidget):
         xd, yd = event.xdata, event.ydata
         self.ax.set_xlim(xd - (xd - xl) * factor, xd + (xr - xd) * factor)
         self.ax.set_ylim(yd - (yd - yb) * factor, yd + (yt - yd) * factor)
+        self._user_view_dirty = True
         self._mpl_canvas.draw_idle()
 
     # ── geometry / hit-test ──
@@ -1094,20 +1126,44 @@ class ModelCanvas(QWidget):
         return span if span > 1e-9 else 1.0
 
     def _set_axes_limits(self) -> None:
+        """Fit xlim/ylim to the model + grid, then stretch one axis so
+        the data box's aspect matches the canvas widget's pixel aspect.
+
+        Stretching is necessary because ``set_aspect("equal",
+        adjustable="box")`` shrinks the axes rectangle to whichever
+        dimension is shorter at a 1:1 data scale. If we fed it a
+        square data box the user would see the grid as a small square
+        floating in the centre of a wide window. By computing xlim/ylim
+        whose ratio already matches the widget's pixel ratio, the axes
+        rectangle ends up filling the widget with the gridlines and
+        origin markers running edge to edge.
+        """
         model = self._model()
         grid = self._grid_provider()
         xs: list[float] = [n.x for n in model.nodes.values()]
         ys: list[float] = [n.y for n in model.nodes.values()]
         xs += [ln.coord for ln in grid.x_lines]
         ys += [ln.coord for ln in grid.y_lines]
-        if not xs or not ys:
-            self.ax.set_xlim(-1, 11)
-            self.ax.set_ylim(-1, 11)
-            return
-        span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
-        pad = 0.15 * span
-        self.ax.set_xlim(min(xs) - pad, max(xs) + pad)
-        self.ax.set_ylim(min(ys) - pad, max(ys) + pad)
+        if xs and ys:
+            x_lo, x_hi = min(xs), max(xs)
+            y_lo, y_hi = min(ys), max(ys)
+            cx = (x_lo + x_hi) / 2.0
+            cy = (y_lo + y_hi) / 2.0
+            base = max(x_hi - x_lo, y_hi - y_lo, 1.0) / 2.0 * 1.15
+        else:
+            cx, cy, base = 5.0, 5.0, 6.0
+
+        size = self._mpl_canvas.size()
+        w_px = max(size.width(),  1)
+        h_px = max(size.height(), 1)
+        if w_px >= h_px:
+            x_half = base * (w_px / h_px)
+            y_half = base
+        else:
+            x_half = base
+            y_half = base * (h_px / w_px)
+        self.ax.set_xlim(cx - x_half, cx + x_half)
+        self.ax.set_ylim(cy - y_half, cy + y_half)
 
 
 def _point_segment_distance_px(px, py, x1, y1, x2, y2,
