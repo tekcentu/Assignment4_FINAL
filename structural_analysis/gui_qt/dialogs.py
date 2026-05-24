@@ -1708,6 +1708,29 @@ class ElementPropertiesDialog(QDialog):
         for line in loads[1:]:
             form.addRow("", QLabel(line))
 
+        # Static graphical detail block — member sketch, FBD, internal-
+        # force preview, section thumbnail. Visible pre-solve too; the
+        # diagrams just say "Run analysis to see diagrams" until a
+        # result is available. The single source of truth for the N/V/M
+        # math lives in element_graphics; the dialog and the main
+        # canvas both call into it.
+        from .element_graphics import draw_element_detail
+
+        self._detail_fig = Figure(figsize=(6.4, 4.6), dpi=96)
+        self._detail_fig.patch.set_facecolor("white")
+        self._detail_canvas = FigureCanvasQTAgg(self._detail_fig)
+        self._detail_canvas.setMinimumSize(520, 360)
+        layout.addWidget(self._detail_canvas)
+        ok_result = (
+            result if (result is not None
+                       and getattr(result, "status", None) == "ok")
+            else None
+        )
+        self._detail_axes = draw_element_detail(
+            self._detail_fig, elem, model, ok_result,
+        )
+        self._detail_canvas.draw_idle()
+
         # End-force result block (only if a successful static result exists).
         if result is not None and getattr(result, "status", None) == "ok":
             f_local = _element_local_forces(result, elem_id)

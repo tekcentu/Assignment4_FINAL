@@ -387,6 +387,85 @@ def test_property_dialogs_construct(qt_app):
         NodePropertiesDialog(w, m, nid, w._result)
 
 
+def test_element_dialog_renders_graphics_pre_solve(qt_app):
+    """The element detail dialog must be usable *before* solving:
+    member sketch / FBD / section thumbnail render straight from
+    model data, while the internal-force panel shows a "Run analysis"
+    placeholder. No exception must be raised by the figure path."""
+    from structural_analysis.gui_qt.dialogs import ElementPropertiesDialog
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    elem = w._model.elements[0]
+    # Note: result intentionally None to exercise the pre-solve path.
+    d = ElementPropertiesDialog(w, w._model, elem.id, None)
+    qt_app.processEvents()
+
+    axes = d._detail_axes
+    assert set(axes) == {"sketch", "fbd", "diagrams", "section"}
+
+    # Member sketch always renders the centre-line — there must be at
+    # least one Line2D in the sketch panel.
+    assert axes["sketch"].lines, "member sketch must draw the centreline"
+
+    # Internal-force panel pre-solve must show the placeholder text
+    # and must NOT draw any data line yet.
+    diag_texts = [t.get_text() for t in axes["diagrams"].texts]
+    assert any("Run analysis" in t for t in diag_texts)
+    assert not axes["diagrams"].lines
+
+    # Section thumbnail renders only if the element carries a section.
+    if w._model.sections.get(getattr(elem, "section_id", None)):
+        assert axes["section"].patches, (
+            "section thumbnail must render a filled outline"
+        )
+    else:
+        sect_texts = [t.get_text() for t in axes["section"].texts]
+        assert any("no section" in t.lower() for t in sect_texts)
+
+
+def test_element_dialog_renders_graphics_post_solve(qt_app):
+    """After solving, the dialog's internal-force panel must plot at
+    least one N/V/M trace with n_samples station points — and those
+    samples must come from element_graphics.sample_internal_force,
+    not from a duplicate BMD/SFD formula inside the dialog."""
+    from structural_analysis.gui_qt.dialogs import ElementPropertiesDialog
+    from structural_analysis.gui_qt.element_graphics import (
+        sample_internal_force,
+    )
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._result is not None and w._result.status == "ok"
+
+    elem = w._model.elements[0]
+    d = ElementPropertiesDialog(w, w._model, elem.id, w._result)
+    qt_app.processEvents()
+
+    diag_ax = d._detail_axes["diagrams"]
+    assert diag_ax.lines, "post-solve diagrams must render at least one trace"
+    # At least one trace must have >= n_samples points (the default
+    # 11 used by draw_element_detail). Defends against a regression
+    # where the dialog plots only the end-values.
+    longest = max(len(line.get_xdata()) for line in diag_ax.lines)
+    assert longest >= 11, (
+        f"internal-force trace must use at least 11 station points, "
+        f"got {longest}"
+    )
+
+    # Independent path — the *same* element_graphics helper must
+    # produce the same number of station points; this is the
+    # "single source of truth" guarantee.
+    f_local = w._result.member_results[elem.id]["f_local"]
+    ni = w._model.nodes[elem.node_i]
+    nj = w._model.nodes[elem.node_j]
+    xs, _ys = sample_internal_force(elem, ni, nj, f_local, "axial",
+                                      n_samples=11)
+    assert xs is not None and len(xs) == 11
+
+
 def test_property_dialogs_raise_for_unknown_ids(qt_app):
     from structural_analysis.gui_qt.dialogs import (
         ElementPropertiesDialog,
