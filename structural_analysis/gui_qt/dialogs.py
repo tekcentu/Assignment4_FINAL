@@ -1621,7 +1621,8 @@ class BuildingWizardDialog(_ModalDialog):
                     node_i=node_grid[j][i],
                     node_j=node_grid[j + 1][i],
                     E=mat.E, A=section.A, I=section.I,
-                    alpha=mat.alpha, depth=section.depth,
+                    alpha=mat.alpha, rho=mat.density,
+                    depth=section.depth,
                     section_id=section.id,
                 ))
                 eid += 1
@@ -1633,7 +1634,8 @@ class BuildingWizardDialog(_ModalDialog):
                     node_i=node_grid[j][i],
                     node_j=node_grid[j][i + 1],
                     E=mat.E, A=section.A, I=section.I,
-                    alpha=mat.alpha, depth=section.depth,
+                    alpha=mat.alpha, rho=mat.density,
+                    depth=section.depth,
                     section_id=section.id,
                 ))
                 eid += 1

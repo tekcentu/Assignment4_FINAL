@@ -76,9 +76,11 @@ def _world_axes_for(orientation: str
                      ) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(in_plane_axis, out_of_plane_axis)`` unit world vectors
     for the given orientation. ``in_plane_axis`` is the world direction
-    along which the section's *depth* extrudes (the second component of
-    the outline tuple ``(y, z)`` from :func:`section_outline`); for
-    completeness ``out_of_plane_axis`` is the *width* direction."""
+    along which the section's *depth* extrudes — that's the *first*
+    component of the outline tuple ``(y, z)`` from
+    :func:`section_outline` (depth runs along local y); ``out_of_plane_axis``
+    is the *width* direction, the second component (width runs along
+    local z)."""
     if orientation == _ORIENT_Z_UP:
         return (np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0]))
     # y_up (default).
@@ -214,7 +216,10 @@ def _apply_clean_style(ax) -> None:
             pass
     for line in (ax.xaxis.line, ax.yaxis.line, ax.zaxis.line):
         line.set_color((0.55, 0.55, 0.55, 0.85))
-    ax.tick_params(axis="both", colors="#666666", pad=2)
+    # tick_params(axis="both", ...) only reaches X+Y on a 3D axes;
+    # iterate so the Z ticks pick up the same softened colour.
+    for which in ("x", "y", "z"):
+        ax.tick_params(axis=which, colors="#666666", pad=2)
 
 
 class View3DWindow(QMainWindow):

@@ -956,8 +956,6 @@ def test_view3d_orientation_switch_rebuilds_geometry(qt_app):
     the elevation node (here at model y=4) must land on world Y in
     Y-up mode and on world Z in Z-up mode.
     """
-    import numpy as np
-
     from structural_analysis.element import FrameElement2D
     from structural_analysis.gui_qt.view3d import (
         _ORIENT_Y_UP, _ORIENT_Z_UP,
