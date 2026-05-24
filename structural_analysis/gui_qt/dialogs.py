@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -51,6 +54,7 @@ from ..profiles import (
     MATERIAL_TEMPLATES,
     SECTION_SHAPES,
     properties_for_shape,
+    section_outline,
 )
 
 from PyQt6.QtWidgets import QStackedWidget
@@ -351,6 +355,19 @@ class SectionDialog(_ModalDialog):
         self._status.setStyleSheet("color: #b00;")
         form.addRow(self._status)
 
+        # Live cross-section preview. A small square matplotlib figure
+        # rendered next to the existing per-page text read-out. The
+        # widget is built once and re-drawn from _refresh_preview() —
+        # which is already on the textChanged path for every
+        # dimension field and on the shape combo's index-changed
+        # signal — so the preview follows whatever the user types.
+        self._preview_fig = Figure(figsize=(2.6, 2.6), dpi=96)
+        self._preview_fig.patch.set_facecolor("white")
+        self._preview_ax = self._preview_fig.add_subplot(111)
+        self._preview_canvas = FigureCanvasQTAgg(self._preview_fig)
+        self._preview_canvas.setMinimumSize(220, 220)
+        form.addRow("Preview", self._preview_canvas)
+
         # Initialise from existing section if any
         if self._existing:
             s = self._existing
@@ -509,11 +526,13 @@ class SectionDialog(_ModalDialog):
             self._status.setText("")
             if ok is not None:
                 ok.setEnabled(True)
+            self._draw_section_preview(None)
             return
         derived = self._compute_derived()
         if derived is None:
             if ok is not None:
                 ok.setEnabled(False)
+            self._draw_section_preview(None)
             return
         self._status.setText("")
         if ok is not None:
@@ -527,6 +546,154 @@ class SectionDialog(_ModalDialog):
             self._sq_preview.setText(text)
         elif shape == "i_section":
             self._i_preview.setText(text)
+        self._draw_section_preview(derived)
+
+    def _draw_section_preview(self, derived: dict[str, float] | None) -> None:
+        """Re-render the small cross-section thumbnail.
+
+        ``derived`` is the dict returned by :meth:`_compute_derived` or
+        ``None`` when the input is incomplete / invalid (or when the
+        manual shape is selected, which has no geometric dimensions).
+        The graphical preview is additive — the per-page text read-out
+        (``_rect_preview`` / ``_sq_preview`` / ``_i_preview``) and the
+        red ``_status`` label keep doing their existing jobs.
+        """
+        ax = self._preview_ax
+        ax.clear()
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_axis_off()
+        shape = self._current_shape()
+
+        if shape == "manual":
+            # Manual sections have no geometric inputs in this dialog —
+            # the user types A / I / depth / width directly. Showing
+            # an outline would be misleading, so leave the preview
+            # blank with a single line of explanatory text.
+            ax.text(
+                0.5, 0.5,
+                "manual section\n(no shape preview)",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=9, color="#555",
+            )
+            self._preview_canvas.draw_idle()
+            return
+
+        if derived is None:
+            ax.text(
+                0.5, 0.5,
+                "invalid dimensions",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=9, color="#b00",
+            )
+            self._preview_canvas.draw_idle()
+            return
+
+        try:
+            section = self._section_from_inputs(shape, derived)
+            pts = section_outline(section)
+        except (ValueError, KeyError):
+            ax.text(
+                0.5, 0.5,
+                "invalid dimensions",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=9, color="#b00",
+            )
+            self._preview_canvas.draw_idle()
+            return
+
+        # Outline tuples are (y, z) with depth on local y, width on
+        # local z. Plot width on the horizontal screen axis and depth
+        # on the vertical screen axis so the thumbnail matches the
+        # user's mental "wide horizontally, deep vertically" picture.
+        zs = [p[1] for p in pts]
+        ys = [p[0] for p in pts]
+        ax.fill(zs, ys, facecolor="#cfe3f6", edgecolor="#1f3a5f",
+                linewidth=1.2, alpha=0.95)
+        ax.plot(zs + [zs[0]], ys + [ys[0]], color="#1f3a5f", linewidth=1.2)
+
+        # Dimension labels — small, positioned just outside the outline.
+        # b = width along z, h = depth along y; tf / tw only for I.
+        b = derived.get("width", 0.0)
+        h = derived.get("depth", 0.0)
+        if b > 0 and h > 0:
+            ax.annotate(
+                f"b = {b:g}",
+                xy=(0.0, -h / 2.0), xytext=(0.0, -h / 2.0 - 0.18 * h),
+                ha="center", va="top", fontsize=8, color="#333",
+            )
+            ax.annotate(
+                f"h = {h:g}",
+                xy=(b / 2.0, 0.0), xytext=(b / 2.0 + 0.18 * b, 0.0),
+                ha="left", va="center", fontsize=8, color="#333",
+            )
+        if shape == "i_section":
+            try:
+                tf = float(self._i_tf.text() or "0")
+                tw = float(self._i_tw.text() or "0")
+            except ValueError:
+                tf = tw = 0.0
+            if tf > 0:
+                ax.annotate(
+                    f"tf = {tf:g}",
+                    xy=(-b / 2.0, h / 2.0 - tf / 2.0),
+                    xytext=(-b / 2.0 - 0.22 * b, h / 2.0 - tf / 2.0),
+                    ha="right", va="center", fontsize=8, color="#333",
+                )
+            if tw > 0:
+                ax.annotate(
+                    f"tw = {tw:g}",
+                    xy=(tw / 2.0, 0.0),
+                    xytext=(tw / 2.0 + 0.18 * b, -0.25 * h),
+                    ha="left", va="center", fontsize=8, color="#333",
+                )
+
+        # A little breathing room around the outline so the dimension
+        # labels don't run off the edge of the figure.
+        ax.relim()
+        ax.autoscale_view()
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        pad_x = (x1 - x0) * 0.30 + 1e-6
+        pad_y = (y1 - y0) * 0.25 + 1e-6
+        ax.set_xlim(x0 - pad_x, x1 + pad_x)
+        ax.set_ylim(y0 - pad_y, y1 + pad_y)
+
+        self._preview_canvas.draw_idle()
+
+    def _section_from_inputs(self, shape: str,
+                              derived: dict[str, float]) -> Section:
+        """Build a transient Section from the current dialog inputs so
+        :func:`section_outline` can render it. ID / material_id are
+        placeholders — this object is only used for outline geometry
+        and never reaches the model."""
+        if shape == "rectangle":
+            return Section(
+                id=0, shape_type="rectangle",
+                b=float(self._rect_b.text() or "0"),
+                h=float(self._rect_h.text() or "0"),
+                A=derived["A"], I=derived["I"],
+                depth=derived["depth"], width=derived["width"],
+            )
+        if shape == "square":
+            h = float(self._sq_h.text() or "0")
+            return Section(
+                id=0, shape_type="square",
+                b=h, h=h,
+                A=derived["A"], I=derived["I"],
+                depth=derived["depth"], width=derived["width"],
+            )
+        if shape == "i_section":
+            return Section(
+                id=0, shape_type="i_section",
+                b=float(self._i_b.text() or "0"),
+                h=float(self._i_h.text() or "0"),
+                tf=float(self._i_tf.text() or "0"),
+                tw=float(self._i_tw.text() or "0"),
+                A=derived["A"], I=derived["I"],
+                depth=derived["depth"], width=derived["width"],
+                J=derived.get("J", 0.0),
+            )
+        raise ValueError(f"unsupported shape {shape!r}")
 
     def _copy_to_manual(self) -> None:
         derived = self._compute_derived()

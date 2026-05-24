@@ -878,6 +878,61 @@ def test_section_dialog_i_section_validation_disables_ok(qt_app):
     assert d._status.text(), "status label should describe the error"
 
 
+def test_section_dialog_preview_updates_with_shape_switch(qt_app):
+    """The live cross-section preview must follow whatever the user
+    types. Rectangle dimensions should render a 4-vertex polygon and
+    switching to a valid I-section should rebuild it as 12 vertices —
+    proving the preview is driven by _refresh_preview() and uses the
+    profiles.section_outline() helper (no parallel geometry inside
+    the dialog).
+    """
+    from matplotlib.patches import Polygon
+
+    from structural_analysis.gui_qt.dialogs import SectionDialog
+    from structural_analysis.model import Material, StructuralModel
+
+    model = StructuralModel()
+    model.materials[1] = Material(id=1, name="Steel", E=2.10e8)
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = SectionDialog(w, model=model, existing=None, default_id=1)
+
+    # Rectangle: 4-vertex outline.
+    idx = d._shape_combo.findData("rectangle")
+    d._shape_combo.setCurrentIndex(idx)
+    d._rect_b.setText("0.3")
+    d._rect_h.setText("0.5")
+    qt_app.processEvents()
+    rect_polys = [p for p in d._preview_ax.patches if isinstance(p, Polygon)]
+    assert rect_polys, "rectangle preview must render a Polygon patch"
+    rect_xy = rect_polys[-1].get_xy()
+    # Polygon.get_xy() closes the loop (returns N+1 points). The
+    # interior outline must be the 4-vertex rectangle from section_outline.
+    assert len(rect_xy) - 1 == 4, (
+        f"rectangle outline must be 4 vertices, got {len(rect_xy) - 1}"
+    )
+
+    # Switch to a valid I-section and confirm the patch grows to 12.
+    idx = d._shape_combo.findData("i_section")
+    d._shape_combo.setCurrentIndex(idx)
+    d._i_h.setText("0.2")
+    d._i_b.setText("0.1")
+    d._i_tf.setText("0.0085")
+    d._i_tw.setText("0.0056")
+    qt_app.processEvents()
+    i_polys = [p for p in d._preview_ax.patches if isinstance(p, Polygon)]
+    assert i_polys, "i_section preview must render a Polygon patch"
+    i_xy = i_polys[-1].get_xy()
+    assert len(i_xy) - 1 == 12, (
+        f"i_section outline must be 12 vertices, got {len(i_xy) - 1}"
+    )
+
+    # Existing read-out text label must still be populated alongside —
+    # the graphical preview is additive, not a replacement.
+    assert "A =" in d._i_preview.text()
+
+
 # ── 3D extruded viewer ─────────────────────────────────────────
 
 
