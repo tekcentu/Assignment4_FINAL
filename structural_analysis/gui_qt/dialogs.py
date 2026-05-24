@@ -570,13 +570,12 @@ class SectionDialog(_ModalDialog):
             # the dialog opens for a new section the canvas would
             # otherwise be empty, which gives the user no idea what
             # the preview is for. Render a small example rectangle
-            # with b / h dimension labels as a visual hint, plus a
-            # tag so the user knows it's illustrative. For an
+            # with b / h dimension labels as a visual hint. For an
             # *existing* manual section we keep the previous
             # "no shape preview" message — the user is editing real
             # numbers and doesn't want a fake outline interfering.
             if self._existing is None:
-                self._draw_example_outline(ax)
+                self._draw_example_outline(ax, "rectangle")
             else:
                 ax.text(
                     0.5, 0.5,
@@ -588,12 +587,23 @@ class SectionDialog(_ModalDialog):
             return
 
         if derived is None:
-            ax.text(
-                0.5, 0.5,
-                "invalid dimensions",
-                ha="center", va="center", transform=ax.transAxes,
-                fontsize=9, color="#b00",
-            )
+            # Input is incomplete or invalid. For a brand-new section
+            # render the canonical example of the *currently selected*
+            # shape so the canvas always tells the user what they're
+            # about to build (an I-section after switching to "i" is
+            # far more useful than the previous "invalid dimensions"
+            # placeholder). For an existing section we still show
+            # "invalid dimensions", because the user's own valid
+            # input was just broken and we shouldn't paper over it.
+            if self._existing is None:
+                self._draw_example_outline(ax, shape)
+            else:
+                ax.text(
+                    0.5, 0.5,
+                    "invalid dimensions",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=9, color="#b00",
+                )
             self._preview_canvas.draw_idle()
             return
 
@@ -669,40 +679,94 @@ class SectionDialog(_ModalDialog):
 
         self._preview_canvas.draw_idle()
 
-    def _draw_example_outline(self, ax) -> None:
-        """Render an example 0.30 m × 0.50 m rectangle on the preview
-        canvas with dimension labels so a freshly-opened Add Section
-        dialog doesn't show a blank preview. The outline is for
-        illustration only — it isn't tied to any input field and is
-        clearly labelled "(example)".
+    # Canonical example dimensions per shape. Used by the preview
+    # when no valid user input exists yet — picked so each outline
+    # is visually readable at the dialog's 220×220 px thumbnail size.
+    _EXAMPLE_DIMS: dict[str, dict[str, float]] = {
+        "rectangle": dict(b=0.30, h=0.50),
+        "square":    dict(h=0.40),
+        "i_section": dict(h=0.20, b=0.10, tf=0.0085, tw=0.0056),
+    }
+
+    def _draw_example_outline(self, ax, shape: str) -> None:
+        """Render the canonical example outline for ``shape`` on the
+        preview canvas so a freshly-opened Add Section dialog never
+        shows a blank canvas — even before the user types any
+        dimensions. The geometry comes from :func:`section_outline`
+        (same path the live preview uses), drawn dashed in a muted
+        palette and tagged "(example)" so it can't be mistaken for
+        the user's own input. Manual + new defaults to "rectangle";
+        the other shapes use their dedicated example dims.
         """
-        b, h = 0.30, 0.50
-        zs = [b / 2, -b / 2, -b / 2,  b / 2]
-        ys = [h / 2,  h / 2, -h / 2, -h / 2]
+        shape_key = shape if shape in self._EXAMPLE_DIMS else "rectangle"
+        dims = self._EXAMPLE_DIMS[shape_key]
+        if shape_key == "i_section":
+            section = Section(
+                id=0, shape_type="i_section",
+                b=dims["b"], h=dims["h"],
+                tf=dims["tf"], tw=dims["tw"],
+            )
+        elif shape_key == "square":
+            h = dims["h"]
+            section = Section(
+                id=0, shape_type="square", b=h, h=h,
+            )
+        else:  # rectangle
+            section = Section(
+                id=0, shape_type="rectangle",
+                b=dims["b"], h=dims["h"],
+            )
+        pts = section_outline(section)
+        zs = [p[1] for p in pts]
+        ys = [p[0] for p in pts]
         ax.fill(zs, ys, facecolor="#e8eef5", edgecolor="#9aa9bf",
-                linewidth=1.2, alpha=0.9)
-        ax.plot(zs + [zs[0]], ys + [ys[0]],
-                color="#9aa9bf", linewidth=1.2, linestyle="--")
+                linewidth=1.2, alpha=0.9, linestyle="--")
+
+        # Dimension annotations — same set the real preview shows,
+        # so the example reads as "this is what your input will draw".
+        b_ann = dims.get("b", dims.get("h", 0.0))
+        h_ann = dims["h"]
         ax.annotate(
-            f"b = {b:g}",
-            xy=(0.0, -h / 2.0), xytext=(0.0, -h / 2.0 - 0.18 * h),
+            f"b = {b_ann:g}",
+            xy=(0.0, -h_ann / 2.0),
+            xytext=(0.0, -h_ann / 2.0 - 0.18 * h_ann),
             ha="center", va="top", fontsize=8, color="#666",
         )
         ax.annotate(
-            f"h = {h:g}",
-            xy=(b / 2.0, 0.0), xytext=(b / 2.0 + 0.18 * b, 0.0),
+            f"h = {h_ann:g}",
+            xy=(b_ann / 2.0, 0.0),
+            xytext=(b_ann / 2.0 + 0.18 * b_ann, 0.0),
             ha="left", va="center", fontsize=8, color="#666",
         )
+        if shape_key == "i_section":
+            ax.annotate(
+                f"tf = {dims['tf']:g}",
+                xy=(-b_ann / 2.0, h_ann / 2.0 - dims["tf"] / 2.0),
+                xytext=(-b_ann / 2.0 - 0.22 * b_ann,
+                         h_ann / 2.0 - dims["tf"] / 2.0),
+                ha="right", va="center", fontsize=8, color="#666",
+            )
+            ax.annotate(
+                f"tw = {dims['tw']:g}",
+                xy=(dims["tw"] / 2.0, 0.0),
+                xytext=(dims["tw"] / 2.0 + 0.18 * b_ann, -0.25 * h_ann),
+                ha="left", va="center", fontsize=8, color="#666",
+            )
+
         ax.text(
             0.5, 0.97,
-            "example (pick a shape to begin)",
+            f"example {shape_key} (type dimensions to override)",
             ha="center", va="top", transform=ax.transAxes,
             fontsize=8, color="#888", style="italic",
         )
-        pad_x = b * 0.45
-        pad_y = h * 0.35
-        ax.set_xlim(-b / 2.0 - pad_x, b / 2.0 + pad_x)
-        ax.set_ylim(-h / 2.0 - pad_y, h / 2.0 + pad_y)
+        ax.relim()
+        ax.autoscale_view()
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        pad_x = (x1 - x0) * 0.30 + 1e-6
+        pad_y = (y1 - y0) * 0.25 + 1e-6
+        ax.set_xlim(x0 - pad_x, x1 + pad_x)
+        ax.set_ylim(y0 - pad_y, y1 + pad_y)
 
     def _section_from_inputs(self, shape: str,
                               derived: dict[str, float]) -> Section:

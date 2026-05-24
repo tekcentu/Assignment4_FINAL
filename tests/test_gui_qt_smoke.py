@@ -935,9 +935,10 @@ def test_section_dialog_preview_updates_with_shape_switch(qt_app):
 
 def test_section_dialog_first_open_shows_example_outline(qt_app):
     """Opening "Add section" on a fresh model must not leave the
-    preview blank. The default shape is "manual" — which has no
-    geometric inputs — so the dialog renders a small illustrative
-    rectangle with b / h labels and an "(example)" tag.
+    preview blank for *any* shape — manual, rectangle, square, and
+    i_section each render their canonical example outline (with
+    dimension labels + an "example" tag) until the user types real
+    dimensions of their own.
     """
     from matplotlib.patches import Polygon
 
@@ -951,25 +952,73 @@ def test_section_dialog_first_open_shows_example_outline(qt_app):
     qt_app.processEvents()
     d = SectionDialog(w, model=model, existing=None, default_id=1)
 
+    # Polygon.get_xy() closes the loop, so an N-vertex outline shows
+    # as N+1 points. Manual defaults to a rectangle hint (4 verts);
+    # i_section has 12; rectangle and square each have 4.
+    expected = {
+        "manual":    4,
+        "rectangle": 4,
+        "square":    4,
+        "i_section": 12,
+    }
+
     # Default shape is still "manual" — confirms we didn't change
     # the dropdown default in passing.
     assert d._shape_combo.currentData() == "manual"
 
+    for shape_key, expected_vertices in expected.items():
+        idx = d._shape_combo.findData(shape_key)
+        d._shape_combo.setCurrentIndex(idx)
+        qt_app.processEvents()
+        polys = [p for p in d._preview_ax.patches if isinstance(p, Polygon)]
+        assert polys, (
+            f"first-open preview for {shape_key!r} must render an "
+            f"example outline, not a blank canvas"
+        )
+        xy = polys[-1].get_xy()
+        assert len(xy) - 1 == expected_vertices, (
+            f"{shape_key!r} example outline must be "
+            f"{expected_vertices} vertices, got {len(xy) - 1}"
+        )
+        texts = [t.get_text() for t in d._preview_ax.texts]
+        assert any("example" in t.lower() for t in texts), (
+            f"{shape_key!r} example must be clearly tagged so the "
+            f"user doesn't mistake it for their own input"
+        )
+        assert any("b =" in t for t in texts)
+        assert any("h =" in t for t in texts)
+
+
+def test_section_dialog_existing_section_does_not_show_example(qt_app):
+    """When the user *edits* an existing section the example outline
+    must NOT appear — that path is for first-open guidance only. A
+    valid existing section renders its real outline; a corrupted /
+    invalid edit shows the existing "invalid dimensions" placeholder.
+    """
+    from matplotlib.patches import Polygon
+
+    from structural_analysis.gui_qt.dialogs import SectionDialog
+    from structural_analysis.model import Material, Section, StructuralModel
+
+    model = StructuralModel()
+    model.materials[1] = Material(id=1, name="Steel", E=2.10e8)
+    existing = Section(
+        id=7, name="R30x50", material_id=1,
+        A=0.15, I=3.125e-3, depth=0.5, width=0.3,
+        shape_type="rectangle", b=0.3, h=0.5,
+    )
+    model.sections[7] = existing
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = SectionDialog(w, model=model, existing=existing, default_id=7)
+
     polys = [p for p in d._preview_ax.patches if isinstance(p, Polygon)]
-    assert polys, (
-        "first-open preview must render an example rectangle, not a "
-        "blank canvas"
-    )
-    xy = polys[-1].get_xy()
-    # Polygon.get_xy() closes the loop, so 4 inner vertices → 5 points.
-    assert len(xy) - 1 == 4
+    assert polys, "existing section must still render its real outline"
     texts = [t.get_text() for t in d._preview_ax.texts]
-    assert any("example" in t.lower() for t in texts), (
-        "the example outline must be clearly tagged so the user "
-        "doesn't mistake it for their own input"
+    assert not any("example" in t.lower() for t in texts), (
+        "the example-outline hint must only appear for new sections"
     )
-    assert any("b =" in t for t in texts)
-    assert any("h =" in t for t in texts)
 
 
 def test_main_window_keeps_version_badge_top_right(qt_app):
