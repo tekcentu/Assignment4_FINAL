@@ -34,7 +34,6 @@ from ..model import (
 from .grid import GridSystem
 from .snap import SnapCandidate, SnapEngine
 from .element_graphics import (
-    evaluate_internal_force as _diagram_evaluator,
     sample_internal_force as _diagram_ordinates,
     internal_force_at as _diagram_value,
 )

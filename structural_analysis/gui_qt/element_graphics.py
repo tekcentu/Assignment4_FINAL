@@ -111,7 +111,16 @@ def sample_internal_force(
     """Discretise :func:`evaluate_internal_force` at ``n_samples``
     evenly spaced station points along the element. Returns
     ``(xs, ys)`` or ``(None, None)`` if the kind doesn't apply.
+
+    Raises :class:`ValueError` if ``n_samples < 2`` — one station is
+    not enough to form a polyline, and we'd otherwise divide by zero
+    in the step calculation. Fail fast with a clear message instead
+    of letting the caller see a ZeroDivisionError.
     """
+    if n_samples < 2:
+        raise ValueError(
+            f"n_samples must be >= 2 to form a polyline, got {n_samples}"
+        )
     L, fn = evaluate_internal_force(elem, ni, nj, f_local, kind)
     if fn is None:
         return None, None
@@ -251,25 +260,30 @@ def _draw_fbd(
         elif isinstance(ml, TrussTemperatureLoad):
             thermals.append(f"ΔT={ml.delta_T:g}")
 
-    # UDL — six arrows along the span, all pointing the same way (sign
-    # of summed w in local +y).
+    # UDL — six arrows along the span. Sign convention matches the
+    # main canvas (ModelCanvas._draw_member_loads): a positive wy
+    # puts the *arrow tails* on the +y_local side of the member, so
+    # +y / -y loads always render on the side the main canvas does.
     w_sum = sum(udls)
     if abs(w_sum) > 0:
-        sign = -1.0 if w_sum > 0 else 1.0   # arrow points -y_local on +w
+        sign = 1.0 if w_sum > 0 else -1.0
         for k in range(6):
             x_loc = (k + 0.5) * L / 6.0
-            ax = _arrow_in_local(
+            _arrow_in_local(
                 ax, ni, tx, ty, nxh, nyh, x_loc, arrow_len * sign,
             )
-        # Use a label that doesn't require unicode escape gymnastics.
-        ax.text(ni.x + tx * L / 2.0 + nxh * arrow_len * 1.6,
-                ni.y + ty * L / 2.0 + nyh * arrow_len * 1.6,
+        # Label sits on the same side as the arrow tails so the load
+        # and its caption don't end up on opposite sides of the member.
+        ax.text(ni.x + tx * L / 2.0 + nxh * arrow_len * 1.6 * sign,
+                ni.y + ty * L / 2.0 + nyh * arrow_len * 1.6 * sign,
                 f"w = {w_sum:g}", fontsize=8, color=_LOAD_COLOR,
                 ha="center")
 
+    # Point load — same sign convention: positive py → tail on
+    # +y_local side, matching ModelCanvas._draw_member_loads.
     for a, py in points:
-        sign = -1.0 if py > 0 else 1.0
-        ax = _arrow_in_local(
+        sign = 1.0 if py > 0 else -1.0
+        _arrow_in_local(
             ax, ni, tx, ty, nxh, nyh, a, arrow_len * 1.5 * sign,
             color=_LOAD_COLOR,
         )
@@ -279,16 +293,21 @@ def _draw_fbd(
                 color=_LOAD_COLOR, ha="center")
 
     if thermals:
+        # Offset along the local normal so the tag doesn't overlap the
+        # member on inclined elements (a fixed -y_global offset only
+        # works for horizontal members).
         ax.text(
-            (ni.x + nj.x) / 2.0, (ni.y + nj.y) / 2.0 - arrow_len * 0.6,
+            (ni.x + nj.x) / 2.0 - nxh * arrow_len * 0.6,
+            (ni.y + nj.y) / 2.0 - nyh * arrow_len * 0.6,
             "; ".join(thermals), fontsize=8, color="#a06b00",
             ha="center", va="top",
         )
 
     # End forces only when an analysis result is present. f_local is
     # the 6-vector [N_i, V_i, M_i, N_j, V_j, M_j] in the element's
-    # local frame; we render small annotation arrows just outside the
-    # nodes so they don't visually overlap the in-span loads.
+    # local frame; we render a single compact text tag next to each
+    # node so the FBD stays readable on the small thumbnail. The
+    # in-span load arrows above already carry the visual punch.
     if f_local is not None:
         N_i, V_i, M_i, N_j, V_j, M_j = (float(v) for v in f_local)
         _end_force_label(ax, ni, tx, ty, nxh, nyh,
@@ -322,10 +341,11 @@ def _end_force_label(
     ax, anchor: Node, tx: float, ty: float, nxh: float, nyh: float,
     *, N: float, V: float, M: float, side: str,
 ) -> None:
-    """End-force / end-moment annotation at one end of the member.
-
-    Direction conventions match the local frame: ``N`` along +x_local,
-    ``V`` along +y_local, ``M`` rendered as a small text tag.
+    """End-force / end-moment text tag at one end of the member —
+    a single line listing ``N`` (along +x_local), ``V`` (along
+    +y_local), and ``M`` (about +z_local). The compact text form is
+    deliberate: the small thumbnail can't fit three separate arrows
+    plus a moment glyph without crowding the in-span load arrows.
     """
     label_x = anchor.x + nxh * 0.06
     label_y = anchor.y + nyh * 0.06
@@ -353,7 +373,8 @@ def _draw_internal_force_diagrams(
         ax.text(0.5, 0.5, "Run analysis to see diagrams",
                 transform=ax.transAxes, ha="center", va="center",
                 color="#555", fontsize=9)
-        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xticks([])
+        ax.set_yticks([])
         return
 
     is_truss = isinstance(elem, TrussElement2D)
