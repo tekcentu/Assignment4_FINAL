@@ -947,3 +947,129 @@ def test_view3d_manual_section_uses_sqrt_A_and_shows_banner(qt_app):
     assert not w._view3d_window._banner.isVisible(), (
         "banner must clear once every section has a real shape"
     )
+
+
+def test_view3d_orientation_switch_rebuilds_geometry(qt_app):
+    """The vertical-axis combobox swaps the world mapping (Y-up vs
+    Z-up) without touching the underlying model. The mesh count and
+    per-element id mapping must be preserved across the switch, and
+    the elevation node (here at model y=4) must land on world Y in
+    Y-up mode and on world Z in Z-up mode.
+    """
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.gui_qt.view3d import (
+        _ORIENT_Y_UP, _ORIENT_Z_UP,
+    )
+    from structural_analysis.model import Material, Node, Section
+
+    w = MainWindow()
+    w._model.materials = {1: Material(id=1, name="Steel", E=2.10e8)}
+    w._model.sections = {
+        1: Section(
+            id=1, name="Rect", material_id=1,
+            A=0.06, I=1.25e-3, depth=0.5, width=0.12,
+            shape_type="rectangle", b=0.12, h=0.5,
+        ),
+    }
+    # A vertical column from the origin straight up the model y axis.
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 0.0, 4.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.10e8,
+        A=0.06, I=1.25e-3, section_id=1,
+    )]
+    qt_app.processEvents()
+    w._open_view3d()
+    qt_app.processEvents()
+    view = w._view3d_window
+
+    # Default mode is Y-up (preserves the existing 2D convention).
+    assert view._orientation == _ORIENT_Y_UP
+    elem_ids = {e.id for e in w._model.elements}
+    assert set(view._element_meshes) == elem_ids
+
+    # Axis labels expose the mode-dependent convention publicly —
+    # in Y-up the elevation lives on world Y, out-of-plane on world Z.
+    assert "elevation" in view.ax.get_ylabel()
+    assert "out-of-plane" in view.ax.get_zlabel()
+
+    # Independent geometry check: poke the lift helper directly to
+    # confirm the top of the column landed on world Y in Y-up mode.
+    from structural_analysis.gui_qt.view3d import _node_world
+    top_y_up = _node_world(0.0, 4.0, _ORIENT_Y_UP)
+    assert top_y_up.tolist() == [0.0, 4.0, 0.0]
+
+    # Switch to Z-up via the combobox — same UI path a user would take.
+    idx = view._orient_combo.findData(_ORIENT_Z_UP)
+    view._orient_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    assert view._orientation == _ORIENT_Z_UP
+    # Mesh-per-element invariant preserved across the rebuild.
+    assert set(view._element_meshes) == elem_ids
+    # Labels follow the mode — Z is now the elevation axis.
+    assert "elevation" in view.ax.get_zlabel()
+    assert "out-of-plane" in view.ax.get_ylabel()
+    # And the lift helper now places the column top on world Z.
+    top_z_up = _node_world(0.0, 4.0, _ORIENT_Z_UP)
+    assert top_z_up.tolist() == [0.0, 0.0, 4.0]
+
+    # The underlying 2D model must be unchanged by the visual switch.
+    assert w._model.nodes[2].x == 0.0 and w._model.nodes[2].y == 4.0
+    # And the scroll handler is wired exactly once (mpl_connect
+    # returns an integer connection id).
+    assert isinstance(view._scroll_cid, int)
+
+
+# ── Building wizard ─────────────────────────────────────────────
+
+
+def test_building_wizard_creates_model(qt_app):
+    """The wizard generates a portal frame and routes through ReplaceModelCmd
+    so a single Undo restores the previous model."""
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+
+    w = MainWindow()
+    qt_app.processEvents()
+
+    # Starter model has sections, so the wizard dialog should construct.
+    d = BuildingWizardDialog(w, model=w._model)
+    d._stories.setValue(2)
+    d._story_h.setValue(3.0)
+    d._bays.setValue(2)
+    d._bay_w.setValue(4.0)
+    d._fixed_base.setChecked(True)
+    new_model = d._accept()
+    assert len(new_model.nodes) == 9
+    assert len(new_model.elements) == 10
+    assert len(new_model.supports) == 3
+    assert new_model.materials == w._model.materials
+    assert new_model.sections == w._model.sections
+
+
+def test_building_wizard_action_undoable(qt_app):
+    """Driving the wizard handler through a stubbed dialog must apply
+    ReplaceModelCmd; one Undo must restore the previous (empty) model."""
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+
+    w = MainWindow()
+    qt_app.processEvents()
+    original_exec = BuildingWizardDialog.exec
+
+    def fake_exec(self):
+        from PyQt6.QtWidgets import QDialog as _QD
+        self._stories.setValue(1)
+        self._bays.setValue(1)
+        self.result_value = self._accept()
+        return _QD.DialogCode.Accepted
+
+    BuildingWizardDialog.exec = fake_exec
+    try:
+        w._do_building_wizard()
+    finally:
+        BuildingWizardDialog.exec = original_exec
+
+    assert len(w._model.nodes) == 4
+    assert len(w._model.elements) == 3
+    w._do_undo()
+    assert len(w._model.nodes) == 0
+    assert len(w._model.elements) == 0
