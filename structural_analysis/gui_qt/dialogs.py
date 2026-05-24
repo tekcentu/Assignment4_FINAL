@@ -618,7 +618,6 @@ class SectionDialog(_ModalDialog):
         ys = [p[0] for p in pts]
         ax.fill(zs, ys, facecolor="#cfe3f6", edgecolor="#1f3a5f",
                 linewidth=1.2, alpha=0.95)
-        ax.plot(zs + [zs[0]], ys + [ys[0]], color="#1f3a5f", linewidth=1.2)
 
         # Dimension labels — small, positioned just outside the outline.
         # b = width along z, h = depth along y; tf / tw only for I.
@@ -636,11 +635,12 @@ class SectionDialog(_ModalDialog):
                 ha="left", va="center", fontsize=8, color="#333",
             )
         if shape == "i_section":
-            try:
-                tf = float(self._i_tf.text() or "0")
-                tw = float(self._i_tw.text() or "0")
-            except ValueError:
-                tf = tw = 0.0
+            # section.tf / section.tw are already populated from the
+            # same input fields by _section_from_inputs (which only
+            # runs when the text parses cleanly), so re-parsing the
+            # widgets here would only repeat work and risk drifting
+            # from the geometry we just drew.
+            tf, tw = section.tf, section.tw
             if tf > 0:
                 ax.annotate(
                     f"tf = {tf:g}",
@@ -709,32 +709,40 @@ class SectionDialog(_ModalDialog):
         """Build a transient Section from the current dialog inputs so
         :func:`section_outline` can render it. ID / material_id are
         placeholders — this object is only used for outline geometry
-        and never reaches the model."""
+        and never reaches the model.
+
+        The shape calculators copy their ``b`` / ``h`` inputs through
+        to the ``width`` / ``depth`` keys of the returned dict
+        (see ``profiles.rectangle_properties`` / ``i_section_properties``),
+        so we read them out of ``derived`` here instead of re-parsing
+        the text widgets. ``tf`` / ``tw`` only exist on the I-section
+        page and still come from the widget — that's the one input
+        the calculator does not echo back.
+        """
+        b = derived["width"]
+        h = derived["depth"]
         if shape == "rectangle":
             return Section(
                 id=0, shape_type="rectangle",
-                b=float(self._rect_b.text() or "0"),
-                h=float(self._rect_h.text() or "0"),
+                b=b, h=h,
                 A=derived["A"], I=derived["I"],
-                depth=derived["depth"], width=derived["width"],
+                depth=h, width=b,
             )
         if shape == "square":
-            h = float(self._sq_h.text() or "0")
             return Section(
                 id=0, shape_type="square",
                 b=h, h=h,
                 A=derived["A"], I=derived["I"],
-                depth=derived["depth"], width=derived["width"],
+                depth=h, width=h,
             )
         if shape == "i_section":
             return Section(
                 id=0, shape_type="i_section",
-                b=float(self._i_b.text() or "0"),
-                h=float(self._i_h.text() or "0"),
+                b=b, h=h,
                 tf=float(self._i_tf.text() or "0"),
                 tw=float(self._i_tw.text() or "0"),
                 A=derived["A"], I=derived["I"],
-                depth=derived["depth"], width=derived["width"],
+                depth=h, width=b,
                 J=derived.get("J", 0.0),
             )
         raise ValueError(f"unsupported shape {shape!r}")
