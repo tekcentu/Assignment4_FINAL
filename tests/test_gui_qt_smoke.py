@@ -878,6 +878,164 @@ def test_section_dialog_i_section_validation_disables_ok(qt_app):
     assert d._status.text(), "status label should describe the error"
 
 
+def test_section_dialog_preview_updates_with_shape_switch(qt_app):
+    """The live cross-section preview must follow whatever the user
+    types. Rectangle dimensions should render a 4-vertex polygon and
+    switching to a valid I-section should rebuild it as 12 vertices —
+    proving the preview is driven by _refresh_preview() and uses the
+    profiles.section_outline() helper (no parallel geometry inside
+    the dialog).
+    """
+    from matplotlib.patches import Polygon
+
+    from structural_analysis.gui_qt.dialogs import SectionDialog
+    from structural_analysis.model import Material, StructuralModel
+
+    model = StructuralModel()
+    model.materials[1] = Material(id=1, name="Steel", E=2.10e8)
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = SectionDialog(w, model=model, existing=None, default_id=1)
+
+    # Rectangle: 4-vertex outline.
+    idx = d._shape_combo.findData("rectangle")
+    d._shape_combo.setCurrentIndex(idx)
+    d._rect_b.setText("0.3")
+    d._rect_h.setText("0.5")
+    qt_app.processEvents()
+    rect_polys = [p for p in d._preview_ax.patches if isinstance(p, Polygon)]
+    assert rect_polys, "rectangle preview must render a Polygon patch"
+    rect_xy = rect_polys[-1].get_xy()
+    # Polygon.get_xy() closes the loop (returns N+1 points). The
+    # interior outline must be the 4-vertex rectangle from section_outline.
+    assert len(rect_xy) - 1 == 4, (
+        f"rectangle outline must be 4 vertices, got {len(rect_xy) - 1}"
+    )
+
+    # Switch to a valid I-section and confirm the patch grows to 12.
+    idx = d._shape_combo.findData("i_section")
+    d._shape_combo.setCurrentIndex(idx)
+    d._i_h.setText("0.2")
+    d._i_b.setText("0.1")
+    d._i_tf.setText("0.0085")
+    d._i_tw.setText("0.0056")
+    qt_app.processEvents()
+    i_polys = [p for p in d._preview_ax.patches if isinstance(p, Polygon)]
+    assert i_polys, "i_section preview must render a Polygon patch"
+    i_xy = i_polys[-1].get_xy()
+    assert len(i_xy) - 1 == 12, (
+        f"i_section outline must be 12 vertices, got {len(i_xy) - 1}"
+    )
+
+    # Existing read-out text label must still be populated alongside —
+    # the graphical preview is additive, not a replacement.
+    assert "A =" in d._i_preview.text()
+
+
+def test_section_dialog_first_open_shows_example_outline(qt_app):
+    """Opening "Add section" on a fresh model must not leave the
+    preview blank for *any* shape — manual, rectangle, square, and
+    i_section each render their canonical example outline (with
+    dimension labels + an "example" tag) until the user types real
+    dimensions of their own.
+    """
+    from matplotlib.patches import Polygon
+
+    from structural_analysis.gui_qt.dialogs import SectionDialog
+    from structural_analysis.model import Material, StructuralModel
+
+    model = StructuralModel()
+    model.materials[1] = Material(id=1, name="Steel", E=2.10e8)
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = SectionDialog(w, model=model, existing=None, default_id=1)
+
+    # Polygon.get_xy() closes the loop, so an N-vertex outline shows
+    # as N+1 points. Manual defaults to a rectangle hint (4 verts);
+    # i_section has 12; rectangle and square each have 4.
+    expected = {
+        "manual":    4,
+        "rectangle": 4,
+        "square":    4,
+        "i_section": 12,
+    }
+
+    # Default shape is still "manual" — confirms we didn't change
+    # the dropdown default in passing.
+    assert d._shape_combo.currentData() == "manual"
+
+    for shape_key, expected_vertices in expected.items():
+        idx = d._shape_combo.findData(shape_key)
+        d._shape_combo.setCurrentIndex(idx)
+        qt_app.processEvents()
+        polys = [p for p in d._preview_ax.patches if isinstance(p, Polygon)]
+        assert polys, (
+            f"first-open preview for {shape_key!r} must render an "
+            f"example outline, not a blank canvas"
+        )
+        xy = polys[-1].get_xy()
+        assert len(xy) - 1 == expected_vertices, (
+            f"{shape_key!r} example outline must be "
+            f"{expected_vertices} vertices, got {len(xy) - 1}"
+        )
+        texts = [t.get_text() for t in d._preview_ax.texts]
+        assert any("example" in t.lower() for t in texts), (
+            f"{shape_key!r} example must be clearly tagged so the "
+            f"user doesn't mistake it for their own input"
+        )
+        assert any("b =" in t for t in texts)
+        assert any("h =" in t for t in texts)
+
+
+def test_section_dialog_existing_section_does_not_show_example(qt_app):
+    """When the user *edits* an existing section the example outline
+    must NOT appear — that path is for first-open guidance only. A
+    valid existing section renders its real outline; a corrupted /
+    invalid edit shows the existing "invalid dimensions" placeholder.
+    """
+    from matplotlib.patches import Polygon
+
+    from structural_analysis.gui_qt.dialogs import SectionDialog
+    from structural_analysis.model import Material, Section, StructuralModel
+
+    model = StructuralModel()
+    model.materials[1] = Material(id=1, name="Steel", E=2.10e8)
+    existing = Section(
+        id=7, name="R30x50", material_id=1,
+        A=0.15, I=3.125e-3, depth=0.5, width=0.3,
+        shape_type="rectangle", b=0.3, h=0.5,
+    )
+    model.sections[7] = existing
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = SectionDialog(w, model=model, existing=existing, default_id=7)
+
+    polys = [p for p in d._preview_ax.patches if isinstance(p, Polygon)]
+    assert polys, "existing section must still render its real outline"
+    texts = [t.get_text() for t in d._preview_ax.texts]
+    assert not any("example" in t.lower() for t in texts), (
+        "the example-outline hint must only appear for new sections"
+    )
+
+
+def test_main_window_keeps_version_badge_top_right(qt_app):
+    """The top-right version + what's-new badge in the menu bar
+    must stay populated and reflect the current package version —
+    don't regress the existing badge.
+    """
+    from structural_analysis import __version__, __what_is_new__
+
+    w = MainWindow()
+    qt_app.processEvents()
+    assert w._version_label is not None
+    text = w._version_label.text()
+    assert __version__ in text
+    assert __what_is_new__ in text
+
+
 # ── 3D extruded viewer ─────────────────────────────────────────
 
 

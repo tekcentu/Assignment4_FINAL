@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -51,6 +54,7 @@ from ..profiles import (
     MATERIAL_TEMPLATES,
     SECTION_SHAPES,
     properties_for_shape,
+    section_outline,
 )
 
 from PyQt6.QtWidgets import QStackedWidget
@@ -351,6 +355,19 @@ class SectionDialog(_ModalDialog):
         self._status.setStyleSheet("color: #b00;")
         form.addRow(self._status)
 
+        # Live cross-section preview. A small square matplotlib figure
+        # rendered next to the existing per-page text read-out. The
+        # widget is built once and re-drawn from _refresh_preview() —
+        # which is already on the textChanged path for every
+        # dimension field and on the shape combo's index-changed
+        # signal — so the preview follows whatever the user types.
+        self._preview_fig = Figure(figsize=(2.6, 2.6), dpi=96)
+        self._preview_fig.patch.set_facecolor("white")
+        self._preview_ax = self._preview_fig.add_subplot(111)
+        self._preview_canvas = FigureCanvasQTAgg(self._preview_fig)
+        self._preview_canvas.setMinimumSize(220, 220)
+        form.addRow("Preview", self._preview_canvas)
+
         # Initialise from existing section if any
         if self._existing:
             s = self._existing
@@ -509,11 +526,13 @@ class SectionDialog(_ModalDialog):
             self._status.setText("")
             if ok is not None:
                 ok.setEnabled(True)
+            self._draw_section_preview(None)
             return
         derived = self._compute_derived()
         if derived is None:
             if ok is not None:
                 ok.setEnabled(False)
+            self._draw_section_preview(None)
             return
         self._status.setText("")
         if ok is not None:
@@ -527,6 +546,270 @@ class SectionDialog(_ModalDialog):
             self._sq_preview.setText(text)
         elif shape == "i_section":
             self._i_preview.setText(text)
+        self._draw_section_preview(derived)
+
+    def _draw_section_preview(self, derived: dict[str, float] | None) -> None:
+        """Re-render the small cross-section thumbnail.
+
+        ``derived`` is the dict returned by :meth:`_compute_derived` or
+        ``None`` when the input is incomplete / invalid (or when the
+        manual shape is selected, which has no geometric dimensions).
+        The graphical preview is additive — the per-page text read-out
+        (``_rect_preview`` / ``_sq_preview`` / ``_i_preview``) and the
+        red ``_status`` label keep doing their existing jobs.
+        """
+        ax = self._preview_ax
+        ax.clear()
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_axis_off()
+        shape = self._current_shape()
+
+        if shape == "manual":
+            # Manual sections have no geometric inputs in this dialog
+            # — the user types A / I / depth / width directly. When
+            # the dialog opens for a new section the canvas would
+            # otherwise be empty, which gives the user no idea what
+            # the preview is for. Render a small example rectangle
+            # with b / h dimension labels as a visual hint. For an
+            # *existing* manual section we keep the previous
+            # "no shape preview" message — the user is editing real
+            # numbers and doesn't want a fake outline interfering.
+            if self._existing is None:
+                self._draw_example_outline(ax, "rectangle")
+            else:
+                ax.text(
+                    0.5, 0.5,
+                    "manual section\n(no shape preview)",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=9, color="#555",
+                )
+            self._preview_canvas.draw_idle()
+            return
+
+        if derived is None:
+            # Input is incomplete or invalid. For a brand-new section
+            # render the canonical example of the *currently selected*
+            # shape so the canvas always tells the user what they're
+            # about to build (an I-section after switching to "i" is
+            # far more useful than the previous "invalid dimensions"
+            # placeholder). For an existing section we still show
+            # "invalid dimensions", because the user's own valid
+            # input was just broken and we shouldn't paper over it.
+            if self._existing is None:
+                self._draw_example_outline(ax, shape)
+            else:
+                ax.text(
+                    0.5, 0.5,
+                    "invalid dimensions",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=9, color="#b00",
+                )
+            self._preview_canvas.draw_idle()
+            return
+
+        try:
+            section = self._section_from_inputs(shape, derived)
+            pts = section_outline(section)
+        except (ValueError, KeyError):
+            ax.text(
+                0.5, 0.5,
+                "invalid dimensions",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=9, color="#b00",
+            )
+            self._preview_canvas.draw_idle()
+            return
+
+        # Outline tuples are (y, z) with depth on local y, width on
+        # local z. Plot width on the horizontal screen axis and depth
+        # on the vertical screen axis so the thumbnail matches the
+        # user's mental "wide horizontally, deep vertically" picture.
+        zs = [p[1] for p in pts]
+        ys = [p[0] for p in pts]
+        ax.fill(zs, ys, facecolor="#cfe3f6", edgecolor="#1f3a5f",
+                linewidth=1.2, alpha=0.95)
+
+        # Dimension labels — small, positioned just outside the outline.
+        # b = width along z, h = depth along y; tf / tw only for I.
+        b = derived.get("width", 0.0)
+        h = derived.get("depth", 0.0)
+        if b > 0 and h > 0:
+            ax.annotate(
+                f"b = {b:g}",
+                xy=(0.0, -h / 2.0), xytext=(0.0, -h / 2.0 - 0.18 * h),
+                ha="center", va="top", fontsize=8, color="#333",
+            )
+            ax.annotate(
+                f"h = {h:g}",
+                xy=(b / 2.0, 0.0), xytext=(b / 2.0 + 0.18 * b, 0.0),
+                ha="left", va="center", fontsize=8, color="#333",
+            )
+        if shape == "i_section":
+            # section.tf / section.tw are already populated from the
+            # same input fields by _section_from_inputs (which only
+            # runs when the text parses cleanly), so re-parsing the
+            # widgets here would only repeat work and risk drifting
+            # from the geometry we just drew.
+            tf, tw = section.tf, section.tw
+            if tf > 0:
+                ax.annotate(
+                    f"tf = {tf:g}",
+                    xy=(-b / 2.0, h / 2.0 - tf / 2.0),
+                    xytext=(-b / 2.0 - 0.22 * b, h / 2.0 - tf / 2.0),
+                    ha="right", va="center", fontsize=8, color="#333",
+                )
+            if tw > 0:
+                ax.annotate(
+                    f"tw = {tw:g}",
+                    xy=(tw / 2.0, 0.0),
+                    xytext=(tw / 2.0 + 0.18 * b, -0.25 * h),
+                    ha="left", va="center", fontsize=8, color="#333",
+                )
+
+        # A little breathing room around the outline so the dimension
+        # labels don't run off the edge of the figure.
+        ax.relim()
+        ax.autoscale_view()
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        pad_x = (x1 - x0) * 0.30 + 1e-6
+        pad_y = (y1 - y0) * 0.25 + 1e-6
+        ax.set_xlim(x0 - pad_x, x1 + pad_x)
+        ax.set_ylim(y0 - pad_y, y1 + pad_y)
+
+        self._preview_canvas.draw_idle()
+
+    # Canonical example dimensions per shape. Used by the preview
+    # when no valid user input exists yet — picked so each outline
+    # is visually readable at the dialog's 220×220 px thumbnail size.
+    _EXAMPLE_DIMS: dict[str, dict[str, float]] = {
+        "rectangle": dict(b=0.30, h=0.50),
+        "square":    dict(h=0.40),
+        "i_section": dict(h=0.20, b=0.10, tf=0.0085, tw=0.0056),
+    }
+
+    def _draw_example_outline(self, ax, shape: str) -> None:
+        """Render the canonical example outline for ``shape`` on the
+        preview canvas so a freshly-opened Add Section dialog never
+        shows a blank canvas — even before the user types any
+        dimensions. The geometry comes from :func:`section_outline`
+        (same path the live preview uses), drawn dashed in a muted
+        palette and tagged "(example)" so it can't be mistaken for
+        the user's own input. Manual + new defaults to "rectangle";
+        the other shapes use their dedicated example dims.
+        """
+        shape_key = shape if shape in self._EXAMPLE_DIMS else "rectangle"
+        dims = self._EXAMPLE_DIMS[shape_key]
+        if shape_key == "i_section":
+            section = Section(
+                id=0, shape_type="i_section",
+                b=dims["b"], h=dims["h"],
+                tf=dims["tf"], tw=dims["tw"],
+            )
+        elif shape_key == "square":
+            h = dims["h"]
+            section = Section(
+                id=0, shape_type="square", b=h, h=h,
+            )
+        else:  # rectangle
+            section = Section(
+                id=0, shape_type="rectangle",
+                b=dims["b"], h=dims["h"],
+            )
+        pts = section_outline(section)
+        zs = [p[1] for p in pts]
+        ys = [p[0] for p in pts]
+        ax.fill(zs, ys, facecolor="#e8eef5", edgecolor="#9aa9bf",
+                linewidth=1.2, alpha=0.9, linestyle="--")
+
+        # Dimension annotations — same set the real preview shows,
+        # so the example reads as "this is what your input will draw".
+        b_ann = dims.get("b", dims.get("h", 0.0))
+        h_ann = dims["h"]
+        ax.annotate(
+            f"b = {b_ann:g}",
+            xy=(0.0, -h_ann / 2.0),
+            xytext=(0.0, -h_ann / 2.0 - 0.18 * h_ann),
+            ha="center", va="top", fontsize=8, color="#666",
+        )
+        ax.annotate(
+            f"h = {h_ann:g}",
+            xy=(b_ann / 2.0, 0.0),
+            xytext=(b_ann / 2.0 + 0.18 * b_ann, 0.0),
+            ha="left", va="center", fontsize=8, color="#666",
+        )
+        if shape_key == "i_section":
+            ax.annotate(
+                f"tf = {dims['tf']:g}",
+                xy=(-b_ann / 2.0, h_ann / 2.0 - dims["tf"] / 2.0),
+                xytext=(-b_ann / 2.0 - 0.22 * b_ann,
+                         h_ann / 2.0 - dims["tf"] / 2.0),
+                ha="right", va="center", fontsize=8, color="#666",
+            )
+            ax.annotate(
+                f"tw = {dims['tw']:g}",
+                xy=(dims["tw"] / 2.0, 0.0),
+                xytext=(dims["tw"] / 2.0 + 0.18 * b_ann, -0.25 * h_ann),
+                ha="left", va="center", fontsize=8, color="#666",
+            )
+
+        ax.text(
+            0.5, 0.97,
+            f"example {shape_key} (type dimensions to override)",
+            ha="center", va="top", transform=ax.transAxes,
+            fontsize=8, color="#888", style="italic",
+        )
+        ax.relim()
+        ax.autoscale_view()
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        pad_x = (x1 - x0) * 0.30 + 1e-6
+        pad_y = (y1 - y0) * 0.25 + 1e-6
+        ax.set_xlim(x0 - pad_x, x1 + pad_x)
+        ax.set_ylim(y0 - pad_y, y1 + pad_y)
+
+    def _section_from_inputs(self, shape: str,
+                              derived: dict[str, float]) -> Section:
+        """Build a transient Section from the current dialog inputs so
+        :func:`section_outline` can render it. ID / material_id are
+        placeholders — this object is only used for outline geometry
+        and never reaches the model.
+
+        The shape calculators copy their ``b`` / ``h`` inputs through
+        to the ``width`` / ``depth`` keys of the returned dict
+        (see ``profiles.rectangle_properties`` / ``i_section_properties``),
+        so we read them out of ``derived`` here instead of re-parsing
+        the text widgets. ``tf`` / ``tw`` only exist on the I-section
+        page and still come from the widget — that's the one input
+        the calculator does not echo back.
+        """
+        b = derived["width"]
+        h = derived["depth"]
+        if shape == "rectangle":
+            return Section(
+                id=0, shape_type="rectangle",
+                b=b, h=h,
+                A=derived["A"], I=derived["I"],
+                depth=h, width=b,
+            )
+        if shape == "square":
+            return Section(
+                id=0, shape_type="square",
+                b=h, h=h,
+                A=derived["A"], I=derived["I"],
+                depth=h, width=h,
+            )
+        if shape == "i_section":
+            return Section(
+                id=0, shape_type="i_section",
+                b=b, h=h,
+                tf=float(self._i_tf.text() or "0"),
+                tw=float(self._i_tw.text() or "0"),
+                A=derived["A"], I=derived["I"],
+                depth=h, width=b,
+                J=derived.get("J", 0.0),
+            )
+        raise ValueError(f"unsupported shape {shape!r}")
 
     def _copy_to_manual(self) -> None:
         derived = self._compute_derived()
