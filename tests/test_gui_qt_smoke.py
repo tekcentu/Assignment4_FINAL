@@ -933,6 +933,60 @@ def test_section_dialog_preview_updates_with_shape_switch(qt_app):
     assert "A =" in d._i_preview.text()
 
 
+def test_section_dialog_first_open_shows_example_outline(qt_app):
+    """Opening "Add section" on a fresh model must not leave the
+    preview blank. The default shape is "manual" — which has no
+    geometric inputs — so the dialog renders a small illustrative
+    rectangle with b / h labels and an "(example)" tag.
+    """
+    from matplotlib.patches import Polygon
+
+    from structural_analysis.gui_qt.dialogs import SectionDialog
+    from structural_analysis.model import Material, StructuralModel
+
+    model = StructuralModel()
+    model.materials[1] = Material(id=1, name="Steel", E=2.10e8)
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = SectionDialog(w, model=model, existing=None, default_id=1)
+
+    # Default shape is still "manual" — confirms we didn't change
+    # the dropdown default in passing.
+    assert d._shape_combo.currentData() == "manual"
+
+    polys = [p for p in d._preview_ax.patches if isinstance(p, Polygon)]
+    assert polys, (
+        "first-open preview must render an example rectangle, not a "
+        "blank canvas"
+    )
+    xy = polys[-1].get_xy()
+    # Polygon.get_xy() closes the loop, so 4 inner vertices → 5 points.
+    assert len(xy) - 1 == 4
+    texts = [t.get_text() for t in d._preview_ax.texts]
+    assert any("example" in t.lower() for t in texts), (
+        "the example outline must be clearly tagged so the user "
+        "doesn't mistake it for their own input"
+    )
+    assert any("b =" in t for t in texts)
+    assert any("h =" in t for t in texts)
+
+
+def test_main_window_keeps_version_badge_top_right(qt_app):
+    """The top-right version + what's-new badge in the menu bar
+    must stay populated and reflect the current package version —
+    don't regress the existing badge.
+    """
+    from structural_analysis import __version__, __what_is_new__
+
+    w = MainWindow()
+    qt_app.processEvents()
+    assert w._version_label is not None
+    text = w._version_label.text()
+    assert __version__ in text
+    assert __what_is_new__ in text
+
+
 # ── 3D extruded viewer ─────────────────────────────────────────
 
 

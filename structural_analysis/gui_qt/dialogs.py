@@ -565,16 +565,25 @@ class SectionDialog(_ModalDialog):
         shape = self._current_shape()
 
         if shape == "manual":
-            # Manual sections have no geometric inputs in this dialog —
-            # the user types A / I / depth / width directly. Showing
-            # an outline would be misleading, so leave the preview
-            # blank with a single line of explanatory text.
-            ax.text(
-                0.5, 0.5,
-                "manual section\n(no shape preview)",
-                ha="center", va="center", transform=ax.transAxes,
-                fontsize=9, color="#555",
-            )
+            # Manual sections have no geometric inputs in this dialog
+            # — the user types A / I / depth / width directly. When
+            # the dialog opens for a new section the canvas would
+            # otherwise be empty, which gives the user no idea what
+            # the preview is for. Render a small example rectangle
+            # with b / h dimension labels as a visual hint, plus a
+            # tag so the user knows it's illustrative. For an
+            # *existing* manual section we keep the previous
+            # "no shape preview" message — the user is editing real
+            # numbers and doesn't want a fake outline interfering.
+            if self._existing is None:
+                self._draw_example_outline(ax)
+            else:
+                ax.text(
+                    0.5, 0.5,
+                    "manual section\n(no shape preview)",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=9, color="#555",
+                )
             self._preview_canvas.draw_idle()
             return
 
@@ -659,6 +668,41 @@ class SectionDialog(_ModalDialog):
         ax.set_ylim(y0 - pad_y, y1 + pad_y)
 
         self._preview_canvas.draw_idle()
+
+    def _draw_example_outline(self, ax) -> None:
+        """Render an example 0.30 m × 0.50 m rectangle on the preview
+        canvas with dimension labels so a freshly-opened Add Section
+        dialog doesn't show a blank preview. The outline is for
+        illustration only — it isn't tied to any input field and is
+        clearly labelled "(example)".
+        """
+        b, h = 0.30, 0.50
+        zs = [b / 2, -b / 2, -b / 2,  b / 2]
+        ys = [h / 2,  h / 2, -h / 2, -h / 2]
+        ax.fill(zs, ys, facecolor="#e8eef5", edgecolor="#9aa9bf",
+                linewidth=1.2, alpha=0.9)
+        ax.plot(zs + [zs[0]], ys + [ys[0]],
+                color="#9aa9bf", linewidth=1.2, linestyle="--")
+        ax.annotate(
+            f"b = {b:g}",
+            xy=(0.0, -h / 2.0), xytext=(0.0, -h / 2.0 - 0.18 * h),
+            ha="center", va="top", fontsize=8, color="#666",
+        )
+        ax.annotate(
+            f"h = {h:g}",
+            xy=(b / 2.0, 0.0), xytext=(b / 2.0 + 0.18 * b, 0.0),
+            ha="left", va="center", fontsize=8, color="#666",
+        )
+        ax.text(
+            0.5, 0.97,
+            "example (pick a shape to begin)",
+            ha="center", va="top", transform=ax.transAxes,
+            fontsize=8, color="#888", style="italic",
+        )
+        pad_x = b * 0.45
+        pad_y = h * 0.35
+        ax.set_xlim(-b / 2.0 - pad_x, b / 2.0 + pad_x)
+        ax.set_ylim(-h / 2.0 - pad_y, h / 2.0 + pad_y)
 
     def _section_from_inputs(self, shape: str,
                               derived: dict[str, float]) -> Section:
