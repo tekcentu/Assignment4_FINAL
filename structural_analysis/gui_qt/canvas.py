@@ -107,6 +107,13 @@ class ModelCanvas(QWidget):
         # viewport — resize keeps the current limits and only fit_to_view
         # (View → Fit) takes the wheel back.
         self._user_view_dirty: bool = False
+        # Guard flipped to True while we (canvas internals) are
+        # programmatically setting xlim/ylim — first fit, redraw's
+        # save-and-restore, fit_to_view. The xlim/ylim-changed mpl
+        # callbacks consult this flag so the dirty bit only flips for
+        # *external* mutations (matplotlib navigation toolbar pan/zoom,
+        # programmatic test pokes, etc.).
+        self._setting_axes_limits: bool = False
 
         # Middle-mouse-drag pan state (display coordinates at drag start).
         self._pan_origin: tuple[float, float] | None = None
@@ -123,6 +130,13 @@ class ModelCanvas(QWidget):
         # The legacy "datalim" mode would silently rewrite our limits
         # and emit "Ignoring fixed y limits…" on every redraw.
         self.ax.set_aspect("equal", adjustable="box")
+        # Mark the view dirty whenever something *outside* canvas
+        # internals changes the limits — most importantly the
+        # matplotlib navigation toolbar's pan/zoom modes, which
+        # otherwise leave _user_view_dirty False and let the next
+        # window resize silently discard the user's view.
+        self.ax.callbacks.connect("xlim_changed", self._on_limits_changed)
+        self.ax.callbacks.connect("ylim_changed", self._on_limits_changed)
 
         self._mpl_canvas = FigureCanvasQTAgg(self.fig)
         self.toolbar = NavigationToolbar2QT(self._mpl_canvas, self)
@@ -231,15 +245,23 @@ class ModelCanvas(QWidget):
         else:
             saved_xlim = saved_ylim = None
 
-        self.ax.clear()
-        self.ax.set_aspect("equal", adjustable="box")
+        # ax.clear() resets xlim/ylim and would fire the limit-changed
+        # callbacks; the restore call below would also fire them.
+        # Both are programmatic, so suppress the dirty-bit toggle for
+        # the duration. (_set_axes_limits handles its own guard.)
+        self._setting_axes_limits = True
+        try:
+            self.ax.clear()
+            self.ax.set_aspect("equal", adjustable="box")
 
-        if saved_xlim is not None:
-            self.ax.set_xlim(saved_xlim)
-            self.ax.set_ylim(saved_ylim)
-        else:
-            self._set_axes_limits()
-            self._view_initialised = True
+            if saved_xlim is not None:
+                self.ax.set_xlim(saved_xlim)
+                self.ax.set_ylim(saved_ylim)
+            else:
+                self._set_axes_limits()
+                self._view_initialised = True
+        finally:
+            self._setting_axes_limits = False
 
         self._draw_grid()
         self._draw_origin_axes()
@@ -1162,8 +1184,21 @@ class ModelCanvas(QWidget):
         else:
             x_half = base
             y_half = base * (h_px / w_px)
-        self.ax.set_xlim(cx - x_half, cx + x_half)
-        self.ax.set_ylim(cy - y_half, cy + y_half)
+        self._setting_axes_limits = True
+        try:
+            self.ax.set_xlim(cx - x_half, cx + x_half)
+            self.ax.set_ylim(cy - y_half, cy + y_half)
+        finally:
+            self._setting_axes_limits = False
+
+    def _on_limits_changed(self, _ax) -> None:
+        """Mark the view as user-owned when xlim/ylim change for any
+        reason other than our own programmatic fits. The matplotlib
+        navigation toolbar's pan/zoom modes route through here, so
+        after the user pans/zooms via the toolbar a subsequent resize
+        no longer silently re-fits and throws their view away."""
+        if not self._setting_axes_limits:
+            self._user_view_dirty = True
 
 
 def _point_segment_distance_px(px, py, x1, y1, x2, y2,
