@@ -1655,18 +1655,88 @@ def _node_reaction(result, node_id: int) -> str | None:
 
 
 class ElementPropertiesDialog(QDialog):
-    """Read-only inspector for an element — opened by left-click in Select tool."""
+    """Read-only inspector for an element.
+
+    Non-modal so the main window stays usable for view-only operations
+    (pan / zoom / solve / overlay toggles). The host
+    (:class:`MainWindow`) is responsible for locking edit actions
+    while the inspector is visible — see
+    :meth:`MainWindow._set_editing_locked`.
+
+    Constructed as a singleton on ``MainWindow._element_inspector``;
+    re-opening from another element calls :meth:`set_target` to swap
+    the contents in place. After a solve the host calls
+    :meth:`refresh` so the diagrams pick up the new result.
+    """
 
     def __init__(self, parent, model: StructuralModel, elem_id: int,
                  result=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Element {elem_id} properties")
-        self.setModal(True)
+        self.setModal(False)
+        # Persist across close so MainWindow's singleton stays valid;
+        # tests + the host both rely on _element_inspector being
+        # reusable across right-clicks.
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
+        self._outer = QVBoxLayout(self)
+        # Body widget — wholly replaced by set_target on each refresh.
+        self._body_widget: QWidget = QWidget(self)
+        self._outer.addWidget(self._body_widget)
+
+        # Buttons live at the bottom permanently — only the body swaps.
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Close, parent=self,
+        )
+        self._buttons.rejected.connect(self.close)
+        self._buttons.accepted.connect(self.close)
+        close_btn = self._buttons.button(QDialogButtonBox.StandardButton.Close)
+        if close_btn is not None:
+            close_btn.clicked.connect(self.close)
+        self._outer.addWidget(self._buttons)
+
+        self._elem_id: int = elem_id
+        self.set_target(model, elem_id, result)
+
+    def set_target(
+        self, model: StructuralModel, elem_id: int, result=None,
+    ) -> None:
+        """Swap the inspector to show ``elem_id``. Raises ``ValueError``
+        if the element does not exist. The figure / form widgets are
+        rebuilt from scratch — simpler than wiring every field for
+        individual updates, and the dialog is hardly hot-path."""
         elem = next((e for e in model.elements if e.id == elem_id), None)
         if elem is None:
             raise ValueError(f"Element {elem_id} does not exist.")
+        new_body = self._build_body(model, elem, result)
+        self._outer.replaceWidget(self._body_widget, new_body)
+        self._body_widget.setParent(None)
+        self._body_widget.deleteLater()
+        self._body_widget = new_body
+        self._elem_id = elem_id
+        self.setWindowTitle(f"Element {elem_id} properties")
 
+    def refresh(self, model: StructuralModel, result=None) -> None:
+        """Re-render the current element against ``model`` / ``result``.
+        Called by the host after :meth:`MainWindow._do_solve` so the
+        N/V/M traces and the end-force block pick up the new result.
+        Silently no-ops if the current element id no longer exists."""
+        if not any(e.id == self._elem_id for e in model.elements):
+            self.close()
+            return
+        self.set_target(model, self._elem_id, result)
+
+    def _build_body(
+        self, model: StructuralModel, elem, result,
+    ) -> QWidget:
+        from .element_graphics import draw_element_detail
+
+        body = QWidget(self)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 0, 0)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        elem_id = elem.id
         section = model.sections.get(getattr(elem, "section_id", None) or -1)
         material = (model.materials.get(section.material_id)
                      if section is not None else None)
@@ -1677,10 +1747,6 @@ class ElementPropertiesDialog(QDialog):
             length = 0.0
         else:
             length = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
-
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-        layout.addLayout(form)
 
         form.addRow("Element ID:", QLabel(str(elem_id)))
         form.addRow("Kind:", QLabel(elem.kind.capitalize()))
@@ -1708,14 +1774,8 @@ class ElementPropertiesDialog(QDialog):
         for line in loads[1:]:
             form.addRow("", QLabel(line))
 
-        # Static graphical detail block — member sketch, FBD, internal-
-        # force preview, section thumbnail. Visible pre-solve too; the
-        # diagrams just say "Run analysis to see diagrams" until a
-        # result is available. The single source of truth for the N/V/M
-        # math lives in element_graphics; the dialog and the main
-        # canvas both call into it.
-        from .element_graphics import draw_element_detail
-
+        # Graphical detail block — single source of truth in
+        # element_graphics, shared with the main canvas.
         self._detail_fig = Figure(figsize=(6.4, 4.6), dpi=96)
         self._detail_fig.patch.set_facecolor("white")
         self._detail_canvas = FigureCanvasQTAgg(self._detail_fig)
@@ -1731,7 +1791,6 @@ class ElementPropertiesDialog(QDialog):
         )
         self._detail_canvas.draw_idle()
 
-        # End-force result block (only if a successful static result exists).
         if result is not None and getattr(result, "status", None) == "ok":
             f_local = _element_local_forces(result, elem_id)
             if f_local is not None:
@@ -1760,14 +1819,7 @@ class ElementPropertiesDialog(QDialog):
                         ),
                     )
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close,
-                                     parent=self)
-        buttons.rejected.connect(self.reject)
-        buttons.accepted.connect(self.accept)
-        close_btn = buttons.button(QDialogButtonBox.StandardButton.Close)
-        if close_btn is not None:
-            close_btn.clicked.connect(self.accept)
-        layout.addWidget(buttons)
+        return body
 
 
 def _element_local_forces(result, elem_id: int):

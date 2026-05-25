@@ -342,26 +342,162 @@ def test_member_load_dialog_raises_for_unknown_element(qt_app):
         MemberLoadDialog(w, model=w._model, elem_id=9999)
 
 
-def test_select_tool_left_click_shows_details(qt_app):
-    """Left-clicking a node or element with the Select tool must open
-    the read-only details dialog directly — no right-click menu needed."""
+def test_select_tool_left_click_only_selects(qt_app):
+    """Left-clicking with the Select tool must only update the
+    canvas highlight + status text — opening the modal detail
+    dialog on every left-click was the *old* behaviour. The detail
+    inspector is now reached by right-click (see the dedicated
+    right-click test) and the modal popup is gone."""
+    from structural_analysis.element import FrameElement2D
     from structural_analysis.model import Node
 
     w = MainWindow()
     w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+    )]
 
-    calls: list[tuple[str, int]] = []
-    w.show_node_details = lambda nid: calls.append(("node", nid))
-    w.show_element_details = lambda eid: calls.append(("elem", eid))
+    # Guard against the old code path firing the modal dialog. If
+    # either call lands here, the test should fail loudly.
+    illegal: list[str] = []
+    w.show_node_details = lambda nid: illegal.append(f"node {nid}")
+    w.show_element_details = lambda eid: illegal.append(f"elem {eid}")
 
     w._select_tool("select")
     w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
-    assert calls == [("node", 1)]
-    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=2), "left")
-    assert calls == [("node", 1), ("elem", 2)]
-    # Empty click — no detail dialog opens.
+    assert w.canvas._selected_node_id == 1
+    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=1), "left")
+    assert w.canvas._selected_element_id == 1
+    assert w.canvas._selected_node_id is None
+    # Empty click clears selection.
     w._on_canvas_click(HitResult(x=5.0, y=5.0), "left")
-    assert calls == [("node", 1), ("elem", 2)]
+    assert w.canvas._selected_element_id is None
+    assert w.canvas._selected_node_id is None
+    # No modal-dialog escape hatch fired.
+    assert illegal == [], (
+        f"Select-tool left-click must not open the modal details dialog, "
+        f"got: {illegal}"
+    )
+
+
+def test_right_click_element_opens_inspector(qt_app):
+    """Right-clicking any element on the canvas opens the new
+    non-modal element-detail inspector. The previous edit context
+    menu (`show_element_menu`) must not fire — its replacement is
+    the inspector itself."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+    )]
+
+    illegal: list[str] = []
+    w.show_element_menu = lambda eid: illegal.append(f"menu {eid}")
+
+    assert w._element_inspector is None
+    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=1), "right")
+    qt_app.processEvents()
+
+    assert w._element_inspector is not None
+    assert w._element_inspector.isVisible()
+    assert w._element_inspector._elem_id == 1
+    assert illegal == [], (
+        f"Right-click on an element must go through the inspector, "
+        f"not the old edit context menu. Got: {illegal}"
+    )
+
+    # Right-clicking a different element re-targets the same window.
+    w._model.nodes[3] = Node(3, 4.0, 0.0)
+    w._model.elements.append(FrameElement2D(
+        id=2, node_i=2, node_j=3, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+    ))
+    same_window = w._element_inspector
+    w._on_canvas_click(HitResult(x=3.0, y=0.0, element_id=2), "right")
+    qt_app.processEvents()
+    assert w._element_inspector is same_window, (
+        "the singleton inspector must be reused, not replaced"
+    )
+    assert w._element_inspector._elem_id == 2
+
+
+def test_inspector_open_locks_editing_keeps_view(qt_app):
+    """When the inspector is open, editing actions (tool palette
+    add/delete, Undo/Redo, Materials, building wizard, "Add node at
+    coordinates", Forget element defaults) must be disabled, and the
+    active tool must be forced to Select. View / solve / overlay
+    actions stay enabled. Closing re-enables everything."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+    )]
+    w._select_tool("node")
+    assert w._active_tool.name == "node"
+    assert w._tool_actions["node"].isEnabled()
+
+    w._open_element_inspector(1)
+    qt_app.processEvents()
+
+    # Editing tools and registered lockable actions must be disabled.
+    for name in ("node", "frame", "truss", "support",
+                 "nodal_load", "member_load", "delete"):
+        assert not w._tool_actions[name].isEnabled(), (
+            f"tool {name!r} must be disabled while inspector is open"
+        )
+    for action in w._lockable_actions:
+        assert not action.isEnabled(), (
+            f"editing action {action.text()!r} must be disabled "
+            f"while inspector is open"
+        )
+    # Select must stay enabled so right-clicks still route through.
+    assert w._tool_actions["select"].isEnabled()
+    assert w._active_tool.name == "select"
+    # View-only actions stay enabled — solve, fit, 3D viewer, snap.
+    assert w.act_solve.isEnabled()
+    assert w.act_fit_view.isEnabled()
+    assert w.act_open_view3d.isEnabled()
+
+    # Close: lock released, full edit surface back.
+    w._element_inspector.close()
+    qt_app.processEvents()
+    for name in ("node", "frame", "truss", "support",
+                 "nodal_load", "member_load", "delete"):
+        assert w._tool_actions[name].isEnabled(), (
+            f"tool {name!r} must be re-enabled after inspector closes"
+        )
+    for action in w._lockable_actions:
+        assert action.isEnabled()
+
+
+def test_inspector_refreshes_on_solve(qt_app):
+    """Solving while the inspector is open must push the new
+    member-end forces into its diagrams panel — without making the
+    user close-and-reopen the window."""
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    elem = w._model.elements[0]
+
+    w._open_element_inspector(elem.id)
+    qt_app.processEvents()
+    diag_ax = w._element_inspector._detail_axes["diagrams"]
+    pre_solve_lines = len(diag_ax.lines)
+    assert pre_solve_lines == 0, (
+        "pre-solve diagrams panel must hold no traces (only the "
+        "placeholder text)"
+    )
+
+    w._do_solve()
+    qt_app.processEvents()
+    diag_ax = w._element_inspector._detail_axes["diagrams"]
+    assert diag_ax.lines, (
+        "post-solve refresh must populate the diagrams panel"
+    )
 
 
 def test_property_dialogs_construct(qt_app):

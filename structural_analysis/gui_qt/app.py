@@ -196,6 +196,14 @@ class MainWindow(QMainWindow):
         self._modal_result = None
         self._modal_results_dialog = None
         self._view3d_window = None
+        # Singleton element-detail inspector. Held alive across closes
+        # so right-clicking a different element reuses the same window
+        # (see _open_element_inspector). MainWindow owns the
+        # "locked while open" UX so the inspector dialog itself can
+        # stay non-modal without losing the safety of "no edits while
+        # inspecting".
+        self._element_inspector: ElementPropertiesDialog | None = None
+        self._lockable_actions: list[QAction] = []
         # Sticky element-creation defaults (None = ask the user on the
         # next pair-click). When the ElementDialog's "Remember" box is
         # checked these are saved and applied silently for subsequent
@@ -401,6 +409,20 @@ class MainWindow(QMainWindow):
             group.addAction(a)
             self._tool_actions[name] = a
         self._tool_actions["select"].setChecked(True)
+
+        # Actions disabled while the element-detail inspector is open.
+        # Editing the model from underneath an open inspector would
+        # produce a stale view of the very element under inspection;
+        # locking these on inspector-open enforces the "view-only
+        # while inspecting" invariant the user asked for. Anything
+        # view-only (pan, zoom, solve, overlay toggles, View menu,
+        # 3D viewer, fit) stays enabled and is *intentionally* not in
+        # this list.
+        self._lockable_actions = [
+            self.act_undo, self.act_redo,
+            self.act_building_wizard, self.act_add_node_coords,
+            self.act_materials, self.act_forget_elem_defaults,
+        ]
 
     def _build_menus(self) -> None:
         m_file = self.menuBar().addMenu("&File")
@@ -884,11 +906,16 @@ class MainWindow(QMainWindow):
 
     def _on_canvas_click(self, hit: HitResult, button: str) -> None:
         if button == "right":
+            # Right-click on an element opens the detail inspector
+            # directly (the previous edit context menu is gone — its
+            # actions still live in the tool palette and Edit menu).
+            # Right-click on a node keeps the node context menu since
+            # nodes don't have a dedicated inspector window.
+            if hit.element_id is not None:
+                self._open_element_inspector(hit.element_id)
+                return
             if hit.node_id is not None:
                 self.show_node_menu(hit.node_id)
-                return
-            if hit.element_id is not None:
-                self.show_element_menu(hit.element_id)
                 return
         try:
             self._active_tool.on_click(hit, button)
@@ -1031,6 +1058,60 @@ class MainWindow(QMainWindow):
         self._view3d_window.show()
         self._view3d_window.raise_()
         self._view3d_window.activateWindow()
+
+    def _open_element_inspector(self, elem_id: int) -> None:
+        """Open (or re-target) the non-modal element-detail inspector.
+
+        The inspector is a singleton on ``self._element_inspector`` —
+        right-clicking a different element while it's open re-targets
+        the same window instead of stacking dialogs. While it's
+        visible the host locks the editing actions (see
+        :meth:`_set_editing_locked`); the inspector itself stays
+        non-modal so pan / zoom / solve / overlay buttons continue to
+        work on the main canvas.
+        """
+        try:
+            if self._element_inspector is None:
+                self._element_inspector = ElementPropertiesDialog(
+                    self, self._model, elem_id, self._result,
+                )
+                self._element_inspector.finished.connect(
+                    self._on_element_inspector_closed
+                )
+            else:
+                self._element_inspector.set_target(
+                    self._model, elem_id, self._result,
+                )
+        except ValueError as e:
+            QMessageBox.warning(self, "Element not found", str(e))
+            return
+        self._set_editing_locked(True)
+        self._element_inspector.show()
+        self._element_inspector.raise_()
+        self._element_inspector.activateWindow()
+
+    def _on_element_inspector_closed(self, _result_code=None) -> None:
+        """Re-enable the editing surface once the user closes the
+        inspector (Close button or window-close). Called by the dialog's
+        ``finished`` signal — the connection is wired once at
+        construction in :meth:`_open_element_inspector`."""
+        self._set_editing_locked(False)
+
+    def _set_editing_locked(self, locked: bool) -> None:
+        """Toggle the editing surface — tool palette (everything except
+        Select) and the explicit "Edit" QActions registered in
+        :attr:`_lockable_actions`. View, solve, modal, fit, snap,
+        diagram-station and deformed-scale actions stay enabled so the
+        user can still pan / zoom / re-solve / toggle overlays while
+        the inspector is open. When locking, also forces the active
+        tool back to "select" so pending left-clicks can't add nodes /
+        elements / loads."""
+        for name, action in self._tool_actions.items():
+            action.setEnabled((not locked) or name == "select")
+        for action in self._lockable_actions:
+            action.setEnabled(not locked)
+        if locked and self._active_tool.name != "select":
+            self._select_tool("select")
 
     def _populate_examples_menu(self) -> None:
         """Fill the File → Open example submenu from ``inputs/``."""
@@ -1379,6 +1460,12 @@ class MainWindow(QMainWindow):
             return
         self.canvas.set_result(self._result)
         self._update_result_text()
+        # If the user solved while the element-detail inspector is
+        # open, push the new diagrams into it without making them
+        # close-and-reopen the window.
+        if (self._element_inspector is not None
+                and self._element_inspector.isVisible()):
+            self._element_inspector.refresh(self._model, self._result)
         if self._result.status == "ok":
             self.set_status(
                 f"Analysis complete · residual = {self._result.residual:.2e}"

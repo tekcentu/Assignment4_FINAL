@@ -56,21 +56,25 @@ class Tool:
 class SelectTool(Tool):
     name = "select"
     description = (
-        "Select: left-click a node or element to view its details. "
-        "Right-click for edit actions."
+        "Select: left-click a node or element to highlight it. "
+        "Right-click an element for its detail inspector (FBD + "
+        "internal-force diagrams)."
     )
 
     def on_click(self, hit: HitResult, button: str) -> None:
         if button == "right":
-            if hit.node_id is not None:
-                self.host.show_node_menu(hit.node_id)
-            elif hit.element_id is not None:
-                self.host.show_element_menu(hit.element_id)
-        elif button == "left":
-            if hit.node_id is not None:
-                self.host.show_node_details(hit.node_id)
-            elif hit.element_id is not None:
-                self.host.show_element_details(hit.element_id)
+            # Right-click routing is owned by MainWindow._on_canvas_click
+            # so the inspector / node-menu paths run even when a
+            # non-select tool is active. Nothing for the tool to do here.
+            return
+        if button != "left":
+            return
+        if hit.node_id is not None:
+            self.host.select_node(hit.node_id)
+        elif hit.element_id is not None:
+            self.host.select_element(hit.element_id)
+        else:
+            self.host.clear_selection()
 
 
 class NodeTool(Tool):
