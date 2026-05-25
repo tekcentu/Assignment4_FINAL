@@ -140,6 +140,11 @@ def write_input_file(model: StructuralModel, path: str) -> None:
                 line += "  START"
             elif elem.release_j:
                 line += "  END"
+        # Per-element material override — keyword-style trailing token so
+        # backward compatibility with files that don't carry it is
+        # automatic. Omitted entirely when the override is None.
+        if getattr(elem, "material_id_override", None) is not None:
+            line += f"  material_override_id={elem.material_id_override}"
         out.append(line)
     out.append("")
 

@@ -82,6 +82,14 @@ class Element2D:
             tests). Stiffness math ignores this — it's a back-reference used
             by the writer and the GUI command propagation logic to find
             elements that belong to a given Section/Material.
+        material_id_override: optional id of a :class:`Material` that takes
+            precedence over the section's default material for this element.
+            ``None`` means "use the section default". E / α / ρ on this
+            element are always populated from the *effective* material
+            (override if set, otherwise section default) — see
+            :func:`structural_analysis.model.effective_material`. Stiffness
+            math doesn't read this attribute directly; it reads ``self.E``
+            etc., which are written at construction / propagation time.
         member_loads: List of MemberLoad objects (UDL, PointLoad, thermal).
     """
 
@@ -94,6 +102,7 @@ class Element2D:
     depth: float = 0.0
     rho: float = 0.0
     section_id: int | None = None
+    material_id_override: int | None = None
     member_loads: list[MemberLoad] = field(default_factory=list)
 
     @property

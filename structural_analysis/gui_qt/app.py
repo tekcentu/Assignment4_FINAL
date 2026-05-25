@@ -641,12 +641,19 @@ class MainWindow(QMainWindow):
             else:
                 release_i = False
                 release_j = False
+            # Sticky override is only re-applied if the material still
+            # exists; otherwise drop it so we don't carry a stale id.
+            sticky_override = sticky.get("material_override_id")
+            if (sticky_override is not None
+                    and sticky_override not in self._model.materials):
+                sticky_override = None
             self.execute(AddElementCmd(
                 node_i=n_i, node_j=n_j,
                 section_id=sticky["section_id"],
                 kind=effective_kind,
                 release_i=release_i,
                 release_j=release_j,
+                material_override_id=sticky_override,
             ))
             return
 
@@ -655,6 +662,8 @@ class MainWindow(QMainWindow):
                 self, model=self._model,
                 existing_kind=kind or (sticky or {}).get("kind"),
                 existing_section_id=(sticky or {}).get("section_id"),
+                existing_material_override_id=(
+                    sticky or {}).get("material_override_id"),
             )
         except ValueError as e:
             QMessageBox.warning(self, "Cannot add element", str(e))
@@ -667,6 +676,7 @@ class MainWindow(QMainWindow):
                     "section_id": rv["section_id"],
                     "release_i": rv["release_i"],
                     "release_j": rv["release_j"],
+                    "material_override_id": rv.get("material_override_id"),
                 }
                 # Hint the user that subsequent pair clicks will skip
                 # the dialog until they clear the setting.
@@ -685,6 +695,7 @@ class MainWindow(QMainWindow):
                 kind=rv["kind"],
                 release_i=rv["release_i"],
                 release_j=rv["release_j"],
+                material_override_id=rv.get("material_override_id"),
             ))
 
     def _forget_element_defaults(self) -> None:
@@ -817,6 +828,8 @@ class MainWindow(QMainWindow):
             existing_section_id=getattr(elem, "section_id", None),
             existing_release_i=getattr(elem, "release_i", False),
             existing_release_j=getattr(elem, "release_j", False),
+            existing_material_override_id=getattr(
+                elem, "material_id_override", None),
             remember_default=False,
         )
         if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
@@ -828,6 +841,7 @@ class MainWindow(QMainWindow):
             kind=rv["kind"],
             release_i=rv["release_i"],
             release_j=rv["release_j"],
+            material_override_id=rv.get("material_override_id"),
         ))
         self.select_element(elem_id)
 

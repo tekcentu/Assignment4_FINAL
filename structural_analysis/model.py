@@ -304,6 +304,31 @@ class StructuralModel:
         return sorted(self.nodes)
 
 
+# ── Effective material resolver ───────────────────────────────
+
+
+def effective_material(model: "StructuralModel", elem) -> Material:
+    """Return the Material that drives ``elem``'s E / α / ρ / G.
+
+    Per-element overrides take precedence over the section default:
+
+        effective_material_id =
+            elem.material_id_override or section.material_id
+
+    Used by the GUI detail inspector to label "section default" vs
+    "override", and by the propagation paths in
+    :class:`structural_analysis.gui_common.commands.AddOrUpdateMaterialCmd`
+    to decide which elements should refresh when a material is edited.
+
+    Raises:
+        KeyError: if the resolved material id or the element's section id
+            is missing from the model.
+    """
+    section = model.sections[elem.section_id]
+    mid = getattr(elem, "material_id_override", None) or section.material_id
+    return model.materials[mid]
+
+
 # ── Analysis Result ───────────────────────────────────────────
 
 

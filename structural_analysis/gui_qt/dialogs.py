@@ -888,6 +888,7 @@ class ElementDialog(_ModalDialog):
                  existing_section_id: int | None = None,
                  existing_release_i: bool = False,
                  existing_release_j: bool = False,
+                 existing_material_override_id: int | None = None,
                  remember_default: bool = True):
         self._model = model
         if not model.sections:
@@ -896,6 +897,7 @@ class ElementDialog(_ModalDialog):
         self._existing_sec = existing_section_id
         self._existing_ri = existing_release_i
         self._existing_rj = existing_release_j
+        self._existing_mat_override = existing_material_override_id
         self._remember_default = bool(remember_default)
         super().__init__(parent, "Element properties")
 
@@ -931,6 +933,23 @@ class ElementDialog(_ModalDialog):
                 self._sec_combo.setCurrentIndex(idx)
         form.addRow("Section / material:", self._sec_combo)
 
+        # Material override combo. First entry "Use section default"
+        # carries data=None (the common case); remaining entries
+        # enumerate every Material in the model. Changing this is
+        # independent of the Section combo — it just overrides the
+        # section's default material for this single element.
+        self._mat_combo = QComboBox(body)
+        self._mat_combo.addItem("Use section default", None)
+        for mid in sorted(self._model.materials):
+            m = self._model.materials[mid]
+            label = f"{m.name or f'material {mid}'}  (id {mid})"
+            self._mat_combo.addItem(label, mid)
+        if self._existing_mat_override is not None:
+            idx = self._mat_combo.findData(self._existing_mat_override)
+            if idx >= 0:
+                self._mat_combo.setCurrentIndex(idx)
+        form.addRow("Material:", self._mat_combo)
+
         self._cb_ri = QCheckBox("Moment release at start (i)", body)
         self._cb_rj = QCheckBox("Moment release at end (j)", body)
         self._cb_ri.setChecked(self._existing_ri)
@@ -957,11 +976,14 @@ class ElementDialog(_ModalDialog):
         section_id = self._sec_combo.currentData()
         if section_id not in self._model.sections:
             raise ValueError(f"Section {section_id} does not exist.")
+        mat_override = self._mat_combo.currentData()
         return {
             "kind": kind,
             "section_id": int(section_id),
             "release_i": self._cb_ri.isChecked() if kind == "frame" else False,
             "release_j": self._cb_rj.isChecked() if kind == "frame" else False,
+            "material_override_id": (int(mat_override)
+                                      if mat_override is not None else None),
             "remember": self._cb_remember.isChecked(),
         }
 
@@ -1742,8 +1764,18 @@ class ElementPropertiesDialog(QDialog):
 
         elem_id = elem.id
         section = model.sections.get(getattr(elem, "section_id", None) or -1)
-        material = (model.materials.get(section.material_id)
-                     if section is not None else None)
+        # Default (section-driven) material — always shown so the user
+        # can see what the section would assign if the override were
+        # cleared.
+        default_material = (model.materials.get(section.material_id)
+                             if section is not None else None)
+        # Effective material — the one currently driving E/α/ρ on the
+        # element. Falls back to the default when there's no override.
+        override_id = getattr(elem, "material_id_override", None)
+        if override_id is not None:
+            effective_mat = model.materials.get(override_id)
+        else:
+            effective_mat = default_material
 
         ni = model.nodes.get(elem.node_i)
         nj = model.nodes.get(elem.node_j)
@@ -1781,9 +1813,25 @@ class ElementPropertiesDialog(QDialog):
             form.addRow("Section:", QLabel(f"{sec_text}  (id {section.id})"))
         else:
             form.addRow("Section:", QLabel("(none)"))
-        if material is not None:
-            mat_text = material.name or f"material {material.id}"
-            form.addRow("Material:", QLabel(f"{mat_text}  (id {material.id})"))
+        if effective_mat is not None:
+            eff_name = effective_mat.name or f"material {effective_mat.id}"
+            if override_id is None:
+                tag = "— section default"
+                mat_line = (f"{eff_name}  (id {effective_mat.id})  {tag}")
+            else:
+                default_name = (default_material.name
+                                if default_material is not None
+                                and default_material.name
+                                else f"material "
+                                     f"{section.material_id if section else '?'}")
+                default_id = (default_material.id
+                              if default_material is not None
+                              else (section.material_id if section else None))
+                mat_line = (
+                    f"{eff_name}  (id {effective_mat.id})  — override "
+                    f"(default: {default_name}, id {default_id})"
+                )
+            form.addRow("Material:", QLabel(mat_line))
 
         form.addRow("E:", QLabel(f"{elem.E:g} kN/m²"))
         form.addRow("A:", QLabel(f"{elem.A:g} m²"))
