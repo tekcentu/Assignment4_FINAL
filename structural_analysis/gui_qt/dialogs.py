@@ -1739,8 +1739,6 @@ class ElementPropertiesDialog(QDialog):
         body = QWidget(self)
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
-        form = QFormLayout()
-        layout.addLayout(form)
 
         elem_id = elem.id
         section = model.sections.get(getattr(elem, "section_id", None) or -1)
@@ -1753,6 +1751,25 @@ class ElementPropertiesDialog(QDialog):
             length = 0.0
         else:
             length = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+
+        # Top row: property form on the left, compact section
+        # thumbnail mini-figure on the right.  Pulling the section
+        # outline out of the main matplotlib figure trims the dialog's
+        # vertical footprint significantly.
+        top_row = QHBoxLayout()
+        form_widget = QWidget(body)
+        form = QFormLayout(form_widget)
+        form.setContentsMargins(0, 0, 0, 0)
+        top_row.addWidget(form_widget, stretch=3)
+
+        self._section_fig = Figure(figsize=(2.2, 2.2), dpi=92)
+        self._section_fig.patch.set_facecolor("white")
+        self._section_canvas = FigureCanvasQTAgg(self._section_fig)
+        self._section_canvas.setMinimumSize(180, 180)
+        self._section_canvas.setMaximumSize(260, 260)
+        top_row.addWidget(self._section_canvas, stretch=1)
+
+        layout.addLayout(top_row)
 
         form.addRow("Element ID:", QLabel(str(elem_id)))
         form.addRow("Kind:", QLabel(elem.kind.capitalize()))
@@ -1780,13 +1797,13 @@ class ElementPropertiesDialog(QDialog):
         for line in loads[1:]:
             form.addRow("", QLabel(line))
 
-        # Graphical detail block — single source of truth in
-        # element_graphics, shared with the main canvas. Taller figure
-        # to accommodate the five-row landscape stack.
-        self._detail_fig = Figure(figsize=(7.0, 9.2), dpi=92)
+        # Main figure — only sketch + FBD + N + V + M (section is in
+        # the side mini-figure above).  Shorter overall so the dialog
+        # fits comfortably on typical laptop screens.
+        self._detail_fig = Figure(figsize=(7.0, 6.8), dpi=92)
         self._detail_fig.patch.set_facecolor("white")
         self._detail_canvas = FigureCanvasQTAgg(self._detail_fig)
-        self._detail_canvas.setMinimumSize(560, 700)
+        self._detail_canvas.setMinimumSize(560, 480)
         layout.addWidget(self._detail_canvas)
         ok_result = (
             result if (result is not None
@@ -1795,8 +1812,10 @@ class ElementPropertiesDialog(QDialog):
         )
         self._detail_axes = draw_element_detail(
             self._detail_fig, elem, model, ok_result,
+            section_fig=self._section_fig,
         )
         self._detail_canvas.draw_idle()
+        self._section_canvas.draw_idle()
 
         # Cache the three N/V/M sub-panel axes for the interactive layer.
         self._ax_n = self._detail_axes.ax_n

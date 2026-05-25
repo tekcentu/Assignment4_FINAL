@@ -457,10 +457,11 @@ def draw_element_detail(
     fig: Figure, elem, model: StructuralModel,
     result: Optional[AnalysisResult] = None,
     *, n_samples: int = 11,
+    section_fig: Optional[Figure] = None,
 ) -> ElementDetailAxes:
     """Render the landscape-stacked element detail into ``fig``.
 
-    Layout (5 rows × 6 columns)::
+    Default layout (5 rows × 6 columns, section inside ``fig``)::
 
         Row 0, cols 0-1  →  section thumbnail
         Row 0, cols 2-5  →  member sketch   (local frame)
@@ -469,25 +470,50 @@ def draw_element_detail(
         Row 3, cols 0-5  →  V — shear  (kN)     .ax_v attribute
         Row 4, cols 0-5  →  M — moment (kN·m)   .ax_m attribute
 
+    When ``section_fig`` is provided, the section thumbnail is drawn
+    into that *separate* figure instead — letting the host dialog
+    place a compact section preview alongside its property form, so
+    the main ``fig`` only needs five thin rows for sketch + FBD +
+    N + V + M.  This trims the dialog's vertical footprint without
+    sacrificing the section drawing.
+
     Returns an :class:`ElementDetailAxes` dict with exactly four keys
     ``{"sketch", "fbd", "diagrams", "section"}`` for backward compat;
     ``.ax_n / .ax_v / .ax_m`` give the dialog access to all three
-    diagram sub-panels.
+    diagram sub-panels.  When ``section_fig`` is given,
+    ``axes["section"]`` points at the axis inside that figure.
     """
     fig.clear()
-    gs = GridSpec(
-        5, 6, figure=fig,
-        hspace=0.60, wspace=0.40,
-        top=0.96, bottom=0.05, left=0.08, right=0.97,
-        height_ratios=[2, 2, 1.2, 1.2, 1.6],
-    )
 
-    ax_section = fig.add_subplot(gs[0:2, 0:2])
-    ax_sketch  = fig.add_subplot(gs[0, 2:6])
-    ax_fbd     = fig.add_subplot(gs[1, 2:6])
-    ax_n       = fig.add_subplot(gs[2, 0:6])
-    ax_v       = fig.add_subplot(gs[3, 0:6], sharex=ax_n)
-    ax_m       = fig.add_subplot(gs[4, 0:6], sharex=ax_n)
+    if section_fig is not None:
+        # Compact layout: section lives in its own figure, main figure
+        # is a single full-width column with five thin rows.
+        section_fig.clear()
+        ax_section = section_fig.add_subplot(111)
+        gs = GridSpec(
+            5, 1, figure=fig,
+            hspace=0.70,
+            top=0.96, bottom=0.06, left=0.14, right=0.97,
+            height_ratios=[1.3, 1.3, 1.0, 1.0, 1.4],
+        )
+        ax_sketch = fig.add_subplot(gs[0, 0])
+        ax_fbd    = fig.add_subplot(gs[1, 0])
+        ax_n      = fig.add_subplot(gs[2, 0])
+        ax_v      = fig.add_subplot(gs[3, 0], sharex=ax_n)
+        ax_m      = fig.add_subplot(gs[4, 0], sharex=ax_n)
+    else:
+        gs = GridSpec(
+            5, 6, figure=fig,
+            hspace=0.60, wspace=0.40,
+            top=0.96, bottom=0.05, left=0.08, right=0.97,
+            height_ratios=[2, 2, 1.2, 1.2, 1.6],
+        )
+        ax_section = fig.add_subplot(gs[0:2, 0:2])
+        ax_sketch  = fig.add_subplot(gs[0, 2:6])
+        ax_fbd     = fig.add_subplot(gs[1, 2:6])
+        ax_n       = fig.add_subplot(gs[2, 0:6])
+        ax_v       = fig.add_subplot(gs[3, 0:6], sharex=ax_n)
+        ax_m       = fig.add_subplot(gs[4, 0:6], sharex=ax_n)
 
     ni = model.nodes.get(getattr(elem, "node_i", None))
     nj = model.nodes.get(getattr(elem, "node_j", None))
