@@ -1313,6 +1313,108 @@ def test_main_window_keeps_version_badge_top_right(qt_app):
     assert __what_is_new__ in text
 
 
+# ── Element-detail interactive layer (crosshair, maxima, BMD) ─────
+
+
+def test_element_dialog_crosshair_tracks_motion(qt_app):
+    """Synthesise a motion event inside the N diagram axis; the three
+    cursor axvlines must update to the same x and the readout labels
+    must show numeric content (not '—')."""
+    from types import SimpleNamespace
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._result is not None and w._result.status == "ok"
+
+    elem = w._model.elements[0]
+    ni = w._model.nodes[elem.node_i]
+    nj = w._model.nodes[elem.node_j]
+    L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+
+    w._open_element_inspector(elem.id)
+    qt_app.processEvents()
+    d = w._element_inspector
+    assert d is not None and d._cursors, (
+        "crosshair axvlines must be created post-solve"
+    )
+
+    # Synthesise a motion event inside the N (axial) axis at x = L/2
+    x_test = L / 2.0
+    evt = SimpleNamespace(inaxes=d._ax_n, xdata=x_test, ydata=0.0)
+    d._on_diagram_motion(evt)
+
+    # All three cursors must be at the same x and visible
+    for c in d._cursors:
+        xdata = list(c.get_xdata())
+        assert abs(xdata[0] - x_test) < 1e-9, (
+            f"cursor xdata {xdata[0]} != test x {x_test}"
+        )
+        assert c.get_alpha() > 0, "cursor must become visible after motion"
+
+    # Readout labels must show numeric values
+    assert "x:" in d._lbl_x.text() and "—" not in d._lbl_x.text()
+    assert "N:" in d._lbl_N.text() and "—" not in d._lbl_N.text()
+
+
+def test_element_dialog_maxima_checkbox_toggles_annotations(qt_app):
+    """Checking 'Show Maxima' must add annotations on applicable diagram
+    axes; unchecking must remove all of them.  Wiring test — numerical
+    correctness is tested in test_diagram_signs.py."""
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+
+    elem = w._model.elements[0]
+    w._open_element_inspector(elem.id)
+    qt_app.processEvents()
+    d = w._element_inspector
+    assert d._show_maxima_cb.isEnabled(), (
+        "Show Maxima checkbox must be enabled post-solve"
+    )
+
+    d._show_maxima_cb.setChecked(True)
+    assert d._maxima_annotations, (
+        "checking Show Maxima must create at least one annotation"
+    )
+
+    d._show_maxima_cb.setChecked(False)
+    assert not d._maxima_annotations, (
+        "unchecking Show Maxima must clear all annotations"
+    )
+
+
+def test_element_dialog_bmd_axis_is_inverted(qt_app):
+    """The M subplot must use the structural tension-fibre BMD
+    convention (y-axis inverted); N and V subplots must not be inverted."""
+    from structural_analysis.element import FrameElement2D
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+
+    frame_elem = next(
+        (e for e in w._model.elements if isinstance(e, FrameElement2D)),
+        None,
+    )
+    assert frame_elem is not None, (
+        "q2a model must have at least one frame element"
+    )
+
+    w._open_element_inspector(frame_elem.id)
+    qt_app.processEvents()
+    d = w._element_inspector
+
+    assert d._ax_m.yaxis_inverted(), (
+        "M subplot must have inverted y-axis (tension-fibre BMD convention)"
+    )
+    assert not d._ax_n.yaxis_inverted(), "N subplot must NOT be inverted"
+    assert not d._ax_v.yaxis_inverted(), "V subplot must NOT be inverted"
+
+
 # ── 3D extruded viewer ─────────────────────────────────────────
 
 

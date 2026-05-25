@@ -14,18 +14,23 @@ Public surface:
 * :func:`sample_internal_force` — discretise that closure at
   ``n_samples`` evenly spaced station points.
 * :func:`internal_force_at` — single-point read-out at one arc-length.
-* :func:`draw_element_detail` — render the 4-panel detail block
-  (member sketch, FBD, N/V/M mini diagrams, cross-section thumbnail)
-  into a caller-supplied :class:`matplotlib.figure.Figure`. The
-  caller owns the figure / canvas widget; we only draw onto it.
+* :func:`draw_element_detail` — render the landscape-stacked detail
+  block into a caller-supplied :class:`matplotlib.figure.Figure`.
+  Returns an :class:`ElementDetailAxes` dict subclass that carries the
+  four standard keys (backward-compat with the smoke-test assertion
+  ``set(axes) == {"sketch", "fbd", "diagrams", "section"}``) plus
+  ``.ax_n``, ``.ax_v``, ``.ax_m`` attributes for the interactive
+  crosshair layer.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional
 
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import MaxNLocator
 
 from ..element import FrameElement2D, TrussElement2D
 from ..model import (
@@ -143,7 +148,30 @@ def internal_force_at(
     return float(fn(x))
 
 
-# ── Element-detail figure ─────────────────────────────────────────
+# ── Return type ──────────────────────────────────────────────────
+
+
+class ElementDetailAxes(dict):
+    """Backward-compatible dict returned by :func:`draw_element_detail`.
+
+    Carries exactly four standard keys (``"sketch"``, ``"fbd"``,
+    ``"diagrams"``, ``"section"``) so existing tests that assert
+    ``set(axes) == {"sketch", "fbd", "diagrams", "section"}`` continue
+    to pass.  The three N/V/M subplot axes are *also* accessible as
+    instance attributes (``.ax_n``, ``.ax_v``, ``.ax_m``) for the
+    dialog's interactive crosshair layer without breaking the set check.
+
+    ``"diagrams"`` always maps to the N (axial) subplot so the
+    pre-/post-solve line-count assertions in the smoke tests pass:
+    pre-solve the N subplot holds the placeholder text and zero lines;
+    post-solve it holds the axial trace with ≥ n_samples data points.
+    """
+    ax_n: object = None
+    ax_v: object = None
+    ax_m: object = None
+
+
+# ── Colour palette ───────────────────────────────────────────────
 
 _MEMBER_COLOR = "#1f3a5f"
 _SELECTED_COLOR = "#d24c4c"
@@ -155,264 +183,248 @@ _DIAGRAM_COLOR = {
 }
 
 
-def _draw_member_sketch(ax, elem, ni: Node, nj: Node) -> None:
-    """Top-left panel — member centreline + local axes + node labels
-    + release/hinge dots if present."""
-    ax.set_title("Member sketch", fontsize=9, pad=2)
-    ax.set_aspect("equal", adjustable="datalim")
-    ax.tick_params(labelsize=7)
-    ax.set_xlabel("x (m)", fontsize=8)
-    ax.set_ylabel("y (m)", fontsize=8)
-    ax.grid(True, alpha=0.25)
+# ── Local-frame helpers ──────────────────────────────────────────
 
+
+def _member_length(ni: Node, nj: Node) -> float:
     dx, dy = nj.x - ni.x, nj.y - ni.y
-    L = (dx * dx + dy * dy) ** 0.5
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def _spine_clean(ax) -> None:
+    """Hide top and right spines (clean landscape look)."""
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
+def _draw_member_sketch(ax, elem, ni: Node, nj: Node,
+                        section: Optional[Section] = None) -> None:
+    """Member sketch panel — local coordinate frame (horizontal).
+
+    x = 0 at node i, x = L at node j.  The member is always drawn as
+    a horizontal line so inclined members are still readable.
+    """
+    L = _member_length(ni, nj)
+    ax.set_title("Member sketch — local frame", fontsize=8, pad=3)
+    ax.tick_params(labelsize=6)
+    ax.set_xlabel("x (m)", fontsize=7)
+    _spine_clean(ax)
+    ax.grid(linestyle=":", alpha=0.3)
+
     if L < 1e-12:
         ax.text(0.5, 0.5, "zero-length member", transform=ax.transAxes,
                 ha="center", va="center", color="#b00", fontsize=9)
         return
 
-    tx, ty = dx / L, dy / L
-    nxh, nyh = -ty, tx
+    h_ref = 0.1 * L
+    if section is not None and getattr(section, "depth", 0) > 0:
+        h_ref = max(section.depth, 0.05 * L)
 
-    ax.plot([ni.x, nj.x], [ni.y, nj.y],
-            color=_SELECTED_COLOR, linewidth=2.4, zorder=3)
-    ax.plot([ni.x, nj.x], [ni.y, nj.y],
-            marker="o", linestyle="none", color=_MEMBER_COLOR, zorder=4)
-    ax.annotate(f"i ({ni.id})", (ni.x, ni.y), textcoords="offset points",
-                xytext=(-10, -10), fontsize=8, color=_MEMBER_COLOR)
-    ax.annotate(f"j ({nj.id})", (nj.x, nj.y), textcoords="offset points",
-                xytext=(6, 6), fontsize=8, color=_MEMBER_COLOR)
+    ax.set_xlim(-0.06 * L, 1.06 * L)
+    ax.set_ylim(-0.55 * h_ref, 0.85 * h_ref)
+    ax.set_yticks([])
 
-    # Local axes anchored at the midpoint of the member. Arrow length
-    # ~15 % of L so they read on the small thumbnail.
-    cx, cy = (ni.x + nj.x) / 2.0, (ni.y + nj.y) / 2.0
-    arrow_len = max(L * 0.18, 1e-6)
-    ax.annotate(
-        "", xy=(cx + tx * arrow_len, cy + ty * arrow_len),
-        xytext=(cx, cy),
-        arrowprops=dict(arrowstyle="->", color="#444", lw=1.2),
-    )
-    ax.text(cx + tx * arrow_len * 1.08, cy + ty * arrow_len * 1.08,
-            "x", fontsize=8, color="#444",
+    # Member centreline
+    ax.plot([0, L], [0, 0], color=_SELECTED_COLOR, linewidth=2.4, zorder=3)
+    ax.plot([0, L], [0, 0], marker="o", linestyle="none",
+            color=_MEMBER_COLOR, markersize=5, zorder=4)
+
+    # Node labels
+    ax.annotate(f"i ({ni.id})", (0, 0), textcoords="offset points",
+                xytext=(-4, 6), fontsize=7, color=_MEMBER_COLOR)
+    ax.annotate(f"j ({nj.id})", (L, 0), textcoords="offset points",
+                xytext=(4, 6), fontsize=7, color=_MEMBER_COLOR)
+
+    # Local axis arrows anchored at 55 % of L
+    cx = 0.55 * L
+    arr_x = 0.13 * L
+    arr_y = 0.3 * h_ref
+    ax.annotate("", xy=(cx + arr_x, 0), xytext=(cx, 0),
+                arrowprops=dict(arrowstyle="->", color="#444", lw=1.1))
+    ax.text(cx + arr_x * 1.1, 0.04 * h_ref, "x", fontsize=7, color="#444",
             ha="left", va="bottom")
-    ax.annotate(
-        "", xy=(cx + nxh * arrow_len, cy + nyh * arrow_len),
-        xytext=(cx, cy),
-        arrowprops=dict(arrowstyle="->", color="#444", lw=1.2),
-    )
-    ax.text(cx + nxh * arrow_len * 1.08, cy + nyh * arrow_len * 1.08,
-            "y", fontsize=8, color="#444",
+    ax.annotate("", xy=(cx, arr_y), xytext=(cx, 0),
+                arrowprops=dict(arrowstyle="->", color="#444", lw=1.1))
+    ax.text(cx + 0.02 * L, arr_y * 1.05, "y", fontsize=7, color="#444",
             ha="left", va="bottom")
 
-    # Release / hinge markers — small hollow circles at the released
-    # end. Only frame elements carry the release_i / release_j flags.
+    # Release / hinge markers
     if isinstance(elem, FrameElement2D):
         if getattr(elem, "release_i", False):
-            ax.plot(ni.x, ni.y, marker="o", markersize=8, mfc="white",
+            ax.plot(0, 0, marker="o", markersize=9, mfc="white",
                     mec=_MEMBER_COLOR, mew=1.4, zorder=5)
         if getattr(elem, "release_j", False):
-            ax.plot(nj.x, nj.y, marker="o", markersize=8, mfc="white",
+            ax.plot(L, 0, marker="o", markersize=9, mfc="white",
                     mec=_MEMBER_COLOR, mew=1.4, zorder=5)
 
 
-def _draw_fbd(
-    ax, elem, ni: Node, nj: Node,
-    f_local: Optional[list[float]],
-) -> None:
-    """Top-right panel — member with member-load glyphs and (when a
-    result exists) end-force / end-moment annotations. All loads are
-    drawn in the local frame using arrows perpendicular to the member
-    axis; thermal loads land as a small tag instead of an arrow.
-    """
-    ax.set_title("Free body", fontsize=9, pad=2)
-    ax.set_aspect("equal", adjustable="datalim")
-    ax.tick_params(labelsize=7)
-    ax.set_xlabel("x (m)", fontsize=8)
-    ax.set_ylabel("y (m)", fontsize=8)
-    ax.grid(True, alpha=0.25)
+def _draw_fbd(ax, elem, ni: Node, nj: Node,
+              f_local: Optional[list],
+              section: Optional[Section] = None) -> None:
+    """Free body diagram in LOCAL coordinate frame.
 
-    dx, dy = nj.x - ni.x, nj.y - ni.y
-    L = (dx * dx + dy * dy) ** 0.5
+    Member drawn as a horizontal line x ∈ [0, L].  Loads and end-force
+    arrows are all projected into local coordinates so inclined members
+    remain readable.
+    """
+    L = _member_length(ni, nj)
+    ax.set_title("Free body — local frame", fontsize=8, pad=3)
+    ax.tick_params(labelsize=6)
+    ax.set_xlabel("x (m)", fontsize=7)
+    _spine_clean(ax)
+    ax.grid(linestyle=":", alpha=0.3)
+
     if L < 1e-12:
         ax.text(0.5, 0.5, "zero-length member", transform=ax.transAxes,
                 ha="center", va="center", color="#b00", fontsize=9)
         return
-    tx, ty = dx / L, dy / L
-    nxh, nyh = -ty, tx
 
-    ax.plot([ni.x, nj.x], [ni.y, nj.y],
-            color=_MEMBER_COLOR, linewidth=2.0, zorder=3)
+    h_ref = 0.1 * L
+    if section is not None and getattr(section, "depth", 0) > 0:
+        h_ref = max(section.depth, 0.05 * L)
+    arrow_h = 0.45 * h_ref
 
-    arrow_len = max(L * 0.14, 1e-6)
+    ax.set_xlim(-0.12 * L, 1.12 * L)
+    ax.set_ylim(-0.75 * h_ref, 0.85 * h_ref)
+    ax.set_yticks([])
+
+    # Member baseline
+    ax.plot([0, L], [0, 0], color=_MEMBER_COLOR, linewidth=2.0, zorder=3)
+    ax.plot([0, L], [0, 0], marker="o", linestyle="none",
+            color=_MEMBER_COLOR, markersize=5, zorder=4)
+
     udls: list[float] = []
-    points: list[tuple[float, float]] = []
+    points_list: list[tuple[float, float]] = []
     thermals: list[str] = []
     for ml in getattr(elem, "member_loads", []):
         if isinstance(ml, UniformDistributedLoad):
             udls.append(ml.wy)
         elif isinstance(ml, PointLoad):
-            points.append((ml.a, ml.py))
+            points_list.append((ml.a, ml.py))
         elif isinstance(ml, FrameTemperatureLoad):
-            thermals.append(
-                f"ΔT_top={ml.t_top:g}, ΔT_bot={ml.t_bottom:g}"
-            )
+            thermals.append(f"ΔT_top={ml.t_top:g}, ΔT_bot={ml.t_bottom:g}")
         elif isinstance(ml, TrussTemperatureLoad):
             thermals.append(f"ΔT={ml.delta_T:g}")
 
-    # UDL — six arrows along the span. Sign convention matches the
-    # main canvas (ModelCanvas._draw_member_loads): a positive wy
-    # puts the *arrow tails* on the +y_local side of the member, so
-    # +y / -y loads always render on the side the main canvas does.
+    # UDL — six arrows perpendicular to baseline
     w_sum = sum(udls)
     if abs(w_sum) > 0:
         sign = 1.0 if w_sum > 0 else -1.0
         for k in range(6):
             x_loc = (k + 0.5) * L / 6.0
-            _arrow_in_local(
-                ax, ni, tx, ty, nxh, nyh, x_loc, arrow_len * sign,
-            )
-        # Label sits on the same side as the arrow tails so the load
-        # and its caption don't end up on opposite sides of the member.
-        ax.text(ni.x + tx * L / 2.0 + nxh * arrow_len * 1.6 * sign,
-                ni.y + ty * L / 2.0 + nyh * arrow_len * 1.6 * sign,
-                f"w = {w_sum:g}", fontsize=8, color=_LOAD_COLOR,
-                ha="center")
+            tail_y = sign * arrow_h
+            ax.annotate("", xy=(x_loc, 0), xytext=(x_loc, tail_y),
+                        arrowprops=dict(arrowstyle="->", color=_LOAD_COLOR,
+                                        lw=1.1))
+        ax.text(L / 2.0, sign * (arrow_h * 1.55),
+                f"w = {w_sum:g} kN/m", fontsize=7, color=_LOAD_COLOR,
+                ha="center", va="center")
 
-    # Point load — same sign convention: positive py → tail on
-    # +y_local side, matching ModelCanvas._draw_member_loads.
-    for a, py in points:
+    # Point loads
+    for a, py in points_list:
         sign = 1.0 if py > 0 else -1.0
-        _arrow_in_local(
-            ax, ni, tx, ty, nxh, nyh, a, arrow_len * 1.5 * sign,
-            color=_LOAD_COLOR,
-        )
-        px = ni.x + tx * a + nxh * arrow_len * 1.7 * sign
-        py_label = ni.y + ty * a + nyh * arrow_len * 1.7 * sign
-        ax.text(px, py_label, f"P = {py:g}", fontsize=8,
-                color=_LOAD_COLOR, ha="center")
+        tail_y = sign * arrow_h * 1.2
+        ax.annotate("", xy=(a, 0), xytext=(a, tail_y),
+                    arrowprops=dict(arrowstyle="->", color=_LOAD_COLOR,
+                                    lw=1.2))
+        ax.text(a, sign * (arrow_h * 1.85),
+                f"P={py:g}", fontsize=7, color=_LOAD_COLOR, ha="center")
 
+    # Thermal load tag
     if thermals:
-        # Offset along the local normal so the tag doesn't overlap the
-        # member on inclined elements (a fixed -y_global offset only
-        # works for horizontal members).
-        ax.text(
-            (ni.x + nj.x) / 2.0 - nxh * arrow_len * 0.6,
-            (ni.y + nj.y) / 2.0 - nyh * arrow_len * 0.6,
-            "; ".join(thermals), fontsize=8, color="#a06b00",
-            ha="center", va="top",
-        )
+        ax.text(L / 2.0, 0.7 * h_ref, "; ".join(thermals),
+                fontsize=7, color="#a06b00", ha="center", va="bottom",
+                style="italic")
 
-    # End forces only when an analysis result is present. f_local is
-    # the 6-vector [N_i, V_i, M_i, N_j, V_j, M_j] in the element's
-    # local frame; we render a single compact text tag next to each
-    # node so the FBD stays readable on the small thumbnail. The
-    # in-span load arrows above already carry the visual punch.
+    # End-force arrows (only when analysis result present)
     if f_local is not None:
         N_i, V_i, M_i, N_j, V_j, M_j = (float(v) for v in f_local)
-        _end_force_label(ax, ni, tx, ty, nxh, nyh,
-                          N=N_i, V=V_i, M=M_i, side="i")
-        _end_force_label(ax, nj, -tx, -ty, -nxh, -nyh,
-                          N=N_j, V=V_j, M=M_j, side="j")
+        _end_force_arrows(ax, 0, L, h_ref, arrow_h,
+                          N_i, V_i, M_i, "i", side_sign=-1)
+        _end_force_arrows(ax, L, L, h_ref, arrow_h,
+                          N_j, V_j, M_j, "j", side_sign=+1)
 
 
-def _arrow_in_local(
-    ax, anchor: Node, tx: float, ty: float, nxh: float, nyh: float,
-    x_loc: float, length: float, *, color: str = _LOAD_COLOR,
-):
-    """Helper: draw an arrow at ``x_loc`` along the member, length and
-    direction given in the *local* y axis (signed). Returns the same
-    axes so callers can chain — the trick is so the per-arrow helper
-    can be invoked in a list comprehension without exploding the
-    drawing block.
-    """
-    x0 = anchor.x + tx * x_loc + nxh * length
-    y0 = anchor.y + ty * x_loc + nyh * length
-    x1 = anchor.x + tx * x_loc
-    y1 = anchor.y + ty * x_loc
+def _end_force_arrows(ax, x_node: float, L: float, h_ref: float,
+                      arrow_h: float, N: float, V: float, M: float,
+                      label: str, side_sign: int) -> None:
+    """Draw N, V, M arrows/indicators at one terminal of the member."""
+    offset = 0.10 * L * side_sign
+
+    # Axial (N) — horizontal arrow
+    n_col = _DIAGRAM_COLOR["axial"]
     ax.annotate(
-        "", xy=(x1, y1), xytext=(x0, y0),
-        arrowprops=dict(arrowstyle="->", color=color, lw=1.2),
+        "", xy=(x_node, 0), xytext=(x_node - offset, 0),
+        arrowprops=dict(arrowstyle="->", color=n_col, lw=1.2),
     )
-    return ax
+    ax.text(x_node - offset * 1.3, 0.08 * h_ref,
+            f"N={N:.3g}", fontsize=6, color=n_col, ha="center")
+
+    # Shear (V) — vertical arrow
+    v_col = _DIAGRAM_COLOR["shear"]
+    v_sign = 1.0 if V >= 0 else -1.0
+    ax.annotate(
+        "", xy=(x_node, 0), xytext=(x_node, -v_sign * arrow_h * 0.8),
+        arrowprops=dict(arrowstyle="->", color=v_col, lw=1.2),
+    )
+    ax.text(x_node + 0.03 * L * side_sign, -v_sign * arrow_h * 1.1,
+            f"V={V:.3g}", fontsize=6, color=v_col, ha="center")
+
+    # Moment (M) — arc indicator + label
+    m_col = _DIAGRAM_COLOR["moment"]
+    arc_char = "↺" if M >= 0 else "↻"
+    ax.text(x_node - offset * 0.7, 0.35 * h_ref,
+            f"{arc_char} M={M:.3g}", fontsize=6, color=m_col,
+            ha="center", va="bottom")
 
 
-def _end_force_label(
-    ax, anchor: Node, tx: float, ty: float, nxh: float, nyh: float,
-    *, N: float, V: float, M: float, side: str,
-) -> None:
-    """End-force / end-moment text tag at one end of the member —
-    a single line listing ``N`` (along +x_local), ``V`` (along
-    +y_local), and ``M`` (about +z_local). The compact text form is
-    deliberate: the small thumbnail can't fit three separate arrows
-    plus a moment glyph without crowding the in-span load arrows.
+def _draw_single_nvm_diagram(ax, xs, ys, label: str, unit: str,
+                             color: str, *, invert: bool = False) -> None:
+    """Render one of the N / V / M diagrams onto ``ax``.
+
+    ``xs`` / ``ys`` are the sampled arrays (or ``None`` for inapplicable
+    kinds on truss elements).  ``invert=True`` applies the structural
+    BMD tension-fibre convention (moment drawn downward).
     """
-    label_x = anchor.x + nxh * 0.06
-    label_y = anchor.y + nyh * 0.06
-    ax.text(label_x, label_y,
-            f"{side}: N={N:.3g}, V={V:.3g}, M={M:.3g}",
-            fontsize=7, color=_SELECTED_COLOR, ha="left", va="bottom")
+    _spine_clean(ax)
+    ax.set_xlabel("x (m)", fontsize=7)
+    ax.set_ylabel(f"{label} ({unit})", fontsize=7)
+    ax.tick_params(labelsize=6)
+    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
 
-
-def _draw_internal_force_diagrams(
-    ax, elem, ni: Node, nj: Node,
-    f_local: Optional[list[float]],
-    n_samples: int = 11,
-) -> None:
-    """Bottom-left panel — three stacked traces (N, V, M) versus
-    arc-length along the member. Uses :func:`sample_internal_force`
-    so the dialog and the main canvas share one source of truth.
-    """
-    ax.set_title("Internal forces", fontsize=9, pad=2)
-    ax.tick_params(labelsize=7)
-    ax.set_xlabel("x (m)", fontsize=8)
-    ax.set_ylabel("force / moment", fontsize=8)
-    ax.grid(True, alpha=0.25)
-
-    if f_local is None:
-        ax.text(0.5, 0.5, "Run analysis to see diagrams",
+    if xs is None:
+        ax.text(0.5, 0.5, "shear / moment not applicable (truss)",
                 transform=ax.transAxes, ha="center", va="center",
-                color="#555", fontsize=9)
-        ax.set_xticks([])
-        ax.set_yticks([])
+                color="#555", fontsize=7, style="italic")
         return
 
-    is_truss = isinstance(elem, TrussElement2D)
-    legend_handles = []
-    for kind in ("axial", "shear", "moment"):
-        xs, ys = sample_internal_force(
-            elem, ni, nj, f_local, kind, n_samples=n_samples,
-        )
-        if xs is None:
-            continue
-        (line,) = ax.plot(
-            xs, ys, color=_DIAGRAM_COLOR[kind], linewidth=1.4,
-            label=kind.upper()[0],
-        )
-        legend_handles.append(line)
-    if is_truss:
-        ax.text(
-            0.98, 0.02, "shear / moment not applicable (truss)",
-            transform=ax.transAxes, ha="right", va="bottom",
-            color="#555", fontsize=8, style="italic",
-        )
-    if legend_handles:
-        ax.legend(handles=legend_handles, fontsize=7,
-                  loc="upper right", frameon=False)
+    ax.fill_between(xs, ys, 0, color=color, alpha=0.18)
+    ax.plot(xs, ys, color=color, linewidth=1.5)
+    ax.axhline(0, color="#888", linewidth=0.5, linestyle="-", zorder=1)
+
+    if invert:
+        ax.invert_yaxis()
 
 
 def _draw_section_thumbnail(ax, section: Optional[Section]) -> None:
-    """Bottom-right panel — small filled outline of the element's
-    section. Uses :func:`profiles.section_outline` for vertices."""
-    ax.set_title("Section", fontsize=9, pad=2)
-    ax.set_aspect("equal", adjustable="datalim")
-    ax.tick_params(labelsize=7)
-    ax.set_axis_off()
+    """Section thumbnail panel — section outline in local (z, y) frame.
+
+    z maps to the horizontal plot axis, y to the vertical axis.
+    For manual sections the √A equivalent-square fallback is drawn
+    with an explanatory italic label.
+    """
+    ax.set_title("Section", fontsize=8, pad=3)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    ax.set_xticks([])
+    ax.set_yticks([])
 
     if section is None:
         ax.text(0.5, 0.5, "no section", transform=ax.transAxes,
                 ha="center", va="center", color="#555", fontsize=9)
         return
+
     try:
         pts = section_outline(section)
     except (ValueError, KeyError):
@@ -420,42 +432,76 @@ def _draw_section_thumbnail(ax, section: Optional[Section]) -> None:
                 transform=ax.transAxes, ha="center", va="center",
                 color="#b00", fontsize=8)
         return
+
     zs = [p[1] for p in pts]
     ys = [p[0] for p in pts]
     ax.fill(zs, ys, facecolor="#cfe3f6", edgecolor=_MEMBER_COLOR,
-            linewidth=1.2, alpha=0.95)
-    label = section.shape_type or "manual"
-    ax.text(0.5, -0.02, label, transform=ax.transAxes,
-            ha="center", va="top", fontsize=8, color="#555")
+            linewidth=1.2, alpha=0.95, zorder=2)
+    ax.set_aspect("equal", adjustable="datalim")
+
+    shape = getattr(section, "shape_type", None) or "manual"
+    if shape == "manual":
+        ax.text(0.5, -0.04,
+                "Approximate area-equivalent\nsquare fallback (√A)",
+                transform=ax.transAxes, ha="center", va="top",
+                fontsize=6, style="italic", color="#666")
+    else:
+        ax.text(0.5, -0.04, shape, transform=ax.transAxes,
+                ha="center", va="top", fontsize=7, color="#555")
+
+
+# ── Main entry point ─────────────────────────────────────────────
 
 
 def draw_element_detail(
     fig: Figure, elem, model: StructuralModel,
     result: Optional[AnalysisResult] = None,
     *, n_samples: int = 11,
-) -> dict:
-    """Render the four-panel element detail into ``fig`` and return a
-    handle dict keyed by panel name (``"sketch"``, ``"fbd"``,
-    ``"diagrams"``, ``"section"``). Callers can introspect the
-    returned axes (the tests do, asserting line counts and placeholder
-    text).
+) -> ElementDetailAxes:
+    """Render the landscape-stacked element detail into ``fig``.
+
+    Layout (5 rows × 6 columns)::
+
+        Row 0, cols 0-1  →  section thumbnail
+        Row 0, cols 2-5  →  member sketch   (local frame)
+        Row 1, cols 2-5  →  free body       (local frame)
+        Row 2, cols 0-5  →  N — axial  (kN)     "diagrams" key
+        Row 3, cols 0-5  →  V — shear  (kN)     .ax_v attribute
+        Row 4, cols 0-5  →  M — moment (kN·m)   .ax_m attribute
+
+    Returns an :class:`ElementDetailAxes` dict with exactly four keys
+    ``{"sketch", "fbd", "diagrams", "section"}`` for backward compat;
+    ``.ax_n / .ax_v / .ax_m`` give the dialog access to all three
+    diagram sub-panels.
     """
     fig.clear()
-    gs = GridSpec(2, 2, figure=fig, hspace=0.5, wspace=0.35,
-                   top=0.93, bottom=0.10, left=0.10, right=0.97)
-    ax_sketch = fig.add_subplot(gs[0, 0])
-    ax_fbd = fig.add_subplot(gs[0, 1])
-    ax_diag = fig.add_subplot(gs[1, 0])
-    ax_section = fig.add_subplot(gs[1, 1])
+    gs = GridSpec(
+        5, 6, figure=fig,
+        hspace=0.60, wspace=0.40,
+        top=0.96, bottom=0.05, left=0.08, right=0.97,
+        height_ratios=[2, 2, 1.2, 1.2, 1.6],
+    )
+
+    ax_section = fig.add_subplot(gs[0:2, 0:2])
+    ax_sketch  = fig.add_subplot(gs[0, 2:6])
+    ax_fbd     = fig.add_subplot(gs[1, 2:6])
+    ax_n       = fig.add_subplot(gs[2, 0:6])
+    ax_v       = fig.add_subplot(gs[3, 0:6], sharex=ax_n)
+    ax_m       = fig.add_subplot(gs[4, 0:6], sharex=ax_n)
 
     ni = model.nodes.get(getattr(elem, "node_i", None))
     nj = model.nodes.get(getattr(elem, "node_j", None))
     if ni is None or nj is None:
-        for a in (ax_sketch, ax_fbd, ax_diag, ax_section):
+        for a in (ax_sketch, ax_fbd, ax_n, ax_v, ax_m, ax_section):
             a.text(0.5, 0.5, "missing node", transform=a.transAxes,
                    ha="center", va="center", color="#b00", fontsize=9)
-        return {"sketch": ax_sketch, "fbd": ax_fbd,
-                "diagrams": ax_diag, "section": ax_section}
+        axes = ElementDetailAxes(
+            sketch=ax_sketch, fbd=ax_fbd, diagrams=ax_n, section=ax_section,
+        )
+        axes.ax_n = ax_n
+        axes.ax_v = ax_v
+        axes.ax_m = ax_m
+        return axes
 
     section = None
     sid = getattr(elem, "section_id", None)
@@ -468,11 +514,54 @@ def draw_element_detail(
         if mr is not None and "f_local" in mr:
             f_local = mr["f_local"]
 
-    _draw_member_sketch(ax_sketch, elem, ni, nj)
-    _draw_fbd(ax_fbd, elem, ni, nj, f_local)
-    _draw_internal_force_diagrams(
-        ax_diag, elem, ni, nj, f_local, n_samples=n_samples,
-    )
+    # ── Upper panels (local frame) ────────────────────────────────
+    _draw_member_sketch(ax_sketch, elem, ni, nj, section)
+    _draw_fbd(ax_fbd, elem, ni, nj, f_local, section)
     _draw_section_thumbnail(ax_section, section)
-    return {"sketch": ax_sketch, "fbd": ax_fbd,
-            "diagrams": ax_diag, "section": ax_section}
+
+    L = _member_length(ni, nj)
+    if L > 1e-12:
+        ax_n.set_xlim(0.0, L)
+
+    # ── N / V / M diagrams ────────────────────────────────────────
+    if f_local is None:
+        # Pre-solve placeholder — zero lines, placeholder text on ax_n.
+        # The "Run analysis" text MUST land on ax_n because the smoke
+        # test asserts axes["diagrams"].texts (which is ax_n) contains
+        # "Run analysis".
+        ax_n.text(0.5, 0.5, "Run analysis to see N/V/M diagrams",
+                  transform=ax_n.transAxes, ha="center", va="center",
+                  color="#555", fontsize=9)
+        ax_n.set_xticks([])
+        ax_n.set_yticks([])
+        _spine_clean(ax_n)
+        for ax, lbl in ((ax_v, "V — shear"), (ax_m, "M — moment")):
+            ax.set_xticks([])
+            ax.set_yticks([])
+            _spine_clean(ax)
+            ax.text(0.5, 0.5, lbl, transform=ax.transAxes,
+                    ha="center", va="center", color="#bbb", fontsize=8,
+                    style="italic")
+    else:
+        xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local,
+                                            "axial",  n_samples)
+        xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local,
+                                            "shear",  n_samples)
+        xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local,
+                                            "moment", n_samples)
+
+        _draw_single_nvm_diagram(ax_n, xs_n, ys_n, "N", "kN",
+                                 color=_DIAGRAM_COLOR["axial"])
+        _draw_single_nvm_diagram(ax_v, xs_v, ys_v, "V", "kN",
+                                 color=_DIAGRAM_COLOR["shear"])
+        _draw_single_nvm_diagram(ax_m, xs_m, ys_m, "M", "kN·m",
+                                 color=_DIAGRAM_COLOR["moment"],
+                                 invert=True)
+
+    axes = ElementDetailAxes(
+        sketch=ax_sketch, fbd=ax_fbd, diagrams=ax_n, section=ax_section,
+    )
+    axes.ax_n = ax_n
+    axes.ax_v = ax_v
+    axes.ax_m = ax_m
+    return axes
