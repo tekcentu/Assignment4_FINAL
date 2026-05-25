@@ -719,22 +719,41 @@ class MainWindow(QMainWindow):
         if action == "member_load":
             self._add_member_load(elem_id)
             return
+        # While the element-detail inspector is open the host has the
+        # rest of the editing surface locked (see _set_editing_locked).
+        # The right-click context menu's edit items are built fresh
+        # each time so they're not part of _lockable_actions — disable
+        # them here based on the inspector's visibility instead. The
+        # "show details" item stays enabled so the user can re-target
+        # the open inspector to a different element from any
+        # right-click.
+        edits_locked = (
+            self._element_inspector is not None
+            and self._element_inspector.isVisible()
+        )
         menu = QMenu(self)
-        a1 = menu.addAction(f"Element {elem_id}: edit section/material...")
-        a2 = menu.addAction(f"Element {elem_id}: show results / FBD...")
-        a3 = menu.addAction(f"Element {elem_id}: add member load...")
-        a4 = menu.addAction(f"Element {elem_id}: clear member loads")
-        a5 = menu.addAction(f"Element {elem_id}: delete")
+        a_details = menu.addAction(
+            f"Element {elem_id}: show details / FBD…"
+        )
+        menu.addSeparator()
+        a_edit = menu.addAction(f"Element {elem_id}: edit section/material…")
+        a_add_load = menu.addAction(f"Element {elem_id}: add member load…")
+        a_clear_loads = menu.addAction(
+            f"Element {elem_id}: clear member loads"
+        )
+        a_delete = menu.addAction(f"Element {elem_id}: delete")
+        for action in (a_edit, a_add_load, a_clear_loads, a_delete):
+            action.setEnabled(not edits_locked)
         chosen = menu.exec(self.cursor().pos())
-        if chosen is a1:
+        if chosen is a_details:
+            self._open_element_inspector(elem_id)
+        elif chosen is a_edit:
             self._edit_element(elem_id)
-        elif chosen is a2:
-            self._show_element_results(elem_id)
-        elif chosen is a3:
+        elif chosen is a_add_load:
             self._add_member_load(elem_id)
-        elif chosen is a4:
+        elif chosen is a_clear_loads:
             self.execute(ClearMemberLoadsCmd(elem_id=elem_id))
-        elif chosen is a5:
+        elif chosen is a_delete:
             self.execute(DeleteElementCmd(elem_id=elem_id))
 
     def show_node_details(self, node_id: int) -> None:
@@ -906,13 +925,14 @@ class MainWindow(QMainWindow):
 
     def _on_canvas_click(self, hit: HitResult, button: str) -> None:
         if button == "right":
-            # Right-click on an element opens the detail inspector
-            # directly (the previous edit context menu is gone — its
-            # actions still live in the tool palette and Edit menu).
-            # Right-click on a node keeps the node context menu since
-            # nodes don't have a dedicated inspector window.
+            # Right-click on an element shows the context menu (edit /
+            # add load / clear loads / delete + the "show details" item
+            # that opens the inspector). While the inspector is open
+            # the edit items are greyed inside show_element_menu so the
+            # user can still pick "show details" to re-target it.
+            # Right-click on a node keeps the node context menu.
             if hit.element_id is not None:
-                self._open_element_inspector(hit.element_id)
+                self.show_element_menu(hit.element_id)
                 return
             if hit.node_id is not None:
                 self.show_node_menu(hit.node_id)

@@ -380,11 +380,12 @@ def test_select_tool_left_click_only_selects(qt_app):
     )
 
 
-def test_right_click_element_opens_inspector(qt_app):
-    """Right-clicking any element on the canvas opens the new
-    non-modal element-detail inspector. The previous edit context
-    menu (`show_element_menu`) must not fire — its replacement is
-    the inspector itself."""
+def test_right_click_element_shows_context_menu(qt_app):
+    """Right-clicking an element must route to the context menu (the
+    one with edit / add load / clear loads / delete + the new
+    "show details" item). The menu is the entry point both for the
+    edit actions and for the detail inspector — right-click must
+    not bypass it."""
     from structural_analysis.element import FrameElement2D
     from structural_analysis.model import Node
 
@@ -394,33 +395,94 @@ def test_right_click_element_opens_inspector(qt_app):
         id=1, node_i=1, node_j=2, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
     )]
 
-    illegal: list[str] = []
-    w.show_element_menu = lambda eid: illegal.append(f"menu {eid}")
+    calls: list[int] = []
+    w.show_element_menu = lambda eid: calls.append(eid)
 
-    assert w._element_inspector is None
     w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=1), "right")
     qt_app.processEvents()
+    assert calls == [1]
 
+
+def test_open_element_inspector_is_singleton_and_retargets(qt_app):
+    """The detail inspector is the singleton path that the context
+    menu's "show details" item calls into. Re-opening for a different
+    element must reuse the same window, not stack a new one."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 2.0, 0.0),
+        3: Node(3, 4.0, 0.0),
+    }
+    w._model.elements = [
+        FrameElement2D(id=1, node_i=1, node_j=2, E=2.0e8,
+                       A=0.01, I=1.0e-4, section_id=1),
+        FrameElement2D(id=2, node_i=2, node_j=3, E=2.0e8,
+                       A=0.01, I=1.0e-4, section_id=1),
+    ]
+
+    assert w._element_inspector is None
+    w._open_element_inspector(1)
+    qt_app.processEvents()
     assert w._element_inspector is not None
     assert w._element_inspector.isVisible()
     assert w._element_inspector._elem_id == 1
-    assert illegal == [], (
-        f"Right-click on an element must go through the inspector, "
-        f"not the old edit context menu. Got: {illegal}"
-    )
 
-    # Right-clicking a different element re-targets the same window.
-    w._model.nodes[3] = Node(3, 4.0, 0.0)
-    w._model.elements.append(FrameElement2D(
-        id=2, node_i=2, node_j=3, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
-    ))
     same_window = w._element_inspector
-    w._on_canvas_click(HitResult(x=3.0, y=0.0, element_id=2), "right")
+    w._open_element_inspector(2)
     qt_app.processEvents()
     assert w._element_inspector is same_window, (
         "the singleton inspector must be reused, not replaced"
     )
     assert w._element_inspector._elem_id == 2
+
+
+def test_show_element_menu_disables_edits_while_inspector_open(qt_app):
+    """While the inspector is open the context menu must still build,
+    but its edit items (edit / add load / clear loads / delete) must
+    be greyed out so a right-click → Delete can't slip past the edit
+    lock. The "show details" item stays enabled so the user can
+    re-target the inspector from any right-click."""
+    from PyQt6.QtWidgets import QMenu
+
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+    )]
+
+    # Stub QMenu.exec so the test doesn't block on a popup — we only
+    # care about the QActions' enabled state at exec-time.
+    captured: dict = {}
+
+    def fake_exec(self, _pos):
+        captured["actions"] = [(a.text(), a.isEnabled()) for a in self.actions()]
+        return None  # user dismissed the menu
+
+    QMenu.exec = fake_exec
+    try:
+        w._open_element_inspector(1)
+        qt_app.processEvents()
+        w.show_element_menu(1)
+    finally:
+        del QMenu.exec   # restore the real method
+
+    by_label = {label: enabled for label, enabled in captured["actions"]}
+    details_label = next(l for l in by_label if "show details" in l.lower())
+    assert by_label[details_label], (
+        '"show details" must stay enabled while inspector is open'
+    )
+    for needle in ("edit section", "add member load",
+                    "clear member loads", "delete"):
+        label = next(l for l in by_label if needle in l.lower())
+        assert not by_label[label], (
+            f'menu item {label!r} must be disabled while inspector is open'
+        )
 
 
 def test_inspector_open_locks_editing_keeps_view(qt_app):
