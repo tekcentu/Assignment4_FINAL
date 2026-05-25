@@ -33,6 +33,10 @@ from ..model import (
 )
 from .grid import GridSystem
 from .snap import SnapCandidate, SnapEngine
+from .element_graphics import (
+    sample_internal_force as _diagram_ordinates,
+    internal_force_at as _diagram_value,
+)
 
 
 @dataclass
@@ -1218,90 +1222,6 @@ def _point_segment_distance_px(px, py, x1, y1, x2, y2,
     cx = ax + t * abx
     cy = ay + t * aby
     return ((qx - cx) ** 2 + (qy - cy) ** 2) ** 0.5
-
-
-def _diagram_evaluator(elem, ni, nj, f_local, kind: str):
-    """Build a single-x evaluator ``f(x_loc) -> value`` for ``kind`` on
-    this element. Returns ``(L, evaluator)``; ``evaluator`` is ``None``
-    when the requested kind doesn't apply (e.g. moment/shear on a truss
-    bar). Reused by both :func:`_diagram_ordinates` for drawing and by
-    the hover-status path for "value at the cursor's projected x_loc".
-
-    Sign convention. ``V_i`` and ``M_i`` are the local member-end
-    shear / moment at the i-end (``q_local = K·d − p_local`` entries
-    from :meth:`FrameElement2D.local_displacement_and_end_forces`).
-    ``w`` is the summed UDL intensity in +y_local. ``points`` are
-    in-span point loads with ``py`` in +y_local. The point-load terms
-    in ``shear`` and ``moment`` carry the **same** sign of ``py`` so
-    ``dM/dx = V`` holds across the discontinuity (regression in
-    ``tests/test_diagram_signs.py``).
-    """
-    L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
-    if L < 1e-12:
-        return 0.0, None
-    N_i, V_i, M_i, _N_j, _V_j, _M_j = (float(v) for v in f_local)
-
-    if kind == "axial":
-        # Axial: plot ``-N_i`` so compression reads positive on the
-        # page (the local-frame member-end axial force is positive in
-        # the +x_local direction, which is tension on the i-end;
-        # flipping the sign gives compression-positive).
-        n_value = -N_i
-        return L, (lambda _x, _v=n_value: _v)
-
-    if isinstance(elem, TrussElement2D):
-        # Truss elements don't carry shear or bending.
-        return L, None
-
-    udls = []
-    points = []
-    for ml in getattr(elem, "member_loads", []):
-        if isinstance(ml, UniformDistributedLoad):
-            udls.append(ml.wy)
-        elif isinstance(ml, PointLoad):
-            points.append((ml.a, ml.py))
-    w = sum(udls)
-
-    if kind == "shear":
-        def shear(x):
-            v = V_i - w * x
-            for a, py in points:
-                if x > a:
-                    v += py
-            return v
-        return L, shear
-
-    if kind == "moment":
-        def moment(x):
-            m = -M_i + V_i * x - 0.5 * w * x * x
-            for a, py in points:
-                if x > a:
-                    m += py * (x - a)
-            return m
-        return L, moment
-
-    return L, None
-
-
-def _diagram_ordinates(elem, ni, nj, f_local, kind: str,
-                        n_samples: int = 21):
-    L, fn = _diagram_evaluator(elem, ni, nj, f_local, kind)
-    if fn is None:
-        return None, None
-    xs = [i * L / (n_samples - 1) for i in range(n_samples)]
-    ys = [fn(x) for x in xs]
-    return xs, ys
-
-
-def _diagram_value(elem, ni, nj, f_local, kind: str, x_loc: float):
-    """Return the diagram value at arc-length ``x_loc`` along the element,
-    or ``None`` if the kind doesn't apply to this element. Used by the
-    canvas hover handler to report the value at the projected cursor."""
-    L, fn = _diagram_evaluator(elem, ni, nj, f_local, kind)
-    if fn is None:
-        return None
-    x = max(0.0, min(L, float(x_loc)))
-    return float(fn(x))
 
 
 _DIAGRAM_UNITS = {"moment": "kN·m", "shear": "kN", "axial": "kN"}

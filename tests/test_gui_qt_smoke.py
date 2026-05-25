@@ -342,26 +342,224 @@ def test_member_load_dialog_raises_for_unknown_element(qt_app):
         MemberLoadDialog(w, model=w._model, elem_id=9999)
 
 
-def test_select_tool_left_click_shows_details(qt_app):
-    """Left-clicking a node or element with the Select tool must open
-    the read-only details dialog directly — no right-click menu needed."""
+def test_select_tool_left_click_only_selects(qt_app):
+    """Left-clicking with the Select tool must only update the
+    canvas highlight + status text — opening the modal detail
+    dialog on every left-click was the *old* behaviour. The detail
+    inspector is now reached by right-click (see the dedicated
+    right-click test) and the modal popup is gone."""
+    from structural_analysis.element import FrameElement2D
     from structural_analysis.model import Node
 
     w = MainWindow()
     w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+    )]
 
-    calls: list[tuple[str, int]] = []
-    w.show_node_details = lambda nid: calls.append(("node", nid))
-    w.show_element_details = lambda eid: calls.append(("elem", eid))
+    # Guard against the old code path firing the modal dialog. If
+    # either call lands here, the test should fail loudly.
+    illegal: list[str] = []
+    w.show_node_details = lambda nid: illegal.append(f"node {nid}")
+    w.show_element_details = lambda eid: illegal.append(f"elem {eid}")
 
     w._select_tool("select")
     w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
-    assert calls == [("node", 1)]
-    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=2), "left")
-    assert calls == [("node", 1), ("elem", 2)]
-    # Empty click — no detail dialog opens.
+    assert w.canvas._selected_node_id == 1
+    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=1), "left")
+    assert w.canvas._selected_element_id == 1
+    assert w.canvas._selected_node_id is None
+    # Empty click clears selection.
     w._on_canvas_click(HitResult(x=5.0, y=5.0), "left")
-    assert calls == [("node", 1), ("elem", 2)]
+    assert w.canvas._selected_element_id is None
+    assert w.canvas._selected_node_id is None
+    # No modal-dialog escape hatch fired.
+    assert illegal == [], (
+        f"Select-tool left-click must not open the modal details dialog, "
+        f"got: {illegal}"
+    )
+
+
+def test_right_click_element_shows_context_menu(qt_app):
+    """Right-clicking an element must route to the context menu (the
+    one with edit / add load / clear loads / delete + the new
+    "show details" item). The menu is the entry point both for the
+    edit actions and for the detail inspector — right-click must
+    not bypass it."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+    )]
+
+    calls: list[int] = []
+    w.show_element_menu = lambda eid: calls.append(eid)
+
+    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=1), "right")
+    qt_app.processEvents()
+    assert calls == [1]
+
+
+def test_open_element_inspector_is_singleton_and_retargets(qt_app):
+    """The detail inspector is the singleton path that the context
+    menu's "show details" item calls into. Re-opening for a different
+    element must reuse the same window, not stack a new one."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 2.0, 0.0),
+        3: Node(3, 4.0, 0.0),
+    }
+    w._model.elements = [
+        FrameElement2D(id=1, node_i=1, node_j=2, E=2.0e8,
+                       A=0.01, I=1.0e-4, section_id=1),
+        FrameElement2D(id=2, node_i=2, node_j=3, E=2.0e8,
+                       A=0.01, I=1.0e-4, section_id=1),
+    ]
+
+    assert w._element_inspector is None
+    w._open_element_inspector(1)
+    qt_app.processEvents()
+    assert w._element_inspector is not None
+    assert w._element_inspector.isVisible()
+    assert w._element_inspector._elem_id == 1
+
+    same_window = w._element_inspector
+    w._open_element_inspector(2)
+    qt_app.processEvents()
+    assert w._element_inspector is same_window, (
+        "the singleton inspector must be reused, not replaced"
+    )
+    assert w._element_inspector._elem_id == 2
+
+
+def test_show_element_menu_disables_edits_while_inspector_open(qt_app):
+    """While the inspector is open the context menu must still build,
+    but its edit items (edit / add load / clear loads / delete) must
+    be greyed out so a right-click → Delete can't slip past the edit
+    lock. The "show details" item stays enabled so the user can
+    re-target the inspector from any right-click."""
+    from PyQt6.QtWidgets import QMenu
+
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+    )]
+
+    # Stub QMenu.exec so the test doesn't block on a popup — we only
+    # care about the QActions' enabled state at exec-time.
+    captured: dict = {}
+
+    def fake_exec(self, _pos):
+        captured["actions"] = [(a.text(), a.isEnabled()) for a in self.actions()]
+        return None  # user dismissed the menu
+
+    QMenu.exec = fake_exec
+    try:
+        w._open_element_inspector(1)
+        qt_app.processEvents()
+        w.show_element_menu(1)
+    finally:
+        del QMenu.exec   # restore the real method
+
+    by_label = {label: enabled for label, enabled in captured["actions"]}
+    details_label = next(l for l in by_label if "show details" in l.lower())
+    assert by_label[details_label], (
+        '"show details" must stay enabled while inspector is open'
+    )
+    for needle in ("edit section", "add member load",
+                    "clear member loads", "delete"):
+        label = next(l for l in by_label if needle in l.lower())
+        assert not by_label[label], (
+            f'menu item {label!r} must be disabled while inspector is open'
+        )
+
+
+def test_inspector_open_locks_editing_keeps_view(qt_app):
+    """When the inspector is open, editing actions (tool palette
+    add/delete, Undo/Redo, Materials, building wizard, "Add node at
+    coordinates", Forget element defaults) must be disabled, and the
+    active tool must be forced to Select. View / solve / overlay
+    actions stay enabled. Closing re-enables everything."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 2.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+    )]
+    w._select_tool("node")
+    assert w._active_tool.name == "node"
+    assert w._tool_actions["node"].isEnabled()
+
+    w._open_element_inspector(1)
+    qt_app.processEvents()
+
+    # Editing tools and registered lockable actions must be disabled.
+    for name in ("node", "frame", "truss", "support",
+                 "nodal_load", "member_load", "delete"):
+        assert not w._tool_actions[name].isEnabled(), (
+            f"tool {name!r} must be disabled while inspector is open"
+        )
+    for action in w._lockable_actions:
+        assert not action.isEnabled(), (
+            f"editing action {action.text()!r} must be disabled "
+            f"while inspector is open"
+        )
+    # Select must stay enabled so right-clicks still route through.
+    assert w._tool_actions["select"].isEnabled()
+    assert w._active_tool.name == "select"
+    # View-only actions stay enabled — solve, fit, 3D viewer, snap.
+    assert w.act_solve.isEnabled()
+    assert w.act_fit_view.isEnabled()
+    assert w.act_open_view3d.isEnabled()
+
+    # Close: lock released, full edit surface back.
+    w._element_inspector.close()
+    qt_app.processEvents()
+    for name in ("node", "frame", "truss", "support",
+                 "nodal_load", "member_load", "delete"):
+        assert w._tool_actions[name].isEnabled(), (
+            f"tool {name!r} must be re-enabled after inspector closes"
+        )
+    for action in w._lockable_actions:
+        assert action.isEnabled()
+
+
+def test_inspector_refreshes_on_solve(qt_app):
+    """Solving while the inspector is open must push the new
+    member-end forces into its diagrams panel — without making the
+    user close-and-reopen the window."""
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    elem = w._model.elements[0]
+
+    w._open_element_inspector(elem.id)
+    qt_app.processEvents()
+    diag_ax = w._element_inspector._detail_axes["diagrams"]
+    pre_solve_lines = len(diag_ax.lines)
+    assert pre_solve_lines == 0, (
+        "pre-solve diagrams panel must hold no traces (only the "
+        "placeholder text)"
+    )
+
+    w._do_solve()
+    qt_app.processEvents()
+    diag_ax = w._element_inspector._detail_axes["diagrams"]
+    assert diag_ax.lines, (
+        "post-solve refresh must populate the diagrams panel"
+    )
 
 
 def test_property_dialogs_construct(qt_app):
@@ -385,6 +583,85 @@ def test_property_dialogs_construct(qt_app):
         ElementPropertiesDialog(w, m, elem.id, w._result)
     for nid in m.nodes:
         NodePropertiesDialog(w, m, nid, w._result)
+
+
+def test_element_dialog_renders_graphics_pre_solve(qt_app):
+    """The element detail dialog must be usable *before* solving:
+    member sketch / FBD / section thumbnail render straight from
+    model data, while the internal-force panel shows a "Run analysis"
+    placeholder. No exception must be raised by the figure path."""
+    from structural_analysis.gui_qt.dialogs import ElementPropertiesDialog
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    elem = w._model.elements[0]
+    # Note: result intentionally None to exercise the pre-solve path.
+    d = ElementPropertiesDialog(w, w._model, elem.id, None)
+    qt_app.processEvents()
+
+    axes = d._detail_axes
+    assert set(axes) == {"sketch", "fbd", "diagrams", "section"}
+
+    # Member sketch always renders the centre-line — there must be at
+    # least one Line2D in the sketch panel.
+    assert axes["sketch"].lines, "member sketch must draw the centreline"
+
+    # Internal-force panel pre-solve must show the placeholder text
+    # and must NOT draw any data line yet.
+    diag_texts = [t.get_text() for t in axes["diagrams"].texts]
+    assert any("Run analysis" in t for t in diag_texts)
+    assert not axes["diagrams"].lines
+
+    # Section thumbnail renders only if the element carries a section.
+    if w._model.sections.get(getattr(elem, "section_id", None)):
+        assert axes["section"].patches, (
+            "section thumbnail must render a filled outline"
+        )
+    else:
+        sect_texts = [t.get_text() for t in axes["section"].texts]
+        assert any("no section" in t.lower() for t in sect_texts)
+
+
+def test_element_dialog_renders_graphics_post_solve(qt_app):
+    """After solving, the dialog's internal-force panel must plot at
+    least one N/V/M trace with n_samples station points — and those
+    samples must come from element_graphics.sample_internal_force,
+    not from a duplicate BMD/SFD formula inside the dialog."""
+    from structural_analysis.gui_qt.dialogs import ElementPropertiesDialog
+    from structural_analysis.gui_qt.element_graphics import (
+        sample_internal_force,
+    )
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._result is not None and w._result.status == "ok"
+
+    elem = w._model.elements[0]
+    d = ElementPropertiesDialog(w, w._model, elem.id, w._result)
+    qt_app.processEvents()
+
+    diag_ax = d._detail_axes["diagrams"]
+    assert diag_ax.lines, "post-solve diagrams must render at least one trace"
+    # At least one trace must have >= n_samples points (the default
+    # 11 used by draw_element_detail). Defends against a regression
+    # where the dialog plots only the end-values.
+    longest = max(len(line.get_xdata()) for line in diag_ax.lines)
+    assert longest >= 11, (
+        f"internal-force trace must use at least 11 station points, "
+        f"got {longest}"
+    )
+
+    # Independent path — the *same* element_graphics helper must
+    # produce the same number of station points; this is the
+    # "single source of truth" guarantee.
+    f_local = w._result.member_results[elem.id]["f_local"]
+    ni = w._model.nodes[elem.node_i]
+    nj = w._model.nodes[elem.node_j]
+    xs, _ys = sample_internal_force(elem, ni, nj, f_local, "axial",
+                                      n_samples=11)
+    assert xs is not None and len(xs) == 11
 
 
 def test_property_dialogs_raise_for_unknown_ids(qt_app):
@@ -1034,6 +1311,108 @@ def test_main_window_keeps_version_badge_top_right(qt_app):
     text = w._version_label.text()
     assert __version__ in text
     assert __what_is_new__ in text
+
+
+# ── Element-detail interactive layer (crosshair, maxima, BMD) ─────
+
+
+def test_element_dialog_crosshair_tracks_motion(qt_app):
+    """Synthesise a motion event inside the N diagram axis; the three
+    cursor axvlines must update to the same x and the readout labels
+    must show numeric content (not '—')."""
+    from types import SimpleNamespace
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._result is not None and w._result.status == "ok"
+
+    elem = w._model.elements[0]
+    ni = w._model.nodes[elem.node_i]
+    nj = w._model.nodes[elem.node_j]
+    L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+
+    w._open_element_inspector(elem.id)
+    qt_app.processEvents()
+    d = w._element_inspector
+    assert d is not None and d._cursors, (
+        "crosshair axvlines must be created post-solve"
+    )
+
+    # Synthesise a motion event inside the N (axial) axis at x = L/2
+    x_test = L / 2.0
+    evt = SimpleNamespace(inaxes=d._ax_n, xdata=x_test, ydata=0.0)
+    d._on_diagram_motion(evt)
+
+    # All three cursors must be at the same x and visible
+    for c in d._cursors:
+        xdata = list(c.get_xdata())
+        assert abs(xdata[0] - x_test) < 1e-9, (
+            f"cursor xdata {xdata[0]} != test x {x_test}"
+        )
+        assert c.get_alpha() > 0, "cursor must become visible after motion"
+
+    # Readout labels must show numeric values
+    assert "x:" in d._lbl_x.text() and "—" not in d._lbl_x.text()
+    assert "N:" in d._lbl_N.text() and "—" not in d._lbl_N.text()
+
+
+def test_element_dialog_maxima_checkbox_toggles_annotations(qt_app):
+    """Checking 'Show Maxima' must add annotations on applicable diagram
+    axes; unchecking must remove all of them.  Wiring test — numerical
+    correctness is tested in test_diagram_signs.py."""
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+
+    elem = w._model.elements[0]
+    w._open_element_inspector(elem.id)
+    qt_app.processEvents()
+    d = w._element_inspector
+    assert d._show_maxima_cb.isEnabled(), (
+        "Show Maxima checkbox must be enabled post-solve"
+    )
+
+    d._show_maxima_cb.setChecked(True)
+    assert d._maxima_annotations, (
+        "checking Show Maxima must create at least one annotation"
+    )
+
+    d._show_maxima_cb.setChecked(False)
+    assert not d._maxima_annotations, (
+        "unchecking Show Maxima must clear all annotations"
+    )
+
+
+def test_element_dialog_bmd_axis_is_inverted(qt_app):
+    """The M subplot must use the structural tension-fibre BMD
+    convention (y-axis inverted); N and V subplots must not be inverted."""
+    from structural_analysis.element import FrameElement2D
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+
+    frame_elem = next(
+        (e for e in w._model.elements if isinstance(e, FrameElement2D)),
+        None,
+    )
+    assert frame_elem is not None, (
+        "q2a model must have at least one frame element"
+    )
+
+    w._open_element_inspector(frame_elem.id)
+    qt_app.processEvents()
+    d = w._element_inspector
+
+    assert d._ax_m.yaxis_inverted(), (
+        "M subplot must have inverted y-axis (tension-fibre BMD convention)"
+    )
+    assert not d._ax_n.yaxis_inverted(), "N subplot must NOT be inverted"
+    assert not d._ax_v.yaxis_inverted(), "V subplot must NOT be inverted"
 
 
 # ── 3D extruded viewer ─────────────────────────────────────────

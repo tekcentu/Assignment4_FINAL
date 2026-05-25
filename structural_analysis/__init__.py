@@ -1,8 +1,8 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.6.0"
+__version__ = "0.7.1"
 __what_is_new__ = (
-    "3D Y-up/Z-up viewer · live section preview · grid fills window"
+    "element detail · crosshair tracker · compact section sidebar"
 )
 
 from .model import (
