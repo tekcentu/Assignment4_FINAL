@@ -1372,10 +1372,28 @@ def _node_reaction(result, node_id: int) -> str | None:
 
 
 class ElementPropertiesDialog(QDialog):
-    """Read-only inspector for an element — opened by left-click in Select tool."""
+    """Read-only inspector for an element — landscape stacked N/V/M view.
+
+    Shows a five-row graphical detail (section thumbnail, member sketch,
+    free-body diagram, and three independent N/V/M landscape sub-plots)
+    rendered in the element's local coordinate frame.  An interactive
+    crosshair tracks the mouse across all three diagram axes simultaneously
+    and a real-time readout strip below the figure shows x, N, V, M.
+    A 'Show Maxima' checkbox annotates absolute peak values on demand.
+    """
 
     def __init__(self, parent, model: StructuralModel, elem_id: int,
                  result=None) -> None:
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+        from PyQt6.QtGui import QFont
+
+        from .element_graphics import (
+            draw_element_detail,
+            internal_force_at,
+            sample_internal_force,
+        )
+
         super().__init__(parent)
         self.setWindowTitle(f"Element {elem_id} properties")
         self.setModal(True)
@@ -1396,14 +1414,14 @@ class ElementPropertiesDialog(QDialog):
             length = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
 
         layout = QVBoxLayout(self)
+
+        # ── Property form ─────────────────────────────────────────────
         form = QFormLayout()
         layout.addLayout(form)
-
         form.addRow("Element ID:", QLabel(str(elem_id)))
         form.addRow("Kind:", QLabel(elem.kind.capitalize()))
         form.addRow("Nodes:", QLabel(f"{elem.node_i} → {elem.node_j}"))
         form.addRow("Length:", QLabel(f"{length:g} m"))
-
         if section is not None:
             sec_text = section.name or f"section {section.id}"
             form.addRow("Section:", QLabel(f"{sec_text}  (id {section.id})"))
@@ -1412,48 +1430,117 @@ class ElementPropertiesDialog(QDialog):
         if material is not None:
             mat_text = material.name or f"material {material.id}"
             form.addRow("Material:", QLabel(f"{mat_text}  (id {material.id})"))
-
         form.addRow("E:", QLabel(f"{elem.E:g} kN/m²"))
         form.addRow("A:", QLabel(f"{elem.A:g} m²"))
         if isinstance(elem, FrameElement2D):
             form.addRow("I:", QLabel(f"{elem.I:g} m⁴"))
             form.addRow("Releases:",
                          QLabel(f"i={elem.release_i},  j={elem.release_j}"))
-
         loads = _member_loads_summary(elem)
         form.addRow("Member loads:", QLabel(loads[0]))
         for line in loads[1:]:
             form.addRow("", QLabel(line))
 
-        # End-force result block (only if a successful static result exists).
-        if result is not None and getattr(result, "status", None) == "ok":
-            f_local = _element_local_forces(result, elem_id)
-            if f_local is not None:
-                sep = QLabel("── End forces (local) ──")
-                sep.setStyleSheet("font-weight: bold;")
-                layout.addWidget(sep)
-                ef_form = QFormLayout()
-                layout.addLayout(ef_form)
-                Ni, Vi, Mi, Nj, Vj, Mj = f_local
-                if isinstance(elem, TrussElement2D):
-                    ef_form.addRow("Node i:", QLabel(f"N = {Ni:+.4f} kN"))
-                    ef_form.addRow("Node j:", QLabel(f"N = {Nj:+.4f} kN"))
-                else:
-                    ef_form.addRow(
-                        "Node i:",
-                        QLabel(
-                            f"N = {Ni:+.4f} kN,  V = {Vi:+.4f} kN,  "
-                            f"M = {Mi:+.4f} kN·m"
-                        ),
-                    )
-                    ef_form.addRow(
-                        "Node j:",
-                        QLabel(
-                            f"N = {Nj:+.4f} kN,  V = {Vj:+.4f} kN,  "
-                            f"M = {Mj:+.4f} kN·m"
-                        ),
-                    )
+        # ── Graphical detail (landscape N/V/M stack) ──────────────────
+        ok_result = (result if (result is not None
+                                and getattr(result, "status", None) == "ok")
+                     else None)
+        f_local_raw = (_element_local_forces(ok_result, elem_id)
+                       if ok_result is not None else None)
 
+        self._detail_fig = Figure(figsize=(7.0, 9.2), dpi=92)
+        self._detail_fig.patch.set_facecolor("white")
+        self._detail_canvas = FigureCanvasQTAgg(self._detail_fig)
+        self._detail_canvas.setMinimumSize(560, 700)
+        layout.addWidget(self._detail_canvas)
+
+        self._detail_axes = draw_element_detail(
+            self._detail_fig, elem, model, ok_result, n_samples=11,
+        )
+        self._detail_canvas.draw_idle()
+
+        # Store axes references for the interactive layer
+        self._ax_n = self._detail_axes.ax_n
+        self._ax_v = self._detail_axes.ax_v
+        self._ax_m = self._detail_axes.ax_m
+        self._diagram_axes_set = {self._ax_n, self._ax_v, self._ax_m}
+
+        # Cache element data for crosshair math
+        self._elem_ref   = elem
+        self._ni_ref     = ni
+        self._nj_ref     = nj
+        self._f_local_ref = (list(f_local_raw) if f_local_raw is not None
+                             else None)
+        self._L          = length
+        self._cursors: list = []
+        self._maxima_annotations: list = []
+        self._internal_force_at = internal_force_at
+        self._sample_internal_force = sample_internal_force
+
+        # Crosshair — hidden axvlines on each diagram axis (post-solve only)
+        if self._f_local_ref is not None:
+            _kw = dict(color="red", linestyle="--", linewidth=0.9,
+                       alpha=0.0, zorder=5)
+            self._cursors = [
+                self._ax_n.axvline(x=0, **_kw),
+                self._ax_v.axvline(x=0, **_kw),
+                self._ax_m.axvline(x=0, **_kw),
+            ]
+            self._detail_canvas.mpl_connect(
+                "motion_notify_event", self._on_diagram_motion)
+            self._detail_canvas.mpl_connect(
+                "button_press_event", self._on_diagram_motion)
+
+        # ── Real-time readout strip ───────────────────────────────────
+        _mono = QFont("Courier")
+        _mono.setPointSize(8)
+
+        val_row = QHBoxLayout()
+        self._lbl_x = QLabel("x: —  m")
+        self._lbl_N = QLabel("N: —  kN")
+        self._lbl_V = QLabel("V: —  kN")
+        self._lbl_M = QLabel("M: —  kN·m")
+        for lbl in (self._lbl_x, self._lbl_N, self._lbl_V, self._lbl_M):
+            lbl.setFont(_mono)
+            lbl.setMinimumWidth(115)
+            lbl.setStyleSheet("border: 1px solid #ccc; padding: 2px 4px;")
+            val_row.addWidget(lbl)
+        val_row.addStretch()
+        layout.addLayout(val_row)
+
+        # ── Show Maxima checkbox ──────────────────────────────────────
+        maxima_row = QHBoxLayout()
+        self._show_maxima_cb = QCheckBox("Show Maxima")
+        self._show_maxima_cb.setEnabled(self._f_local_ref is not None)
+        self._show_maxima_cb.stateChanged.connect(self._toggle_maxima)
+        maxima_row.addWidget(self._show_maxima_cb)
+        maxima_row.addStretch()
+        layout.addLayout(maxima_row)
+
+        # ── End-force table (retained from original for precision read-out)
+        if ok_result is not None and f_local_raw is not None:
+            Ni, Vi, Mi, Nj, Vj, Mj = f_local_raw
+            sep = QLabel("── End forces (local) ──")
+            sep.setStyleSheet("font-weight: bold;")
+            layout.addWidget(sep)
+            ef_form = QFormLayout()
+            layout.addLayout(ef_form)
+            if isinstance(elem, TrussElement2D):
+                ef_form.addRow("Node i:", QLabel(f"N = {Ni:+.4f} kN"))
+                ef_form.addRow("Node j:", QLabel(f"N = {Nj:+.4f} kN"))
+            else:
+                ef_form.addRow(
+                    "Node i:",
+                    QLabel(f"N = {Ni:+.4f} kN,  V = {Vi:+.4f} kN,  "
+                           f"M = {Mi:+.4f} kN·m"),
+                )
+                ef_form.addRow(
+                    "Node j:",
+                    QLabel(f"N = {Nj:+.4f} kN,  V = {Vj:+.4f} kN,  "
+                           f"M = {Mj:+.4f} kN·m"),
+                )
+
+        # ── Close button ──────────────────────────────────────────────
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close,
                                      parent=self)
         buttons.rejected.connect(self.reject)
@@ -1462,6 +1549,85 @@ class ElementPropertiesDialog(QDialog):
         if close_btn is not None:
             close_btn.clicked.connect(self.accept)
         layout.addWidget(buttons)
+
+    # ── Interactive handlers ──────────────────────────────────────────
+
+    def _on_diagram_motion(self, event) -> None:
+        """Synchronise the crosshair cursor across N/V/M axes and update
+        the readout strip.  Bound to both motion_notify and button_press."""
+        if not self._cursors or self._f_local_ref is None:
+            return
+        if event.inaxes not in self._diagram_axes_set:
+            for c in self._cursors:
+                c.set_alpha(0.0)
+            for lbl, base in (
+                (self._lbl_x, "x"),
+                (self._lbl_N, "N"),
+                (self._lbl_V, "V"),
+                (self._lbl_M, "M"),
+            ):
+                lbl.setText(f"{base}: —")
+            self._detail_canvas.draw_idle()
+            return
+
+        if event.xdata is None:
+            return
+        x = max(0.0, min(self._L, float(event.xdata)))
+        for c in self._cursors:
+            c.set_xdata([x, x])
+            c.set_alpha(0.7)
+
+        n_val = self._internal_force_at(
+            self._elem_ref, self._ni_ref, self._nj_ref,
+            self._f_local_ref, "axial", x)
+        v_val = self._internal_force_at(
+            self._elem_ref, self._ni_ref, self._nj_ref,
+            self._f_local_ref, "shear", x)
+        m_val = self._internal_force_at(
+            self._elem_ref, self._ni_ref, self._nj_ref,
+            self._f_local_ref, "moment", x)
+
+        self._lbl_x.setText(f"x: {x:.3f} m")
+        self._lbl_N.setText(f"N: {n_val:.3f} kN"
+                            if n_val is not None else "N: —")
+        self._lbl_V.setText(f"V: {v_val:.3f} kN"
+                            if v_val is not None else "V: —")
+        self._lbl_M.setText(f"M: {m_val:.3f} kN·m"
+                            if m_val is not None else "M: —")
+        self._detail_canvas.draw_idle()
+
+    def _toggle_maxima(self, state: int) -> None:
+        """Add / remove absolute-peak annotations on each diagram axis."""
+        for ann in self._maxima_annotations:
+            try:
+                ann.remove()
+            except ValueError:
+                pass
+        self._maxima_annotations.clear()
+
+        if state and self._f_local_ref is not None:
+            for kind, ax in (
+                ("axial",  self._ax_n),
+                ("shear",  self._ax_v),
+                ("moment", self._ax_m),
+            ):
+                xs, ys = self._sample_internal_force(
+                    self._elem_ref, self._ni_ref, self._nj_ref,
+                    self._f_local_ref, kind, n_samples=101,
+                )
+                if xs is None or ys is None:
+                    continue
+                peak_i = max(range(len(ys)), key=lambda i: abs(ys[i]))
+                ann = ax.annotate(
+                    f"{ys[peak_i]:.3g}",
+                    xy=(xs[peak_i], ys[peak_i]),
+                    xytext=(0, 10), textcoords="offset points",
+                    fontsize=7, color="#222", ha="center",
+                    arrowprops=dict(arrowstyle="->", lw=0.7, color="#444"),
+                )
+                self._maxima_annotations.append(ann)
+
+        self._detail_canvas.draw_idle()
 
 
 def _element_local_forces(result, elem_id: int):

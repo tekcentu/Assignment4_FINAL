@@ -1,8 +1,8 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.5.0"
+__version__ = "0.7.0"
 __what_is_new__ = (
-    "Building wizard · scroll-wheel zoom · middle-button pan"
+    "element detail · landscape N/V/M stack · crosshair tracker"
 )
 
 from .model import (
