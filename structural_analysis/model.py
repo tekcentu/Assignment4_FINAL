@@ -304,6 +304,39 @@ class StructuralModel:
         return sorted(self.nodes)
 
 
+# ── Effective material resolver ───────────────────────────────
+
+
+def effective_material(model: "StructuralModel", elem) -> Material:
+    """Return the Material that drives ``elem``'s E / α / ρ / G.
+
+    Per-element overrides take precedence over the section default:
+
+        effective_material_id =
+            elem.material_id_override or section.material_id
+
+    Centralises effective-material resolution for callers that need the
+    Material object behind an element's E / α / ρ / G — primarily the
+    command-propagation paths in
+    :class:`structural_analysis.gui_common.commands.AddOrUpdateMaterialCmd`
+    and :class:`structural_analysis.gui_common.commands.AddOrUpdateSectionCmd`,
+    which use it to decide which elements should refresh when a material
+    or a section is edited.
+
+    The GUI detail inspector resolves the same lookup inline because it
+    must tolerate partially-broken models (e.g. mid-edit, with a dangling
+    section_id or material id), whereas this helper raises ``KeyError``
+    in that case.
+
+    Raises:
+        KeyError: if the resolved material id or the element's section id
+            is missing from the model.
+    """
+    section = model.sections[elem.section_id]
+    mid = getattr(elem, "material_id_override", None) or section.material_id
+    return model.materials[mid]
+
+
 # ── Analysis Result ───────────────────────────────────────────
 
 

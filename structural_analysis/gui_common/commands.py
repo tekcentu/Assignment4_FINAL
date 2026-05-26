@@ -150,6 +150,7 @@ class AddElementCmd(Command):
     release_i: bool = False
     release_j: bool = False
     elem_id: int | None = None
+    material_override_id: int | None = None
     description: str = "add element"
 
     def do(self, model: StructuralModel) -> None:
@@ -167,7 +168,16 @@ class AddElementCmd(Command):
                 f"Section {self.section_id} references material "
                 f"{section.material_id}, which does not exist."
             )
-        mat = model.materials[section.material_id]
+        # Resolve the effective material: override if given, else section default.
+        if self.material_override_id is not None:
+            if self.material_override_id not in model.materials:
+                raise ValueError(
+                    f"Material override id {self.material_override_id} "
+                    "does not exist."
+                )
+            mat = model.materials[self.material_override_id]
+        else:
+            mat = model.materials[section.material_id]
         ni = model.nodes[self.node_i]
         nj = model.nodes[self.node_j]
         if abs(ni.x - nj.x) < 1e-12 and abs(ni.y - nj.y) < 1e-12:
@@ -192,14 +202,18 @@ class AddElementCmd(Command):
             elem = TrussElement2D(
                 id=self.elem_id, node_i=self.node_i, node_j=self.node_j,
                 E=mat.E, A=section.A, alpha=mat.alpha, depth=section.depth,
+                rho=mat.density,
                 section_id=section.id,
+                material_id_override=self.material_override_id,
             )
         else:
             elem = FrameElement2D(
                 id=self.elem_id, node_i=self.node_i, node_j=self.node_j,
                 E=mat.E, A=section.A, I=section.I,
                 alpha=mat.alpha, depth=section.depth,
+                rho=mat.density,
                 section_id=section.id,
+                material_id_override=self.material_override_id,
                 release_i=self.release_i, release_j=self.release_j,
             )
         model.elements.append(elem)
@@ -237,6 +251,7 @@ class UpdateElementCmd(Command):
     kind: str
     release_i: bool = False
     release_j: bool = False
+    material_override_id: int | None = None
     _saved: object | None = None
     _saved_index: int = -1
     description: str = "edit element"
@@ -266,19 +281,32 @@ class UpdateElementCmd(Command):
             raise ValueError(
                 "Clear member loads before changing an element between frame and truss."
             )
-        mat = model.materials[section.material_id]
+        # Resolve the effective material: override if given, else section default.
+        if self.material_override_id is not None:
+            if self.material_override_id not in model.materials:
+                raise ValueError(
+                    f"Material override id {self.material_override_id} "
+                    "does not exist."
+                )
+            mat = model.materials[self.material_override_id]
+        else:
+            mat = model.materials[section.material_id]
         if kind == "truss":
             elem = TrussElement2D(
                 id=self.elem_id, node_i=old.node_i, node_j=old.node_j,
                 E=mat.E, A=section.A, alpha=mat.alpha, depth=section.depth,
+                rho=mat.density,
                 section_id=section.id,
+                material_id_override=self.material_override_id,
             )
         else:
             elem = FrameElement2D(
                 id=self.elem_id, node_i=old.node_i, node_j=old.node_j,
                 E=mat.E, A=section.A, I=section.I,
                 alpha=mat.alpha, depth=section.depth,
+                rho=mat.density,
                 section_id=section.id,
+                material_id_override=self.material_override_id,
                 release_i=self.release_i, release_j=self.release_j,
             )
         elem.member_loads = list(getattr(old, "member_loads", []))
@@ -304,15 +332,17 @@ class AddOrUpdateMaterialCmd(Command):
         if self.material.density < 0:
             raise ValueError("Material density cannot be negative.")
         previous = model.materials.get(self.material.id)
-        owned_sections = {s.id for s in model.sections.values()
-                          if s.material_id == self.material.id}
         self._previous = previous
         model.materials[self.material.id] = self.material
-        # Propagate updated E/α/ρ to elements that belong to any section
-        # whose material_id is this material.
+        # Propagate updated E / α / ρ to every element whose *effective*
+        # material is this one. An element's effective material is its
+        # override if set, else its section's default material — so an
+        # overridden element only updates when its override matches this
+        # material id, regardless of section.
         if previous is not None:
+            mat_id = self.material.id
             for elem in model.elements:
-                if elem.section_id in owned_sections:
+                if _effective_material_id(model, elem) == mat_id:
                     elem.E = self.material.E
                     elem.alpha = self.material.alpha
                     elem.rho = self.material.density
@@ -322,13 +352,27 @@ class AddOrUpdateMaterialCmd(Command):
             model.materials.pop(self.material.id, None)
         else:
             model.materials[self.material.id] = self._previous
-            owned_sections = {s.id for s in model.sections.values()
-                              if s.material_id == self.material.id}
+            mat_id = self._previous.id
             for elem in model.elements:
-                if elem.section_id in owned_sections:
+                if _effective_material_id(model, elem) == mat_id:
                     elem.E = self._previous.E
                     elem.alpha = self._previous.alpha
                     elem.rho = self._previous.density
+
+
+def _effective_material_id(model: StructuralModel, elem) -> int | None:
+    """Return the id of the material driving ``elem``'s E/α/ρ.
+
+    Used only inside the command-propagation paths in this module —
+    higher-level code (GUI display, future self-weight) should call
+    :func:`structural_analysis.model.effective_material`, which returns
+    the full Material object.
+    """
+    override = getattr(elem, "material_id_override", None)
+    if override is not None:
+        return override
+    sec = model.sections.get(elem.section_id)
+    return sec.material_id if sec is not None else None
 
 
 @dataclass
@@ -342,10 +386,22 @@ class DeleteMaterialCmd(Command):
             raise ValueError(f"Material {self.material_id} does not exist.")
         used_by_sec = [s.id for s in model.sections.values()
                        if s.material_id == self.material_id]
-        if used_by_sec:
+        used_by_override = [
+            e.id for e in model.elements
+            if getattr(e, "material_id_override", None) == self.material_id
+        ]
+        if used_by_sec or used_by_override:
+            parts = []
+            if used_by_sec:
+                parts.append(f"section(s) {used_by_sec}")
+            if used_by_override:
+                parts.append(
+                    f"element override(s) {used_by_override}"
+                )
             raise ValueError(
-                f"Material {self.material_id} is in use by section(s) "
-                f"{used_by_sec}; delete those sections first."
+                f"Material {self.material_id} is in use by "
+                + " and ".join(parts)
+                + "; clear those references first."
             )
         self._saved = model.materials.pop(self.material_id)
 
@@ -379,15 +435,18 @@ class AddOrUpdateSectionCmd(Command):
                              if e.section_id == self.section.id]
         self._previous = previous
         model.sections[self.section.id] = self.section
-        # Propagate A/I/depth to elements that point at this section.
-        # If the section's material_id changed, also re-pull E/α from the
-        # new material so the element matches the new combination.
+        # Geometry (A, I, depth) always propagates — it follows the section.
+        # Material-derived properties (E, α, ρ) propagate only to elements
+        # that don't carry an override. Overridden elements keep their
+        # override material's properties even if the section's default
+        # material changed.
         for elem in affected_elements:
             elem.A = self.section.A
             elem.depth = self.section.depth
             if isinstance(elem, FrameElement2D):
                 elem.I = self.section.I
-            if new_mat is not None:
+            if (new_mat is not None
+                    and getattr(elem, "material_id_override", None) is None):
                 elem.E = new_mat.E
                 elem.alpha = new_mat.alpha
                 elem.rho = new_mat.density
@@ -405,7 +464,9 @@ class AddOrUpdateSectionCmd(Command):
                     elem.depth = prev.depth
                     if isinstance(elem, FrameElement2D):
                         elem.I = prev.I
-                    if prev_mat is not None:
+                    if (prev_mat is not None
+                            and getattr(elem, "material_id_override", None)
+                            is None):
                         elem.E = prev_mat.E
                         elem.alpha = prev_mat.alpha
                         elem.rho = prev_mat.density

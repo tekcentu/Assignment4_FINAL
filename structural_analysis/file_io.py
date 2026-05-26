@@ -275,15 +275,17 @@ def read_input_file(filepath: str) -> StructuralModel:
                         f"{section.material_id}, which has no MATERIALS entry."
                     )
 
-                # Optional element type
+                # Optional element type. Only the value at position 5 is
+                # treated as a positional kind token; once we see a key=value
+                # pair we stop consuming positional tokens.
                 etype = "FRAME"
-                if len(parts) >= 5:
+                if len(parts) >= 5 and "=" not in parts[4]:
                     etype = parts[4].upper()
 
-                # Optional release
+                # Optional release at position 6.
                 release_i = False
                 release_j = False
-                if len(parts) >= 6:
+                if len(parts) >= 6 and "=" not in parts[5]:
                     r = parts[5].upper()
                     if r == "START":
                         release_i = True
@@ -293,21 +295,75 @@ def read_input_file(filepath: str) -> StructuralModel:
                         release_i = True
                         release_j = True
 
+                # Trailing key=value kwargs. Currently only
+                # ``material_override_id`` is recognised; other unknown
+                # keys are rejected so typos surface immediately rather
+                # than silently being ignored. Positional tokens are only
+                # permitted at idx 4 (kind) and idx 5 (release) — any
+                # later non-``key=value`` token is an error so typos like
+                # ``material_override_id 2`` don't slip through silently.
+                material_override_id: int | None = None
+                for idx, tok in enumerate(parts[4:], start=4):
+                    if "=" not in tok:
+                        positional_slot = (
+                            idx == 4
+                            or (idx == 5 and "=" not in parts[4])
+                        )
+                        if positional_slot:
+                            continue
+                        raise ValueError(
+                            f"Element {eid}: unexpected positional token "
+                            f"{tok!r}. After the optional kind/release "
+                            "tokens, all element options must be key=value "
+                            "pairs (e.g. material_override_id=2)."
+                        )
+                    key, _, value = tok.partition("=")
+                    key = key.strip().lower()
+                    value = value.strip()
+                    if key == "material_override_id":
+                        try:
+                            mid = int(value)
+                        except ValueError:
+                            raise ValueError(
+                                f"Element {eid}: material_override_id must "
+                                f"be an integer, got {value!r}."
+                            )
+                        if mid not in model.materials:
+                            raise ValueError(
+                                f"Element {eid}: material_override_id={mid} "
+                                "has no MATERIALS entry."
+                            )
+                        material_override_id = mid
+                    else:
+                        raise ValueError(
+                            f"Element {eid}: unknown element option "
+                            f"{tok!r}; expected material_override_id=<id>."
+                        )
+
+                # Resolve the *effective* material for E / α / ρ. Geometry
+                # (A, I, depth) always comes from the section.
+                if material_override_id is not None:
+                    eff_mat = model.materials[material_override_id]
+                else:
+                    eff_mat = mat
+
                 if etype == "TRUSS":
                     elem = TrussElement2D(
                         id=eid, node_i=sn, node_j=en,
-                        E=mat.E, A=section.A,
-                        alpha=mat.alpha, depth=section.depth,
-                        rho=mat.density,
+                        E=eff_mat.E, A=section.A,
+                        alpha=eff_mat.alpha, depth=section.depth,
+                        rho=eff_mat.density,
                         section_id=section.id,
+                        material_id_override=material_override_id,
                     )
                 else:
                     elem = FrameElement2D(
                         id=eid, node_i=sn, node_j=en,
-                        E=mat.E, A=section.A, I=section.I,
-                        alpha=mat.alpha, depth=section.depth,
-                        rho=mat.density,
+                        E=eff_mat.E, A=section.A, I=section.I,
+                        alpha=eff_mat.alpha, depth=section.depth,
+                        rho=eff_mat.density,
                         section_id=section.id,
+                        material_id_override=material_override_id,
                         release_i=release_i, release_j=release_j,
                     )
                 model.elements.append(elem)

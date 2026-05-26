@@ -1415,6 +1415,86 @@ def test_element_dialog_bmd_axis_is_inverted(qt_app):
     assert not d._ax_v.yaxis_inverted(), "V subplot must NOT be inverted"
 
 
+# ── Element material override (PR #16) ────────────────────────
+
+
+def test_element_properties_dialog_shows_override_tag(qt_app):
+    """The detail inspector must label the Material row "— section default"
+    when the element has no override, and "— override (default: …)"
+    when it does. Walks every QLabel in the dialog and checks for the
+    expected substrings."""
+    from PyQt6.QtWidgets import QLabel
+
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.gui_common.commands import UpdateElementCmd
+    from structural_analysis.gui_qt.dialogs import ElementPropertiesDialog
+    from structural_analysis.model import (
+        Material, Node, Section, Support,
+    )
+
+    w = MainWindow()
+    m = w._model
+    m.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 5.0, 0.0),
+        3: Node(3, 0.0, 5.0),
+        4: Node(4, 5.0, 5.0),
+    }
+    m.materials = {
+        1: Material(id=1, name="Steel_S275", E=2.10e8, alpha=1.2e-5,
+                    density=7850.0),
+        2: Material(id=2, name="Concrete_C25", E=3.10e7, alpha=1.0e-5,
+                    density=2400.0),
+    }
+    m.sections = {
+        1: Section(id=1, name="IPE200", material_id=1,
+                   A=0.0028, I=1.94e-5, depth=0.2, width=0.1),
+    }
+    m.elements = [
+        FrameElement2D(1, 1, 2, E=2.10e8, A=0.0028, I=1.94e-5,
+                       alpha=1.2e-5, depth=0.2, rho=7850.0, section_id=1),
+        FrameElement2D(2, 3, 4, E=2.10e8, A=0.0028, I=1.94e-5,
+                       alpha=1.2e-5, depth=0.2, rho=7850.0, section_id=1),
+    ]
+    m.supports = {
+        1: Support(1, ux=True, uy=True, rz=True),
+        3: Support(3, ux=True, uy=True, rz=True),
+    }
+    # Override elem 1 to Concrete_C25; leave elem 2 on the section default.
+    UpdateElementCmd(elem_id=1, section_id=1, kind="frame",
+                     material_override_id=2).do(m)
+
+    def _all_label_texts(dialog):
+        return [w.text() for w in dialog.findChildren(QLabel)]
+
+    d_ovr = ElementPropertiesDialog(w, m, 1, None)
+    qt_app.processEvents()
+    texts_ovr = _all_label_texts(d_ovr)
+    assert any("Concrete_C25" in t and "override" in t
+               for t in texts_ovr), (
+        f"override label must mention the override material name + "
+        f"the word 'override'. Got: "
+        f"{[t for t in texts_ovr if 'Material' in t or 'override' in t]}"
+    )
+    assert any("Steel_S275" in t and "default" in t.lower()
+               for t in texts_ovr), (
+        "override label must also surface the section default for context"
+    )
+
+    d_def = ElementPropertiesDialog(w, m, 2, None)
+    qt_app.processEvents()
+    texts_def = _all_label_texts(d_def)
+    assert any("Steel_S275" in t and "section default" in t
+               for t in texts_def), (
+        f"non-override label must mention the section-default material + "
+        f"the substring 'section default'. Got: "
+        f"{[t for t in texts_def if 'Material' in t or 'default' in t]}"
+    )
+    assert not any("override" in t for t in texts_def), (
+        "non-override element must NOT show the word 'override'"
+    )
+
+
 # ── 3D extruded viewer ─────────────────────────────────────────
 
 

@@ -140,6 +140,20 @@ def write_input_file(model: StructuralModel, path: str) -> None:
                 line += "  START"
             elif elem.release_j:
                 line += "  END"
+        # Per-element material override — keyword-style trailing token so
+        # backward compatibility with files that don't carry it is
+        # automatic. Omitted entirely when the override is None. The
+        # referenced material id must still exist in MATERIALS, otherwise
+        # the file we'd write could not be reloaded.
+        override_id = getattr(elem, "material_id_override", None)
+        if override_id is not None:
+            if override_id not in model.materials:
+                raise ValueError(
+                    f"Element {elem.id} references material override "
+                    f"{override_id}, which is not in the model. "
+                    "Cannot serialise."
+                )
+            line += f"  material_override_id={override_id}"
         out.append(line)
     out.append("")
 
