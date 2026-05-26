@@ -484,6 +484,11 @@ def read_input_file(filepath: str) -> StructuralModel:
                 i += 1
                 while i < len(lines) and (not lines[i] or lines[i].startswith("#")):
                     i += 1
+                if i >= len(lines):
+                    raise ValueError(
+                        "Unexpected end of file inside ANALYSIS_OPTIONS "
+                        f"block (expected {count} key=value rows)."
+                    )
                 opt_line = lines[i].split("#")[0].strip()
                 if "=" not in opt_line:
                     raise ValueError(
@@ -491,7 +496,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                         "key=value pair."
                     )
                 key, _, val = opt_line.partition("=")
-                key = key.strip()
+                key = key.strip().lower()
                 val = val.strip()
                 if key == "include_self_weight":
                     model.include_self_weight = _parse_bool(val, key)

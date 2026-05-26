@@ -179,7 +179,9 @@ class MassSummaryWindow(QMainWindow):
             A = float(getattr(elem, "A", 0.0))
             try:
                 L, _, _ = elem.length_cos_sin(model.nodes)
-            except KeyError:
+            except (KeyError, ValueError):
+                # KeyError: dangling node reference mid-edit.
+                # ValueError: coincident nodes (zero length) mid-edit.
                 L = 0.0
 
             mass = rho * A * L  # kg
