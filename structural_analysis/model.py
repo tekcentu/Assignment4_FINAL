@@ -19,6 +19,19 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 
+# ── Physical constants ─────────────────────────────────────────
+
+STANDARD_GRAVITY = 9.81  # m/s²
+"""Single source of truth for gravitational acceleration.
+
+Used by the assembler's self-weight pass, the mass / self-weight summary
+window, and the tests that verify them. In v0.9.0 this constant is the
+only supported value; future versions may let the user pick from a
+fixed list (9.81 / 9.80665 / 10.0 / custom) on an Advanced analysis
+settings panel.
+"""
+
+
 # ── Nodes ──────────────────────────────────────────────────────
 
 
@@ -269,6 +282,15 @@ class StructuralModel:
     elements: list = field(default_factory=list)        # list[Element2D]
     supports: dict[int, Support] = field(default_factory=dict)
     nodal_loads: list[NodalLoad] = field(default_factory=list)
+
+    # ── analysis settings ──
+    # When True, the static assembler injects gravity loads on every
+    # element (frame: full local fixed-end forces; truss: half-weight
+    # lumped at each endpoint in global -Y). Gravity direction is
+    # hard-coded to global -Y at g = STANDARD_GRAVITY m/s² in v0.9.0.
+    # The loads are applied during assembly only — never persisted into
+    # ``nodal_loads`` or any element's ``member_loads``.
+    include_self_weight: bool = False
 
     # ── convenience helpers ──
 

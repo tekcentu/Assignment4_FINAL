@@ -2214,3 +2214,38 @@ class BuildingWizardDialog(_ModalDialog):
                 )
 
         return m
+
+
+# ── analysis settings (v0.9.0) ──
+
+
+class AnalysisSettingsDialog(_ModalDialog):
+    """Edit the model's analysis settings.
+
+    v0.9.0 exposes a single switch — "Include self-weight in static
+    analysis". Gravity is fixed at g = 9.81 m/s² in global -Y; future
+    versions may expose those as user-editable controls.
+    """
+
+    def __init__(self, parent, *, include_self_weight: bool) -> None:
+        self._initial = bool(include_self_weight)
+        super().__init__(parent, "Analysis settings")
+
+    def _build_body(self, body: QWidget) -> None:
+        layout = QVBoxLayout(body)
+        self._sw_check = QCheckBox(
+            "Include self-weight in static analysis", body,
+        )
+        self._sw_check.setChecked(self._initial)
+        layout.addWidget(self._sw_check)
+        note = QLabel(
+            "Gravity acts in global −Y at g = 9.81 m/s².\n"
+            "Future versions will let you change these.",
+            body,
+        )
+        note.setStyleSheet("color: #555; font-size: 9pt;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+    def _accept(self) -> dict:
+        return {"include_self_weight": bool(self._sw_check.isChecked())}

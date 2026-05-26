@@ -473,6 +473,51 @@ def read_input_file(filepath: str) -> StructuralModel:
                         ))
                         break
 
+        elif keyword == "ANALYSIS_OPTIONS":
+            # Format: ANALYSIS_OPTIONS <count> followed by count
+            # key=value lines. v0.9.0 recognises only
+            # ``include_self_weight=<bool>``; unknown keys raise
+            # ``ValueError`` so typos surface (mirrors the per-element
+            # override-key strictness already in this parser).
+            count = int(tokens[1])
+            for _ in range(count):
+                i += 1
+                while i < len(lines) and (not lines[i] or lines[i].startswith("#")):
+                    i += 1
+                if i >= len(lines):
+                    raise ValueError(
+                        "Unexpected end of file inside ANALYSIS_OPTIONS "
+                        f"block (expected {count} key=value rows)."
+                    )
+                opt_line = lines[i].split("#")[0].strip()
+                if "=" not in opt_line:
+                    raise ValueError(
+                        f"ANALYSIS_OPTIONS row {opt_line!r} is not a "
+                        "key=value pair."
+                    )
+                key, _, val = opt_line.partition("=")
+                key = key.strip().lower()
+                val = val.strip()
+                if key == "include_self_weight":
+                    model.include_self_weight = _parse_bool(val, key)
+                else:
+                    raise ValueError(
+                        f"Unknown ANALYSIS_OPTIONS key {key!r}. "
+                        f"Allowed: ['include_self_weight']."
+                    )
+
         i += 1
 
     return model
+
+
+def _parse_bool(s: str, key: str) -> bool:
+    low = s.lower()
+    if low in ("true", "1", "yes", "on"):
+        return True
+    if low in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(
+        f"ANALYSIS_OPTIONS {key}={s!r}: expected a boolean "
+        "(true/false, 1/0, yes/no, on/off)."
+    )

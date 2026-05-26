@@ -72,6 +72,7 @@ from .controllers import (
     TrussTool,
 )
 from .dialogs import (
+    AnalysisSettingsDialog,
     BuildingWizardDialog,
     ElementDialog,
     ElementPropertiesDialog,
@@ -196,6 +197,7 @@ class MainWindow(QMainWindow):
         self._modal_result = None
         self._modal_results_dialog = None
         self._view3d_window = None
+        self._mass_summary_window = None
         # Singleton element-detail inspector. Held alive across closes
         # so right-clicking a different element reuses the same window
         # (see _open_element_inspector). MainWindow owns the
@@ -385,6 +387,14 @@ class MainWindow(QMainWindow):
                                    triggered=self._do_solve)
         self.act_modal = QAction("&Modal analysis…", self, shortcut="F6",
                                    triggered=self._do_modal)
+        self.act_analysis_settings = QAction(
+            "Analysis &settings…", self,
+            triggered=self._edit_analysis_settings,
+        )
+        self.act_mass_summary = QAction(
+            "&Mass / self-weight summary…", self,
+            triggered=self._show_mass_summary,
+        )
         self.act_clear_result = QAction("&Clear results", self,
                                           triggered=self._clear_result)
 
@@ -485,6 +495,10 @@ class MainWindow(QMainWindow):
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)
         m_run.addAction(self.act_modal)
+        m_run.addSeparator()
+        m_run.addAction(self.act_analysis_settings)
+        m_run.addAction(self.act_mass_summary)
+        m_run.addSeparator()
         m_run.addAction(self.act_clear_result)
 
     def _build_toolbar(self) -> None:
@@ -1093,6 +1107,53 @@ class MainWindow(QMainWindow):
         self._view3d_window.raise_()
         self._view3d_window.activateWindow()
 
+    def _edit_analysis_settings(self) -> None:
+        """Open the modal analysis-settings dialog.
+
+        v0.9.0 exposes a single switch — include self-weight in the
+        static solve. Accepting the dialog updates the model flag and
+        invalidates any stale results so the user knows to re-solve.
+        """
+        d = AnalysisSettingsDialog(
+            self,
+            include_self_weight=bool(
+                getattr(self._model, "include_self_weight", False)
+            ),
+        )
+        if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
+            return
+        new_flag = bool(d.result_value["include_self_weight"])
+        if new_flag != bool(getattr(self._model, "include_self_weight", False)):
+            self._model.include_self_weight = new_flag
+            self._modified = True
+            self._update_title()
+            self._invalidate_result()
+        # Even if the flag didn't change, the summary window header
+        # may need a refresh (idempotent — cheap).
+        if self._mass_summary_window is not None:
+            self._mass_summary_window.refresh()
+        self.set_status(
+            "Self-weight: enabled in solver."
+            if new_flag else "Self-weight: disabled in solver."
+        )
+
+    def _show_mass_summary(self) -> None:
+        """Open the non-modal mass / self-weight summary, or raise it.
+
+        Singleton pattern mirrors :meth:`_open_view3d`.
+        """
+        from .mass_summary import MassSummaryWindow
+
+        if self._mass_summary_window is None:
+            self._mass_summary_window = MassSummaryWindow(
+                self, lambda: self._model,
+            )
+        else:
+            self._mass_summary_window.refresh()
+        self._mass_summary_window.show()
+        self._mass_summary_window.raise_()
+        self._mass_summary_window.activateWindow()
+
     def _open_element_inspector(self, elem_id: int) -> None:
         """Open (or re-target) the non-modal element-detail inspector.
 
@@ -1577,6 +1638,12 @@ class MainWindow(QMainWindow):
             if self._modal_results_dialog is not None:
                 self._modal_results_dialog.close()
                 self._modal_results_dialog = None
+        # Mass / self-weight summary tracks ρ / A / L from the model;
+        # any edit that invalidates a result could also have changed
+        # those numbers. The window itself is non-modal and cheap to
+        # repopulate, so refresh unconditionally when it's open.
+        if self._mass_summary_window is not None:
+            self._mass_summary_window.refresh()
 
     def _update_result_text(self) -> None:
         text = format_result(self._model, self._result) if self._result \

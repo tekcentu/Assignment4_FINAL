@@ -1690,3 +1690,96 @@ def test_building_wizard_action_undoable(qt_app):
     w._do_undo()
     assert len(w._model.nodes) == 0
     assert len(w._model.elements) == 0
+
+
+# ── v0.9.0: analysis settings dialog + mass / self-weight summary ──
+
+
+def test_analysis_settings_dialog_toggles_model_flag(qt_app):
+    """Opening the dialog with an unstubbed exec doesn't fit in a smoke
+    test, so we drive the slot via a stubbed exec that flips the
+    checkbox and returns Accepted."""
+    from structural_analysis.gui_qt.dialogs import AnalysisSettingsDialog
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    assert w._model.include_self_weight is False
+
+    original_exec = AnalysisSettingsDialog.exec
+
+    def fake_exec(self):
+        self._sw_check.setChecked(True)
+        self.result_value = self._accept()
+        return QDialog.DialogCode.Accepted
+
+    AnalysisSettingsDialog.exec = fake_exec
+    try:
+        w._edit_analysis_settings()
+    finally:
+        AnalysisSettingsDialog.exec = original_exec
+
+    assert w._model.include_self_weight is True
+
+
+def test_mass_summary_window_singleton_and_renders_rows(qt_app):
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._show_mass_summary()
+    win = w._mass_summary_window
+    assert win is not None
+    assert win.isVisible()
+    # Re-opening must reuse the same instance.
+    w._show_mass_summary()
+    assert w._mass_summary_window is win
+    # Row count matches the model.
+    assert win._table.rowCount() == len(w._model.elements)
+    # Mass column equals ρ·A·L for at least the first element.
+    elem = w._model.elements[0]
+    L, _, _ = elem.length_cos_sin(w._model.nodes)
+    expected_mass = float(elem.rho) * float(elem.A) * float(L)
+    cell = win._table.item(0, 7).text()
+    assert float(cell) == pytest.approx(expected_mass, rel=1e-6, abs=1e-6)
+
+
+def test_mass_summary_window_header_reflects_flag(qt_app):
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._show_mass_summary()
+    win = w._mass_summary_window
+    assert "DISABLED" in win._status_label.text()
+    w._model.include_self_weight = True
+    win.refresh()
+    assert "ENABLED" in win._status_label.text()
+
+
+def test_mass_summary_window_refreshes_after_edit(qt_app):
+    """Editing the model invalidates results — the summary window
+    should re-read totals automatically when open."""
+    from structural_analysis.gui_common.commands import AddOrUpdateMaterialCmd
+    from structural_analysis.model import Material
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._show_mass_summary()
+    win = w._mass_summary_window
+
+    # The fixture loads materials with density = 0 (no density column
+    # in the legacy file), so the initial total mass is 0. Doubling
+    # the density of one material should change the totals after
+    # refresh — but only if the material is the *effective* one for
+    # at least one element. Pick the material the first element uses.
+    elem = w._model.elements[0]
+    from structural_analysis.model import effective_material as _eff
+    eff_mat = _eff(w._model, elem)
+    bumped = Material(
+        id=eff_mat.id, name=eff_mat.name,
+        E=eff_mat.E, alpha=eff_mat.alpha,
+        density=eff_mat.density + 1000.0,
+        nu=eff_mat.nu, template=eff_mat.template,
+    )
+    pre_text = win._totals_label.text()
+    cmd = AddOrUpdateMaterialCmd(material=bumped)
+    w.execute(cmd)
+    qt_app.processEvents()
+    post_text = win._totals_label.text()
+    assert pre_text != post_text
