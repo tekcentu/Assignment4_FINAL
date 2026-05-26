@@ -1783,3 +1783,31 @@ def test_mass_summary_window_refreshes_after_edit(qt_app):
     qt_app.processEvents()
     post_text = win._totals_label.text()
     assert pre_text != post_text
+
+
+def test_joint_masses_window_singleton_and_renders_rows(qt_app):
+    """v0.9.1: Assembled Joint Masses window — singleton, row per node,
+    totals agree with mass_inspect.joint_mass_table."""
+    from structural_analysis.mass_inspect import joint_mass_table
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._show_joint_masses()
+    win = w._joint_masses_window
+    assert win is not None
+    assert win.isVisible()
+    # Re-opening must reuse the same instance.
+    w._show_joint_masses()
+    assert w._joint_masses_window is win
+    # Row count matches node count.
+    assert win._table.rowCount() == len(w._model.nodes)
+
+    # Totals in the footer must match what the helper would compute now.
+    report = joint_mass_table(w._model, method="row_sum")
+    footer = win._totals_label.text()
+    assert f"{report.totals_kg['ux']:.4f}" in footer
+    assert f"Active modal DOFs = {report.n_free_dofs}" in footer
+
+    # First-column cells must be the node IDs in model order.
+    for r, nid in enumerate(w._model.node_ids):
+        assert win._table.item(r, 0).text() == str(nid)
