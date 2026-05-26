@@ -413,8 +413,11 @@ def assemble_global_system(
         }
 
     # Self-weight pass — applied directly to F, never persisted to the model.
+    # Per-element raw fixed-end vectors are stashed in ``elem_data`` so the
+    # postprocessor can feed them into ``q = K·d − p`` recovery without
+    # the loads ever being attached as member_loads.
     if model.include_self_weight:
-        _apply_self_weight(model, dofs, F)
+        _apply_self_weight(model, dofs, F, elem_data)
 
     return K, F, dofs, warnings, elem_data
 
@@ -423,6 +426,7 @@ def _apply_self_weight(
     model: StructuralModel,
     dofs: DofManager,
     F: np.ndarray,
+    elem_data: dict[int, dict],
 ) -> None:
     """Inject gravity loads on every element into the global F vector.
 
@@ -463,7 +467,7 @@ def _apply_self_weight(
         if isinstance(elem, FrameElement2D):
             w_local_x = -w * s
             w_local_y = -w * c
-            p_local = np.array([
+            p_local_raw = np.array([
                 w_local_x * L / 2.0,
                 w_local_y * L / 2.0,
                 w_local_y * L ** 2 / 12.0,
@@ -471,11 +475,17 @@ def _apply_self_weight(
                 w_local_y * L / 2.0,
                 -w_local_y * L ** 2 / 12.0,
             ])
+            # Stash the RAW (uncondensed) fixed-end vector so the
+            # postprocessor can include it in q = K·d − p recovery. The
+            # back-substitution path needs p_b at released DOFs, so the
+            # condensed (zero-at-released) version is the wrong thing to
+            # hand off — see Element2D.local_displacement_and_end_forces.
+            elem_data[elem.id]["self_weight_p_local"] = p_local_raw
             # Released rotational DOFs are unassembled (mapping[r]=None);
             # without this Schur reduction the released-end moment FEF
             # would be silently dropped instead of redistributed to the
             # retained DOFs.
-            p_local = elem.condense_local_load_for_releases(p_local, model.nodes)
+            p_local = elem.condense_local_load_for_releases(p_local_raw, model.nodes)
             R = elem.transformation_matrix(model.nodes)
             p_global = R.T @ p_local
             mapping = dofs.element_dof_map(elem)

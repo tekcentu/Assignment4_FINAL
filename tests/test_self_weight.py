@@ -126,6 +126,27 @@ def test_self_weight_equivalent_to_explicit_udl_on_horizontal_beam():
             r_udl.reactions[1][dof], rel=1e-9, abs=1e-9,
         )
 
+    # Member end forces must match too: self-weight is folded back into
+    # p_full during q = K·d − p recovery (postprocessor.compute_member_forces).
+    f_sw = r_sw.member_results[1]["f_local"]
+    f_udl = r_udl.member_results[1]["f_local"]
+    for k in range(6):
+        assert f_sw[k] == pytest.approx(f_udl[k], rel=1e-9, abs=1e-9)
+
+
+def test_self_weight_not_attached_as_persistent_member_load_after_solve():
+    """Self-weight must remain a solve-time only contribution: no
+    member load object may be left on any element after run_analysis,
+    even though the postprocessor now reads the local fixed-end vector
+    from elem_data during recovery."""
+    m = _steel_model_with_one_horizontal_beam()
+    m.include_self_weight = True
+    run_analysis(m, verbose=False)
+    for elem in m.elements:
+        assert elem.member_loads == [], (
+            f"element {elem.id} has lingering member_loads: {elem.member_loads}"
+        )
+
 
 # ── 4. inclined frame: vertical equilibrium ────────────────────
 
@@ -399,12 +420,14 @@ def test_self_weight_with_release_matches_equivalent_udl_with_release():
             assert val_sw == pytest.approx(
                 r_udl.reactions[nid][dof], rel=1e-9, abs=1e-9,
             ), f"reaction mismatch at node {nid} dof {dof}"
-    # Recovered ``f_local`` is intentionally NOT compared: self-weight
-    # is added to global F, never attached as a member load, so the
-    # element's ``q = K·d − p_full`` recovery uses ``p_full = 0`` (vs.
-    # ``p_full = p_UDL`` for the UDL model). That separate asymmetry is
-    # tracked outside this PR; what the reviewer flagged — release-end
-    # moment FEF dropped from F at assembly — is what this test pins.
+    # End forces (local q = [N_i, V_i, M_i, N_j, V_j, M_j]) must also
+    # match: the postprocessor now folds the raw self-weight fixed-end
+    # vector into p_full for q = K·d − p recovery (see
+    # postprocessor.compute_member_forces).
+    f_sw = r_sw.member_results[1]["f_local"]
+    f_udl = r_udl.member_results[1]["f_local"]
+    for k in range(6):
+        assert f_sw[k] == pytest.approx(f_udl[k], rel=1e-9, abs=1e-9)
 
 
 def test_self_weight_released_end_has_zero_moment():

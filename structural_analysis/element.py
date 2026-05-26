@@ -211,12 +211,21 @@ class Element2D:
         R = self.transformation_matrix(nodes)
         return R.T @ k_local @ R, R.T @ p_local
 
-    def local_displacement_and_end_forces(self, nodes: dict, u_global_elem: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def local_displacement_and_end_forces(
+        self,
+        nodes: dict,
+        u_global_elem: np.ndarray,
+        p_extra_local: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Compute local displacements and member end forces.
 
         Args:
             nodes: Dict mapping node IDs to Node objects.
             u_global_elem: 6-element array of element global displacements.
+            p_extra_local: Optional extra fixed-end vector to include in
+                the recovery alongside ``local_consistent_load``. Used to
+                feed back transient loads (e.g. self-weight) that were
+                added to global F but are not stored on the element.
 
         Returns:
             Tuple (d_local, q_local) where d_local is the 6-element local
@@ -232,7 +241,10 @@ class Element2D:
         """
         R = self.transformation_matrix(nodes)
         d_local = R @ u_global_elem
-        q_local = self.raw_local_stiffness(nodes) @ d_local - self.local_consistent_load(nodes)
+        p_full = self.local_consistent_load(nodes)
+        if p_extra_local is not None:
+            p_full = p_full + np.asarray(p_extra_local, dtype=float)
+        q_local = self.raw_local_stiffness(nodes) @ d_local - p_full
         return d_local, q_local
 
 
@@ -476,7 +488,12 @@ class FrameElement2D(Element2D):
         p_out = self.condense_local_load_for_releases(p, nodes)
         return k_out, p_out
 
-    def local_displacement_and_end_forces(self, nodes: dict, u_global_elem: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def local_displacement_and_end_forces(
+        self,
+        nodes: dict,
+        u_global_elem: np.ndarray,
+        p_extra_local: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Recover local displacements and end forces (with back-substitution).
 
         For released elements, condensed-out rotational DOFs are recovered:
@@ -486,6 +503,10 @@ class FrameElement2D(Element2D):
         Args:
             nodes: Dict mapping node IDs to Node objects.
             u_global_elem: 6-element array of element global displacements.
+            p_extra_local: Optional extra raw (unreleased) fixed-end
+                vector folded into ``p_full``. Used to include self-weight
+                (or any other non-persisted member load) in both the
+                released-DOF back-substitution and the final ``q = K·d − p``.
 
         Returns:
             Tuple (d_local, q_local) where d_local includes recovered
@@ -495,6 +516,8 @@ class FrameElement2D(Element2D):
         d_from_global = R @ u_global_elem
         k_full = self.raw_local_stiffness(nodes)
         p_full = self.local_consistent_load(nodes)
+        if p_extra_local is not None:
+            p_full = p_full + np.asarray(p_extra_local, dtype=float)
         released = self._released_dofs()
         if not released:
             return d_from_global, k_full @ d_from_global - p_full
