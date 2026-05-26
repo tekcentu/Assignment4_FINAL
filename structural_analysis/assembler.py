@@ -30,8 +30,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .element import Element2D, FrameElement2D
-from .model import StructuralModel
+from .element import Element2D, FrameElement2D, TrussElement2D
+from .model import STANDARD_GRAVITY, StructuralModel
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -412,4 +412,75 @@ def assemble_global_system(
             "L": L, "c": c, "s": s,
         }
 
+    # Self-weight pass — applied directly to F, never persisted to the model.
+    if model.include_self_weight:
+        _apply_self_weight(model, dofs, F)
+
     return K, F, dofs, warnings, elem_data
+
+
+def _apply_self_weight(
+    model: StructuralModel,
+    dofs: DofManager,
+    F: np.ndarray,
+) -> None:
+    """Inject gravity loads on every element into the global F vector.
+
+    Gravity is hard-coded to global -Y at g = STANDARD_GRAVITY in v0.9.0.
+
+    Frame elements get a full local 6-DOF fixed-end force vector built
+    from the same equivalent-load sign convention as the UDL path in
+    ``FrameElement2D.assembled_local_stiffness_and_load`` (see
+    element.py UDL block) — i.e. ``p`` is the equivalent nodal load
+    that is *added* to F, not the fixed-end reaction. The local
+    components of gravity are derived from the element's orientation:
+    a body-force of magnitude ``w = ρ·A·g/1000`` (kN/m) in global -Y
+    projects to ``w_local_x = -w·sin θ`` (axial) and
+    ``w_local_y = -w·cos θ`` (transverse), then transformed back to
+    global via ``Rᵀ``.
+
+    Truss elements take half the bar weight lumped at each endpoint
+    in global -Y. This bypasses the existing TrussElement2D invariant
+    that rejects member loads (only TrussTemperatureLoad is allowed),
+    because the contribution is applied directly to F at the uy DOF
+    of each endpoint — no member-load object is ever attached.
+
+    Elements with ``ρ = 0`` or ``A = 0`` contribute nothing.
+    """
+    g = STANDARD_GRAVITY
+    for elem in model.elements:
+        rho = float(getattr(elem, "rho", 0.0))
+        A = float(getattr(elem, "A", 0.0))
+        if rho == 0.0 or A == 0.0:
+            continue
+
+        L, c, s = elem.length_cos_sin(model.nodes)
+        if L <= 0.0:
+            continue
+
+        w = rho * A * g / 1000.0  # kN/m, magnitude in global -Y
+
+        if isinstance(elem, FrameElement2D):
+            w_local_x = -w * s
+            w_local_y = -w * c
+            p_local = np.array([
+                w_local_x * L / 2.0,
+                w_local_y * L / 2.0,
+                w_local_y * L ** 2 / 12.0,
+                w_local_x * L / 2.0,
+                w_local_y * L / 2.0,
+                -w_local_y * L ** 2 / 12.0,
+            ])
+            R = elem.transformation_matrix(model.nodes)
+            p_global = R.T @ p_local
+            mapping = dofs.element_dof_map(elem)
+            for a, I in enumerate(mapping):
+                if I is None:
+                    continue
+                F[I] += p_global[a]
+        elif isinstance(elem, TrussElement2D):
+            half_kN = w * L / 2.0
+            for nid in (elem.node_i, elem.node_j):
+                idx = dofs.index(nid, "uy")
+                if idx is not None:
+                    F[idx] -= half_kN

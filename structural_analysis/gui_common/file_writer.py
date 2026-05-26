@@ -210,5 +210,13 @@ def write_input_file(model: StructuralModel, path: str) -> None:
             out.append(f"{eid}  {_fmt(t.t_top)}  {_fmt(t.t_bottom)}")
         out.append("")
 
+    # ANALYSIS_OPTIONS — only when at least one option differs from
+    # the default. Omitting the block on default models keeps every
+    # existing fixture's round-trip byte-identical.
+    if model.include_self_weight:
+        out.append("ANALYSIS_OPTIONS 1")
+        out.append("include_self_weight=true")
+        out.append("")
+
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out).rstrip() + "\n")
