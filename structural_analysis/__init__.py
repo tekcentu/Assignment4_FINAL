@@ -1,8 +1,8 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 __what_is_new__ = (
-    "element material override · per-element grade trials · effective material"
+    "element material override · safer delete & write guards · stricter parser"
 )
 
 from .model import (

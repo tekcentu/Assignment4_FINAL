@@ -386,10 +386,22 @@ class DeleteMaterialCmd(Command):
             raise ValueError(f"Material {self.material_id} does not exist.")
         used_by_sec = [s.id for s in model.sections.values()
                        if s.material_id == self.material_id]
-        if used_by_sec:
+        used_by_override = [
+            e.id for e in model.elements
+            if getattr(e, "material_id_override", None) == self.material_id
+        ]
+        if used_by_sec or used_by_override:
+            parts = []
+            if used_by_sec:
+                parts.append(f"section(s) {used_by_sec}")
+            if used_by_override:
+                parts.append(
+                    f"element override(s) {used_by_override}"
+                )
             raise ValueError(
-                f"Material {self.material_id} is in use by section(s) "
-                f"{used_by_sec}; delete those sections first."
+                f"Material {self.material_id} is in use by "
+                + " and ".join(parts)
+                + "; clear those references first."
             )
         self._saved = model.materials.pop(self.material_id)
 

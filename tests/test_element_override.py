@@ -34,6 +34,7 @@ from structural_analysis.file_io import read_input_file
 from structural_analysis.gui_common.commands import (
     AddOrUpdateMaterialCmd,
     AddOrUpdateSectionCmd,
+    DeleteMaterialCmd,
     UpdateElementCmd,
 )
 from structural_analysis.gui_common.file_writer import write_input_file
@@ -357,3 +358,91 @@ def test_section_edit_propagates_geometry_but_not_overrides():
     assert elem_default.E == pytest.approx(M2.E)
     assert elem_overridden.material_id_override == 2
     assert elem_default.material_id_override is None
+
+
+# ── PR #16 review-feedback regression tests ───────────────────
+
+
+def test_delete_material_blocked_by_element_override():
+    """DeleteMaterialCmd must refuse to delete a material that is
+    referenced *only* through ``elem.material_id_override`` (no section
+    points at it). Pre-fix, the check was section-only and would have
+    silently deleted M2, leaving elem 1's override dangling and the
+    next file write/load broken."""
+    m = _two_material_model()
+    # Override elem 1 onto M2. No section references M2 — the only
+    # remaining tether to M2 is the element override.
+    UpdateElementCmd(elem_id=1, section_id=1, kind="frame",
+                     material_override_id=2).do(m)
+    assert m.elements[0].material_id_override == 2
+    assert all(s.material_id != 2 for s in m.sections.values())
+
+    with pytest.raises(ValueError) as excinfo:
+        DeleteMaterialCmd(material_id=2).do(m)
+    msg = str(excinfo.value)
+    assert "element override" in msg.lower()
+    # M2 must still be present after the failed delete.
+    assert 2 in m.materials
+
+    # Clearing the override should allow the delete to succeed.
+    UpdateElementCmd(elem_id=1, section_id=1, kind="frame",
+                     material_override_id=None).do(m)
+    DeleteMaterialCmd(material_id=2).do(m)
+    assert 2 not in m.materials
+
+
+def test_writer_rejects_dangling_material_override():
+    """write_input_file must raise a clear error when an element carries
+    a ``material_id_override`` that is no longer in ``model.materials``,
+    rather than emitting a file that cannot be reloaded."""
+    m = _two_material_model()
+    UpdateElementCmd(elem_id=1, section_id=1, kind="frame",
+                     material_override_id=2).do(m)
+    # Simulate a desync (e.g. caused by a future bug that bypasses
+    # DeleteMaterialCmd) — drop M2 directly from the dict.
+    del m.materials[2]
+    assert m.elements[0].material_id_override == 2
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "out.txt")
+        with pytest.raises(ValueError) as excinfo:
+            write_input_file(m, path)
+        msg = str(excinfo.value)
+        assert "material override" in msg.lower()
+        assert "2" in msg
+        # Nothing should remain on disk for a half-written file —
+        # write_input_file writes via tmp+rename, so the destination
+        # must not exist after the failure.
+        assert not os.path.exists(path)
+
+
+def test_parser_rejects_unknown_positional_token_after_release():
+    """The ELEMENTS parser silently skipped any positional token past
+    the kind/release slots, so a typo like ``material_override_id 2``
+    (space instead of ``=``) would have produced an element with no
+    override and no warning. Now it must raise ``ValueError``."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "bad.txt")
+        with open(path, "w") as f:
+            f.write(
+                "TITLE bad-input\n"
+                "NODES 2\n"
+                "1  0.0  0.0\n"
+                "2  5.0  0.0\n"
+                "MATERIALS 1\n"
+                "1  2.0e8  1.0e-5  7850.0  Steel\n"
+                "SECTIONS 1\n"
+                "1  1  0.01  1.0e-4  0.1  S\n"
+                # `2` (the would-be override material id) is positional
+                # — the user forgot the `=`. Pre-fix this silently
+                # parsed as a regular FRAME element with no override.
+                "ELEMENTS 1\n"
+                "1  1  2  1  FRAME  material_override_id  2\n"
+                "SUPPORTS 1\n"
+                "1  1  1  1\n"
+            )
+        with pytest.raises(ValueError) as excinfo:
+            read_input_file(path)
+        msg = str(excinfo.value)
+        assert "Element 1" in msg
+        assert "positional" in msg.lower()

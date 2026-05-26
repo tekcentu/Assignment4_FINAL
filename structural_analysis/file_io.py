@@ -298,11 +298,25 @@ def read_input_file(filepath: str) -> StructuralModel:
                 # Trailing key=value kwargs. Currently only
                 # ``material_override_id`` is recognised; other unknown
                 # keys are rejected so typos surface immediately rather
-                # than silently being ignored.
+                # than silently being ignored. Positional tokens are only
+                # permitted at idx 4 (kind) and idx 5 (release) — any
+                # later non-``key=value`` token is an error so typos like
+                # ``material_override_id 2`` don't slip through silently.
                 material_override_id: int | None = None
-                for tok in parts[4:]:
+                for idx, tok in enumerate(parts[4:], start=4):
                     if "=" not in tok:
-                        continue
+                        positional_slot = (
+                            idx == 4
+                            or (idx == 5 and "=" not in parts[4])
+                        )
+                        if positional_slot:
+                            continue
+                        raise ValueError(
+                            f"Element {eid}: unexpected positional token "
+                            f"{tok!r}. After the optional kind/release "
+                            "tokens, all element options must be key=value "
+                            "pairs (e.g. material_override_id=2)."
+                        )
                     key, _, value = tok.partition("=")
                     key = key.strip().lower()
                     value = value.strip()
