@@ -471,6 +471,11 @@ def _apply_self_weight(
                 w_local_y * L / 2.0,
                 -w_local_y * L ** 2 / 12.0,
             ])
+            # Released rotational DOFs are unassembled (mapping[r]=None);
+            # without this Schur reduction the released-end moment FEF
+            # would be silently dropped instead of redistributed to the
+            # retained DOFs.
+            p_local = elem.condense_local_load_for_releases(p_local, model.nodes)
             R = elem.transformation_matrix(model.nodes)
             p_global = R.T @ p_local
             mapping = dofs.element_dof_map(elem)

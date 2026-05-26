@@ -419,6 +419,33 @@ class FrameElement2D(Element2D):
         if self.release_j: m[5] = None
         return m
 
+    def condense_local_load_for_releases(
+        self, p_local: np.ndarray, nodes: dict,
+    ) -> np.ndarray:
+        """Apply moment-release condensation to an arbitrary local load.
+
+        Same Schur-complement reduction as
+        ``assembled_local_stiffness_and_load``, but acting on any
+        fixed-fixed local 6-vector (member loads, self-weight, …):
+            p_c = p_a  − k_ab · k_bb⁻¹ · p_b   (released entries → 0)
+
+        Callers that build a self-weight or other equivalent nodal-load
+        vector outside ``local_consistent_load`` MUST route it through
+        this helper before transforming to global, otherwise released
+        rotational terms get silently dropped at assembly time.
+        """
+        released = self._released_dofs()
+        p_arr = np.asarray(p_local, dtype=float)
+        if not released:
+            return p_arr.copy()
+        retained = [i for i in range(6) if i not in released]
+        k = self.raw_local_stiffness(nodes)
+        kab = k[np.ix_(retained, released)]
+        kbb = k[np.ix_(released, released)]
+        p_out = np.zeros(6, dtype=float)
+        p_out[retained] = p_arr[retained] - kab @ np.linalg.solve(kbb, p_arr[released])
+        return p_out
+
     def assembled_local_stiffness_and_load(self, nodes: dict) -> tuple[np.ndarray, np.ndarray]:
         """Apply Schur-complement static condensation for moment releases.
 
@@ -445,9 +472,8 @@ class FrameElement2D(Element2D):
         kbb = k[np.ix_(released, released)]
         kbb_inv = np.linalg.inv(kbb)
         k_out = np.zeros_like(k)
-        p_out = np.zeros_like(p)
         k_out[np.ix_(retained, retained)] = kaa - kab @ kbb_inv @ kba
-        p_out[retained] = p[retained] - kab @ kbb_inv @ p[released]
+        p_out = self.condense_local_load_for_releases(p, nodes)
         return k_out, p_out
 
     def local_displacement_and_end_forces(self, nodes: dict, u_global_elem: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

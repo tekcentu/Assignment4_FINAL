@@ -347,6 +347,98 @@ def test_unknown_analysis_options_key_raises():
             read_input_file(path)
 
 
+# ── 11. self-weight + moment releases (PR #17 review fix) ─────
+
+
+def _released_beam_model(release_i: bool, release_j: bool):
+    """Horizontal pinned-fixed beam with optional moment releases at
+    each end. Identical to the helper above except for releases and a
+    second roller support so the model is still stable when both ends
+    are pinned/released."""
+    rho, A, I, L = 7850.0, 0.01, 1e-4, 5.0
+    m = StructuralModel(title="released-self-weight")
+    m.nodes[1] = Node(1, 0.0, 0.0)
+    m.nodes[2] = Node(2, L, 0.0)
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8,
+                              alpha=1.2e-5, density=rho)
+    m.sections[1] = Section(id=1, name="S", material_id=1,
+                            A=A, I=I, depth=0.3)
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=A, I=I, alpha=1.2e-5, rho=rho,
+        depth=0.3, section_id=1,
+        release_i=release_i, release_j=release_j,
+    ))
+    # Fixed at i, roller at j → stable for any release combo.
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    m.supports[2] = Support(node_id=2, ux=False, uy=True, rz=False)
+    return m, rho, A, L
+
+
+def test_self_weight_with_release_matches_equivalent_udl_with_release():
+    """Self-weight on a released-end frame must produce the SAME
+    reactions and end forces as an explicit UDL of the same magnitude
+    on the same released-end frame. Without Schur condensation of the
+    self-weight FEF, the released-end moment term would be silently
+    dropped at assembly and the reactions would diverge from the
+    UDL-path solution (which routes through the existing
+    ``assembled_local_stiffness_and_load`` condensation)."""
+    m_sw, rho, A, _ = _released_beam_model(release_i=False, release_j=True)
+    m_sw.include_self_weight = True
+    r_sw = run_analysis(m_sw, verbose=False)
+
+    m_udl, _, _, _ = _released_beam_model(release_i=False, release_j=True)
+    w = -rho * A * STANDARD_GRAVITY / 1000.0
+    m_udl.elements[0].member_loads.append(UniformDistributedLoad(wy=w))
+    r_udl = run_analysis(m_udl, verbose=False)
+
+    for nid in (1, 2):
+        # Roller nodes only carry the constrained DOFs in the dict.
+        assert r_sw.reactions[nid].keys() == r_udl.reactions[nid].keys()
+        for dof, val_sw in r_sw.reactions[nid].items():
+            assert val_sw == pytest.approx(
+                r_udl.reactions[nid][dof], rel=1e-9, abs=1e-9,
+            ), f"reaction mismatch at node {nid} dof {dof}"
+    # Recovered ``f_local`` is intentionally NOT compared: self-weight
+    # is added to global F, never attached as a member load, so the
+    # element's ``q = K·d − p_full`` recovery uses ``p_full = 0`` (vs.
+    # ``p_full = p_UDL`` for the UDL model). That separate asymmetry is
+    # tracked outside this PR; what the reviewer flagged — release-end
+    # moment FEF dropped from F at assembly — is what this test pins.
+
+
+def test_self_weight_released_end_has_zero_moment():
+    """The released end's moment in the recovered local end-force
+    vector must be ~0 (that is the definition of a moment release)."""
+    m, _, _, _ = _released_beam_model(release_i=False, release_j=True)
+    m.include_self_weight = True
+    r = run_analysis(m, verbose=False)
+    f_local = r.member_results[1]["f_local"]
+    # q_local = [N_i, V_i, M_i, N_j, V_j, M_j]; release_j → q[5] ≈ 0.
+    assert abs(f_local[5]) < 1e-8
+
+    m2, _, _, _ = _released_beam_model(release_i=True, release_j=False)
+    m2.include_self_weight = True
+    r2 = run_analysis(m2, verbose=False)
+    f2 = r2.member_results[1]["f_local"]
+    # release_i → q[2] ≈ 0.
+    assert abs(f2[2]) < 1e-8
+
+
+def test_self_weight_with_release_still_satisfies_vertical_equilibrium():
+    """ΣFy_reactions = total bar weight even with one end released —
+    proves condensation redistributes the released moment FEF without
+    leaking vertical load."""
+    m, rho, A, L = _released_beam_model(release_i=False, release_j=True)
+    m.include_self_weight = True
+    r = run_analysis(m, verbose=False)
+    W = _total_weight_kN(rho, A, L)
+    sum_uy = sum(
+        rxn["uy"] for rxn in r.reactions.values() if "uy" in rxn
+    )
+    assert sum_uy == pytest.approx(W, rel=1e-9, abs=1e-9)
+
+
 def test_unknown_analysis_options_bool_value_raises():
     text = (
         "TITLE\nx\n\n"
