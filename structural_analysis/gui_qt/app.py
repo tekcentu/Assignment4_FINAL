@@ -40,6 +40,7 @@ from ..model import AnalysisResult, Material, Section, StructuralModel
 from .. import __version__, __what_is_new__
 from ..gui_common.commands import (
     AddElementCmd,
+    AddMemberCmd,
     AddMemberLoadCmd,
     AddNodeCmd,
     AddOrUpdateMaterialCmd,
@@ -568,6 +569,16 @@ class MainWindow(QMainWindow):
         self.canvas.set_element_preview(start_node_id, end_x, end_y, kind)
         self.canvas.redraw()
 
+    def set_element_preview_free(
+        self,
+        start_x: float, start_y: float, end_x: float, end_y: float,
+        kind: str,
+    ) -> None:
+        self.canvas.set_element_preview_free(
+            start_x, start_y, end_x, end_y, kind,
+        )
+        self.canvas.redraw()
+
     def clear_element_preview(self) -> None:
         self.canvas.clear_element_preview()
         self.canvas.redraw()
@@ -633,12 +644,63 @@ class MainWindow(QMainWindow):
     def open_element_dialog_for_pair(
         self, n_i: int, n_j: int, kind: str | None = None
     ) -> None:
+        """Compat wrapper for the legacy two-existing-nodes click flow.
+
+        Looks up node coordinates and forwards to
+        :meth:`open_element_dialog_for_member`, which is the primary
+        entry point as of v0.10.0.
+        """
+        ni = self._model.nodes.get(n_i)
+        nj = self._model.nodes.get(n_j)
+        if ni is None or nj is None:
+            QMessageBox.warning(
+                self, "Cannot add element",
+                "One of the requested nodes no longer exists.",
+            )
+            return
+        self.open_element_dialog_for_member(
+            first_x=ni.x, first_y=ni.y, first_node_id=n_i,
+            second_x=nj.x, second_y=nj.y, second_node_id=n_j,
+            kind=kind,
+        )
+
+    def open_element_dialog_for_member(
+        self,
+        *,
+        first_x: float, first_y: float, first_node_id: int | None,
+        second_x: float, second_y: float, second_node_id: int | None,
+        kind: str | None = None,
+    ) -> None:
+        """Open the element-properties dialog for a member draw.
+
+        v0.10.0: ``first_node_id`` / ``second_node_id`` may be ``None``
+        when the click was on empty space; the underlying
+        :class:`AddMemberCmd` will reuse a nearby node (within 1e-9
+        world units) or allocate a new one.
+        """
         if not self._model.materials:
             QMessageBox.warning(
                 self, "No materials defined",
                 "Define a material first (Edit → Materials…) before placing elements.",
             )
             return
+
+        def _dispatch(
+            section_id: int,
+            effective_kind: str,
+            release_i: bool,
+            release_j: bool,
+            material_override_id: int | None,
+        ) -> None:
+            self.execute(AddMemberCmd(
+                x_i=first_x, y_i=first_y, node_i=first_node_id,
+                x_j=second_x, y_j=second_y, node_j=second_node_id,
+                section_id=section_id,
+                kind=effective_kind,
+                release_i=release_i,
+                release_j=release_j,
+                material_override_id=material_override_id,
+            ))
 
         # Sticky path: if a previous element-pair click checked "Remember",
         # reuse the remembered section + releases without re-opening the
@@ -661,20 +723,14 @@ class MainWindow(QMainWindow):
             else:
                 release_i = False
                 release_j = False
-            # Sticky override is only re-applied if the material still
-            # exists; otherwise drop it so we don't carry a stale id.
             sticky_override = sticky.get("material_override_id")
             if (sticky_override is not None
                     and sticky_override not in self._model.materials):
                 sticky_override = None
-            self.execute(AddElementCmd(
-                node_i=n_i, node_j=n_j,
-                section_id=sticky["section_id"],
-                kind=effective_kind,
-                release_i=release_i,
-                release_j=release_j,
-                material_override_id=sticky_override,
-            ))
+            _dispatch(
+                sticky["section_id"], effective_kind,
+                release_i, release_j, sticky_override,
+            )
             return
 
         try:
@@ -698,8 +754,6 @@ class MainWindow(QMainWindow):
                     "release_j": rv["release_j"],
                     "material_override_id": rv.get("material_override_id"),
                 }
-                # Hint the user that subsequent pair clicks will skip
-                # the dialog until they clear the setting.
                 sec = self._model.sections[rv["section_id"]]
                 label = (f"{rv['kind']} · section {sec.id}"
                          + (f" ({sec.name})" if sec.name else ""))
@@ -709,14 +763,11 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self._sticky_element = None
-            self.execute(AddElementCmd(
-                node_i=n_i, node_j=n_j,
-                section_id=rv["section_id"],
-                kind=rv["kind"],
-                release_i=rv["release_i"],
-                release_j=rv["release_j"],
-                material_override_id=rv.get("material_override_id"),
-            ))
+            _dispatch(
+                rv["section_id"], rv["kind"],
+                rv["release_i"], rv["release_j"],
+                rv.get("material_override_id"),
+            )
 
     def _forget_element_defaults(self) -> None:
         """Clear sticky element-creation settings so the next frame/truss

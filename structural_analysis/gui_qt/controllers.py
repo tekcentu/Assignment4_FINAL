@@ -11,7 +11,13 @@ from __future__ import annotations
 from typing import Optional, Protocol
 
 from .canvas import HitResult
-from ..gui_common.commands import AddElementCmd, AddNodeCmd, DeleteElementCmd, DeleteNodeCmd
+from ..gui_common.commands import (
+    NODE_COINCIDENCE_TOL,
+    AddElementCmd,
+    AddNodeCmd,
+    DeleteElementCmd,
+    DeleteNodeCmd,
+)
 
 
 class _Host(Protocol):
@@ -25,8 +31,19 @@ class _Host(Protocol):
     def open_element_dialog_for_pair(
         self, n_i: int, n_j: int, kind: str | None = None
     ) -> None: ...
+    def open_element_dialog_for_member(
+        self,
+        *,
+        first_x: float, first_y: float, first_node_id: int | None,
+        second_x: float, second_y: float, second_node_id: int | None,
+        kind: str | None = None,
+    ) -> None: ...
     def set_element_preview(self, start_node_id: int, end_x: float,
                             end_y: float, kind: str) -> None: ...
+    def set_element_preview_free(
+        self, start_x: float, start_y: float, end_x: float, end_y: float,
+        kind: str,
+    ) -> None: ...
     def clear_element_preview(self) -> None: ...
     def select_node(self, node_id: int) -> None: ...
     def select_element(self, element_id: int) -> None: ...
@@ -94,14 +111,22 @@ class _PairTool(Tool):
     def __init__(self, host: _Host, kind: str) -> None:
         super().__init__(host)
         self.kind = kind
-        self._first: Optional[int] = None
+        # v0.10.0: clicks can land on empty space, so we remember both
+        # the coordinates and the snapped node id (which may be None).
+        self._first: Optional[tuple[float, float, int | None]] = None
 
     @property
     def description(self) -> str:
         if self._first is None:
-            return f"{self.kind.capitalize()} tool: click the start node."
-        return (f"{self.kind.capitalize()} tool: click the end node "
-                f"(first = node {self._first}).")
+            return (
+                f"{self.kind.capitalize()} tool: click the start point. "
+                "Snaps to nodes; a new node is created if you click empty space."
+            )
+        ref = f"node {self._first[2]}" if self._first[2] is not None else "point"
+        return (
+            f"{self.kind.capitalize()} tool: click the end point "
+            f"(start = {ref})."
+        )
 
     def deactivate(self) -> None:
         self._first = None
@@ -110,28 +135,57 @@ class _PairTool(Tool):
     def on_click(self, hit: HitResult, button: str) -> None:
         if button != "left":
             return
-        if hit.node_id is None:
-            self.host.set_status(
-                f"Click an existing node to "
-                f"{'start' if self._first is None else 'finish'} the element."
-            )
-            return
         if self._first is None:
-            self._first = hit.node_id
-            self.host.set_element_preview(hit.node_id, hit.x, hit.y, self.kind)
+            self._first = (hit.x, hit.y, hit.node_id)
+            if hit.node_id is not None:
+                self.host.set_element_preview(
+                    hit.node_id, hit.x, hit.y, self.kind,
+                )
+            else:
+                self.host.set_element_preview_free(
+                    hit.x, hit.y, hit.x, hit.y, self.kind,
+                )
             self.host.set_status(self.description)
             return
-        if hit.node_id == self._first:
-            self.host.set_status("Start and end nodes must differ.")
+        first_x, first_y, first_id = self._first
+        # Guard against "click in the same spot twice" *before* opening
+        # the element-properties dialog — otherwise the user fills the
+        # dialog in, only to get an "element has zero length" error on
+        # accept. Cover both flavours:
+        #  - both clicks snapped to the same existing node (id == id)
+        #  - both clicks landed on empty space at coincident coords
+        #    (covers the case where neither end has a hinted node id
+        #    but the world coords are within NODE_COINCIDENCE_TOL).
+        same_node = (
+            first_id is not None
+            and hit.node_id is not None
+            and first_id == hit.node_id
+        )
+        same_point = (
+            abs(first_x - hit.x) < NODE_COINCIDENCE_TOL
+            and abs(first_y - hit.y) < NODE_COINCIDENCE_TOL
+        )
+        if same_node or same_point:
+            self.host.set_status("Start and end must be different points.")
             return
         self.host.clear_element_preview()
-        self.host.open_element_dialog_for_pair(self._first, hit.node_id, self.kind)
+        self.host.open_element_dialog_for_member(
+            first_x=first_x, first_y=first_y, first_node_id=first_id,
+            second_x=hit.x, second_y=hit.y, second_node_id=hit.node_id,
+            kind=self.kind,
+        )
         self._first = None
 
     def on_motion(self, hit: HitResult) -> None:
         if self._first is None:
             return
-        self.host.set_element_preview(self._first, hit.x, hit.y, self.kind)
+        first_x, first_y, first_id = self._first
+        if first_id is not None:
+            self.host.set_element_preview(first_id, hit.x, hit.y, self.kind)
+        else:
+            self.host.set_element_preview_free(
+                first_x, first_y, hit.x, hit.y, self.kind,
+            )
 
 
 class FrameTool(_PairTool):

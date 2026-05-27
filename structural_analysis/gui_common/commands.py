@@ -8,10 +8,19 @@ Invariant: each command captures the inverse-state it needs (via ``_previous``,
 ``_saved``, or ``_snapshot``) **before** it mutates the model, and performs all
 the reads it needs from the model (e.g. which sections own a material, which
 elements point at a section) before any writes. ``do()`` and ``undo()`` are
-inverses when ``do()`` completes successfully. If ``do()`` raises mid-mutation
-the controller must not push the command on the undo stack — the model layer
-trusts internal callers to pass well-formed data, so no transactional rollback
-is wired in.
+inverses when ``do()`` completes successfully.
+
+Most commands are single-mutation: if their ``do()`` raises mid-mutation, the
+controller must not push the command on the undo stack — the model layer trusts
+internal callers to pass well-formed data, so no transactional rollback is
+wired in at the framework level.
+
+Composite commands are the exception. :class:`AddMemberCmd` (v0.10.0) auto-
+creates up to two nodes before delegating element creation to
+:class:`AddElementCmd`; if the inner element step raises, ``AddMemberCmd.do()``
+rolls back any nodes it created in the same call so the model is left in its
+pre-``do`` state. New composite commands should follow that pattern explicitly
+in their docstring + implementation rather than relying on framework support.
 """
 
 from __future__ import annotations
@@ -32,6 +41,17 @@ from ..model import (
 
 if TYPE_CHECKING:
     from ..model import MemberLoad
+
+
+# World-unit tolerance for "are these two coordinates the same node?"
+# Shared by AddNodeCmd's add-time block and AddMemberCmd's
+# snap-or-reuse classifier so the two cannot drift apart. Future
+# composite commands that allocate nodes should use this same
+# constant. Note: the snap engine uses a *pixel*-space radius (10 px,
+# see structural_analysis/gui_qt/snap.py) which is a different
+# concern (visual targeting) — that one should not consume this
+# constant.
+NODE_COINCIDENCE_TOL: float = 1e-9
 
 
 class Command:
@@ -67,7 +87,8 @@ class AddNodeCmd(Command):
         if self.node_id in model.nodes:
             raise ValueError(f"Node id {self.node_id} already exists.")
         for n in model.nodes.values():
-            if abs(n.x - self.x) < 1e-9 and abs(n.y - self.y) < 1e-9:
+            if (abs(n.x - self.x) < NODE_COINCIDENCE_TOL
+                    and abs(n.y - self.y) < NODE_COINCIDENCE_TOL):
                 raise ValueError(
                     f"A node already exists at ({self.x}, {self.y}) "
                     f"(id {n.id})."
@@ -220,6 +241,136 @@ class AddElementCmd(Command):
 
     def undo(self, model: StructuralModel) -> None:
         model.elements = [e for e in model.elements if e.id != self.elem_id]
+
+
+@dataclass
+class AddMemberCmd(Command):
+    """Composite: snap-or-create node A, snap-or-create node B, add element.
+
+    Used by the Frame / Truss tools when the user draws a member by
+    clicking two points (v0.10.0). Each click is either over an
+    existing node (``node_i`` / ``node_j`` set to that node's id) or
+    over empty space (``None``). For each ``None`` end, ``do`` first
+    looks for an existing node within ``1e-9`` of the requested
+    coordinate and reuses it (matches the add-time coincidence block in
+    :class:`AddNodeCmd`); only if no match exists does it allocate a
+    new node id and add the node.
+
+    Element creation is then delegated to :class:`AddElementCmd` so the
+    section / material / release / zero-length / duplicate-element
+    rules stay defined in exactly one place.
+
+    do / undo are atomic: a failure mid-``do`` rolls back any nodes
+    this command auto-created; ``undo`` removes the element and then
+    any auto-created node whose id is no longer referenced by some
+    other element / support / nodal load (defensive against a user
+    interleaving an unrelated edit between this draw and its undo).
+    """
+
+    x_i: float
+    y_i: float
+    x_j: float
+    y_j: float
+    kind: str  # "frame" or "truss"
+    section_id: int
+    release_i: bool = False
+    release_j: bool = False
+    material_override_id: int | None = None
+    node_i: int | None = None  # if set, reuse this node id
+    node_j: int | None = None
+    elem_id: int | None = None
+
+    _created_node_i: int | None = field(default=None, init=False)
+    _created_node_j: int | None = field(default=None, init=False)
+    _inner: "AddElementCmd | None" = field(default=None, init=False)
+    description: str = "add member"
+
+    @staticmethod
+    def _find_or_create(
+        model: StructuralModel,
+        x: float,
+        y: float,
+        hinted_id: int | None,
+    ) -> tuple[int, bool]:
+        """Return ``(node_id, was_created)`` for the given coordinate.
+
+        Priority: explicit ``hinted_id`` (from the snap engine) → an
+        existing node within :data:`NODE_COINCIDENCE_TOL` of ``(x, y)``
+        → allocate a new id. The same tolerance is used by
+        :class:`AddNodeCmd` so the two paths cannot drift.
+        """
+        if hinted_id is not None and hinted_id in model.nodes:
+            return hinted_id, False
+        for n in model.nodes.values():
+            if (abs(n.x - x) < NODE_COINCIDENCE_TOL
+                    and abs(n.y - y) < NODE_COINCIDENCE_TOL):
+                return n.id, False
+        new_id = _next_id(model.nodes)
+        model.nodes[new_id] = Node(new_id, float(x), float(y))
+        return new_id, True
+
+    def do(self, model: StructuralModel) -> None:
+        # Reset bookkeeping so a redo (do → undo → do) doesn't
+        # accumulate stale state from the previous do().
+        self._created_node_i = None
+        self._created_node_j = None
+        self._inner = None
+        try:
+            resolved_i, created_i = self._find_or_create(
+                model, self.x_i, self.y_i, self.node_i,
+            )
+            if created_i:
+                self._created_node_i = resolved_i
+            resolved_j, created_j = self._find_or_create(
+                model, self.x_j, self.y_j, self.node_j,
+            )
+            if created_j:
+                self._created_node_j = resolved_j
+            inner = AddElementCmd(
+                node_i=resolved_i,
+                node_j=resolved_j,
+                section_id=self.section_id,
+                kind=self.kind,
+                release_i=self.release_i,
+                release_j=self.release_j,
+                material_override_id=self.material_override_id,
+                elem_id=self.elem_id,
+            )
+            inner.do(model)
+            self.elem_id = inner.elem_id
+            self._inner = inner
+        except Exception:
+            # Roll back any nodes we auto-created in this do() call,
+            # newest first. AddElementCmd raised before mutating
+            # model.elements, so element rollback is a no-op.
+            for nid in (self._created_node_j, self._created_node_i):
+                if nid is not None:
+                    model.nodes.pop(nid, None)
+            self._created_node_i = None
+            self._created_node_j = None
+            self._inner = None
+            raise
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._inner is not None:
+            self._inner.undo(model)
+        # Remove auto-created nodes, but only if nothing else now
+        # depends on them. A node we created may have been attached to
+        # by a later element / support / nodal load between this draw
+        # and its undo; in that case leaving it preserves the user's
+        # later work.
+        for nid in (self._created_node_j, self._created_node_i):
+            if nid is None or nid not in model.nodes:
+                continue
+            if any(
+                e.node_i == nid or e.node_j == nid for e in model.elements
+            ):
+                continue
+            if nid in model.supports:
+                continue
+            if any(ld.node_id == nid for ld in model.nodal_loads):
+                continue
+            del model.nodes[nid]
 
 
 @dataclass

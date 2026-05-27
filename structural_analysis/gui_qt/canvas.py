@@ -85,7 +85,14 @@ class ModelCanvas(QWidget):
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
+        # Either anchored at an existing node id (legacy) or a free
+        # start point (v0.10.0 — first click landed on empty space and
+        # no node has been created yet). Exactly one is non-None at a
+        # time.
         self._element_preview: tuple[int, float, float, str] | None = None
+        self._element_preview_free: (
+            tuple[float, float, float, float, str] | None
+        ) = None
         self._selected_node_id: int | None = None
         self._selected_element_id: int | None = None
         # Per-element max / min markers on the currently-drawn moment /
@@ -170,13 +177,34 @@ class ModelCanvas(QWidget):
     def set_element_preview(
         self, start_node_id: int, end_x: float, end_y: float, kind: str
     ) -> None:
-        """Show a temporary member preview while placing a frame/truss."""
+        """Show a temporary member preview anchored at an existing node."""
         self._element_preview = (
             int(start_node_id), float(end_x), float(end_y), str(kind)
         )
+        self._element_preview_free = None
+
+    def set_element_preview_free(
+        self,
+        start_x: float, start_y: float, end_x: float, end_y: float,
+        kind: str,
+    ) -> None:
+        """Show a temporary member preview when the start is empty space.
+
+        v0.10.0: the Frame / Truss tools now accept a first click on
+        empty space (a node will be auto-created on the second click).
+        While only the first click has landed, there is no existing
+        node id to anchor the preview to.
+        """
+        self._element_preview_free = (
+            float(start_x), float(start_y),
+            float(end_x), float(end_y),
+            str(kind),
+        )
+        self._element_preview = None
 
     def clear_element_preview(self) -> None:
         self._element_preview = None
+        self._element_preview_free = None
 
     def select_node(self, node_id: int) -> None:
         self._selected_node_id = int(node_id)
@@ -543,17 +571,21 @@ class ModelCanvas(QWidget):
                      markeredgewidth=1.5, alpha=0.7, zorder=10)
 
     def _draw_element_preview(self) -> None:
-        if self._element_preview is None:
-            return
-        start_node_id, end_x, end_y, kind = self._element_preview
-        start = self._model().nodes.get(start_node_id)
-        if start is None:
+        if self._element_preview is not None:
+            start_node_id, end_x, end_y, kind = self._element_preview
+            start = self._model().nodes.get(start_node_id)
+            if start is None:
+                return
+            start_x, start_y = start.x, start.y
+        elif self._element_preview_free is not None:
+            start_x, start_y, end_x, end_y, kind = self._element_preview_free
+        else:
             return
         is_frame = kind == "frame"
         color = "#1f77b4" if is_frame else "#d62728"
         linestyle = "-" if is_frame else "--"
         self.ax.plot(
-            [start.x, end_x], [start.y, end_y],
+            [start_x, end_x], [start_y, end_y],
             color=color, linestyle=linestyle, linewidth=2.4,
             alpha=0.55, zorder=3,
         )
@@ -562,6 +594,14 @@ class ModelCanvas(QWidget):
             markerfacecolor="white", markeredgecolor=color,
             alpha=0.85, zorder=9,
         )
+        if self._element_preview_free is not None:
+            # Mark the free start point too (no real node there yet),
+            # so the user has visual confirmation of click 1.
+            self.ax.plot(
+                start_x, start_y, marker="o", markersize=5,
+                markerfacecolor="white", markeredgecolor=color,
+                alpha=0.85, zorder=9,
+            )
 
     def _draw_selection(self) -> None:
         model = self._model()

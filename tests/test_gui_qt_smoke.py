@@ -84,17 +84,31 @@ def test_truss_tool_passes_truss_kind_to_element_dialog(qt_app):
         1: Node(1, 0.0, 0.0),
         2: Node(2, 2.0, 0.0),
     }
-    seen: list[tuple[int, int, str | None]] = []
+    seen: list[dict] = []
 
-    def fake_open(n_i, n_j, kind=None):
-        seen.append((n_i, n_j, kind))
+    def fake_open(
+        *,
+        first_x, first_y, first_node_id,
+        second_x, second_y, second_node_id,
+        kind=None,
+    ):
+        seen.append({
+            "first_node_id": first_node_id,
+            "second_node_id": second_node_id,
+            "kind": kind,
+        })
 
-    w.open_element_dialog_for_pair = fake_open
+    # v0.10.0: _PairTool now routes through open_element_dialog_for_member
+    # (the kwarg-only successor of open_element_dialog_for_pair, which
+    # is kept as a thin shim for back-compat callers).
+    w.open_element_dialog_for_member = fake_open
     w._select_tool("truss")
     w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
     w._on_canvas_click(HitResult(x=2.0, y=0.0, node_id=2), "left")
 
-    assert seen == [(1, 2, "truss")]
+    assert seen == [{
+        "first_node_id": 1, "second_node_id": 2, "kind": "truss",
+    }]
 
 
 def test_canvas_draws_origin_axes(qt_app):
@@ -1967,3 +1981,111 @@ def test_joint_masses_window_lumped_radio_zeros_rotational_cells(qt_app):
         assert text in ("—", "0.0000", "0.000e+00"), (
             f"row {r} rz expected zero on lumped, got {text!r}"
         )
+
+
+def test_frame_tool_draws_member_with_two_empty_clicks(qt_app):
+    """v0.10.0 Stage A end-to-end: select Frame tool, click two empty
+    grid points, dialog accepts defaults, assert 2 nodes + 1 element
+    appear in the model and one Ctrl+Z removes the entire draw."""
+    from structural_analysis.model import Material, Section
+
+    w = MainWindow()
+    qt_app.processEvents()
+
+    # Need a material and a section so the element dialog has something
+    # to default to; otherwise open_element_dialog_for_member would
+    # warn-and-return.
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    # Take the dialog-less sticky path so the smoke test doesn't have
+    # to drive a modal QDialog. This is the same code path the user
+    # hits after one "Remember" tick.
+    w._sticky_element = {
+        "kind": "frame",
+        "section_id": 1,
+        "release_i": False,
+        "release_j": False,
+        "material_override_id": None,
+    }
+
+    w._select_tool("frame")
+    qt_app.processEvents()
+    n0 = len(w._model.nodes)
+    e0 = len(w._model.elements)
+    # Click 1 — empty grid point.
+    w._on_canvas_click(HitResult(x=0.0, y=0.0), "left")
+    qt_app.processEvents()
+    # Still no element yet (first click is just the start point).
+    assert len(w._model.elements) == e0
+    # Click 2 — another empty grid point.
+    w._on_canvas_click(HitResult(x=5.0, y=0.0), "left")
+    qt_app.processEvents()
+
+    assert len(w._model.nodes) == n0 + 2
+    assert len(w._model.elements) == e0 + 1
+    elem = w._model.elements[-1]
+    nodes = [w._model.nodes[elem.node_i], w._model.nodes[elem.node_j]]
+    coords = {(n.x, n.y) for n in nodes}
+    assert coords == {(0.0, 0.0), (5.0, 0.0)}
+
+    # One undo removes the whole draw atomically.
+    w._do_undo()
+    qt_app.processEvents()
+    assert len(w._model.nodes) == n0
+    assert len(w._model.elements) == e0
+
+
+def test_frame_tool_same_empty_point_twice_short_circuits_before_dialog(qt_app):
+    """PR #20 review fix: clicking the same empty point twice with the
+    Frame tool must short-circuit *before* opening the element-
+    properties dialog. Otherwise the user fills the dialog in only to
+    see the AddMemberCmd zero-length error on accept.
+
+    The controller-layer short-circuit lives in
+    :meth:`_PairTool.on_click`; this test asserts the dispatch method
+    is never called when both clicks land on coincident empty space.
+    """
+    from structural_analysis.model import Material, Section
+
+    w = MainWindow()
+    qt_app.processEvents()
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+
+    calls: list[dict] = []
+
+    def fake_open(
+        *,
+        first_x, first_y, first_node_id,
+        second_x, second_y, second_node_id,
+        kind=None,
+    ):
+        calls.append({
+            "first": (first_x, first_y, first_node_id),
+            "second": (second_x, second_y, second_node_id),
+            "kind": kind,
+        })
+
+    w.open_element_dialog_for_member = fake_open
+    w._select_tool("frame")
+    w._on_canvas_click(HitResult(x=2.5, y=1.0), "left")
+    qt_app.processEvents()
+    # Second click at the same world coords — no node anywhere yet,
+    # so both hits have node_id=None. The short-circuit must catch
+    # this before fake_open ever runs.
+    w._on_canvas_click(HitResult(x=2.5, y=1.0), "left")
+    qt_app.processEvents()
+
+    assert calls == [], (
+        "open_element_dialog_for_member was called for a same-point "
+        "double click; the controller should have short-circuited"
+    )
+    # Model is untouched.
+    assert len(w._model.nodes) == 0
+    assert len(w._model.elements) == 0
