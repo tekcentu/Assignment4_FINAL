@@ -2112,6 +2112,78 @@ def _stage_c_seed_frame(w, qt_app) -> int:
     return w._model.elements[0].id
 
 
+def test_node_tool_splits_even_when_snap_kind_is_not_project(qt_app):
+    """Regression — user-reported bug after PR #21 first cut: the snap
+    engine often picks GRID (priority 1) or returns no candidate over
+    PROJECT (priority 4), so real clicks on an element interior arrive
+    at the controller with ``snap_kind != "project"`` even though
+    ``hit.element_id`` is set (the canvas fallback at canvas.py:465-484
+    also produces this shape). The split must still fire — the
+    controller projects (hit.x, hit.y) onto the element in world space
+    rather than trusting snap_kind."""
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+
+    w._select_tool("node")
+    qt_app.processEvents()
+    # The grid-snap fallback path arrives with snap_kind="" — the bug
+    # the user actually hit. element_id is set because the canvas
+    # element-pick fell back to ELEM_PICK_RADIUS_PX.
+    w._on_canvas_click(
+        HitResult(x=3.0, y=0.0, element_id=parent_id, snap_kind=""),
+        "left",
+    )
+    qt_app.processEvents()
+    assert len(w._model.nodes) == 3
+    assert parent_id not in [e.id for e in w._model.elements]
+    assert len(w._model.elements) == 2
+
+
+def test_node_tool_midpoint_snap_also_splits(qt_app):
+    """Symmetric — midpoint snap (snap_kind='midpoint', priority 3)
+    routes through the same split path. MIDPOINT wins over PROJECT
+    when the cursor is near the geometric midpoint of an element."""
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+
+    w._select_tool("node")
+    qt_app.processEvents()
+    w._on_canvas_click(
+        HitResult(x=3.0, y=0.0, element_id=parent_id, snap_kind="midpoint"),
+        "left",
+    )
+    qt_app.processEvents()
+    assert len(w._model.nodes) == 3
+    assert parent_id not in [e.id for e in w._model.elements]
+
+
+def test_node_tool_click_far_off_element_does_not_split(qt_app):
+    """The world-space projection check rejects clicks whose perpendicular
+    projection lands outside (ELEMENT_SPLIT_TOL, 1 - ELEMENT_SPLIT_TOL).
+    Even with element_id set (canvas fallback), if the projected t is
+    near 0 or 1 we should NOT split — the user is trying to add a node
+    near an endpoint, not bisect."""
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+
+    w._select_tool("node")
+    qt_app.processEvents()
+    # Click at world (-1, 0) — projects to t = -1/6 < 0, outside the
+    # strict interior. Should fall through to AddNodeCmd.
+    w._on_canvas_click(
+        HitResult(x=-1.0, y=0.0, element_id=parent_id, snap_kind=""),
+        "left",
+    )
+    qt_app.processEvents()
+    # Original element still here, new free node added.
+    assert parent_id in [e.id for e in w._model.elements]
+    assert len(w._model.elements) == 1
+    assert len(w._model.nodes) == 3
+
+
 def test_node_tool_click_on_element_interior_splits_via_project_snap(qt_app):
     """v0.11.0: clicking the interior of an existing element with the
     Node tool fires SplitElementCmd, not AddNodeCmd. The model gains

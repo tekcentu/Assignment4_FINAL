@@ -12,6 +12,7 @@ from typing import Optional, Protocol
 
 from .canvas import HitResult
 from ..gui_common.commands import (
+    ELEMENT_SPLIT_TOL,
     NODE_COINCIDENCE_TOL,
     AddElementCmd,
     AddNodeCmd,
@@ -19,6 +20,7 @@ from ..gui_common.commands import (
     DeleteNodeCmd,
     SplitElementCmd,
 )
+from ..gui_common.geometry import project_point_on_segment
 
 
 class _Host(Protocol):
@@ -95,20 +97,46 @@ class SelectTool(Tool):
             self.host.clear_selection()
 
 
-def _is_project_snap(hit: HitResult) -> bool:
-    """True when the click landed on an existing element's interior.
+def _split_target_for(
+    hit: HitResult, host: "_Host",
+) -> tuple[int, float, float] | None:
+    """Resolve a click to a split target ``(element_id, x_world, y_world)``.
 
-    The snap engine sets ``snap_kind == "project"`` only when the
-    perpendicular foot from the cursor falls strictly inside the
-    segment (parametric ``0 < t < 1`` in pixel space, see
-    ``snap.py:175-187``) — so `(hit.x, hit.y)` is the projected world
-    point and `hit.element_id` is the parent element.
+    Returns ``None`` when the click is not on an element interior —
+    i.e. either ``hit.element_id`` is missing entirely (click on
+    empty space / grid intersection / a node), or the click's world
+    coordinates project to a parametric position outside the strict
+    interior ``(ELEMENT_SPLIT_TOL, 1 - ELEMENT_SPLIT_TOL)`` of the
+    referenced element.
+
+    The geometric check is necessary because the snap engine
+    (``gui_qt/snap.py``) gives GRID priority 1 and PROJECT priority
+    4 (snap.py:30-37), so most clicks near a grid line win a "grid"
+    snap and never advertise `snap_kind == "project"` even when
+    visually on top of an element. The canvas fallback path
+    (canvas.py:465-484) also sets ``hit.element_id`` without setting
+    ``snap_kind``. Trusting ``hit.element_id`` + a world-space
+    projection covers both paths.
     """
-    return (
-        hit.node_id is None
-        and hit.element_id is not None
-        and hit.snap_kind == "project"
+    if hit.node_id is not None or hit.element_id is None:
+        return None
+    model = host.model()
+    elem = next(
+        (e for e in model.elements if e.id == hit.element_id),
+        None,
     )
+    if elem is None:
+        return None
+    ni = model.nodes.get(elem.node_i)
+    nj = model.nodes.get(elem.node_j)
+    if ni is None or nj is None:
+        return None
+    proj_x, proj_y, t = project_point_on_segment(
+        hit.x, hit.y, ni.x, ni.y, nj.x, nj.y,
+    )
+    if t <= ELEMENT_SPLIT_TOL or t >= 1.0 - ELEMENT_SPLIT_TOL:
+        return None
+    return (hit.element_id, proj_x, proj_y)
 
 
 class NodeTool(Tool):
@@ -124,11 +152,16 @@ class NodeTool(Tool):
         # v0.11.0: clicking an existing element's interior splits the
         # element at the projected point — otherwise the user gets a
         # node that looks "on" the element but isn't connected to it
-        # (the disconnected-component bug PR #21 fixes).
-        if _is_project_snap(hit):
+        # (the disconnected-component bug PR #21 fixes). We project
+        # in world space rather than trusting hit.snap_kind because
+        # the snap engine's GRID priority (1) beats PROJECT (4) for
+        # most clicks near a grid line, leaving snap_kind != "project"
+        # even when the cursor is visually on the element.
+        target = _split_target_for(hit, self.host)
+        if target is not None:
+            elem_id, x_world, y_world = target
             self.host.execute(SplitElementCmd(
-                element_id=hit.element_id,
-                x=hit.x, y=hit.y,
+                element_id=elem_id, x=x_world, y=y_world,
             ))
             return
         self.host.execute(AddNodeCmd(x=hit.x, y=hit.y))
@@ -177,10 +210,12 @@ class _PairTool(Tool):
         the undo stack (two splits + one member); each is
         individually undoable.
         """
-        if not _is_project_snap(hit):
+        target = _split_target_for(hit, self.host)
+        if target is None:
             return (hit.x, hit.y, hit.node_id)
+        elem_id, x_world, y_world = target
         cmd = SplitElementCmd(
-            element_id=hit.element_id, x=hit.x, y=hit.y,
+            element_id=elem_id, x=x_world, y=y_world,
         )
         self.host.execute(cmd)
         if cmd._resolved_node_c is None:
@@ -189,7 +224,7 @@ class _PairTool(Tool):
             # message via QMessageBox.warning, so we just signal
             # cancel to the caller.
             return None
-        return (hit.x, hit.y, cmd._resolved_node_c)
+        return (x_world, y_world, cmd._resolved_node_c)
 
     def on_click(self, hit: HitResult, button: str) -> None:
         if button != "left":
