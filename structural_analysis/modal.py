@@ -6,6 +6,15 @@ carrying natural frequencies (Hz), periods (s), angular frequencies
 (rad/s) and full-length mode-shape vectors (with zeros at restrained
 DOFs so they can be drawn directly on top of the model geometry).
 
+Two mass formulations are supported (v0.9.2). ``"consistent"`` is the
+default and is unchanged from v0.9.1. ``"lumped"`` is a comparison aid:
+it assembles a translational-only mass matrix (zero on every rotational
+DOF) and statically condenses the massless DOFs out of the eigenproblem
+(Guyan reduction). With lumped mass this condensation is mathematically
+exact — massless DOFs carry zero kinetic energy and therefore move
+quasi-statically with the mass DOFs — so the recovered mode shapes
+remain valid full-DOF vectors.
+
 A dedicated result object is used instead of overloading
 :class:`AnalysisResult` (which stays bound to static analysis) — the
 GUI dispatches on the result type.
@@ -14,13 +23,29 @@ GUI dispatches on the result type.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 import scipy.linalg
 
 from .assembler import DofManager, assemble_global_system
-from .mass import assemble_mass_matrix
+from .mass import MassFormulation, assemble_mass_matrix
 from .model import StructuralModel
+
+
+# Relative tolerance used to classify free DOFs as "mass-bearing" vs
+# "massless" when condensing on the lumped path. The classifier
+# compares each diagonal of M_ff against this fraction of the largest
+# diagonal — so a numerically dirty 1e-14 entry from R.T M R doesn't
+# get mistaken for real mass.
+_LUMPED_MASS_REL_TOL: float = 1e-12
+
+LUMPED_COMPARISON_NOTE: str = (
+    "Lumped translational mass is a comparison aid. Agreement with "
+    "external software depends on matching units, density/mass source, "
+    "section properties, mesh, boundary conditions, restraints, and "
+    "mass formulation."
+)
 
 
 @dataclass
@@ -45,6 +70,9 @@ class ModalResult:
             (max-absolute-component = 1).
         dofs: The :class:`DofManager` used so callers can map mode
             entries back to (node_id, dof) tuples.
+        mass_formulation: ``"consistent"`` (default) or ``"lumped"`` —
+            records which modal mass matrix produced these frequencies
+            so the GUI / report can display it.
     """
 
     status: str = "ok"
@@ -57,12 +85,119 @@ class ModalResult:
     modes: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
     normalisation: str = "mass"
     dofs: DofManager | None = None
+    mass_formulation: MassFormulation = "consistent"
+
+
+def _solve_modal_condensed(
+    K_ff: np.ndarray,
+    M_ff: np.ndarray,
+    n_modes_request: int,
+) -> tuple[np.ndarray, np.ndarray, int, list[str]]:
+    """Static-condensation eigensolver for singular (lumped) M_ff.
+
+    Partitions free DOFs into mass-bearing (``m``) and massless (``r``)
+    using a relative tolerance on ``diag(M_ff)``. Solves the condensed
+    problem ``(K_mm − K_mr K_rr⁻¹ K_rm) u_m = ω² M_mm u_m`` and then
+    reconstructs ``u_r = −K_rr⁻¹ K_rm u_m`` so the returned eigenvectors
+    are full free-DOF vectors and can drop straight into
+    ``modes_full[free_idx, :]`` without changes to downstream code.
+
+    Returns:
+        ``(eigvals, eigvecs_free, n_modes, info_messages)`` where
+        ``eigvecs_free`` is ``n_free × n_modes``.
+
+    Raises:
+        ValueError: If no mass-bearing free DOF is detected, or if the
+            massless-stiffness block ``K_rr`` is singular / ill-
+            conditioned (a model whose massless DOFs are not rigidly
+            coupled to the mass DOFs cannot be condensed). The error
+            text is suitable for surfacing to the user.
+    """
+    n_free = K_ff.shape[0]
+    diag_M = np.diag(M_ff)
+    diag_max = float(np.max(diag_M)) if n_free else 0.0
+    if diag_max <= 0.0:
+        raise ValueError(
+            "Lumped modal: every free DOF is massless. Check that "
+            "elements connected to free DOFs have positive ρ and A."
+        )
+    tol = _LUMPED_MASS_REL_TOL * diag_max
+    mass_local = np.where(diag_M > tol)[0]
+    rest_local = np.where(diag_M <= tol)[0]
+    if mass_local.size == 0:
+        raise ValueError(
+            "Lumped modal: no mass-bearing free DOFs after applying "
+            "tolerance. Check ρ, A, and supports."
+        )
+
+    K_mm = K_ff[np.ix_(mass_local, mass_local)]
+    M_mm = M_ff[np.ix_(mass_local, mass_local)]
+
+    if rest_local.size == 0:
+        # No condensation needed — every free DOF carries mass.
+        eigvals, eigvecs_mm = scipy.linalg.eigh(K_mm, M_mm)
+        eigvecs_free = np.zeros((n_free, eigvecs_mm.shape[1]))
+        eigvecs_free[mass_local, :] = eigvecs_mm
+        n_avail = eigvals.size
+        n_modes = max(1, min(n_modes_request, n_avail))
+        return eigvals[:n_modes], eigvecs_free[:, :n_modes], n_modes, []
+
+    K_rr = K_ff[np.ix_(rest_local, rest_local)]
+    K_rm = K_ff[np.ix_(rest_local, mass_local)]
+    K_mr = K_ff[np.ix_(mass_local, rest_local)]
+
+    # K_rr⁻¹ K_rm via solve (never inv).
+    try:
+        # Symmetrise for the Cholesky/Bunch-Kaufman path; K_rr is a
+        # submatrix of a symmetric PSD K so should already be symmetric
+        # to numerical noise.
+        K_rr_sym = 0.5 * (K_rr + K_rr.T)
+        Krr_inv_Krm = scipy.linalg.solve(
+            K_rr_sym, K_rm, assume_a="sym",
+        )
+    except (np.linalg.LinAlgError, ValueError) as exc:
+        raise ValueError(
+            "Lumped modal: massless-DOF stiffness block K_rr is "
+            "singular or ill-conditioned, so the rotational DOFs "
+            "cannot be condensed out. The structure may have an "
+            "unconstrained rotational DOF (e.g. a hinge with no "
+            "translational mass attached). Either pin / restrain the "
+            "DOF or use the Consistent mass formulation."
+        ) from exc
+
+    K_cond = K_mm - K_mr @ Krr_inv_Krm
+    K_cond = 0.5 * (K_cond + K_cond.T)
+
+    eigvals, eigvecs_mm = scipy.linalg.eigh(K_cond, M_mm)
+
+    n_avail = eigvals.size
+    n_modes = max(1, min(n_modes_request, n_avail))
+    eigvals = eigvals[:n_modes]
+    eigvecs_mm = eigvecs_mm[:, :n_modes]
+
+    # u_r = −K_rr⁻¹ K_rm u_m — quasi-static recovery on the massless
+    # block so the returned mode shapes are full free-DOF vectors.
+    eigvecs_rr = -Krr_inv_Krm @ eigvecs_mm
+
+    eigvecs_free = np.zeros((n_free, n_modes))
+    eigvecs_free[mass_local, :] = eigvecs_mm
+    eigvecs_free[rest_local, :] = eigvecs_rr
+
+    info: list[str] = []
+    if n_modes_request > n_avail:
+        info.append(
+            f"Lumped modal: requested {n_modes_request} modes, returned "
+            f"{n_modes} (number of mass-bearing free DOFs)."
+        )
+    return eigvals, eigvecs_free, n_modes, info
 
 
 def solve_modal(
     model: StructuralModel,
     n_modes: int = 6,
     normalisation: str = "mass",
+    *,
+    mass_formulation: MassFormulation = "consistent",
 ) -> ModalResult:
     """Run a free-vibration analysis and return a :class:`ModalResult`.
 
@@ -77,10 +212,14 @@ def solve_modal(
     Args:
         model: The structural model to analyse.
         n_modes: Maximum number of modes to return. Capped at the number
-            of free DOFs.
+            of free DOFs (consistent) or mass-bearing free DOFs
+            (lumped).
         normalisation: ``"mass"`` (default — eigenvectors satisfy
             ``φᵀ·M·φ = 1``) or ``"max"`` (each mode scaled so the
             largest absolute entry is 1).
+        mass_formulation: ``"consistent"`` (default — unchanged from
+            v0.9.1) or ``"lumped"`` (translational-only mass matrix,
+            rotational DOFs condensed out via Guyan reduction).
 
     Returns:
         A populated :class:`ModalResult`.
@@ -88,11 +227,19 @@ def solve_modal(
     Raises:
         ValueError: If no element carries a positive material density
             (so the global mass matrix would be zero and no vibration
-            problem is defined), or if ``normalisation`` is unknown.
+            problem is defined), if ``normalisation`` or
+            ``mass_formulation`` is unknown, or if the lumped path
+            cannot be condensed (no mass-bearing free DOFs / singular
+            massless-DOF stiffness block).
     """
     if normalisation not in ("mass", "max"):
         raise ValueError(
             f"Unknown normalisation {normalisation!r}; expected 'mass' or 'max'."
+        )
+    if mass_formulation not in ("consistent", "lumped"):
+        raise ValueError(
+            f"Unknown mass formulation {mass_formulation!r}; "
+            "expected 'consistent' or 'lumped'."
         )
 
     if not any(getattr(elem, "rho", 0.0) > 0.0 for elem in model.elements):
@@ -103,7 +250,7 @@ def solve_modal(
         )
 
     K, _F, dofs, warnings, _elem_data = assemble_global_system(model)
-    M = assemble_mass_matrix(model, dofs)
+    M = assemble_mass_matrix(model, dofs, formulation=mass_formulation)
 
     free = list(dofs.free_indices)
     if not free:
@@ -114,19 +261,25 @@ def solve_modal(
     K_ff = K[np.ix_(free, free)]
     M_ff = M[np.ix_(free, free)]
 
-    eigvals, eigvecs = scipy.linalg.eigh(K_ff, M_ff)
+    extra_warnings: list[str] = []
+    if mass_formulation == "lumped":
+        eigvals, modes_free, n_modes_returned, extra_warnings = (
+            _solve_modal_condensed(K_ff, M_ff, n_modes)
+        )
+    else:
+        eigvals_all, eigvecs_all = scipy.linalg.eigh(K_ff, M_ff)
+        n_avail = eigvals_all.size
+        n_modes_returned = max(1, min(n_modes, n_avail))
+        eigvals = eigvals_all[:n_modes_returned]
+        modes_free = eigvecs_all[:, :n_modes_returned].copy()
 
     # Small negative numerical noise on near-rigid-body modes.
     eigvals = np.maximum(eigvals, 0.0)
     omegas = np.sqrt(eigvals)
-    n_avail = len(omegas)
-    n_modes = max(1, min(n_modes, n_avail))
 
-    omegas = omegas[:n_modes]
     freqs = omegas / (2.0 * np.pi)
     with np.errstate(divide="ignore"):
         periods = np.where(freqs > 0.0, 1.0 / np.where(freqs == 0.0, 1.0, freqs), np.inf)
-    modes_free = eigvecs[:, :n_modes].copy()
 
     if normalisation == "max":
         for k in range(modes_free.shape[1]):
@@ -135,19 +288,24 @@ def solve_modal(
                 modes_free[:, k] = modes_free[:, k] / peak
 
     n_total = dofs.n_total
-    modes_full = np.zeros((n_total, n_modes))
+    modes_full = np.zeros((n_total, n_modes_returned))
     free_idx = np.array(free, dtype=int)
     modes_full[free_idx, :] = modes_free
+
+    combined_warnings = list(warnings) + extra_warnings
+    if mass_formulation == "lumped":
+        combined_warnings.append(LUMPED_COMPARISON_NOTE)
 
     return ModalResult(
         status="ok",
         title=model.title,
-        warnings=list(warnings),
-        n_modes=n_modes,
+        warnings=combined_warnings,
+        n_modes=n_modes_returned,
         frequencies=freqs,
         periods=periods,
         omegas=omegas,
         modes=modes_full,
         normalisation=normalisation,
         dofs=dofs,
+        mass_formulation=mass_formulation,
     )

@@ -336,6 +336,30 @@ class FrameElement2D(Element2D):
             [  0.0, -13.0*L,  -3.0*L2,  0.0,  -22.0*L,   4.0*L2],
         ])
 
+    def lumped_mass_local(self, nodes: dict) -> np.ndarray:
+        """Translational-only lumped mass matrix for a 2D beam-column.
+
+        Half the total bar mass m = ρ·A·L is placed at each end node
+        on the ux and uy DOFs; rotational θ DOFs receive zero mass.
+        The translational block is isotropic (m/2 · I₂), so the global
+        matrix is rotation-invariant — R.T M_loc R returns the same
+        matrix. The modal solver detects the zero rz diagonals and
+        condenses them out (Guyan reduction), see solve_modal.
+        """
+        L, _, _ = self.length_cos_sin(nodes)
+        rho_consistent = self.rho / 1000.0
+        m_bar = rho_consistent * self.A
+        if m_bar <= 0.0:
+            return np.zeros((6, 6))
+        half = 0.5 * m_bar * L
+        M = np.zeros((6, 6))
+        # ux_i, uy_i at node i ; ux_j, uy_j at node j ; θ slots stay 0.
+        M[0, 0] = half
+        M[1, 1] = half
+        M[3, 3] = half
+        M[4, 4] = half
+        return M
+
     def local_consistent_load(self, nodes: dict) -> np.ndarray:
         """Compute equivalent nodal loads from member loads (fixed-fixed).
 
@@ -599,6 +623,26 @@ class TrussElement2D(Element2D):
             [0.0, 1.0, 0.0, 0.0, 2.0, 0.0],
             [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         ])
+
+    def lumped_mass_local(self, nodes: dict) -> np.ndarray:
+        """Translational-only lumped mass matrix for a 2D truss bar.
+
+        Same diagonal pattern as the frame case: half the total bar
+        mass at each end on ux and uy. The rotational slots remain
+        zero (truss already has no rotational DOF at assembly time).
+        """
+        L, _, _ = self.length_cos_sin(nodes)
+        rho_consistent = self.rho / 1000.0
+        m_bar = rho_consistent * self.A
+        if m_bar <= 0.0:
+            return np.zeros((6, 6))
+        half = 0.5 * m_bar * L
+        M = np.zeros((6, 6))
+        M[0, 0] = half
+        M[1, 1] = half
+        M[3, 3] = half
+        M[4, 4] = half
+        return M
 
     def local_consistent_load(self, nodes: dict) -> np.ndarray:
         """Compute thermal fixed-end forces for truss elements.

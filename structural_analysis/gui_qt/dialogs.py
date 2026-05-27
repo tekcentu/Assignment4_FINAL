@@ -1521,10 +1521,26 @@ class ModalAnalysisDialog(_ModalDialog):
         self._norm_combo.addItem("Max-component = 1", "max")
         form.addRow("Normalisation", self._norm_combo)
 
+        # Mass formulation. Consistent is the default and unchanged
+        # from v0.9.1; lumped translational is a comparison aid that
+        # condenses rotational DOFs out of the modal eigenproblem.
+        self._mass_combo = QComboBox(body)
+        self._mass_combo.addItem(
+            "Consistent element mass", "consistent",
+        )
+        self._mass_combo.addItem(
+            "Lumped translational mass  (comparison aid)", "lumped",
+        )
+        form.addRow("Mass formulation", self._mass_combo)
+
         note = QLabel(
             "Modal analysis requires a positive density on every "
             "element's material.\nSet density (kg/m³) on each Material "
-            "via Edit → Materials and sections.",
+            "via Edit → Materials and sections.\n\n"
+            "Lumped translational mass is a comparison aid. Agreement "
+            "with external software depends on matching units, "
+            "density/mass source, section properties, mesh, boundary "
+            "conditions, restraints, and mass formulation.",
             body,
         )
         note.setWordWrap(True)
@@ -1535,7 +1551,12 @@ class ModalAnalysisDialog(_ModalDialog):
         if n < 1:
             raise ValueError("Number of modes must be at least 1.")
         norm = self._norm_combo.currentData()
-        return {"n_modes": n, "normalisation": norm}
+        mass_formulation = self._mass_combo.currentData()
+        return {
+            "n_modes": n,
+            "normalisation": norm,
+            "mass_formulation": mass_formulation,
+        }
 
 
 # ── read-only property inspectors (left-click in Select tool) ──

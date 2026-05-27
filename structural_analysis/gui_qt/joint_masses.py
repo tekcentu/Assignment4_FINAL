@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..mass import MassFormulation
 from ..mass_inspect import JointMassReport, Method, joint_mass_table
 from ..model import StructuralModel
 
@@ -80,6 +81,7 @@ class JointMassesWindow(QMainWindow):
 
         self._model_provider = model_provider
         self._method: Method = "row_sum"
+        self._mass_formulation: MassFormulation = "consistent"
 
         central = QWidget(self)
         root = QVBoxLayout(central)
@@ -111,6 +113,28 @@ class JointMassesWindow(QMainWindow):
         self._close_btn.clicked.connect(self.close)
         header_row.addWidget(self._close_btn)
         root.addLayout(header_row)
+
+        # Second header row — mass formulation selector. Mirrors the
+        # modal-analysis dialog so users can preview the lumped M
+        # before solving modal with it.
+        formulation_row = QHBoxLayout()
+        formulation_row.addWidget(
+            QLabel("Mass formulation:", central),
+        )
+        self._formulation_group = QButtonGroup(self)
+        self._rb_consistent = QRadioButton("Consistent element mass", central)
+        self._rb_lumped = QRadioButton(
+            "Lumped translational mass  (comparison aid)", central,
+        )
+        self._rb_consistent.setChecked(True)
+        self._formulation_group.addButton(self._rb_consistent)
+        self._formulation_group.addButton(self._rb_lumped)
+        self._rb_consistent.toggled.connect(self._on_formulation_changed)
+        self._rb_lumped.toggled.connect(self._on_formulation_changed)
+        formulation_row.addWidget(self._rb_consistent)
+        formulation_row.addWidget(self._rb_lumped)
+        formulation_row.addStretch(1)
+        root.addLayout(formulation_row)
 
         self._disclosure_label = QLabel(_DISCLOSURE, central)
         self._disclosure_label.setWordWrap(True)
@@ -154,7 +178,11 @@ class JointMassesWindow(QMainWindow):
         """Re-read the model and re-populate the table + totals."""
         model = self._model_provider()
         try:
-            report = joint_mass_table(model, method=self._method)
+            report = joint_mass_table(
+                model,
+                method=self._method,
+                mass_formulation=self._mass_formulation,
+            )
         except Exception as exc:
             # Mid-edit dangling references (missing node / zero-length
             # element) shouldn't crash a non-modal window.
@@ -211,6 +239,14 @@ class JointMassesWindow(QMainWindow):
         if not checked:
             return
         self._method = "row_sum" if self._rb_rowsum.isChecked() else "diagonal"
+        self.refresh()
+
+    def _on_formulation_changed(self, checked: bool) -> None:
+        if not checked:
+            return
+        self._mass_formulation = (
+            "consistent" if self._rb_consistent.isChecked() else "lumped"
+        )
         self.refresh()
 
     def _populate(self, report: JointMassReport) -> None:

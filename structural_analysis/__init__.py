@@ -1,8 +1,8 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 __what_is_new__ = (
-    "assembled joint masses · consistent-mass diagnostics"
+    "modal mass formulation · lumped translational comparison aid"
 )
 
 from .model import (

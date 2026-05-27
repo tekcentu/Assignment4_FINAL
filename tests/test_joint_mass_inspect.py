@@ -288,3 +288,34 @@ def test_joint_mass_table_never_invokes_solve_modal(monkeypatch):
     # Must not raise.
     report = joint_mass_table(m, method="row_sum")
     assert report.warning is None
+
+
+# ── 7. v0.9.2 mass-formulation pass-through ──────────────────
+
+
+def test_joint_mass_table_lumped_zeros_rotational_cells():
+    """v0.9.2: with mass_formulation="lumped", every rz cell is 0.0,
+    and the report's formulation label flips."""
+    m, L, rho, A = _single_frame_model(L=5.0)
+    report = joint_mass_table(m, method="row_sum", mass_formulation="lumped")
+    assert report.formulation == "Lumped translational mass"
+
+    # rz cell on the free node (node 2) is 0.0 under lumped.
+    free_row = next(r for r in report.rows if r.node_id == 2)
+    rz = free_row.values["rz"]
+    assert isinstance(rz, float)
+    assert rz == pytest.approx(0.0, abs=1e-12)
+
+    # Translational totals still match ρ·A·L (translational mass is
+    # preserved in both formulations).
+    expected_kg = rho * A * L
+    assert report.totals_kg["ux"] == pytest.approx(expected_kg, rel=1e-9)
+    assert report.totals_kg["uy"] == pytest.approx(expected_kg, rel=1e-9)
+    # And rz column total is zero.
+    assert report.totals_kg["rz"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_joint_mass_table_unknown_formulation_raises():
+    m, _, _, _ = _single_frame_model()
+    with pytest.raises(ValueError, match="Unknown mass formulation"):
+        joint_mass_table(m, mass_formulation="hrz")  # type: ignore[arg-type]
