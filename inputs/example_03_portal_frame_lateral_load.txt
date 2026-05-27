@@ -28,3 +28,6 @@ SUPPORTS 2
 LOADS 2
 4  50.0  -20.0  0.0
 3  0.0  -20.0  0.0
+
+ANALYSIS_OPTIONS 1
+include_self_weight=true
