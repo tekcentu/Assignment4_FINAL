@@ -21,12 +21,21 @@ from __future__ import annotations
 
 import pytest
 
+from structural_analysis.element import FrameElement2D, TrussElement2D
 from structural_analysis.gui_common.commands import (
     AddMemberCmd,
     AddNodeCmd,
+    SplitElementCmd,
 )
 from structural_analysis.model import (
-    Material, Section, StructuralModel, Support,
+    FrameTemperatureLoad,
+    Material,
+    PointLoad,
+    Section,
+    StructuralModel,
+    Support,
+    TrussTemperatureLoad,
+    UniformDistributedLoad,
 )
 
 
@@ -269,3 +278,185 @@ def test_undo_preserves_auto_created_node_if_later_referenced():
     auto_j = cmd_member._created_node_j
     assert auto_j is not None
     assert auto_j not in m.nodes
+
+
+# ── SplitElementCmd (PR #21 Stage C) ─────────────────────────
+
+
+def _frame_model_one_member(
+    *,
+    release_i: bool = False,
+    release_j: bool = False,
+) -> tuple[StructuralModel, int]:
+    """Return (model, element_id) with a single 6 m horizontal frame
+    from (0,0) to (6,0) and a real material+section. Optional release
+    flags so the release-preservation test can flex them."""
+    m = _model_with_material_and_section()
+    AddMemberCmd(
+        x_i=0.0, y_i=0.0, x_j=6.0, y_j=0.0,
+        kind="frame", section_id=1,
+        release_i=release_i, release_j=release_j,
+    ).do(m)
+    assert len(m.elements) == 1
+    return m, m.elements[0].id
+
+
+def _truss_model_one_member() -> tuple[StructuralModel, int]:
+    m = _model_with_material_and_section()
+    AddMemberCmd(
+        x_i=0.0, y_i=0.0, x_j=4.0, y_j=0.0,
+        kind="truss", section_id=1,
+    ).do(m)
+    return m, m.elements[0].id
+
+
+def test_split_frame_at_midspan_creates_two_children_and_one_new_node():
+    m, eid = _frame_model_one_member()
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    # Parent gone, two children present.
+    assert eid not in [e.id for e in m.elements]
+    assert len(m.elements) == 2
+    # One new node at the midpoint.
+    assert len(m.nodes) == 3
+    new_node = m.nodes[cmd._created_node_c]
+    assert (new_node.x, new_node.y) == (3.0, 0.0)
+    # Children chain through the new node.
+    a, b = m.elements
+    assert a.node_j == new_node.id
+    assert b.node_i == new_node.id
+
+
+def test_split_frame_copies_section_material_overrides_and_inner_end_releases():
+    """The user's contract: outer-end releases stay on the matching
+    child, inner ends get no release."""
+    m, eid = _frame_model_one_member(release_i=True, release_j=True)
+    # Add a second material and set it as override on the parent so
+    # we can verify it propagates to the children.
+    m.materials[2] = Material(id=2, name="Alt", E=1.5e8, density=2400.0)
+    parent = m.elements[0]
+    parent.material_id_override = 2
+
+    cmd = SplitElementCmd(element_id=eid, x=2.0, y=0.0)
+    cmd.do(m)
+    a, b = m.elements
+    # Property propagation.
+    assert a.section_id == parent.section_id == 1
+    assert b.section_id == parent.section_id == 1
+    assert a.material_id_override == 2
+    assert b.material_id_override == 2
+    # Inner-end-loses-release: A's outer end (node_i) keeps the
+    # release; A's inner end (node_j == C) loses it. Same for B.
+    assert isinstance(a, FrameElement2D)
+    assert isinstance(b, FrameElement2D)
+    assert (a.release_i, a.release_j) == (True, False)
+    assert (b.release_i, b.release_j) == (False, True)
+
+
+def test_split_truss_preserves_kind():
+    m, eid = _truss_model_one_member()
+    cmd = SplitElementCmd(element_id=eid, x=2.0, y=0.0)
+    cmd.do(m)
+    a, b = m.elements
+    assert isinstance(a, TrussElement2D)
+    assert isinstance(b, TrussElement2D)
+
+
+def test_split_then_undo_restores_parent_and_removes_auto_node():
+    m, eid = _frame_model_one_member()
+    snapshot_nodes = sorted(m.nodes.keys())
+    snapshot_elem_ids = [e.id for e in m.elements]
+    snapshot_elem_ends = [(e.node_i, e.node_j) for e in m.elements]
+
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    cmd.undo(m)
+
+    assert sorted(m.nodes.keys()) == snapshot_nodes
+    assert [e.id for e in m.elements] == snapshot_elem_ids
+    assert [(e.node_i, e.node_j) for e in m.elements] == snapshot_elem_ends
+    # And redo recovers the split state exactly.
+    cmd.do(m)
+    assert len(m.elements) == 2
+
+
+def test_split_too_close_to_endpoint_raises_and_leaves_model_clean():
+    m, eid = _frame_model_one_member()
+    # ELEMENT_SPLIT_TOL is 1e-6 on parametric t; on a 6 m bar that's
+    # 6e-6 m. A click at world-x = 1e-7 puts t ≈ 1.7e-8 — well below
+    # the tolerance.
+    cmd = SplitElementCmd(element_id=eid, x=1e-7, y=0.0)
+    with pytest.raises(ValueError, match="too close to an endpoint"):
+        cmd.do(m)
+    # Model unchanged.
+    assert len(m.elements) == 1
+    assert len(m.nodes) == 2
+
+
+def test_split_off_the_segment_raises_when_t_outside_unit_interval():
+    """The strict-interior tolerance also rejects t < 0 and t > 1
+    (caller may have asked for a split point past either endpoint).
+    The current implementation lumps this under the same 'too close
+    to an endpoint' message — accept either wording."""
+    m, eid = _frame_model_one_member()
+    with pytest.raises(ValueError):
+        SplitElementCmd(element_id=eid, x=-1.0, y=0.0).do(m)
+    assert len(m.elements) == 1
+    with pytest.raises(ValueError):
+        SplitElementCmd(element_id=eid, x=7.0, y=0.0).do(m)
+    assert len(m.elements) == 1
+
+
+@pytest.mark.parametrize(
+    "load_factory, kind",
+    [
+        (lambda: UniformDistributedLoad(wy=-5.0), "frame"),
+        (lambda: PointLoad(py=-10.0, a=2.0), "frame"),
+        (lambda: FrameTemperatureLoad(t_top=20.0, t_bottom=10.0), "frame"),
+    ],
+)
+def test_split_blocked_when_frame_has_member_load(load_factory, kind):
+    m, eid = _frame_model_one_member()
+    m.elements[0].member_loads.append(load_factory())
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    with pytest.raises(ValueError, match="member loads"):
+        cmd.do(m)
+    # Model entirely untouched — same node + element count, no
+    # auto-created node, no children.
+    assert len(m.elements) == 1
+    assert len(m.nodes) == 2
+
+
+def test_split_blocked_when_truss_has_thermal_load():
+    m, eid = _truss_model_one_member()
+    m.elements[0].member_loads.append(TrussTemperatureLoad(delta_T=15.0))
+    with pytest.raises(ValueError, match="member loads"):
+        SplitElementCmd(element_id=eid, x=2.0, y=0.0).do(m)
+    assert len(m.elements) == 1
+    assert len(m.nodes) == 2
+
+
+def test_split_missing_element_id_raises():
+    m = _model_with_material_and_section()
+    with pytest.raises(ValueError, match="does not exist"):
+        SplitElementCmd(element_id=99, x=0.0, y=0.0).do(m)
+
+
+def test_split_undo_preserves_auto_node_if_later_attached():
+    """If the user splits, then attaches a support / nodal load to
+    the auto-created mid node, undoing the split must leave that
+    node alive — same defensive rule as AddMemberCmd."""
+    m, eid = _frame_model_one_member()
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    mid = cmd._created_node_c
+    assert mid is not None
+    # Pretend the user added a support at the mid node.
+    m.supports[mid] = Support(node_id=mid, ux=True, uy=True, rz=True)
+
+    cmd.undo(m)
+    # Parent restored, children gone — but the mid node survives
+    # because the support depended on it.
+    assert mid in m.nodes
+    assert len(m.elements) == 1
+    assert m.elements[0].id == eid

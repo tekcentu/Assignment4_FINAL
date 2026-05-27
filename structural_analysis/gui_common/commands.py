@@ -53,6 +53,39 @@ if TYPE_CHECKING:
 # constant.
 NODE_COINCIDENCE_TOL: float = 1e-9
 
+# Parametric-`t` tolerance for "is this click on an element interior
+# vs. close enough to an endpoint to be that endpoint?" Used by
+# SplitElementCmd to reject splits within ELEMENT_SPLIT_TOL of either
+# end. Deliberately separate from NODE_COINCIDENCE_TOL — the two
+# answer different questions (parametric-along-element vs. world-unit
+# point equality) and may need to evolve independently.
+ELEMENT_SPLIT_TOL: float = 1e-6
+
+
+def _find_or_create_node(
+    model: StructuralModel,
+    x: float,
+    y: float,
+    hinted_id: int | None,
+) -> tuple[int, bool]:
+    """Return ``(node_id, was_created)`` for the given coordinate.
+
+    Priority: explicit ``hinted_id`` (e.g. from the snap engine) → an
+    existing node within :data:`NODE_COINCIDENCE_TOL` of ``(x, y)`` →
+    allocate a new id and add the node. Composite commands
+    (``AddMemberCmd``, ``SplitElementCmd``) share this so the two
+    paths cannot drift.
+    """
+    if hinted_id is not None and hinted_id in model.nodes:
+        return hinted_id, False
+    for n in model.nodes.values():
+        if (abs(n.x - x) < NODE_COINCIDENCE_TOL
+                and abs(n.y - y) < NODE_COINCIDENCE_TOL):
+            return n.id, False
+    new_id = _next_id(model.nodes)
+    model.nodes[new_id] = Node(new_id, float(x), float(y))
+    return new_id, True
+
 
 class Command:
     """Abstract base. Subclasses implement ``do`` and ``undo``."""
@@ -285,6 +318,10 @@ class AddMemberCmd(Command):
     _inner: "AddElementCmd | None" = field(default=None, init=False)
     description: str = "add member"
 
+    # _find_or_create lifted to module-level _find_or_create_node so
+    # SplitElementCmd shares the same reuse-or-allocate rules. Kept
+    # this stub for any external caller that imported the static
+    # method; delegates to the shared helper.
     @staticmethod
     def _find_or_create(
         model: StructuralModel,
@@ -292,22 +329,7 @@ class AddMemberCmd(Command):
         y: float,
         hinted_id: int | None,
     ) -> tuple[int, bool]:
-        """Return ``(node_id, was_created)`` for the given coordinate.
-
-        Priority: explicit ``hinted_id`` (from the snap engine) → an
-        existing node within :data:`NODE_COINCIDENCE_TOL` of ``(x, y)``
-        → allocate a new id. The same tolerance is used by
-        :class:`AddNodeCmd` so the two paths cannot drift.
-        """
-        if hinted_id is not None and hinted_id in model.nodes:
-            return hinted_id, False
-        for n in model.nodes.values():
-            if (abs(n.x - x) < NODE_COINCIDENCE_TOL
-                    and abs(n.y - y) < NODE_COINCIDENCE_TOL):
-                return n.id, False
-        new_id = _next_id(model.nodes)
-        model.nodes[new_id] = Node(new_id, float(x), float(y))
-        return new_id, True
+        return _find_or_create_node(model, x, y, hinted_id)
 
     def do(self, model: StructuralModel) -> None:
         # Reset bookkeeping so a redo (do → undo → do) doesn't
@@ -316,12 +338,12 @@ class AddMemberCmd(Command):
         self._created_node_j = None
         self._inner = None
         try:
-            resolved_i, created_i = self._find_or_create(
+            resolved_i, created_i = _find_or_create_node(
                 model, self.x_i, self.y_i, self.node_i,
             )
             if created_i:
                 self._created_node_i = resolved_i
-            resolved_j, created_j = self._find_or_create(
+            resolved_j, created_j = _find_or_create_node(
                 model, self.x_j, self.y_j, self.node_j,
             )
             if created_j:
@@ -371,6 +393,230 @@ class AddMemberCmd(Command):
             if any(ld.node_id == nid for ld in model.nodal_loads):
                 continue
             del model.nodes[nid]
+
+
+_SPLIT_BLOCKED_LOADS_MSG: str = (
+    "This element has member loads. Splitting loaded elements requires "
+    "load remapping and is not implemented yet."
+)
+
+
+@dataclass
+class SplitElementCmd(Command):
+    """Replace element A→B with A→C and C→B, where C is the projected click.
+
+    Used when the user clicks an existing element's interior with the
+    Node tool or as a member-draw endpoint (v0.11.0). The split point
+    is computed by projecting ``(x, y)`` onto the parent element's
+    segment in world space; the parametric position must satisfy
+    ``ELEMENT_SPLIT_TOL < t < 1 - ELEMENT_SPLIT_TOL`` or the command
+    raises (the controller is expected to have routed near-endpoint
+    clicks to a node-reuse path instead).
+
+    Member-load policy (v1, per PR #21 design): if the parent element
+    has any entries in ``member_loads``, the command raises with a
+    clear message and the model is left untouched. Splitting with a
+    proper load remap is a follow-up.
+
+    Composite-rollback contract (mirrors :class:`AddMemberCmd`): any
+    mutation a failing ``do()`` may have performed is undone before
+    the exception propagates, so the controller never sees a
+    half-split model. ``undo()`` removes the two child elements,
+    re-inserts the parent at its original index, then conditionally
+    removes the auto-created node C (only if nothing else has come to
+    depend on it in the meantime).
+    """
+
+    element_id: int
+    x: float
+    y: float
+    node_id: int | None = None  # if set, reuse this node id as C
+
+    _saved_parent: object | None = field(default=None, init=False)
+    _saved_parent_index: int = field(default=-1, init=False)
+    _created_node_c: int | None = field(default=None, init=False)
+    _resolved_node_c: int | None = field(default=None, init=False)
+    _child_a_id: int | None = field(default=None, init=False)
+    _child_b_id: int | None = field(default=None, init=False)
+    description: str = "split element"
+
+    def do(self, model: StructuralModel) -> None:
+        # Reset bookkeeping so redo (do → undo → do) doesn't carry
+        # stale state from the previous do().
+        self._saved_parent = None
+        self._saved_parent_index = -1
+        self._created_node_c = None
+        self._resolved_node_c = None
+        self._child_a_id = None
+        self._child_b_id = None
+
+        # Local import keeps the model→commands dependency direction
+        # unchanged (commands.py never imports gui_qt).
+        from .geometry import project_point_on_segment
+
+        parent_idx = next(
+            (i for i, e in enumerate(model.elements)
+             if e.id == self.element_id),
+            -1,
+        )
+        if parent_idx < 0:
+            raise ValueError(
+                f"Element {self.element_id} does not exist; cannot split."
+            )
+        parent = model.elements[parent_idx]
+
+        if getattr(parent, "member_loads", None):
+            raise ValueError(_SPLIT_BLOCKED_LOADS_MSG)
+
+        ni = model.nodes.get(parent.node_i)
+        nj = model.nodes.get(parent.node_j)
+        if ni is None or nj is None:
+            raise ValueError(
+                f"Element {self.element_id} references a missing node; "
+                "cannot split."
+            )
+
+        proj_x, proj_y, t = project_point_on_segment(
+            self.x, self.y, ni.x, ni.y, nj.x, nj.y,
+        )
+        if t <= ELEMENT_SPLIT_TOL or t >= 1.0 - ELEMENT_SPLIT_TOL:
+            raise ValueError(
+                f"Split point is too close to an endpoint of element "
+                f"{self.element_id} (t={t:.6g}); reuse the endpoint "
+                "node instead."
+            )
+
+        # Resolve / create node C. Auto-create is the common path; an
+        # explicit node_id is supported so the controller can pass a
+        # snapped node when the click hits a node-on-element.
+        resolved_c, created_c = _find_or_create_node(
+            model, proj_x, proj_y, self.node_id,
+        )
+        if created_c:
+            self._created_node_c = resolved_c
+        self._resolved_node_c = resolved_c
+
+        if resolved_c == parent.node_i or resolved_c == parent.node_j:
+            # Tolerance race: ELEMENT_SPLIT_TOL passed but the
+            # projected point coincided with an endpoint within
+            # NODE_COINCIDENCE_TOL. Roll back the auto-created node
+            # and bail.
+            if self._created_node_c is not None:
+                model.nodes.pop(self._created_node_c, None)
+                self._created_node_c = None
+            self._resolved_node_c = None
+            raise ValueError(
+                "Split point coincides with an existing endpoint "
+                f"node of element {self.element_id}; reuse that node "
+                "instead."
+            )
+
+        try:
+            child_a, child_b = self._build_children(parent, resolved_c, model)
+        except Exception:
+            # _build_children allocates two new element ids but does
+            # not append to model.elements until both succeed; the
+            # only side effect on failure is the auto-created node.
+            if self._created_node_c is not None:
+                model.nodes.pop(self._created_node_c, None)
+                self._created_node_c = None
+            self._resolved_node_c = None
+            raise
+
+        # Atomically swap parent for the two children at parent's
+        # original slot. Append-then-pop would also work but leaves a
+        # bigger gap in the iteration order.
+        self._saved_parent = parent
+        self._saved_parent_index = parent_idx
+        model.elements[parent_idx:parent_idx + 1] = [child_a, child_b]
+        self._child_a_id = child_a.id
+        self._child_b_id = child_b.id
+
+    def _build_children(
+        self,
+        parent,
+        node_c: int,
+        model: StructuralModel,
+    ) -> tuple[object, object]:
+        """Construct A→C and C→B elements with parent's properties.
+
+        Per the inner-end-loses-release rule: ``release_i`` of A→C
+        inherits from the parent's ``release_i``; ``release_j`` of A→C
+        is False (the inner end of A→C is at C). Similarly C→B's
+        ``release_i`` at C is False; its ``release_j`` is the parent's
+        ``release_j``. Truss children carry no release fields.
+        """
+        # Reserve two distinct element ids. We INCLUDE the parent in
+        # the max() so children never reuse the parent's freed id —
+        # keeping the parent's id strictly historical avoids the
+        # "wait, did this element split or did it just get renamed?"
+        # confusion at undo time.
+        existing_ids = [e.id for e in model.elements]
+        id_a = (max(existing_ids) + 1) if existing_ids else 1
+        id_b = id_a + 1
+
+        is_frame = isinstance(parent, FrameElement2D)
+        if is_frame:
+            child_a = FrameElement2D(
+                id=id_a, node_i=parent.node_i, node_j=node_c,
+                E=parent.E, A=parent.A, I=parent.I,
+                alpha=parent.alpha, depth=parent.depth, rho=parent.rho,
+                section_id=parent.section_id,
+                material_id_override=parent.material_id_override,
+                release_i=parent.release_i, release_j=False,
+            )
+            child_b = FrameElement2D(
+                id=id_b, node_i=node_c, node_j=parent.node_j,
+                E=parent.E, A=parent.A, I=parent.I,
+                alpha=parent.alpha, depth=parent.depth, rho=parent.rho,
+                section_id=parent.section_id,
+                material_id_override=parent.material_id_override,
+                release_i=False, release_j=parent.release_j,
+            )
+        else:
+            child_a = TrussElement2D(
+                id=id_a, node_i=parent.node_i, node_j=node_c,
+                E=parent.E, A=parent.A,
+                alpha=parent.alpha, depth=parent.depth, rho=parent.rho,
+                section_id=parent.section_id,
+                material_id_override=parent.material_id_override,
+            )
+            child_b = TrussElement2D(
+                id=id_b, node_i=node_c, node_j=parent.node_j,
+                E=parent.E, A=parent.A,
+                alpha=parent.alpha, depth=parent.depth, rho=parent.rho,
+                section_id=parent.section_id,
+                material_id_override=parent.material_id_override,
+            )
+        return child_a, child_b
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._saved_parent is None:
+            return
+        # Remove the children.
+        model.elements = [
+            e for e in model.elements
+            if e.id not in (self._child_a_id, self._child_b_id)
+        ]
+        # Re-insert the parent at its original index. If the list
+        # shrank below that index because of unrelated edits, append.
+        idx = self._saved_parent_index
+        if 0 <= idx <= len(model.elements):
+            model.elements.insert(idx, self._saved_parent)
+        else:
+            model.elements.append(self._saved_parent)
+        # Remove the auto-created node C only if nothing else has
+        # come to depend on it.
+        nid = self._created_node_c
+        if nid is None or nid not in model.nodes:
+            return
+        if any(e.node_i == nid or e.node_j == nid for e in model.elements):
+            return
+        if nid in model.supports:
+            return
+        if any(ld.node_id == nid for ld in model.nodal_loads):
+            return
+        del model.nodes[nid]
 
 
 @dataclass
