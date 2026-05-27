@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 
 from ..element import FrameElement2D, TrussElement2D
 from ..model import (
+    NODE_COINCIDENCE_TOL,
     Material,
     Node,
     NodalLoad,
@@ -42,16 +43,14 @@ from ..model import (
 if TYPE_CHECKING:
     from ..model import MemberLoad
 
-
-# World-unit tolerance for "are these two coordinates the same node?"
-# Shared by AddNodeCmd's add-time block and AddMemberCmd's
-# snap-or-reuse classifier so the two cannot drift apart. Future
-# composite commands that allocate nodes should use this same
-# constant. Note: the snap engine uses a *pixel*-space radius (10 px,
-# see structural_analysis/gui_qt/snap.py) which is a different
-# concern (visual targeting) — that one should not consume this
-# constant.
-NODE_COINCIDENCE_TOL: float = 1e-9
+# Re-exported here so callers can keep importing
+# `NODE_COINCIDENCE_TOL` from `commands` — the constant moved to
+# `model.py` in v0.11.0 so the analytic core
+# (`assembler.validate_model`) can also consume it without importing
+# the GUI layer. Single source of truth is now `model.py`.
+__all__ = (
+    "NODE_COINCIDENCE_TOL",
+)
 
 # Parametric-`t` tolerance for "is this click on an element interior
 # vs. close enough to an endpoint to be that endpoint?" Used by
