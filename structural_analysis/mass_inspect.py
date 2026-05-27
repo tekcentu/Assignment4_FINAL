@@ -89,6 +89,11 @@ class JointMassReport:
         n_total_dofs: Total assembled DOFs (free + restrained).
         totals_kg: Column totals — sum of every numeric cell in each
             DOF column. ``ux`` and ``uy`` in kg, ``rz`` in kg·m².
+        warning: Optional non-fatal advisory string when the model
+            assembled successfully but the resulting M is degenerate —
+            e.g. every element contributes zero mass because both ρ
+            and A are zero, or some legacy fixtures omit the density
+            column. ``None`` when the report is healthy.
     """
 
     rows: list[NodeMassRow]
@@ -97,6 +102,65 @@ class JointMassReport:
     n_free_dofs: int
     n_total_dofs: int
     totals_kg: dict[str, float]
+    warning: str | None = None
+
+
+_ZERO_MASS_TOL: float = 1e-12  # kg threshold for "element contributes nothing"
+_MAX_IDS_IN_WARNING: int = 10  # truncate element-ID list to keep banner short
+
+
+def _zero_mass_element_ids(model: StructuralModel) -> list[int]:
+    """Return IDs of elements whose ρ·A is non-positive (zero contribution).
+
+    An element with ρ ≤ 0 *or* A ≤ 0 produces a 6×6 zero element-mass
+    matrix (see ``FrameElement2D.consistent_mass_local`` /
+    ``TrussElement2D.consistent_mass_local`` — both guard on
+    ``m_bar = ρ·A ≤ 0`` and short-circuit to zeros). We don't try to
+    distinguish "ρ=0" from "A=0" in the warning; both are equally
+    valid causes and the user fixes them in the same Materials /
+    Sections dialogs.
+    """
+    bad: list[int] = []
+    for elem in model.elements:
+        rho = float(getattr(elem, "rho", 0.0))
+        A = float(getattr(elem, "A", 0.0))
+        if rho * A <= 0.0:
+            bad.append(int(elem.id))
+    return bad
+
+
+def _build_warning(model: StructuralModel) -> str | None:
+    """Build the non-fatal advisory text for a :class:`JointMassReport`.
+
+    Returns ``None`` when every element contributes a positive mass.
+    Returns an "all-zero" message when *every* element is zero-mass
+    (typical of legacy ``inputs/*.txt`` files that lack a density
+    column). Returns a "some elements" message — with up to
+    ``_MAX_IDS_IN_WARNING`` element IDs and an ``…(+N more)`` suffix
+    — when only a subset is degenerate.
+    """
+    if not model.elements:
+        return None  # empty model is its own kind of empty — no row to warn on
+    bad = _zero_mass_element_ids(model)
+    if not bad:
+        return None
+    if len(bad) == len(model.elements):
+        return (
+            "All assembled element mass contributions are zero. "
+            "Check material density ρ (kg/m³) and section area A. "
+            "Legacy files may have ρ = 0."
+        )
+    shown = bad[:_MAX_IDS_IN_WARNING]
+    suffix = (
+        f" …(+{len(bad) - _MAX_IDS_IN_WARNING} more)"
+        if len(bad) > _MAX_IDS_IN_WARNING
+        else ""
+    )
+    id_list = ", ".join(str(eid) for eid in shown) + suffix
+    return (
+        "Some elements have zero mass contribution. "
+        f"Check ρ and A for elements: {id_list}."
+    )
 
 
 def joint_mass_table(
@@ -185,4 +249,5 @@ def joint_mass_table(
         n_free_dofs=len(dofs.free_indices),
         n_total_dofs=dofs.n_total,
         totals_kg=totals,
+        warning=_build_warning(model),
     )

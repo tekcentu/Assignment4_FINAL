@@ -120,6 +120,13 @@ class JointMassesWindow(QMainWindow):
         )
         root.addWidget(self._disclosure_label)
 
+        # Tri-state banner — green (healthy), amber (degenerate
+        # element-mass contributions), red (assembly raised). Same
+        # idiom as mass_summary._update_status.
+        self._status_label = QLabel("", central)
+        self._status_label.setWordWrap(True)
+        root.addWidget(self._status_label)
+
         self._table = QTableWidget(0, len(_COLUMNS), central)
         self._table.setHorizontalHeaderLabels(_COLUMNS)
         self._table.verticalHeader().setVisible(False)
@@ -153,7 +160,10 @@ class JointMassesWindow(QMainWindow):
             # element) shouldn't crash a non-modal window.
             self._table.setRowCount(0)
             self._formulation_label.setText("(mass assembly unavailable)")
-            self._totals_label.setText(f"Error: {type(exc).__name__}: {exc}")
+            self._totals_label.setText("")
+            self._set_status(
+                f"Error: {type(exc).__name__}: {exc}", level="error",
+            )
             return
 
         self._formulation_label.setText(
@@ -162,7 +172,34 @@ class JointMassesWindow(QMainWindow):
             f"{'Row-sum equivalent' if report.method == 'row_sum' else 'Diagonal'}"
         )
 
+        if report.warning is None:
+            self._set_status(
+                "Mass matrix assembled from current model. "
+                "No modal solve was run.",
+                level="ok",
+            )
+        else:
+            self._set_status(report.warning, level="warn")
+
         self._populate(report)
+
+    def _set_status(
+        self,
+        text: str,
+        *,
+        level: str,  # "ok" | "warn" | "error"
+    ) -> None:
+        """Paint the tri-state status banner.
+
+        Colour idiom mirrors ``mass_summary._update_status`` so the two
+        diagnostic windows feel consistent.
+        """
+        colour = {"ok": "#1a6b1a", "warn": "#a06000", "error": "#b00"}[level]
+        self._status_label.setStyleSheet(
+            f"color: {colour}; font-weight: bold; "
+            "font-size: 10pt; padding: 2px 0;"
+        )
+        self._status_label.setText(text)
 
     # ── helpers ──
 

@@ -207,3 +207,84 @@ def test_active_modal_dof_count_matches_dof_manager():
     report = joint_mass_table(m)
     assert report.n_free_dofs == len(dofs.free_indices)
     assert report.n_total_dofs == dofs.n_total
+
+
+# ── 5. degenerate-mass warning banner ─────────────────────────
+
+
+def test_warning_all_zero_density_model():
+    """Every element has ρ=0 (typical of legacy inputs/*.txt fixtures
+    that omit the density column) → the report carries the global
+    'all assembled element mass contributions are zero' warning, and
+    the table still renders (rows present, just zero)."""
+    m, _, _, _ = _single_frame_model(rho=0.0)
+    report = joint_mass_table(m, method="row_sum")
+    assert report.warning is not None
+    assert "All assembled element mass contributions are zero" in report.warning
+    assert "ρ" in report.warning  # explicit density hint
+    assert "A" in report.warning  # explicit area hint
+    # Table still populated, just zeros.
+    assert len(report.rows) == 2
+    for row in report.rows:
+        for dof in ("ux", "uy", "rz"):
+            v = row.values[dof]
+            assert v == "not_active" or v == 0.0
+
+
+def test_warning_partial_zero_mass_lists_offending_element_ids():
+    """A mixed model (one frame with ρ·A > 0, one with A=0) → the
+    warning starts with 'Some elements have zero mass contribution'
+    and contains the bad element's ID."""
+    m = StructuralModel(title="mixed")
+    m.nodes[1] = Node(1, 0.0, 0.0)
+    m.nodes[2] = Node(2, 5.0, 0.0)
+    m.nodes[3] = Node(3, 10.0, 0.0)
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3)
+    m.sections[2] = Section(id=2, name="S2-zero", material_id=1, A=0.0, I=1e-4, depth=0.3)
+    m.elements.append(FrameElement2D(
+        id=10, node_i=1, node_j=2,
+        E=2.1e8, A=0.01, I=1e-4, rho=7850.0, depth=0.3, section_id=1,
+    ))
+    m.elements.append(FrameElement2D(
+        id=11, node_i=2, node_j=3,
+        E=2.1e8, A=0.0, I=1e-4, rho=7850.0, depth=0.3, section_id=2,
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+
+    report = joint_mass_table(m, method="row_sum")
+    assert report.warning is not None
+    assert report.warning.startswith("Some elements have zero mass contribution")
+    assert "11" in report.warning  # bad element ID is listed
+    # The good element's ID shouldn't be in the list.
+    after_colon = report.warning.split(":", 1)[1]
+    assert "10" not in after_colon
+
+
+def test_warning_healthy_model_is_none():
+    """A model with ρ·A > 0 on every element → no warning."""
+    m, _, _, _ = _single_frame_model()
+    report = joint_mass_table(m, method="row_sum")
+    assert report.warning is None
+
+
+# ── 6. inspection-only contract (regression lock) ─────────────
+
+
+def test_joint_mass_table_never_invokes_solve_modal(monkeypatch):
+    """`joint_mass_table` must read M directly — it must never trigger
+    a modal eigenvalue solve. Lock this down so a future refactor that
+    accidentally calls into modal raises here first.
+    """
+    import structural_analysis.modal as modal_mod
+
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            "solve_modal was invoked from the inspection path"
+        )
+
+    monkeypatch.setattr(modal_mod, "solve_modal", _boom)
+    m, _, _, _ = _single_frame_model()
+    # Must not raise.
+    report = joint_mass_table(m, method="row_sum")
+    assert report.warning is None

@@ -1845,3 +1845,50 @@ def test_joint_masses_window_skips_refresh_when_hidden(qt_app):
         assert calls["n"] >= 1
     finally:
         win.refresh = original_refresh  # type: ignore[method-assign]
+
+
+def test_joint_masses_window_zero_density_fixture_shows_amber_warning(qt_app):
+    """Legacy fixtures (no density column → ρ=0) must open the window
+    immediately, render rows, and surface the amber warning banner —
+    no 'please solve modal first' gate."""
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._show_joint_masses()
+    win = w._joint_masses_window
+    assert win is not None
+    assert win.isVisible()
+
+    status = win._status_label.text()
+    assert "All assembled element mass contributions are zero" in status
+    # Amber colour applied (mirrors the spec in the plan file).
+    assert "#a06000" in win._status_label.styleSheet()
+
+    # Table still renders, one row per node.
+    assert win._table.rowCount() == len(w._model.nodes)
+
+
+def test_joint_masses_window_never_invokes_solve_modal(qt_app, monkeypatch):
+    """Opening + refreshing the window must never invoke the modal
+    eigenvalue solver. Locks the inspection-only contract at the GUI
+    layer (the unit test does the same at the helper layer)."""
+    import structural_analysis.modal as modal_mod
+
+    calls = {"n": 0}
+
+    def _boom(*args, **kwargs):
+        calls["n"] += 1
+        raise AssertionError(
+            "solve_modal invoked from the joint-masses inspection path"
+        )
+
+    monkeypatch.setattr(modal_mod, "solve_modal", _boom)
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._show_joint_masses()
+    win = w._joint_masses_window
+    assert win is not None
+    win.refresh()
+    qt_app.processEvents()
+
+    assert calls["n"] == 0
