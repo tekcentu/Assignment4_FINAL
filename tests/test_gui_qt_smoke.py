@@ -2089,3 +2089,197 @@ def test_frame_tool_same_empty_point_twice_short_circuits_before_dialog(qt_app):
     # Model is untouched.
     assert len(w._model.nodes) == 0
     assert len(w._model.elements) == 0
+
+
+def _stage_c_seed_frame(w, qt_app) -> int:
+    """Set up a single 6 m horizontal frame on `w` and return its element id."""
+    from structural_analysis.model import Material, Section
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._sticky_element = {
+        "kind": "frame", "section_id": 1,
+        "release_i": False, "release_j": False,
+        "material_override_id": None,
+    }
+    w._select_tool("frame")
+    qt_app.processEvents()
+    w._on_canvas_click(HitResult(x=0.0, y=0.0), "left")
+    w._on_canvas_click(HitResult(x=6.0, y=0.0), "left")
+    qt_app.processEvents()
+    assert len(w._model.elements) == 1
+    return w._model.elements[0].id
+
+
+def test_node_tool_click_on_element_interior_splits_via_project_snap(qt_app):
+    """v0.11.0: clicking the interior of an existing element with the
+    Node tool fires SplitElementCmd, not AddNodeCmd. The model gains
+    one node and the parent is replaced by two children — no
+    disconnected free-floating node."""
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+    assert len(w._model.nodes) == 2
+
+    w._select_tool("node")
+    qt_app.processEvents()
+    # HitResult with snap_kind="project" + element_id is what the snap
+    # engine produces for a click on an element's interior.
+    w._on_canvas_click(
+        HitResult(
+            x=3.0, y=0.0,
+            element_id=parent_id, snap_kind="project",
+        ),
+        "left",
+    )
+    qt_app.processEvents()
+
+    assert len(w._model.nodes) == 3
+    elem_ids = [e.id for e in w._model.elements]
+    assert parent_id not in elem_ids
+    assert len(w._model.elements) == 2
+    # The new node lies on the segment.
+    new_node = next(
+        n for n in w._model.nodes.values()
+        if (n.x, n.y) == (3.0, 0.0)
+    )
+    children_with_new = [
+        e for e in w._model.elements
+        if new_node.id in (e.node_i, e.node_j)
+    ]
+    assert len(children_with_new) == 2
+
+    # Single Ctrl+Z restores the parent.
+    w._do_undo()
+    qt_app.processEvents()
+    assert [e.id for e in w._model.elements] == [parent_id]
+    assert len(w._model.nodes) == 2
+
+
+def test_node_tool_split_blocked_when_element_has_member_load(qt_app):
+    """The block-with-warning policy: clicking interior of a loaded
+    element with the Node tool surfaces the message and leaves the
+    model untouched. The original PR #20 disconnected-component bug
+    is preferable to silently breaking the load."""
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+    w._model.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-5.0),
+    )
+    nodes_before = sorted(w._model.nodes.keys())
+    elem_ids_before = [e.id for e in w._model.elements]
+
+    w._select_tool("node")
+    qt_app.processEvents()
+
+    # Silence the QMessageBox host.execute pops on ValueError so the
+    # test doesn't block. The error path is the documented contract
+    # of host.execute(cmd) — see app.py: execute() catches ValueError
+    # and shows a warning dialog.
+    from PyQt6.QtWidgets import QMessageBox
+    seen_warnings: list[str] = []
+    real_warning = QMessageBox.warning
+    QMessageBox.warning = staticmethod(  # type: ignore[assignment]
+        lambda parent, title, text, *a, **k:
+            (seen_warnings.append(text), QMessageBox.StandardButton.Ok)[-1]
+    )
+    try:
+        w._on_canvas_click(
+            HitResult(
+                x=3.0, y=0.0,
+                element_id=parent_id, snap_kind="project",
+            ),
+            "left",
+        )
+        qt_app.processEvents()
+    finally:
+        QMessageBox.warning = real_warning  # type: ignore[assignment]
+
+    assert sorted(w._model.nodes.keys()) == nodes_before
+    assert [e.id for e in w._model.elements] == elem_ids_before
+    assert any("member loads" in w for w in seen_warnings)
+
+
+def test_node_tool_endpoint_click_does_not_split(qt_app):
+    """Clicking exactly on an endpoint node (snap_kind == 'node', not
+    'project') reuses that node — no split happens. PR #21 spec
+    item 'endpoint click does not split'."""
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+    # Endpoint node 1 is at (0, 0).
+    endpoint_node_id = w._model.elements[0].node_i
+
+    w._select_tool("node")
+    qt_app.processEvents()
+    w._on_canvas_click(
+        HitResult(
+            x=0.0, y=0.0,
+            node_id=endpoint_node_id,
+            snap_kind="node",
+        ),
+        "left",
+    )
+    qt_app.processEvents()
+
+    # No split — parent still exists, no new node created.
+    assert [e.id for e in w._model.elements] == [parent_id]
+    assert len(w._model.nodes) == 2
+
+
+def test_frame_draw_endpoint_on_element_interior_splits_and_connects(qt_app):
+    """The main bug PR #21 fixes: drawing a member whose endpoint
+    lands on an existing element's interior must split that element
+    AND connect the new member to the split point. After the draw,
+    the model has 3 nodes (the original 2 + the split point) and 3
+    elements (parent split into 2 children + the new member)."""
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+    # Add an extra free node above the bar for the member's start.
+    from structural_analysis.gui_common.commands import AddNodeCmd
+    w.execute(AddNodeCmd(x=3.0, y=5.0))
+    qt_app.processEvents()
+    free_node = max(w._model.nodes.keys())
+    assert len(w._model.nodes) == 3
+
+    # Frame tool: click free node, then click interior of parent at (3, 0).
+    w._select_tool("frame")
+    qt_app.processEvents()
+    free = w._model.nodes[free_node]
+    w._on_canvas_click(
+        HitResult(x=free.x, y=free.y, node_id=free_node, snap_kind="node"),
+        "left",
+    )
+    qt_app.processEvents()
+    w._on_canvas_click(
+        HitResult(
+            x=3.0, y=0.0,
+            element_id=parent_id, snap_kind="project",
+        ),
+        "left",
+    )
+    qt_app.processEvents()
+
+    # 3 original nodes (1, 2, free) + 1 split node = 4 nodes.
+    assert len(w._model.nodes) == 4
+    # Parent removed, 2 children + the new member = 3 elements.
+    assert len(w._model.elements) == 3
+    assert parent_id not in [e.id for e in w._model.elements]
+    # The split node is shared between the new member and a child of
+    # the original parent — i.e. the model is now mathematically
+    # connected at the split point, not just visually overlapping.
+    split_node = next(
+        n for n in w._model.nodes.values()
+        if (n.x, n.y) == (3.0, 0.0)
+    )
+    elements_at_split = [
+        e for e in w._model.elements
+        if split_node.id in (e.node_i, e.node_j)
+    ]
+    # Two split children + the new member all connect here.
+    assert len(elements_at_split) == 3

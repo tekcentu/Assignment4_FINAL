@@ -17,6 +17,7 @@ from ..gui_common.commands import (
     AddNodeCmd,
     DeleteElementCmd,
     DeleteNodeCmd,
+    SplitElementCmd,
 )
 
 
@@ -94,6 +95,22 @@ class SelectTool(Tool):
             self.host.clear_selection()
 
 
+def _is_project_snap(hit: HitResult) -> bool:
+    """True when the click landed on an existing element's interior.
+
+    The snap engine sets ``snap_kind == "project"`` only when the
+    perpendicular foot from the cursor falls strictly inside the
+    segment (parametric ``0 < t < 1`` in pixel space, see
+    ``snap.py:175-187``) — so `(hit.x, hit.y)` is the projected world
+    point and `hit.element_id` is the parent element.
+    """
+    return (
+        hit.node_id is None
+        and hit.element_id is not None
+        and hit.snap_kind == "project"
+    )
+
+
 class NodeTool(Tool):
     name = "node"
     description = "Node tool: click on the grid to place a node."
@@ -103,6 +120,16 @@ class NodeTool(Tool):
             return
         if hit.node_id is not None:
             self.host.set_status(f"Node {hit.node_id} already at this location.")
+            return
+        # v0.11.0: clicking an existing element's interior splits the
+        # element at the projected point — otherwise the user gets a
+        # node that looks "on" the element but isn't connected to it
+        # (the disconnected-component bug PR #21 fixes).
+        if _is_project_snap(hit):
+            self.host.execute(SplitElementCmd(
+                element_id=hit.element_id,
+                x=hit.x, y=hit.y,
+            ))
             return
         self.host.execute(AddNodeCmd(x=hit.x, y=hit.y))
 
@@ -132,18 +159,56 @@ class _PairTool(Tool):
         self._first = None
         self.host.clear_element_preview()
 
+    def _resolve_endpoint(
+        self, hit: HitResult,
+    ) -> tuple[float, float, int | None] | None:
+        """Resolve a member-draw click to ``(x, y, node_id_or_None)``.
+
+        If the click lands on an existing element's interior, fires a
+        :class:`SplitElementCmd` first. On split success, the
+        projected point and the freshly-created mid node id become
+        the endpoint. On split failure (e.g. parent has member
+        loads), returns ``None`` so the caller can cancel the draw.
+
+        Each split is its own undo step — per the PR #21 design call,
+        we deliberately avoid the atomic-composite path here so
+        SplitElementCmd stays cheap to reason about. A user who drew
+        a member that bisected two elements will see three entries on
+        the undo stack (two splits + one member); each is
+        individually undoable.
+        """
+        if not _is_project_snap(hit):
+            return (hit.x, hit.y, hit.node_id)
+        cmd = SplitElementCmd(
+            element_id=hit.element_id, x=hit.x, y=hit.y,
+        )
+        self.host.execute(cmd)
+        if cmd._resolved_node_c is None:
+            # Split was rejected (member-loaded element, tolerance
+            # race, etc.). host.execute already surfaced the error
+            # message via QMessageBox.warning, so we just signal
+            # cancel to the caller.
+            return None
+        return (hit.x, hit.y, cmd._resolved_node_c)
+
     def on_click(self, hit: HitResult, button: str) -> None:
         if button != "left":
             return
         if self._first is None:
-            self._first = (hit.x, hit.y, hit.node_id)
-            if hit.node_id is not None:
+            resolved = self._resolve_endpoint(hit)
+            if resolved is None:
+                # Split blocked — don't even stash the first click.
+                # The user can adjust and try again.
+                return
+            first_x, first_y, first_id = resolved
+            self._first = (first_x, first_y, first_id)
+            if first_id is not None:
                 self.host.set_element_preview(
-                    hit.node_id, hit.x, hit.y, self.kind,
+                    first_id, first_x, first_y, self.kind,
                 )
             else:
                 self.host.set_element_preview_free(
-                    hit.x, hit.y, hit.x, hit.y, self.kind,
+                    first_x, first_y, first_x, first_y, self.kind,
                 )
             self.host.set_status(self.description)
             return
@@ -168,10 +233,25 @@ class _PairTool(Tool):
         if same_node or same_point:
             self.host.set_status("Start and end must be different points.")
             return
+        # Second click can also land on an element interior. Resolve
+        # via the same helper — on split failure, abandon the draw
+        # (any first-click split that succeeded stays as a standalone
+        # undo step; the user can revert it themselves).
+        resolved = self._resolve_endpoint(hit)
+        if resolved is None:
+            self.host.clear_element_preview()
+            self._first = None
+            self.host.set_status(
+                "Member draw cancelled — second click could not be "
+                "resolved (split blocked or invalid). Use Ctrl+Z to "
+                "revert any pending split."
+            )
+            return
+        second_x, second_y, second_id = resolved
         self.host.clear_element_preview()
         self.host.open_element_dialog_for_member(
             first_x=first_x, first_y=first_y, first_node_id=first_id,
-            second_x=hit.x, second_y=hit.y, second_node_id=hit.node_id,
+            second_x=second_x, second_y=second_y, second_node_id=second_id,
             kind=self.kind,
         )
         self._first = None
