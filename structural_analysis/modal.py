@@ -144,16 +144,19 @@ def _solve_modal_condensed(
 
     K_rr = K_ff[np.ix_(rest_local, rest_local)]
     K_rm = K_ff[np.ix_(rest_local, mass_local)]
-    K_mr = K_ff[np.ix_(mass_local, rest_local)]
+    # K_ff is symmetric, so K_mr is exactly K_rm.T — skip a redundant
+    # np.ix_ slice (per gemini PR-19 review).
+    K_mr = K_rm.T
 
     # K_rr⁻¹ K_rm via solve (never inv).
     try:
-        # Symmetrise for the Cholesky/Bunch-Kaufman path; K_rr is a
-        # submatrix of a symmetric PSD K so should already be symmetric
-        # to numerical noise.
+        # K_rr is a principal submatrix of the SPD K_ff, hence itself
+        # symmetric positive-definite — use Cholesky via assume_a="pos"
+        # (~2× faster and more stable than Bunch-Kaufman "sym"). Per
+        # gemini PR-19 review.
         K_rr_sym = 0.5 * (K_rr + K_rr.T)
         Krr_inv_Krm = scipy.linalg.solve(
-            K_rr_sym, K_rm, assume_a="sym",
+            K_rr_sym, K_rm, assume_a="pos",
         )
     except (np.linalg.LinAlgError, ValueError) as exc:
         raise ValueError(
