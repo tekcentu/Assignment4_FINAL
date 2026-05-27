@@ -1,8 +1,8 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 __what_is_new__ = (
-    "direct member drawing · auto-create nodes on draw"
+    "split element on insert · coincident-node warning"
 )
 
 from .model import (
