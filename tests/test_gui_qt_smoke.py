@@ -1811,3 +1811,37 @@ def test_joint_masses_window_singleton_and_renders_rows(qt_app):
     # First-column cells must be the node IDs in model order.
     for r, nid in enumerate(w._model.node_ids):
         assert win._table.item(r, 0).text() == str(nid)
+
+
+def test_joint_masses_window_skips_refresh_when_hidden(qt_app):
+    """Per PR #18 review: model edits must NOT trigger a mass-matrix
+    assembly while the joint-masses singleton is hidden."""
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._show_joint_masses()
+    win = w._joint_masses_window
+    assert win.isVisible()
+
+    win.close()
+    qt_app.processEvents()
+    assert not win.isVisible()
+    # Singleton still held (close() doesn't destroy).
+    assert w._joint_masses_window is win
+
+    # Patch refresh to a counting stub; trigger an invalidation; assert
+    # it wasn't called while hidden.
+    calls = {"n": 0}
+    original_refresh = win.refresh
+    win.refresh = lambda: calls.__setitem__("n", calls["n"] + 1)  # type: ignore[method-assign]
+    try:
+        w._invalidate_result()
+        qt_app.processEvents()
+        assert calls["n"] == 0, (
+            "refresh() ran while hidden — would trigger needless "
+            "mass-matrix assembly on every edit"
+        )
+        # And reopening still gives a refreshed view (via _show_joint_masses).
+        w._show_joint_masses()
+        assert calls["n"] >= 1
+    finally:
+        win.refresh = original_refresh  # type: ignore[method-assign]

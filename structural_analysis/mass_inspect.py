@@ -9,10 +9,15 @@ Two equivalent-mass summary methods are offered, mirroring SAP2000's
 "Assembled Joint Masses" table:
 
   * ``"diagonal"`` — display ``M[i, i]`` at each DOF row.
-  * ``"row_sum"`` — display ``Σ_j M[i, j]`` at each DOF row. For
-    consistent element mass this is the lumped-equivalent total mass
-    that translates with that DOF; commonly used for SAP-style joint
-    mass cross-checks against hand calculations.
+  * ``"row_sum"`` — display ``Σ_{j in same DOF block} M[i, j]`` at
+    each DOF row. The sum is restricted to columns of the same DOF
+    type (ux-row over ux-columns, uy-row over uy-columns, rz-row over
+    rz-columns) so per-cell units stay physical: kg for translational
+    rows, kg·m² for rotational rows. Mixing across blocks would add
+    Mg + Mg·m (translational ↔ rotational coupling terms) and yield
+    non-physical numbers at the cell level. The block-restricted sum
+    still preserves the SAP-style identity Σ_node M_translational =
+    total translational mass of the structure.
 
 Units. The mass matrix is assembled in kN·s²/m (= Mg) for translational
 DOFs and kN·m·s² (= Mg·m²) for rotational DOFs. This module multiplies
@@ -33,7 +38,6 @@ from .model import StructuralModel
 
 _DOFS: tuple[str, str, str] = ("ux", "uy", "rz")
 _NOT_ACTIVE: str = "not_active"
-_RESTRAINED: str = "restrained"
 
 Method = Literal["diagonal", "row_sum"]
 
@@ -126,6 +130,30 @@ def joint_mass_table(
     M = assemble_mass_matrix(model, dofs)
     restrained_set = set(dofs.restrained_indices)
 
+    # Precompute the per-DOF-block row sums once (O(n²) numpy work)
+    # instead of recomputing inside the per-node Python loop. For
+    # method="row_sum" we restrict each row's sum to columns of the
+    # same DOF type so per-cell units stay physical — see module
+    # docstring for the unit-mixing rationale.
+    block_row_sums: dict[str, np.ndarray] | None = None
+    if method == "row_sum":
+        block_row_sums = {}
+        for dof in _DOFS:
+            # DofManager.active_map[nid] may store inactive DOFs as
+            # explicit ``None`` rather than omitting the key — filter
+            # on the value, not key presence.
+            col_idx = np.fromiter(
+                (
+                    idx for nid in model.node_ids
+                    if (idx := dofs.active_map[nid].get(dof)) is not None
+                ),
+                dtype=np.intp,
+            )
+            if col_idx.size == 0:
+                block_row_sums[dof] = np.zeros(dofs.n_total)
+            else:
+                block_row_sums[dof] = M[:, col_idx].sum(axis=1)
+
     rows: list[NodeMassRow] = []
     totals = {dof: 0.0 for dof in _DOFS}
 
@@ -141,7 +169,8 @@ def joint_mass_table(
             if method == "diagonal":
                 m_consistent = float(M[i, i])
             else:
-                m_consistent = float(np.sum(M[i, :]))
+                # block_row_sums is populated above when method=="row_sum".
+                m_consistent = float(block_row_sums[dof][i])  # type: ignore[index]
             # Mg → kg (and Mg·m² → kg·m² for rz).
             m_kg = m_consistent * 1000.0
             values[dof] = m_kg

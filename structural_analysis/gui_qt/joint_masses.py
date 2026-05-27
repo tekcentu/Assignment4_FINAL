@@ -166,8 +166,13 @@ class JointMassesWindow(QMainWindow):
 
     # ── helpers ──
 
-    def _on_method_changed(self, _checked: bool) -> None:
-        # Both radios fire on every toggle; act on whichever is now on.
+    def _on_method_changed(self, checked: bool) -> None:
+        # Both radios in the exclusive group fire `toggled` on every
+        # click (one going off, one going on). Acting on both would
+        # trigger two full refresh() calls — i.e. two mass-matrix
+        # assemblies — per user click. Early-return on the "off" edge.
+        if not checked:
+            return
         self._method = "row_sum" if self._rb_rowsum.isChecked() else "diagonal"
         self.refresh()
 

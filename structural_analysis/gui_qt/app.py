@@ -1669,7 +1669,14 @@ class MainWindow(QMainWindow):
             self._mass_summary_window.refresh()
         # Same story for the assembled-joint-masses window: any model
         # edit (nodes, supports, sections) can change M's contents.
-        if self._joint_masses_window is not None:
+        # Skip the refresh when the window is hidden — _show_joint_masses
+        # always refreshes on re-open, so a hidden singleton can't
+        # show stale data. Avoiding the call here means no mass-matrix
+        # assembly on every keystroke / drag when the panel isn't open.
+        if (
+            self._joint_masses_window is not None
+            and self._joint_masses_window.isVisible()
+        ):
             self._joint_masses_window.refresh()
 
     def _update_result_text(self) -> None:

@@ -151,6 +151,51 @@ def test_unknown_method_raises():
         joint_mass_table(m, method="lumped")  # type: ignore[arg-type]
 
 
+def test_row_sum_is_block_restricted_to_same_dof_type():
+    """Row-sum must restrict to columns of the same DOF type so a uy
+    row never picks up rz coupling columns (which would mix kg with
+    kg·m). Verified against a hand calculation on the symmetric beam
+    consistent-mass matrix: uy row at one node sums to ρAL/2 when
+    restricted to uy columns; an unrestricted sum would instead give
+    (210 + 9L)/420 · ρAL — see PR #18 review.
+    """
+    m, L, rho, A = _single_frame_model(L=5.0)
+    report = joint_mass_table(m, method="row_sum")
+
+    rows_by_id = {row.node_id: row for row in report.rows}
+    expected_per_node = rho * A * L / 2.0  # ρAL/2
+    for nid in (1, 2):
+        uy = rows_by_id[nid].values["uy"]
+        ux = rows_by_id[nid].values["ux"]
+        assert isinstance(uy, float)
+        assert isinstance(ux, float)
+        # Symmetric model — both nodes should carry ρAL/2 translational
+        # mass in both ux and uy under block-restricted row-sum.
+        assert uy == pytest.approx(expected_per_node, rel=1e-9)
+        assert ux == pytest.approx(expected_per_node, rel=1e-9)
+
+
+def test_row_sum_rotational_cell_is_physical_kg_m2():
+    """rz row, restricted to rz columns, must yield a non-negative
+    physical kg·m² value. Cross-block sums could go negative because
+    of the -3L² off-diagonal in the consistent mass — that's the
+    reviewer's concern, locked down here."""
+    m, L, rho, A = _single_frame_model(L=5.0)
+    report = joint_mass_table(m, method="row_sum")
+
+    for row in report.rows:
+        rz = row.values["rz"]
+        assert isinstance(rz, float)
+        assert rz >= 0.0, f"rz block-row-sum must be ≥ 0, got {rz}"
+
+    # Hand value: rz-row over rz-columns is (4L² - 3L²)·coef = L²·coef
+    # where coef = ρ_consistent · A · L / 420 (kg/m³ → Mg/m³ → ×1000 = kg).
+    # So per-node rz = L² · ρ A L / 420 (in kg·m²).
+    expected_per_node = (L * L) * rho * A * L / 420.0
+    for row in report.rows:
+        assert row.values["rz"] == pytest.approx(expected_per_node, rel=1e-9)
+
+
 def test_active_modal_dof_count_matches_dof_manager():
     """``n_free_dofs`` in the report equals ``len(DofManager.free_indices)``
     so the footer always agrees with the modal solver's view of the
