@@ -8,10 +8,19 @@ Invariant: each command captures the inverse-state it needs (via ``_previous``,
 ``_saved``, or ``_snapshot``) **before** it mutates the model, and performs all
 the reads it needs from the model (e.g. which sections own a material, which
 elements point at a section) before any writes. ``do()`` and ``undo()`` are
-inverses when ``do()`` completes successfully. If ``do()`` raises mid-mutation
-the controller must not push the command on the undo stack — the model layer
-trusts internal callers to pass well-formed data, so no transactional rollback
-is wired in.
+inverses when ``do()`` completes successfully.
+
+Most commands are single-mutation: if their ``do()`` raises mid-mutation, the
+controller must not push the command on the undo stack — the model layer trusts
+internal callers to pass well-formed data, so no transactional rollback is
+wired in at the framework level.
+
+Composite commands are the exception. :class:`AddMemberCmd` (v0.10.0) auto-
+creates up to two nodes before delegating element creation to
+:class:`AddElementCmd`; if the inner element step raises, ``AddMemberCmd.do()``
+rolls back any nodes it created in the same call so the model is left in its
+pre-``do`` state. New composite commands should follow that pattern explicitly
+in their docstring + implementation rather than relying on framework support.
 """
 
 from __future__ import annotations
@@ -32,6 +41,17 @@ from ..model import (
 
 if TYPE_CHECKING:
     from ..model import MemberLoad
+
+
+# World-unit tolerance for "are these two coordinates the same node?"
+# Shared by AddNodeCmd's add-time block and AddMemberCmd's
+# snap-or-reuse classifier so the two cannot drift apart. Future
+# composite commands that allocate nodes should use this same
+# constant. Note: the snap engine uses a *pixel*-space radius (10 px,
+# see structural_analysis/gui_qt/snap.py) which is a different
+# concern (visual targeting) — that one should not consume this
+# constant.
+NODE_COINCIDENCE_TOL: float = 1e-9
 
 
 class Command:
@@ -67,7 +87,8 @@ class AddNodeCmd(Command):
         if self.node_id in model.nodes:
             raise ValueError(f"Node id {self.node_id} already exists.")
         for n in model.nodes.values():
-            if abs(n.x - self.x) < 1e-9 and abs(n.y - self.y) < 1e-9:
+            if (abs(n.x - self.x) < NODE_COINCIDENCE_TOL
+                    and abs(n.y - self.y) < NODE_COINCIDENCE_TOL):
                 raise ValueError(
                     f"A node already exists at ({self.x}, {self.y}) "
                     f"(id {n.id})."
@@ -274,12 +295,15 @@ class AddMemberCmd(Command):
         """Return ``(node_id, was_created)`` for the given coordinate.
 
         Priority: explicit ``hinted_id`` (from the snap engine) → an
-        existing node within 1e-9 of ``(x, y)`` → allocate a new id.
+        existing node within :data:`NODE_COINCIDENCE_TOL` of ``(x, y)``
+        → allocate a new id. The same tolerance is used by
+        :class:`AddNodeCmd` so the two paths cannot drift.
         """
         if hinted_id is not None and hinted_id in model.nodes:
             return hinted_id, False
         for n in model.nodes.values():
-            if abs(n.x - x) < 1e-9 and abs(n.y - y) < 1e-9:
+            if (abs(n.x - x) < NODE_COINCIDENCE_TOL
+                    and abs(n.y - y) < NODE_COINCIDENCE_TOL):
                 return n.id, False
         new_id = _next_id(model.nodes)
         model.nodes[new_id] = Node(new_id, float(x), float(y))

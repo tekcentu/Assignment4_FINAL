@@ -1983,7 +1983,7 @@ def test_joint_masses_window_lumped_radio_zeros_rotational_cells(qt_app):
         )
 
 
-def test_frame_tool_draws_member_with_two_empty_clicks(qt_app, monkeypatch):
+def test_frame_tool_draws_member_with_two_empty_clicks(qt_app):
     """v0.10.0 Stage A end-to-end: select Frame tool, click two empty
     grid points, dialog accepts defaults, assert 2 nodes + 1 element
     appear in the model and one Ctrl+Z removes the entire draw."""
@@ -2037,3 +2037,55 @@ def test_frame_tool_draws_member_with_two_empty_clicks(qt_app, monkeypatch):
     qt_app.processEvents()
     assert len(w._model.nodes) == n0
     assert len(w._model.elements) == e0
+
+
+def test_frame_tool_same_empty_point_twice_short_circuits_before_dialog(qt_app):
+    """PR #20 review fix: clicking the same empty point twice with the
+    Frame tool must short-circuit *before* opening the element-
+    properties dialog. Otherwise the user fills the dialog in only to
+    see the AddMemberCmd zero-length error on accept.
+
+    The controller-layer short-circuit lives in
+    :meth:`_PairTool.on_click`; this test asserts the dispatch method
+    is never called when both clicks land on coincident empty space.
+    """
+    from structural_analysis.model import Material, Section
+
+    w = MainWindow()
+    qt_app.processEvents()
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+
+    calls: list[dict] = []
+
+    def fake_open(
+        *,
+        first_x, first_y, first_node_id,
+        second_x, second_y, second_node_id,
+        kind=None,
+    ):
+        calls.append({
+            "first": (first_x, first_y, first_node_id),
+            "second": (second_x, second_y, second_node_id),
+            "kind": kind,
+        })
+
+    w.open_element_dialog_for_member = fake_open
+    w._select_tool("frame")
+    w._on_canvas_click(HitResult(x=2.5, y=1.0), "left")
+    qt_app.processEvents()
+    # Second click at the same world coords — no node anywhere yet,
+    # so both hits have node_id=None. The short-circuit must catch
+    # this before fake_open ever runs.
+    w._on_canvas_click(HitResult(x=2.5, y=1.0), "left")
+    qt_app.processEvents()
+
+    assert calls == [], (
+        "open_element_dialog_for_member was called for a same-point "
+        "double click; the controller should have short-circuited"
+    )
+    # Model is untouched.
+    assert len(w._model.nodes) == 0
+    assert len(w._model.elements) == 0

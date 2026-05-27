@@ -26,7 +26,7 @@ from structural_analysis.gui_common.commands import (
     AddNodeCmd,
 )
 from structural_analysis.model import (
-    Material, Node, NodalLoad, Section, StructuralModel, Support,
+    Material, Section, StructuralModel, Support,
 )
 
 

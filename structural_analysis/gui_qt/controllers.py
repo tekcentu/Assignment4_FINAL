@@ -11,7 +11,13 @@ from __future__ import annotations
 from typing import Optional, Protocol
 
 from .canvas import HitResult
-from ..gui_common.commands import AddElementCmd, AddNodeCmd, DeleteElementCmd, DeleteNodeCmd
+from ..gui_common.commands import (
+    NODE_COINCIDENCE_TOL,
+    AddElementCmd,
+    AddNodeCmd,
+    DeleteElementCmd,
+    DeleteNodeCmd,
+)
 
 
 class _Host(Protocol):
@@ -142,16 +148,25 @@ class _PairTool(Tool):
             self.host.set_status(self.description)
             return
         first_x, first_y, first_id = self._first
-        # Guard against "click in the same spot twice" — let
-        # AddMemberCmd's zero-length / coincidence rules catch the case
-        # where the second click resolves to a different node id, but
-        # short-circuit the obvious self-click for a cleaner message.
-        if (
+        # Guard against "click in the same spot twice" *before* opening
+        # the element-properties dialog — otherwise the user fills the
+        # dialog in, only to get an "element has zero length" error on
+        # accept. Cover both flavours:
+        #  - both clicks snapped to the same existing node (id == id)
+        #  - both clicks landed on empty space at coincident coords
+        #    (covers the case where neither end has a hinted node id
+        #    but the world coords are within NODE_COINCIDENCE_TOL).
+        same_node = (
             first_id is not None
             and hit.node_id is not None
             and first_id == hit.node_id
-        ):
-            self.host.set_status("Start and end must be different nodes.")
+        )
+        same_point = (
+            abs(first_x - hit.x) < NODE_COINCIDENCE_TOL
+            and abs(first_y - hit.y) < NODE_COINCIDENCE_TOL
+        )
+        if same_node or same_point:
+            self.host.set_status("Start and end must be different points.")
             return
         self.host.clear_element_preview()
         self.host.open_element_dialog_for_member(
