@@ -1,8 +1,8 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 __what_is_new__ = (
-    "analysis settings · self-weight in static solve · mass/weight summary"
+    "assembled joint masses · consistent-mass diagnostics"
 )
 
 from .model import (

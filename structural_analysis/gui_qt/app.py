@@ -198,6 +198,7 @@ class MainWindow(QMainWindow):
         self._modal_results_dialog = None
         self._view3d_window = None
         self._mass_summary_window = None
+        self._joint_masses_window = None
         # Singleton element-detail inspector. Held alive across closes
         # so right-clicking a different element reuses the same window
         # (see _open_element_inspector). MainWindow owns the
@@ -395,6 +396,10 @@ class MainWindow(QMainWindow):
             "&Mass / self-weight summary…", self,
             triggered=self._show_mass_summary,
         )
+        self.act_joint_masses = QAction(
+            "&Assembled joint masses…", self,
+            triggered=self._show_joint_masses,
+        )
         self.act_clear_result = QAction("&Clear results", self,
                                           triggered=self._clear_result)
 
@@ -498,6 +503,7 @@ class MainWindow(QMainWindow):
         m_run.addSeparator()
         m_run.addAction(self.act_analysis_settings)
         m_run.addAction(self.act_mass_summary)
+        m_run.addAction(self.act_joint_masses)
         m_run.addSeparator()
         m_run.addAction(self.act_clear_result)
 
@@ -1154,6 +1160,23 @@ class MainWindow(QMainWindow):
         self._mass_summary_window.raise_()
         self._mass_summary_window.activateWindow()
 
+    def _show_joint_masses(self) -> None:
+        """Open the non-modal Assembled Joint Masses window, or raise it.
+
+        Singleton pattern mirrors :meth:`_show_mass_summary`.
+        """
+        from .joint_masses import JointMassesWindow
+
+        if self._joint_masses_window is None:
+            self._joint_masses_window = JointMassesWindow(
+                self, lambda: self._model,
+            )
+        else:
+            self._joint_masses_window.refresh()
+        self._joint_masses_window.show()
+        self._joint_masses_window.raise_()
+        self._joint_masses_window.activateWindow()
+
     def _open_element_inspector(self, elem_id: int) -> None:
         """Open (or re-target) the non-modal element-detail inspector.
 
@@ -1644,6 +1667,17 @@ class MainWindow(QMainWindow):
         # repopulate, so refresh unconditionally when it's open.
         if self._mass_summary_window is not None:
             self._mass_summary_window.refresh()
+        # Same story for the assembled-joint-masses window: any model
+        # edit (nodes, supports, sections) can change M's contents.
+        # Skip the refresh when the window is hidden — _show_joint_masses
+        # always refreshes on re-open, so a hidden singleton can't
+        # show stale data. Avoiding the call here means no mass-matrix
+        # assembly on every keystroke / drag when the panel isn't open.
+        if (
+            self._joint_masses_window is not None
+            and self._joint_masses_window.isVisible()
+        ):
+            self._joint_masses_window.refresh()
 
     def _update_result_text(self) -> None:
         text = format_result(self._model, self._result) if self._result \
