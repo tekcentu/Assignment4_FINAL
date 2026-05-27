@@ -107,6 +107,37 @@ def test_node_coincidence_tol_is_shared_with_commands_module():
     assert NODE_COINCIDENCE_TOL == CMD_TOL
 
 
+def test_pairs_at_bounding_box_corner_are_not_coincident():
+    """PR #21 review fix: two nodes with ``|dx| < tol AND |dy| < tol``
+    can still have Euclidean distance up to ``sqrt(2)·tol``. The
+    helper must enforce the strict Euclidean check so the warning
+    message's stated threshold is honest.
+
+    Place two nodes such that ``|dx| = |dy| = 0.8·tol``; ``√(2)·0.8 =
+    1.13·tol > tol``, so they must NOT be flagged.
+    """
+    m = StructuralModel(title="bbox-corner")
+    m.nodes[1] = Node(1, 0.0, 0.0)
+    m.nodes[2] = Node(2, 0.8 * NODE_COINCIDENCE_TOL, 0.8 * NODE_COINCIDENCE_TOL)
+    pairs = _find_coincident_node_pairs(m)
+    assert pairs == [], (
+        "expected no coincident pair: |dx|, |dy| < tol but Euclidean "
+        f"distance is √2·0.8·tol > tol; got {pairs}"
+    )
+
+
+def test_pairs_just_inside_euclidean_are_coincident():
+    """Symmetric: place two nodes at half-tolerance on each axis so
+    Euclidean distance √2·0.5·tol ≈ 0.71·tol stays under the
+    threshold. Must be flagged."""
+    m = StructuralModel(title="bbox-inside")
+    m.nodes[1] = Node(1, 0.0, 0.0)
+    m.nodes[2] = Node(2, 0.5 * NODE_COINCIDENCE_TOL, 0.5 * NODE_COINCIDENCE_TOL)
+    pairs = _find_coincident_node_pairs(m)
+    assert len(pairs) == 1
+    assert pairs[0][2] < NODE_COINCIDENCE_TOL
+
+
 def test_coincident_warning_caps_pair_list_for_large_groups():
     """Pathological imports may have many coincident pairs; the
     warning lists at most _MAX_COINCIDENT_PAIRS_IN_WARNING (10) and

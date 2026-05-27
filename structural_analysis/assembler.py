@@ -290,10 +290,20 @@ def _find_coincident_node_pairs(
         for nj in nodes[i + 1:]:
             dx = ni.x - nj.x
             dy = ni.y - nj.y
-            if abs(dx) < tol and abs(dy) < tol:
-                dist = float(np.hypot(dx, dy))
-                a, b = (ni.id, nj.id) if ni.id < nj.id else (nj.id, ni.id)
-                pairs.append((a, b, dist))
+            # Cheap bounding-box pre-filter rules out the obviously-
+            # distant majority before the hypot call. The strict
+            # Euclidean check below is what actually decides whether
+            # the pair counts as coincident — using only the box
+            # check could flag pairs whose Euclidean distance reaches
+            # √2·tol, contradicting the warning message's "Δ ≤ tol"
+            # claim (per gemini PR-21 review).
+            if abs(dx) >= tol or abs(dy) >= tol:
+                continue
+            dist = float(np.hypot(dx, dy))
+            if dist >= tol:
+                continue
+            a, b = (ni.id, nj.id) if ni.id < nj.id else (nj.id, ni.id)
+            pairs.append((a, b, dist))
     return pairs
 
 
