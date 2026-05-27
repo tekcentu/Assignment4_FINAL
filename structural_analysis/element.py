@@ -136,6 +136,35 @@ class Element2D:
         """
         return _length_cos_sin(nodes[self.node_i], nodes[self.node_j])
 
+    def lumped_mass_local(self, nodes: dict) -> np.ndarray:
+        """Translational-only lumped mass matrix (shared by all 2-D elements).
+
+        Local DOFs: ``[u_i, v_i, θ_i, u_j, v_j, θ_j]``. Half the total
+        bar mass ``m = ρ·A·L`` is placed at each end on ux and uy;
+        rotational θ slots receive zero. The translational block is
+        isotropic (``m/2 · I₂``) so the matrix is rotation-invariant
+        (``R.T M_loc R = M_loc``). The modal solver detects the zero
+        rz diagonals and condenses them out — see
+        :func:`structural_analysis.modal.solve_modal`.
+
+        Implemented on the base class because the formula is identical
+        for frames and trusses; subclasses override only
+        ``consistent_mass_local`` since the consistent form *does*
+        differ between element kinds.
+        """
+        L, _, _ = self.length_cos_sin(nodes)
+        rho_consistent = self.rho / 1000.0  # kg/m³ → Mg/m³
+        m_bar = rho_consistent * self.A      # Mg/m
+        if m_bar <= 0.0:
+            return np.zeros((6, 6))
+        half = 0.5 * m_bar * L
+        M = np.zeros((6, 6))
+        M[0, 0] = half
+        M[1, 1] = half
+        M[3, 3] = half
+        M[4, 4] = half
+        return M
+
     def transformation_matrix(self, nodes: dict) -> np.ndarray:
         """Build the 6×6 rotation matrix R (local → global).
 

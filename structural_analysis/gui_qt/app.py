@@ -1610,6 +1610,9 @@ class MainWindow(QMainWindow):
                 self._model,
                 n_modes=d.result_value["n_modes"],
                 normalisation=d.result_value["normalisation"],
+                mass_formulation=d.result_value.get(
+                    "mass_formulation", "consistent",
+                ),
             )
         except ValueError as e:
             QMessageBox.warning(self, "Modal analysis", str(e))

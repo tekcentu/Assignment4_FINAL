@@ -1845,3 +1845,125 @@ def test_joint_masses_window_skips_refresh_when_hidden(qt_app):
         assert calls["n"] >= 1
     finally:
         win.refresh = original_refresh  # type: ignore[method-assign]
+
+
+def test_joint_masses_window_zero_density_fixture_shows_amber_warning(qt_app):
+    """Legacy fixtures (no density column → ρ=0) must open the window
+    immediately, render rows, and surface the amber warning banner —
+    no 'please solve modal first' gate."""
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._show_joint_masses()
+    win = w._joint_masses_window
+    assert win is not None
+    assert win.isVisible()
+
+    status = win._status_label.text()
+    assert "All assembled element mass contributions are zero" in status
+    # Amber colour applied (mirrors the spec in the plan file).
+    assert "#a06000" in win._status_label.styleSheet()
+
+    # Table still renders, one row per node.
+    assert win._table.rowCount() == len(w._model.nodes)
+
+
+def test_joint_masses_window_never_invokes_solve_modal(qt_app, monkeypatch):
+    """Opening + refreshing the window must never invoke the modal
+    eigenvalue solver. Locks the inspection-only contract at the GUI
+    layer (the unit test does the same at the helper layer)."""
+    import structural_analysis.modal as modal_mod
+
+    calls = {"n": 0}
+
+    def _boom(*args, **kwargs):
+        calls["n"] += 1
+        raise AssertionError(
+            "solve_modal invoked from the joint-masses inspection path"
+        )
+
+    monkeypatch.setattr(modal_mod, "solve_modal", _boom)
+
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._show_joint_masses()
+    win = w._joint_masses_window
+    assert win is not None
+    win.refresh()
+    qt_app.processEvents()
+
+    assert calls["n"] == 0
+
+
+def test_modal_dialog_default_formulation_is_consistent(qt_app):
+    """v0.9.2: the modal-analysis dialog's formulation dropdown defaults
+    to 'consistent', and round-trips the selection through _accept()."""
+    from structural_analysis.gui_qt.dialogs import ModalAnalysisDialog
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = ModalAnalysisDialog(w, default_n_modes=4)
+    qt_app.processEvents()
+    # Default is consistent.
+    assert d._mass_combo.currentData() == "consistent"
+    # Validation path round-trips.
+    accepted = d._accept()
+    assert accepted["mass_formulation"] == "consistent"
+    # Flip to lumped.
+    idx = d._mass_combo.findData("lumped")
+    assert idx >= 0
+    d._mass_combo.setCurrentIndex(idx)
+    accepted = d._accept()
+    assert accepted["mass_formulation"] == "lumped"
+
+
+def test_joint_masses_window_lumped_radio_zeros_rotational_cells(qt_app):
+    """v0.9.2: flipping the joint-masses formulation radio to Lumped
+    routes through joint_mass_table(mass_formulation='lumped') and the
+    table's rz column reads 0.0 for every node."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, Node, Section, StructuralModel, Support,
+    )
+
+    # Build a fresh 2-node cantilever with positive density so the
+    # consistent path produces nonzero rz cells (the legacy
+    # q2a_settlement.txt fixture has ρ=0 and would give zero rz on
+    # both formulations, masking the contrast we're testing).
+    m = StructuralModel(title="lumped-radio-test")
+    m.nodes[1] = Node(1, 0.0, 0.0)
+    m.nodes[2] = Node(2, 3.0, 0.0)
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=0.01, I=1e-4, rho=7850.0, depth=0.3, section_id=1,
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+
+    w = MainWindow()
+    w._model = m
+    qt_app.processEvents()
+    w._show_joint_masses()
+    win = w._joint_masses_window
+    assert win is not None
+    win.refresh()
+    qt_app.processEvents()
+
+    rz_col = 3  # Mrz / rz column
+    # Sanity: consistent mode is the default; node-2 rz cell should be
+    # nonzero (cantilever free end carries rotational consistent mass).
+    rz_text_consistent = win._table.item(1, rz_col).text()
+    assert rz_text_consistent not in ("—", "0.0000", "0.000e+00"), (
+        f"expected nonzero rz cell on consistent mass, got {rz_text_consistent!r}"
+    )
+
+    # Flip to lumped.
+    win._rb_lumped.setChecked(True)
+    qt_app.processEvents()
+    for r in range(win._table.rowCount()):
+        text = win._table.item(r, rz_col).text()
+        assert text in ("—", "0.0000", "0.000e+00"), (
+            f"row {r} rz expected zero on lumped, got {text!r}"
+        )

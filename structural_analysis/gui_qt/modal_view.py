@@ -51,11 +51,31 @@ class ModalResultsDialog(QDialog):
 
         v = QVBoxLayout(self)
 
+        _mass_label = (
+            "consistent"
+            if result.mass_formulation == "consistent"
+            else "lumped translational"
+        )
         v.addWidget(QLabel(
             f"<b>{result.title or 'Model'}</b> · {result.n_modes} modes · "
+            f"mass: {_mass_label} · "
             f"normalisation: {result.normalisation}",
             self,
         ))
+        if result.mass_formulation == "lumped":
+            note = QLabel(
+                "Lumped translational mass is a comparison aid. "
+                "Agreement with external software depends on matching "
+                "units, density/mass source, section properties, mesh, "
+                "boundary conditions, restraints, and mass formulation.",
+                self,
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet(
+                "color: #a06000; font-style: italic; "
+                "font-size: 9pt; padding: 2px 0;"
+            )
+            v.addWidget(note)
 
         self._tree = QTreeWidget(self)
         self._tree.setHeaderLabels(
