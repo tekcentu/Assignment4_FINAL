@@ -1,8 +1,8 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.9.2"
+__version__ = "0.10.0"
 __what_is_new__ = (
-    "modal mass formulation · lumped translational comparison aid"
+    "direct member drawing · auto-create nodes on draw"
 )
 
 from .model import (
