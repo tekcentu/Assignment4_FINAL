@@ -1,8 +1,8 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 __what_is_new__ = (
-    "split element on insert (grouped under member draw) · "
+    "split on insert (grouped undo) · split works under labeled grid · "
     "coincident-node warning"
 )
 

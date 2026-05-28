@@ -126,6 +126,47 @@ def test_canvas_draws_origin_axes(qt_app):
     assert "Y" in labels
 
 
+def test_hit_test_attaches_element_id_when_grid_snap_wins(qt_app):
+    """PR #21 review (codex P1): when a labeled grid is configured, the
+    snap engine prefers the 'grid' candidate over 'project', and the
+    grid candidate carries no element_id. _hit_test must still recover
+    the nearest element for non-element snaps — otherwise a click on an
+    element interior near a grid intersection is treated as empty space
+    and the Node/Frame split path never engages (re-introducing the
+    disconnected-component bug)."""
+    from types import SimpleNamespace
+
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.gui_qt.snap import SnapCandidate
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=7, node_i=1, node_j=2,
+        E=2.1e8, A=0.01, I=1e-4, rho=7850.0, depth=0.3, section_id=1,
+    )]
+    w.canvas.redraw()
+    # Frame the element so the px ratios are sane and (3, 0) is interior.
+    w.canvas.ax.set_xlim(-1.0, 7.0)
+    w.canvas.ax.set_ylim(-4.0, 4.0)
+
+    # Force the snap engine to return a GRID candidate (no element id)
+    # at the element's midspan — exactly the case the bug missed.
+    w.canvas.snap_engine.find_snap = (  # type: ignore[assignment]
+        lambda **kw: SnapCandidate(
+            x=3.0, y=0.0, kind="grid", priority=1,
+            screen_distance_px=0.0, label="B-2", object_id=None,
+        )
+    )
+    event = SimpleNamespace(xdata=3.0, ydata=0.0)
+    hit = w.canvas._hit_test(event)
+
+    assert hit.snap_kind == "grid"
+    # The fix: element_id recovered despite the grid snap.
+    assert hit.element_id == 7
+
+
 def test_select_tool_highlights_and_reports_selection(qt_app):
     from structural_analysis.element import FrameElement2D
     from structural_analysis.model import Node

@@ -150,8 +150,49 @@ def test_coincident_warning_caps_pair_list_for_large_groups():
         m.nodes[i] = Node(i, 5.0 + i * 1e-12, 0.0)
     pairs = _find_coincident_node_pairs(m)
     assert len(pairs) > 10
-    # The validate_model warning path is exercised indirectly: build a
-    # minimal valid model and inject a coincident cluster of 12.
-    # Easier just to assert the helper output here; the truncation
-    # logic itself lives in validate_model which is exercised by the
-    # other tests above.
+
+
+def test_validate_model_warning_truncates_pair_list_with_suffix():
+    """Cover the truncation *formatting* in validate_model itself (PR
+    #21 review): with more than _MAX_COINCIDENT_PAIRS_IN_WARNING pairs,
+    the emitted warning must list exactly the cap and end with the
+    '…(+N more)' suffix. The previous test only exercised the helper,
+    leaving the suffix assembly in validate_model unverified.
+
+    Model shape: one fixed anchor at the origin plus a fan of 6
+    near-coincident nodes around (5, 0), each tied to the anchor by a
+    frame element. Every fan node has incidence >= 1 (not isolated)
+    and the whole thing is one supported connected component, so
+    validate_model returns (warnings) rather than raising. The fan of
+    6 yields C(6, 2) = 15 coincident pairs > cap of 10."""
+    from structural_analysis.assembler import _MAX_COINCIDENT_PAIRS_IN_WARNING
+
+    m = StructuralModel(title="fan-of-dups")
+    m.materials[1] = Material(id=1, name="S", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    m.nodes[0] = Node(0, 0.0, 0.0)  # anchor
+    n_fan = 6
+    for i in range(1, n_fan + 1):
+        m.nodes[i] = Node(i, 5.0 + i * 1e-12, 0.0)  # all within tol
+        m.elements.append(FrameElement2D(
+            id=i, node_i=0, node_j=i,
+            E=2.1e8, A=0.01, I=1e-4, rho=7850.0, depth=0.3, section_id=1,
+        ))
+    m.supports[0] = Support(node_id=0, ux=True, uy=True, rz=True)
+
+    dofs = DofManager.from_model(m)
+    warnings = validate_model(m, dofs)
+    coincident = [w for w in warnings if "Coincident nodes" in w]
+    assert len(coincident) == 1
+    msg = coincident[0]
+    total_pairs = _find_coincident_node_pairs(m)
+    extra = len(total_pairs) - _MAX_COINCIDENT_PAIRS_IN_WARNING
+    assert extra > 0
+    assert f"…(+{extra} more)" in msg
+    # Exactly the cap number of "(a, b)" pairs is listed (the regex
+    # ignores the "(Δ ≤ …)" prefix and the "(+N more)" suffix).
+    import re
+    shown_pairs = re.findall(r"\(\d+, \d+\)", msg)
+    assert len(shown_pairs) == _MAX_COINCIDENT_PAIRS_IN_WARNING

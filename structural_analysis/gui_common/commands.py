@@ -47,10 +47,9 @@ if TYPE_CHECKING:
 # `NODE_COINCIDENCE_TOL` from `commands` — the constant moved to
 # `model.py` in v0.11.0 so the analytic core
 # (`assembler.validate_model`) can also consume it without importing
-# the GUI layer. Single source of truth is now `model.py`.
-__all__ = (
-    "NODE_COINCIDENCE_TOL",
-)
+# the GUI layer. Single source of truth is now `model.py`. Plain
+# module-level binding (no `__all__`) so `from … import *` keeps
+# exporting the public command classes as before.
 
 # Parametric-`t` tolerance for "is this click on an element interior
 # vs. close enough to an endpoint to be that endpoint?" Used by
@@ -488,6 +487,25 @@ class SplitElementCmd(Command):
         # Resolve / create node C. Auto-create is the common path; an
         # explicit node_id is supported so the controller can pass a
         # snapped node when the click hits a node-on-element.
+        #
+        # Defensive guard (PR #21 review): _find_or_create_node trusts
+        # a non-None hint purely by existence, so a mis-wired caller
+        # passing an off-element node id would silently produce
+        # geometrically incoherent children (A→far → far→B). Reject
+        # any hint whose coordinates don't match the projected split
+        # point within NODE_COINCIDENCE_TOL. Current callers always
+        # leave self.node_id=None; this just prevents a future
+        # foot-gun.
+        if self.node_id is not None and self.node_id in model.nodes:
+            hinted = model.nodes[self.node_id]
+            if (abs(hinted.x - proj_x) >= NODE_COINCIDENCE_TOL
+                    or abs(hinted.y - proj_y) >= NODE_COINCIDENCE_TOL):
+                raise ValueError(
+                    f"Hinted node_id={self.node_id} at "
+                    f"({hinted.x}, {hinted.y}) does not lie on element "
+                    f"{self.element_id}'s split point "
+                    f"({proj_x}, {proj_y}); refusing to split."
+                )
         resolved_c, created_c = _find_or_create_node(
             model, proj_x, proj_y, self.node_id,
         )

@@ -460,12 +460,36 @@ class ModelCanvas(QWidget):
             elif candidate.kind in ("endpoint", "midpoint", "project",
                                      "diagram"):
                 hit.element_id = candidate.object_id
+            else:
+                # Non-element snap (e.g. "grid"): the snap engine
+                # prefers grid over project, so a click on an
+                # element's interior near a grid intersection arrives
+                # here. Still attach the nearest element so the
+                # NodeTool / _PairTool split path can engage —
+                # otherwise the disconnected-component bug returns
+                # whenever a labeled grid is configured (PR #21 review,
+                # codex P1).
+                hit.element_id = self._pick_nearest_element_px(
+                    event.xdata, event.ydata, px_per_dx, px_per_dy, model,
+                )
             return hit
 
         # No snap → fall back to rectangular-grid snapping + element pick.
         sx, sy = self._snap(event.xdata, event.ydata)
         hit = HitResult(x=sx, y=sy)
-        # Still try to pick a nearby element (for select/right-click on a line).
+        hit.element_id = self._pick_nearest_element_px(
+            event.xdata, event.ydata, px_per_dx, px_per_dy, model,
+        )
+        return hit
+
+    def _pick_nearest_element_px(
+        self, x: float, y: float,
+        px_per_dx: float, px_per_dy: float, model,
+    ) -> Optional[int]:
+        """Return the id of the element closest to ``(x, y)`` within
+        :attr:`ELEM_PICK_RADIUS_PX`, or ``None``. Shared by the
+        no-snap fallback and the grid-snap branch — keeps the
+        element-pick logic in one place (PR #21 review)."""
         best_eid = None
         best_dpx = self.ELEM_PICK_RADIUS_PX
         for elem in model.elements:
@@ -474,14 +498,12 @@ class ModelCanvas(QWidget):
             if ni is None or nj is None:
                 continue
             dpx = _point_segment_distance_px(
-                event.xdata, event.ydata, ni.x, ni.y, nj.x, nj.y,
-                px_per_dx, px_per_dy,
+                x, y, ni.x, ni.y, nj.x, nj.y, px_per_dx, px_per_dy,
             )
             if dpx < best_dpx:
                 best_dpx = dpx
                 best_eid = elem.id
-        hit.element_id = best_eid
-        return hit
+        return best_eid
 
     # ── drawing ──
 

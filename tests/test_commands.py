@@ -463,6 +463,26 @@ def test_split_undo_preserves_auto_node_if_later_attached():
     assert m.elements[0].id == eid
 
 
+def test_split_rejects_node_id_hint_far_from_projected_point():
+    """Defensive guard (PR #21 review): a node_id hint pointing at an
+    off-element node must be rejected, not silently used. Without the
+    coordinate check, _find_or_create_node would accept the hint by id
+    alone and produce geometrically incoherent children."""
+    m, eid = _frame_model_one_member()  # frame 1→2 along y=0
+    # Add a free node far from the segment.
+    free = _add_node(m, 10.0, 10.0)
+    n_nodes_before = len(m.nodes)
+    elem_ids_before = [e.id for e in m.elements]
+
+    with pytest.raises(ValueError, match="does not lie on element"):
+        SplitElementCmd(
+            element_id=eid, x=3.0, y=0.0, node_id=free,
+        ).do(m)
+    # Atomic-rollback: parent intact, free node untouched.
+    assert len(m.nodes) == n_nodes_before
+    assert [e.id for e in m.elements] == elem_ids_before
+
+
 # ── DrawMemberWithSplitsCmd (PR #21 follow-up: grouped undo) ──
 
 
