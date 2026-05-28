@@ -91,6 +91,11 @@ def test_truss_tool_passes_truss_kind_to_element_dialog(qt_app):
         first_x, first_y, first_node_id,
         second_x, second_y, second_node_id,
         kind=None,
+        # v0.11.0 follow-up: _PairTool now always passes deferred
+        # split targets (None for node-snap / free clicks). Tolerate
+        # them so this node-snap-only test keeps exercising the stub.
+        first_split_target=None,
+        second_split_target=None,
     ):
         seen.append({
             "first_node_id": first_node_id,
@@ -2065,6 +2070,9 @@ def test_frame_tool_same_empty_point_twice_short_circuits_before_dialog(qt_app):
         first_x, first_y, first_node_id,
         second_x, second_y, second_node_id,
         kind=None,
+        # v0.11.0 follow-up: tolerate deferred split-target kwargs.
+        first_split_target=None,
+        second_split_target=None,
     ):
         calls.append({
             "first": (first_x, first_y, first_node_id),
@@ -2355,3 +2363,118 @@ def test_frame_draw_endpoint_on_element_interior_splits_and_connects(qt_app):
     ]
     # Two split children + the new member all connect here.
     assert len(elements_at_split) == 3
+
+
+def test_member_draw_split_collapses_to_single_undo(qt_app):
+    """v0.11.0 follow-up: drawing a member whose endpoint bisects an
+    element is ONE undoable gesture. After the draw (split + member),
+    a single Ctrl+Z must restore the pre-split parent AND remove the
+    new member — not leave the split stranded on the stack."""
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+    from structural_analysis.gui_common.commands import AddNodeCmd
+    w.execute(AddNodeCmd(x=3.0, y=5.0))
+    qt_app.processEvents()
+    free_node = max(w._model.nodes.keys())
+
+    w._select_tool("frame")
+    qt_app.processEvents()
+    free = w._model.nodes[free_node]
+    w._on_canvas_click(
+        HitResult(x=free.x, y=free.y, node_id=free_node, snap_kind="node"),
+        "left",
+    )
+    qt_app.processEvents()
+    w._on_canvas_click(
+        HitResult(x=3.0, y=0.0, element_id=parent_id, snap_kind="project"),
+        "left",
+    )
+    qt_app.processEvents()
+    # Drawn: parent split + new member.
+    assert len(w._model.nodes) == 4
+    assert len(w._model.elements) == 3
+
+    # ONE undo reverses the whole gesture.
+    w._do_undo()
+    qt_app.processEvents()
+    assert [e.id for e in w._model.elements] == [parent_id]
+    assert len(w._model.nodes) == 3  # free node + the 2 bar endpoints
+    assert all((n.x, n.y) != (3.0, 0.0) for n in w._model.nodes.values())
+
+
+def test_member_draw_bisecting_two_elements_collapses_to_single_undo(qt_app):
+    """Worst case from the user's report: a member whose BOTH endpoints
+    land on element interiors. The draw splits two parents and adds the
+    connecting member; one Ctrl+Z must restore both parents and remove
+    the member (previously took three)."""
+    from structural_analysis.gui_common.commands import AddMemberCmd
+
+    w = MainWindow()
+    qt_app.processEvents()
+    lower_id = _stage_c_seed_frame(w, qt_app)  # (0,0)-(6,0)
+    # Add a parallel upper bar (0,4)-(6,4).
+    w.execute(AddMemberCmd(
+        x_i=0.0, y_i=4.0, x_j=6.0, y_j=4.0, kind="frame", section_id=1,
+    ))
+    qt_app.processEvents()
+    upper_id = max(e.id for e in w._model.elements)
+    assert (len(w._model.nodes), len(w._model.elements)) == (4, 2)
+
+    w._select_tool("frame")
+    qt_app.processEvents()
+    w._on_canvas_click(
+        HitResult(x=3.0, y=0.0, element_id=lower_id, snap_kind="project"),
+        "left",
+    )
+    qt_app.processEvents()
+    w._on_canvas_click(
+        HitResult(x=3.0, y=4.0, element_id=upper_id, snap_kind="project"),
+        "left",
+    )
+    qt_app.processEvents()
+    # Both parents split (4 children) + 1 member; 2 new split nodes.
+    assert (len(w._model.nodes), len(w._model.elements)) == (6, 5)
+    assert lower_id not in [e.id for e in w._model.elements]
+    assert upper_id not in [e.id for e in w._model.elements]
+
+    # ONE undo restores both parents and removes the member.
+    w._do_undo()
+    qt_app.processEvents()
+    assert (len(w._model.nodes), len(w._model.elements)) == (4, 2)
+    assert lower_id in [e.id for e in w._model.elements]
+    assert upper_id in [e.id for e in w._model.elements]
+
+
+def test_member_draw_split_is_deferred_until_dialog_accept(qt_app):
+    """Deferred-split cancel-safety: with splits no longer firing
+    eagerly on click, abandoning the draw before dispatch (here:
+    the dialog opens and the user cancels) leaves the model fully
+    intact — the parent is never split. Previously the first click
+    eagerly fired SplitElementCmd, leaving an orphaned split on the
+    undo stack when the dialog was cancelled."""
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+    # Drop the sticky settings so the (stubbed) dialog path is taken.
+    w._sticky_element = None
+    nodes_before = sorted(w._model.nodes.keys())
+    elems_before = [e.id for e in w._model.elements]
+
+    # Stub the dialog open to a no-op == user cancelled (no dispatch).
+    w.open_element_dialog_for_member = lambda **kw: None
+
+    w._select_tool("frame")
+    qt_app.processEvents()
+    # Click 1: free node start. Click 2: interior of the parent.
+    w._on_canvas_click(HitResult(x=0.0, y=5.0), "left")
+    qt_app.processEvents()
+    w._on_canvas_click(
+        HitResult(x=3.0, y=0.0, element_id=parent_id, snap_kind="project"),
+        "left",
+    )
+    qt_app.processEvents()
+
+    # No split happened — the click only *staged* the split target.
+    assert sorted(w._model.nodes.keys()) == nodes_before
+    assert [e.id for e in w._model.elements] == elems_before

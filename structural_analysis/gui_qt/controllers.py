@@ -40,6 +40,8 @@ class _Host(Protocol):
         first_x: float, first_y: float, first_node_id: int | None,
         second_x: float, second_y: float, second_node_id: int | None,
         kind: str | None = None,
+        first_split_target: tuple[int, float, float] | None = None,
+        second_split_target: tuple[int, float, float] | None = None,
     ) -> None: ...
     def set_element_preview(self, start_node_id: int, end_x: float,
                             end_y: float, kind: str) -> None: ...
@@ -171,9 +173,17 @@ class _PairTool(Tool):
     def __init__(self, host: _Host, kind: str) -> None:
         super().__init__(host)
         self.kind = kind
-        # v0.10.0: clicks can land on empty space, so we remember both
-        # the coordinates and the snapped node id (which may be None).
-        self._first: Optional[tuple[float, float, int | None]] = None
+        # v0.11.0 (post-PR21): the per-endpoint stash carries the
+        # world coords, a node-id hint (None if the click came from a
+        # split target or free space), and an optional split target
+        # `(parent_element_id, projected_x, projected_y)` which gets
+        # plumbed through the dialog so the composite can run the
+        # split on accept rather than eagerly.
+        #
+        # Fields: (x, y, node_id_hint, split_target_or_None)
+        self._first: Optional[
+            tuple[float, float, int | None, tuple[int, float, float] | None]
+        ] = None
 
     @property
     def description(self) -> str:
@@ -182,7 +192,14 @@ class _PairTool(Tool):
                 f"{self.kind.capitalize()} tool: click the start point. "
                 "Snaps to nodes; a new node is created if you click empty space."
             )
-        ref = f"node {self._first[2]}" if self._first[2] is not None else "point"
+        first_id = self._first[2]
+        first_split = self._first[3]
+        if first_id is not None:
+            ref = f"node {first_id}"
+        elif first_split is not None:
+            ref = f"on element {first_split[0]}"
+        else:
+            ref = "point"
         return (
             f"{self.kind.capitalize()} tool: click the end point "
             f"(start = {ref})."
@@ -194,60 +211,59 @@ class _PairTool(Tool):
 
     def _resolve_endpoint(
         self, hit: HitResult,
-    ) -> tuple[float, float, int | None] | None:
-        """Resolve a member-draw click to ``(x, y, node_id_or_None)``.
+    ) -> tuple[float, float, int | None, tuple[int, float, float] | None]:
+        """Resolve a member-draw click into ``(x, y, node_id, split_target)``.
 
-        If the click lands on an existing element's interior, fires a
-        :class:`SplitElementCmd` first. On split success, the
-        projected point and the freshly-created mid node id become
-        the endpoint. On split failure (e.g. parent has member
-        loads), returns ``None`` so the caller can cancel the draw.
+        Deferred-split semantics (v0.11.0 follow-up): this helper no
+        longer calls ``host.execute``. It only *classifies* the click
+        and returns the data the dialog flow needs. The actual
+        :class:`SplitElementCmd` and :class:`AddMemberCmd` are bundled
+        into a single :class:`DrawMemberWithSplitsCmd` on dialog
+        accept, so the whole draw collapses to one undo step and
+        cancelling the dialog leaves the model untouched.
 
-        Each split is its own undo step — per the PR #21 design call,
-        we deliberately avoid the atomic-composite path here so
-        SplitElementCmd stays cheap to reason about. A user who drew
-        a member that bisected two elements will see three entries on
-        the undo stack (two splits + one member); each is
-        individually undoable.
+        Returns one of:
+
+        - ``(hit.x, hit.y, hit.node_id, None)`` — endpoint is at a
+          snapped node or in free space. No split needed.
+        - ``(proj_x, proj_y, None, (parent_element_id, proj_x, proj_y))``
+          — endpoint will split the named element on dialog accept.
+
+        The previous v0.11.0 cut had a third "None ⇒ cancel" return
+        path for split failures; that no longer applies because we
+        don't execute anything here. Member-load blocks now surface
+        from :class:`DrawMemberWithSplitsCmd.do` via the host's
+        existing ValueError handler.
         """
         target = _split_target_for(hit, self.host)
         if target is None:
-            return (hit.x, hit.y, hit.node_id)
+            return (hit.x, hit.y, hit.node_id, None)
         elem_id, x_world, y_world = target
-        cmd = SplitElementCmd(
-            element_id=elem_id, x=x_world, y=y_world,
-        )
-        self.host.execute(cmd)
-        if cmd._resolved_node_c is None:
-            # Split was rejected (member-loaded element, tolerance
-            # race, etc.). host.execute already surfaced the error
-            # message via QMessageBox.warning, so we just signal
-            # cancel to the caller.
-            return None
-        return (x_world, y_world, cmd._resolved_node_c)
+        return (x_world, y_world, None, (elem_id, x_world, y_world))
 
     def on_click(self, hit: HitResult, button: str) -> None:
         if button != "left":
             return
         if self._first is None:
-            resolved = self._resolve_endpoint(hit)
-            if resolved is None:
-                # Split blocked — don't even stash the first click.
-                # The user can adjust and try again.
-                return
-            first_x, first_y, first_id = resolved
-            self._first = (first_x, first_y, first_id)
+            self._first = self._resolve_endpoint(hit)
+            first_x, first_y, first_id, first_split = self._first
             if first_id is not None:
                 self.host.set_element_preview(
                     first_id, first_x, first_y, self.kind,
                 )
             else:
+                # Free space OR a deferred split target both anchor
+                # the rubber-band preview from the projected world
+                # coordinate — no node id is needed for the preview.
+                # Visible diff from the eager-split version: the
+                # parent element stays whole during the preview phase
+                # (split happens on dialog accept, not on click 1).
                 self.host.set_element_preview_free(
                     first_x, first_y, first_x, first_y, self.kind,
                 )
             self.host.set_status(self.description)
             return
-        first_x, first_y, first_id = self._first
+        first_x, first_y, first_id, first_split = self._first
         # Guard against "click in the same spot twice" *before* opening
         # the element-properties dialog — otherwise the user fills the
         # dialog in, only to get an "element has zero length" error on
@@ -268,33 +284,21 @@ class _PairTool(Tool):
         if same_node or same_point:
             self.host.set_status("Start and end must be different points.")
             return
-        # Second click can also land on an element interior. Resolve
-        # via the same helper — on split failure, abandon the draw
-        # (any first-click split that succeeded stays as a standalone
-        # undo step; the user can revert it themselves).
-        resolved = self._resolve_endpoint(hit)
-        if resolved is None:
-            self.host.clear_element_preview()
-            self._first = None
-            self.host.set_status(
-                "Member draw cancelled — second click could not be "
-                "resolved (split blocked or invalid). Use Ctrl+Z to "
-                "revert any pending split."
-            )
-            return
-        second_x, second_y, second_id = resolved
+        second_x, second_y, second_id, second_split = self._resolve_endpoint(hit)
         self.host.clear_element_preview()
         self.host.open_element_dialog_for_member(
             first_x=first_x, first_y=first_y, first_node_id=first_id,
             second_x=second_x, second_y=second_y, second_node_id=second_id,
             kind=self.kind,
+            first_split_target=first_split,
+            second_split_target=second_split,
         )
         self._first = None
 
     def on_motion(self, hit: HitResult) -> None:
         if self._first is None:
             return
-        first_x, first_y, first_id = self._first
+        first_x, first_y, first_id, _first_split = self._first
         if first_id is not None:
             self.host.set_element_preview(first_id, hit.x, hit.y, self.kind)
         else:

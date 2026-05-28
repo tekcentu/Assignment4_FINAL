@@ -25,6 +25,7 @@ from structural_analysis.element import FrameElement2D, TrussElement2D
 from structural_analysis.gui_common.commands import (
     AddMemberCmd,
     AddNodeCmd,
+    DrawMemberWithSplitsCmd,
     SplitElementCmd,
 )
 from structural_analysis.model import (
@@ -460,3 +461,163 @@ def test_split_undo_preserves_auto_node_if_later_attached():
     assert mid in m.nodes
     assert len(m.elements) == 1
     assert m.elements[0].id == eid
+
+
+# ── DrawMemberWithSplitsCmd (PR #21 follow-up: grouped undo) ──
+
+
+def _two_parallel_bars() -> tuple[StructuralModel, int, int]:
+    """Return (model, lower_id, upper_id): two horizontal 0..6 frames,
+    the lower at y=0 and the upper at y=4. Drawing a vertical member
+    between their midspans bisects both."""
+    m = _model_with_material_and_section()
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=6.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)
+    lower = m.elements[-1].id
+    AddMemberCmd(x_i=0.0, y_i=4.0, x_j=6.0, y_j=4.0,
+                 kind="frame", section_id=1).do(m)
+    upper = m.elements[-1].id
+    return m, lower, upper
+
+
+def test_draw_member_bisecting_two_elements_runs_two_splits_and_one_member():
+    """Worst case: both endpoints land on element interiors. One
+    composite do() must split both parents and add the connecting
+    member; one undo() must reverse all three; redo replays."""
+    m, lower, upper = _two_parallel_bars()
+    assert (len(m.nodes), len(m.elements)) == (4, 2)
+
+    cmd = DrawMemberWithSplitsCmd(
+        split_target_i=(lower, 3.0, 0.0),
+        split_target_j=(upper, 3.0, 4.0),
+        x_i=3.0, y_i=0.0, x_j=3.0, y_j=4.0,
+        kind="frame", section_id=1,
+    )
+    cmd.do(m)
+    # 4 originals + 2 split nodes; 2 parents → 4 children + 1 member.
+    assert (len(m.nodes), len(m.elements)) == (6, 5)
+    assert lower not in [e.id for e in m.elements]
+    assert upper not in [e.id for e in m.elements]
+    # The new member connects the two freshly-created split nodes.
+    mid_lo = next(n for n in m.nodes.values() if (n.x, n.y) == (3.0, 0.0))
+    mid_hi = next(n for n in m.nodes.values() if (n.x, n.y) == (3.0, 4.0))
+    member = next(
+        e for e in m.elements
+        if {e.node_i, e.node_j} == {mid_lo.id, mid_hi.id}
+    )
+    assert member is not None
+
+    # One undo reverses everything.
+    cmd.undo(m)
+    assert (len(m.nodes), len(m.elements)) == (4, 2)
+    assert lower in [e.id for e in m.elements]
+    assert upper in [e.id for e in m.elements]
+
+    # Redo replays identically.
+    cmd.do(m)
+    assert (len(m.nodes), len(m.elements)) == (6, 5)
+
+
+def test_draw_member_one_interior_one_node_snap_runs_single_split():
+    """One endpoint on an element interior, the other on an existing
+    node: exactly one split + one member, reversed in one step."""
+    m, _, _ = _two_parallel_bars()
+    # Remove the upper bar so only the lower one is interesting, and
+    # add a free node to snap the member's far end onto.
+    upper = m.elements[-1]
+    m.elements.remove(upper)
+    free = _add_node(m, 3.0, 5.0)
+    lower = m.elements[0].id
+    # Now: nodes {0,0; 6,0; 0,4; 6,4; 3,5}; one element (lower bar).
+    n_nodes_before = len(m.nodes)
+    assert len(m.elements) == 1
+
+    cmd = DrawMemberWithSplitsCmd(
+        split_target_i=(lower, 3.0, 0.0),
+        split_target_j=None,
+        x_i=3.0, y_i=0.0, x_j=3.0, y_j=5.0, node_j_hint=free,
+        kind="frame", section_id=1,
+    )
+    cmd.do(m)
+    # One split node added; parent → 2 children + 1 member.
+    assert len(m.nodes) == n_nodes_before + 1
+    assert len(m.elements) == 3
+    mid = next(n for n in m.nodes.values() if (n.x, n.y) == (3.0, 0.0))
+    assert any(
+        {e.node_i, e.node_j} == {mid.id, free} for e in m.elements
+    )
+
+    cmd.undo(m)
+    assert len(m.nodes) == n_nodes_before
+    assert len(m.elements) == 1
+    assert m.elements[0].id == lower
+
+
+def test_draw_member_with_no_split_targets_degenerates_to_add_member():
+    """Both split targets None ⇒ the composite behaves like a plain
+    AddMemberCmd (auto-creates the two endpoint nodes)."""
+    m = _model_with_material_and_section()
+    cmd = DrawMemberWithSplitsCmd(
+        split_target_i=None, split_target_j=None,
+        x_i=0.0, y_i=0.0, x_j=6.0, y_j=0.0,
+        kind="frame", section_id=1,
+    )
+    cmd.do(m)
+    assert (len(m.nodes), len(m.elements)) == (2, 1)
+    cmd.undo(m)
+    assert (len(m.nodes), len(m.elements)) == (0, 0)
+
+
+def test_draw_member_rolls_back_first_split_when_second_split_blocked():
+    """If the second split is rejected (loaded parent), the first
+    split is reversed and the model is left exactly as it began —
+    no member, no orphaned split node."""
+    m, lower, upper = _two_parallel_bars()
+    # Block the upper bar with a member load.
+    m.elements[1].member_loads.append(UniformDistributedLoad(wy=-5.0))
+
+    cmd = DrawMemberWithSplitsCmd(
+        split_target_i=(lower, 3.0, 0.0),
+        split_target_j=(upper, 3.0, 4.0),
+        x_i=3.0, y_i=0.0, x_j=3.0, y_j=4.0,
+        kind="frame", section_id=1,
+    )
+    with pytest.raises(ValueError, match="member loads"):
+        cmd.do(m)
+    # Fully rolled back: both parents whole, no split nodes, no member.
+    assert (len(m.nodes), len(m.elements)) == (4, 2)
+    assert lower in [e.id for e in m.elements]
+    assert upper in [e.id for e in m.elements]
+
+
+def test_draw_member_rolls_back_both_splits_when_member_add_fails():
+    """If the inner AddMemberCmd raises, every preceding split is
+    reversed and the model is untouched.
+
+    Setup: two bars cross at (3,0). Splitting both at that point makes
+    the second split reuse the first's freshly-created node (the
+    coincidence-dedup rule), so the inner member would connect a node
+    to itself → AddMemberCmd raises *after* both splits succeeded.
+    The composite must still unwind both."""
+    m = _model_with_material_and_section()
+    # Two bars crossing at (3,0): one horizontal, one vertical.
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=6.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)
+    horiz = m.elements[-1].id
+    AddMemberCmd(x_i=3.0, y_i=-3.0, x_j=3.0, y_j=3.0,
+                 kind="frame", section_id=1).do(m)
+    vert = m.elements[-1].id
+    assert (len(m.nodes), len(m.elements)) == (4, 2)
+
+    cmd = DrawMemberWithSplitsCmd(
+        split_target_i=(horiz, 3.0, 0.0),
+        split_target_j=(vert, 3.0, 0.0),
+        x_i=3.0, y_i=0.0, x_j=3.0, y_j=0.0,
+        kind="frame", section_id=1,
+    )
+    with pytest.raises(ValueError, match="cannot be the same"):
+        cmd.do(m)
+    # Both splits rolled back: 4 nodes, 2 elements, both parents whole.
+    assert (len(m.nodes), len(m.elements)) == (4, 2)
+    assert horiz in [e.id for e in m.elements]
+    assert vert in [e.id for e in m.elements]

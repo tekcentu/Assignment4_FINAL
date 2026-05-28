@@ -619,6 +619,116 @@ class SplitElementCmd(Command):
 
 
 @dataclass
+class DrawMemberWithSplitsCmd(Command):
+    """Composite: split 0–2 parent elements, then add a new member.
+
+    Used by the Frame / Truss tools (v0.11.0 follow-up) so that
+    drawing a member whose endpoint(s) land on an existing element's
+    interior collapses to **one undo step** — one ``Ctrl+Z`` reverses
+    every side effect of that single user gesture, instead of the
+    1–3 separate `Ctrl+Z`s the previous wiring required.
+
+    Composition rules:
+
+    - ``split_target_i`` / ``split_target_j`` are
+      ``(parent_element_id, projected_x, projected_y)`` tuples or
+      ``None``. A ``None`` slot means that endpoint came from a node-
+      snap or free-space click, not from an element interior — the
+      composite skips the split for that slot and uses the supplied
+      ``node_*_hint`` / ``x_*, y_*`` like a plain ``AddMemberCmd``.
+    - When *both* targets are ``None`` the composite degenerates to a
+      thin wrapper around :class:`AddMemberCmd`. The dialog dispatch
+      in :mod:`gui_qt.app` short-circuits this case (plain
+      ``AddMemberCmd`` push), but the degenerate path is supported
+      here so the command class is usable without that branching.
+
+    Atomic-rollback contract (mirrors :class:`AddMemberCmd`): if any
+    step raises after earlier steps succeeded, the composite reverses
+    them in LIFO order and re-raises. So:
+
+    - split-1 fails → model untouched.
+    - split-2 fails (e.g. parent has member loads) → split-1's parent
+      is restored, no member is created, model untouched.
+    - inner ``AddMemberCmd`` fails (e.g. zero-length, duplicate)
+      → both splits are reversed, model untouched.
+    """
+
+    # Pending split targets — None for endpoints that come from a
+    # node-snap / free-space click and don't need a split.
+    split_target_i: tuple[int, float, float] | None = None
+    split_target_j: tuple[int, float, float] | None = None
+
+    # AddMemberCmd parameters. When a corresponding ``split_target_*``
+    # is set, the matching ``node_*_hint`` is ignored (the composite
+    # uses the split-result node id instead). Otherwise the existing
+    # AddMemberCmd reuse-or-create rules apply.
+    x_i: float = 0.0
+    y_i: float = 0.0
+    node_i_hint: int | None = None
+    x_j: float = 0.0
+    y_j: float = 0.0
+    node_j_hint: int | None = None
+    kind: str = "frame"
+    section_id: int = 0
+    release_i: bool = False
+    release_j: bool = False
+    material_override_id: int | None = None
+
+    _splits: list[SplitElementCmd] = field(default_factory=list, init=False)
+    _inner: "AddMemberCmd | None" = field(default=None, init=False)
+    description: str = "draw member"
+
+    def do(self, model: StructuralModel) -> None:
+        # Reset bookkeeping so a redo (do → undo → do) starts clean.
+        self._splits = []
+        self._inner = None
+        try:
+            resolved_i = self.node_i_hint
+            if self.split_target_i is not None:
+                eid, px, py = self.split_target_i
+                s = SplitElementCmd(element_id=eid, x=px, y=py)
+                s.do(model)
+                self._splits.append(s)
+                resolved_i = s._resolved_node_c
+
+            resolved_j = self.node_j_hint
+            if self.split_target_j is not None:
+                eid, px, py = self.split_target_j
+                s = SplitElementCmd(element_id=eid, x=px, y=py)
+                s.do(model)
+                self._splits.append(s)
+                resolved_j = s._resolved_node_c
+
+            inner = AddMemberCmd(
+                x_i=self.x_i, y_i=self.y_i, node_i=resolved_i,
+                x_j=self.x_j, y_j=self.y_j, node_j=resolved_j,
+                kind=self.kind, section_id=self.section_id,
+                release_i=self.release_i, release_j=self.release_j,
+                material_override_id=self.material_override_id,
+            )
+            inner.do(model)
+            self._inner = inner
+        except Exception:
+            # LIFO rollback. AddMemberCmd / SplitElementCmd each
+            # guarantee atomicity in their own do(); composing them
+            # in reverse undo order leaves the model in its pre-do
+            # state. _inner is None if AddMemberCmd never started.
+            if self._inner is not None:
+                self._inner.undo(model)
+                self._inner = None
+            for s in reversed(self._splits):
+                s.undo(model)
+            self._splits = []
+            raise
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._inner is not None:
+            self._inner.undo(model)
+        for s in reversed(self._splits):
+            s.undo(model)
+
+
+@dataclass
 class DeleteElementCmd(Command):
     elem_id: int
     _saved: object | None = None

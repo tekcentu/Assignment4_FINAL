@@ -2,7 +2,8 @@
 
 __version__ = "0.11.0"
 __what_is_new__ = (
-    "split element on insert · coincident-node warning"
+    "split element on insert (grouped under member draw) · "
+    "coincident-node warning"
 )
 
 from .model import (
