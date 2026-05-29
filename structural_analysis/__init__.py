@@ -1,9 +1,9 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.11.1"
+__version__ = "0.12.0"
 __what_is_new__ = (
-    "split on insert (grouped undo) · split works under labeled grid · "
-    "coincident-node warning"
+    "split loaded members (UDL + point + thermal) · "
+    "split under labeled grid · grouped draw-with-splits undo"
 )
 
 from .model import (

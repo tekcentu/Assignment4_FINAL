@@ -32,12 +32,16 @@ from typing import TYPE_CHECKING
 from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     NODE_COINCIDENCE_TOL,
+    FrameTemperatureLoad,
     Material,
     Node,
     NodalLoad,
+    PointLoad,
     Section,
     StructuralModel,
     Support,
+    TrussTemperatureLoad,
+    UniformDistributedLoad,
 )
 
 if TYPE_CHECKING:
@@ -393,10 +397,86 @@ class AddMemberCmd(Command):
             del model.nodes[nid]
 
 
-_SPLIT_BLOCKED_LOADS_MSG: str = (
-    "This element has member loads. Splitting loaded elements requires "
-    "load remapping and is not implemented yet."
-)
+def _remap_member_loads(
+    parent_loads: list,
+    L1: float, L_parent: float,
+    L_child_a: float, L_child_b: float,
+) -> tuple[list, list]:
+    """Split parent member_loads into (child_A_loads, child_B_loads).
+
+    Rules (v0.12.0 — Feature B):
+
+    * ``UniformDistributedLoad``: append the same (frozen) instance to
+      BOTH children. Resultant w·L = w·L1 + w·L2; FEMs at the shared
+      node C cancel.
+    * ``PointLoad(py, a)``: FP-roundoff tolerance band ``tol_a =
+      1e-12 * max(L_parent, 1.0)`` — tight enough that a load with
+      any real offset from the split routes to the correct child
+      with its true offset, no matter the parent's length. If ``a <
+      L1 - tol_a`` → child A (unchanged). If ``a > L1 + tol_a`` →
+      child B with ``a -= L1`` (clamped to ``L_child_b`` to survive
+      element.py's ``a <= L + 1e-10`` bounds guard). Otherwise (load
+      at split point in FP) → child A with ``a = L_child_a`` (use
+      child A's ACTUAL length so we don't lose the same FP race on
+      the left).
+    * ``FrameTemperatureLoad`` / ``TrussTemperatureLoad``: append
+      unchanged to BOTH children — thermal fixed-end forces are
+      length-independent and contributions at node C cancel exactly.
+    * Anything else: raise ``ValueError`` BEFORE the caller mutates the
+      model so atomicity is preserved.
+    """
+    from dataclasses import replace
+    # Pure FP roundoff tolerance: "is `a` the same number as `L1` in
+    # floating point?", NOT "is `a` within some user-meaningful
+    # distance of L1?". Deliberately decoupled from ELEMENT_SPLIT_TOL
+    # (whose 1e-6 value is correct for the parametric-`t` reject at
+    # SplitElementCmd.do() but six orders too loose here — a long
+    # member would have snapped real loads into the at-split branch).
+    # Fall back to 1.0 for sub-metre elements so a 0.1 m bar still
+    # uses a 1e-12 tolerance, not 1e-13.
+    tol_a = 1e-12 * max(L_parent, 1.0)
+    a_loads: list = []
+    b_loads: list = []
+    for ml in parent_loads:
+        if isinstance(ml, UniformDistributedLoad):
+            # Frozen dataclass — safe to share the same instance.
+            a_loads.append(ml)
+            b_loads.append(ml)
+        elif isinstance(ml, PointLoad):
+            if ml.a < L1 - tol_a:
+                a_loads.append(ml)  # unchanged: a stays the same
+            elif ml.a > L1 + tol_a:
+                b_loads.append(replace(ml, a=min(ml.a - L1, L_child_b)))
+            else:
+                # At split point: deterministic assign to child A's
+                # right end. Use child A's ACTUAL length for round-off
+                # robustness against element.py's `a <= L + 1e-10`
+                # bounds guard.
+                #
+                # Known edge case (near-unreachable): if node C ends up
+                # REUSING a pre-existing stray node within
+                # NODE_COINCIDENCE_TOL (1e-9) of the projected point
+                # rather than being freshly created, child A's
+                # solve-time length can differ from L_child_a by up to
+                # ~sqrt(2)*1e-9, which could nudge `a` past that guard.
+                # No live caller passes a node_id hint and a stray node
+                # sitting ~1e-9 from an interior split point is a
+                # degenerate model, so this is left as-is rather than
+                # clamped (a clamp would break the exact-length
+                # assertion in the unit test).
+                a_loads.append(replace(ml, a=L_child_a))
+        elif isinstance(ml, FrameTemperatureLoad):
+            a_loads.append(ml)
+            b_loads.append(ml)
+        elif isinstance(ml, TrussTemperatureLoad):
+            a_loads.append(ml)
+            b_loads.append(ml)
+        else:
+            raise ValueError(
+                f"Splitting an element with "
+                f"{type(ml).__name__} loads is not yet supported."
+            )
+    return a_loads, b_loads
 
 
 @dataclass
@@ -411,10 +491,19 @@ class SplitElementCmd(Command):
     raises (the controller is expected to have routed near-endpoint
     clicks to a node-reuse path instead).
 
-    Member-load policy (v1, per PR #21 design): if the parent element
-    has any entries in ``member_loads``, the command raises with a
-    clear message and the model is left untouched. Splitting with a
-    proper load remap is a follow-up.
+    Member-load policy (v0.12.0 — Feature B): parent ``member_loads``
+    are remapped onto the children via :func:`_remap_member_loads`
+    BEFORE any model mutation occurs. Supported load types:
+
+      * ``UniformDistributedLoad`` — copied unchanged to BOTH children.
+      * ``PointLoad`` — routed left/right of the split, with the local
+        coordinate ``a`` shifted on the right child; a load exactly at
+        the split point is assigned to child A at its full length.
+      * ``FrameTemperatureLoad`` / ``TrussTemperatureLoad`` — copied
+        unchanged to BOTH children (length-independent).
+      * any other type raises ``ValueError`` and the model is untouched
+        (atomic: the remap is performed BEFORE the parent slot is
+        swapped for the two children).
 
     Composite-rollback contract (mirrors :class:`AddMemberCmd`): any
     mutation a failing ``do()`` may have performed is undone before
@@ -422,7 +511,9 @@ class SplitElementCmd(Command):
     half-split model. ``undo()`` removes the two child elements,
     re-inserts the parent at its original index, then conditionally
     removes the auto-created node C (only if nothing else has come to
-    depend on it in the meantime).
+    depend on it in the meantime). The parent's original
+    ``member_loads`` list comes back intact because the parent
+    instance is held by reference in ``_saved_parent``.
     """
 
     element_id: int
@@ -463,9 +554,6 @@ class SplitElementCmd(Command):
             )
         parent = model.elements[parent_idx]
 
-        if getattr(parent, "member_loads", None):
-            raise ValueError(_SPLIT_BLOCKED_LOADS_MSG)
-
         ni = model.nodes.get(parent.node_i)
         nj = model.nodes.get(parent.node_j)
         if ni is None or nj is None:
@@ -483,6 +571,18 @@ class SplitElementCmd(Command):
                 f"{self.element_id} (t={t:.6g}); reuse the endpoint "
                 "node instead."
             )
+
+        # Remap member_loads BEFORE any model mutation. If any load
+        # type is unsupported this raises and the model is untouched.
+        import math as _math
+        L_parent = _math.hypot(nj.x - ni.x, nj.y - ni.y)
+        L1 = t * L_parent
+        L_child_a = _math.hypot(proj_x - ni.x, proj_y - ni.y)
+        L_child_b = _math.hypot(nj.x - proj_x, nj.y - proj_y)
+        parent_member_loads = list(getattr(parent, "member_loads", None) or [])
+        a_loads, b_loads = _remap_member_loads(
+            parent_member_loads, L1, L_parent, L_child_a, L_child_b,
+        )
 
         # Resolve / create node C. Auto-create is the common path; an
         # explicit node_id is supported so the controller can pass a
@@ -539,6 +639,15 @@ class SplitElementCmd(Command):
                 self._created_node_c = None
             self._resolved_node_c = None
             raise
+
+        # Attach the remapped loads to the children BEFORE the swap so
+        # that the only mutation of model state is a single atomic
+        # slice assignment below. Children are local objects up to
+        # this point, so this can't leave the model half-mutated.
+        if a_loads:
+            child_a.member_loads.extend(a_loads)
+        if b_loads:
+            child_b.member_loads.extend(b_loads)
 
         # Atomically swap parent for the two children at parent's
         # original slot. Append-then-pop would also work but leaves a
@@ -665,8 +774,9 @@ class DrawMemberWithSplitsCmd(Command):
     them in LIFO order and re-raises. So:
 
     - split-1 fails → model untouched.
-    - split-2 fails (e.g. parent has member loads) → split-1's parent
-      is restored, no member is created, model untouched.
+    - split-2 fails (e.g. unsupported member-load type on the parent)
+      → split-1's parent is restored, no member is created, model
+      untouched.
     - inner ``AddMemberCmd`` fails (e.g. zero-length, duplicate)
       → both splits are reversed, model untouched.
     """
