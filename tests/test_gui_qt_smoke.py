@@ -185,18 +185,25 @@ def test_select_tool_highlights_and_reports_selection(qt_app):
     ]
 
     w._select_tool("select")
-    w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
-    assert w.canvas._selected_node_id == 1
+    # v0.13.0: SelectTool defers the single-click select decision to
+    # mouse release (so a drag isn't double-counted). The test harness
+    # has to fire both press and release for a click.
+    def _click(hit, press_px=(0.0, 0.0)):
+        w._on_canvas_click(hit, "left", press_px=press_px, shift=False)
+        w._on_canvas_release(hit, "left", release_px=press_px, shift=False)
+
+    _click(HitResult(x=0.0, y=0.0, node_id=1))
+    assert w.canvas.get_selected_nodes() == frozenset({1})
     assert "Selected node 1" in w._status_label.text()
 
-    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=1), "left")
-    assert w.canvas._selected_element_id == 1
-    assert w.canvas._selected_node_id is None
+    _click(HitResult(x=1.0, y=0.0, element_id=1))
+    assert w.canvas.get_selected_elements() == frozenset({1})
+    assert w.canvas.get_selected_nodes() == frozenset()
     assert "Selected element 1" in w._status_label.text()
 
-    w._on_canvas_click(HitResult(x=5.0, y=5.0), "left")
-    assert w.canvas._selected_element_id is None
-    assert w.canvas._selected_node_id is None
+    _click(HitResult(x=5.0, y=5.0))
+    assert w.canvas.get_selected_elements() == frozenset()
+    assert w.canvas.get_selected_nodes() == frozenset()
     assert "Selection cleared" in w._status_label.text()
 
 
@@ -424,15 +431,20 @@ def test_select_tool_left_click_only_selects(qt_app):
     w.show_element_details = lambda eid: illegal.append(f"elem {eid}")
 
     w._select_tool("select")
-    w._on_canvas_click(HitResult(x=0.0, y=0.0, node_id=1), "left")
-    assert w.canvas._selected_node_id == 1
-    w._on_canvas_click(HitResult(x=1.0, y=0.0, element_id=1), "left")
-    assert w.canvas._selected_element_id == 1
-    assert w.canvas._selected_node_id is None
+
+    def _click(hit):
+        w._on_canvas_click(hit, "left")
+        w._on_canvas_release(hit, "left")
+
+    _click(HitResult(x=0.0, y=0.0, node_id=1))
+    assert w.canvas.get_selected_nodes() == frozenset({1})
+    _click(HitResult(x=1.0, y=0.0, element_id=1))
+    assert w.canvas.get_selected_elements() == frozenset({1})
+    assert w.canvas.get_selected_nodes() == frozenset()
     # Empty click clears selection.
-    w._on_canvas_click(HitResult(x=5.0, y=5.0), "left")
-    assert w.canvas._selected_element_id is None
-    assert w.canvas._selected_node_id is None
+    _click(HitResult(x=5.0, y=5.0))
+    assert w.canvas.get_selected_elements() == frozenset()
+    assert w.canvas.get_selected_nodes() == frozenset()
     # No modal-dialog escape hatch fired.
     assert illegal == [], (
         f"Select-tool left-click must not open the modal details dialog, "
@@ -2612,3 +2624,510 @@ def test_member_draw_split_is_deferred_until_dialog_accept(qt_app):
     # No split happened — the click only *staged* the split target.
     assert sorted(w._model.nodes.keys()) == nodes_before
     assert [e.id for e in w._model.elements] == elems_before
+
+
+# ── v0.13.0 selection UX ──────────────────────────────────────
+
+
+def _make_three_element_model(w: MainWindow) -> tuple[list[int], list[int]]:
+    """Wire a simple 4-node / 3-element horizontal frame into ``w``.
+
+    Returns ``(node_ids, element_ids)`` so tests can assert specific
+    geometry without re-discovering ids. The same model is reused
+    across the selection-UX tests."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Material, Node, Section
+
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.materials[2] = Material(id=2, name="Alu", E=7.0e7, density=2700.0)
+    w._model.sections[1] = Section(
+        id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.sections[2] = Section(
+        id=2, name="S2", material_id=1, A=0.02, I=2e-4, depth=0.4,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 2.0, 0.0),
+        3: Node(3, 4.0, 0.0),
+        4: Node(4, 6.0, 0.0),
+    }
+    w._model.elements = [
+        FrameElement2D(id=i + 1,
+                       node_i=i + 1, node_j=i + 2,
+                       E=2.1e8, A=0.01, I=1e-4,
+                       section_id=1)
+        for i in range(3)
+    ]
+    return [1, 2, 3, 4], [1, 2, 3]
+
+
+def _click(w: MainWindow, hit: HitResult, *, shift: bool = False) -> None:
+    """Simulate a non-drag press + release pair through the host."""
+    px = (100.0, 100.0)
+    w._on_canvas_click(hit, "left", press_px=px, shift=shift)
+    w._on_canvas_release(hit, "left", release_px=px, shift=shift)
+
+
+def _drag(
+    w: MainWindow,
+    press_hit: HitResult, release_hit: HitResult,
+    *,
+    press_px: tuple[float, float],
+    release_px: tuple[float, float],
+    shift: bool = False,
+) -> None:
+    """Simulate press → motion (past threshold) → release for the
+    SelectTool's box-select state machine. Direction (Window vs
+    Crossing) follows from ``release_px.x < press_px.x``."""
+    w._on_canvas_click(press_hit, "left", press_px=press_px, shift=shift)
+    # Single motion past the threshold is enough to flip _dragging.
+    w._active_tool.on_motion(release_hit, cursor_px=release_px)
+    w._on_canvas_release(
+        release_hit, "left", release_px=release_px, shift=shift,
+    )
+
+
+def test_normal_click_selects_one_element_exclusively(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=1.0, y=0.0, element_id=1))
+    assert w.canvas.get_selected_elements() == frozenset({1})
+    # Picking a second element exclusively replaces the selection.
+    _click(w, HitResult(x=3.0, y=0.0, element_id=2))
+    assert w.canvas.get_selected_elements() == frozenset({2})
+
+
+def test_normal_click_on_empty_clears_selection(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=1.0, y=0.0, element_id=1))
+    _click(w, HitResult(x=10.0, y=10.0))
+    assert w.canvas.get_selected_elements() == frozenset()
+    assert w.canvas.get_selected_nodes() == frozenset()
+
+
+def test_shift_click_adds_element_to_selection(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=1.0, y=0.0, element_id=1))
+    _click(w, HitResult(x=3.0, y=0.0, element_id=2), shift=True)
+    assert w.canvas.get_selected_elements() == frozenset({1, 2})
+
+
+def test_shift_click_removes_selected_element(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=1.0, y=0.0, element_id=1))
+    _click(w, HitResult(x=3.0, y=0.0, element_id=2), shift=True)
+    _click(w, HitResult(x=1.0, y=0.0, element_id=1), shift=True)
+    assert w.canvas.get_selected_elements() == frozenset({2})
+
+
+def test_shift_click_empty_keeps_selection(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=1.0, y=0.0, element_id=1))
+    _click(w, HitResult(x=10.0, y=10.0), shift=True)
+    assert w.canvas.get_selected_elements() == frozenset({1})
+
+
+def test_shift_click_adds_node_to_selection(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=0.0, y=0.0, node_id=1))
+    _click(w, HitResult(x=2.0, y=0.0, node_id=2), shift=True)
+    assert w.canvas.get_selected_nodes() == frozenset({1, 2})
+
+
+def test_window_box_selects_element_only_when_both_endpoints_inside(qt_app):
+    """Window mode (left-to-right drag) — element selected only if BOTH
+    endpoints are inside the rect."""
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    # Press at (-1, -1), release at (3, 1) → left-to-right → Window.
+    _drag(
+        w,
+        HitResult(x=-1.0, y=-1.0), HitResult(x=3.0, y=1.0),
+        press_px=(0.0, 0.0), release_px=(100.0, 0.0),
+    )
+    # Element 1 (nodes 1@x=0 and 2@x=2) — both inside [-1,3] → selected.
+    # Element 2 (nodes 2@x=2 and 3@x=4) — node 3 outside → NOT selected
+    # under Window rules even though the segment crosses the rect.
+    assert w.canvas.get_selected_elements() == frozenset({1})
+
+
+def test_window_box_does_not_select_element_that_only_crosses(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    # Press at (1, -1), release at (3, 1) → left-to-right → Window.
+    # The rect encloses node 2 (x=2) only. Element 1 has node 1 (x=0)
+    # outside; element 2 has node 3 (x=4) outside. Both should be
+    # unselected by Window rules.
+    _drag(
+        w,
+        HitResult(x=1.0, y=-1.0), HitResult(x=3.0, y=1.0),
+        press_px=(0.0, 0.0), release_px=(100.0, 0.0),
+    )
+    assert w.canvas.get_selected_elements() == frozenset()
+    assert w.canvas.get_selected_nodes() == frozenset({2})
+
+
+def test_crossing_box_selects_element_whose_segment_crosses_rect(qt_app):
+    """Crossing mode (right-to-left drag) — element selected if either
+    endpoint is inside OR the segment crosses the rect."""
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    # Press at (3, 1), release at (1, -1) → right-to-left → Crossing.
+    # Rect spans x∈[1,3], y∈[-1,1]. Elements 1 (segment 0→2) and 2
+    # (segment 2→4) both cross.
+    _drag(
+        w,
+        HitResult(x=3.0, y=1.0), HitResult(x=1.0, y=-1.0),
+        press_px=(100.0, 0.0), release_px=(0.0, 0.0),
+    )
+    assert {1, 2}.issubset(w.canvas.get_selected_elements())
+
+
+def test_crossing_box_selects_element_with_either_endpoint_inside(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    # Rect spans [3.5, 5] → contains only x=4 (node 3). Crossing mode.
+    _drag(
+        w,
+        HitResult(x=5.0, y=1.0), HitResult(x=3.5, y=-1.0),
+        press_px=(100.0, 0.0), release_px=(0.0, 0.0),
+    )
+    # Elements 2 (2-3, x:2→4) has node 3 inside → selected.
+    # Element 3 (3-4, x:4→6) has node 3 inside → selected.
+    assert {2, 3}.issubset(w.canvas.get_selected_elements())
+
+
+def test_window_box_inclusive_boundary_selects_node_on_edge(qt_app):
+    """Inclusive boundary: a node sitting exactly on the rect edge
+    must be selected."""
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    # Rect spans x∈[0, 2], y∈[-1, 1]. Nodes 1 (x=0) and 2 (x=2) sit
+    # exactly on the boundary. Left-to-right → Window.
+    _drag(
+        w,
+        HitResult(x=0.0, y=-1.0), HitResult(x=2.0, y=1.0),
+        press_px=(0.0, 0.0), release_px=(100.0, 0.0),
+    )
+    assert {1, 2}.issubset(w.canvas.get_selected_nodes())
+
+
+def test_shift_box_adds_to_existing_selection(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=5.0, y=0.0, element_id=3))
+    # Window box over element 1's both endpoints; with Shift the box
+    # adds rather than replaces.
+    _drag(
+        w,
+        HitResult(x=-0.1, y=-1.0), HitResult(x=2.1, y=1.0),
+        press_px=(0.0, 0.0), release_px=(100.0, 0.0),
+        shift=True,
+    )
+    assert {1, 3}.issubset(w.canvas.get_selected_elements())
+
+
+def test_non_shift_box_replaces_selection(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=5.0, y=0.0, element_id=3))
+    _drag(
+        w,
+        HitResult(x=-0.1, y=-1.0), HitResult(x=2.1, y=1.0),
+        press_px=(0.0, 0.0), release_px=(100.0, 0.0),
+    )
+    assert 3 not in w.canvas.get_selected_elements()
+    assert 1 in w.canvas.get_selected_elements()
+
+
+def test_tiny_mouse_movement_is_click_not_box(qt_app):
+    """Pixel jitter below the threshold must register as a click
+    (selection updates exclusively), not a box drag."""
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    press_px = (50.0, 50.0)
+    # Move 2 pixels — below _DRAG_THRESHOLD_PX (=4).
+    w._on_canvas_click(
+        HitResult(x=1.0, y=0.0, element_id=1), "left",
+        press_px=press_px, shift=False,
+    )
+    w._active_tool.on_motion(
+        HitResult(x=1.0, y=0.0, element_id=1), cursor_px=(51.0, 51.0),
+    )
+    w._on_canvas_release(
+        HitResult(x=1.0, y=0.0, element_id=1), "left",
+        release_px=(51.0, 51.0), shift=False,
+    )
+    # Click semantics: element 1 selected, no drag rect active.
+    assert w.canvas.get_selected_elements() == frozenset({1})
+    assert w.canvas._drag_rect is None
+
+
+def test_esc_in_select_mode_clears_selection(qt_app):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QKeyEvent
+    from PyQt6.QtCore import QEvent
+
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=1.0, y=0.0, element_id=1))
+    assert w.canvas.get_selected_elements() == frozenset({1})
+    ev = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier,
+    )
+    w.keyPressEvent(ev)
+    assert w.canvas.get_selected_elements() == frozenset()
+
+
+def test_esc_during_drag_cancels_rect_and_keeps_previous_selection(qt_app):
+    from PyQt6.QtCore import Qt, QEvent
+    from PyQt6.QtGui import QKeyEvent
+
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=5.0, y=0.0, element_id=3))
+    # Start a drag (don't release).
+    w._on_canvas_click(
+        HitResult(x=-1.0, y=-1.0), "left",
+        press_px=(0.0, 0.0), shift=False,
+    )
+    w._active_tool.on_motion(
+        HitResult(x=2.0, y=1.0), cursor_px=(100.0, 0.0),
+    )
+    assert w.canvas._drag_rect is not None
+    # ESC mid-drag.
+    ev = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier,
+    )
+    w.keyPressEvent(ev)
+    # Drag rect cleared; previous element-3 selection preserved.
+    assert w.canvas._drag_rect is None
+    assert 3 in w.canvas.get_selected_elements()
+
+
+def test_esc_cancels_frame_preview_no_model_change(qt_app):
+    """Frame tool first click + ESC: preview goes away, no node/element
+    is created, no undo entry is pushed, and the next click starts
+    fresh in Select mode."""
+    from PyQt6.QtCore import Qt, QEvent
+    from PyQt6.QtGui import QKeyEvent
+    from structural_analysis.model import Material, Section
+
+    w = MainWindow()
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3)
+    w._sticky_element = {
+        "kind": "frame", "section_id": 1,
+        "release_i": False, "release_j": False,
+        "material_override_id": None,
+    }
+    w._select_tool("frame")
+    n0 = len(w._model.nodes)
+    e0 = len(w._model.elements)
+    undo_len_before = len(w._undo)
+    # Click 1.
+    w._on_canvas_click(HitResult(x=0.0, y=0.0), "left")
+    # Preview should be live.
+    assert w._tools["frame"]._first is not None
+    # ESC.
+    ev = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier,
+    )
+    w.keyPressEvent(ev)
+    # FrameTool's first-click stash is cleared, preview gone.
+    assert w._tools["frame"]._first is None
+    assert w.canvas._element_preview is None
+    assert w.canvas._element_preview_free is None
+    # Model unchanged, no undo entry pushed.
+    assert len(w._model.nodes) == n0
+    assert len(w._model.elements) == e0
+    assert len(w._undo) == undo_len_before
+    # Active tool is now Select.
+    assert w._active_tool is w._tools["select"]
+
+
+def test_esc_cancels_truss_preview_no_model_change(qt_app):
+    from PyQt6.QtCore import Qt, QEvent
+    from PyQt6.QtGui import QKeyEvent
+    from structural_analysis.model import Material, Section
+
+    w = MainWindow()
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3)
+    w._sticky_element = {
+        "kind": "truss", "section_id": 1,
+        "release_i": False, "release_j": False,
+        "material_override_id": None,
+    }
+    w._select_tool("truss")
+    n0 = len(w._model.nodes)
+    e0 = len(w._model.elements)
+    w._on_canvas_click(HitResult(x=0.0, y=0.0), "left")
+    assert w._tools["truss"]._first is not None
+    ev = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier,
+    )
+    w.keyPressEvent(ev)
+    assert w._tools["truss"]._first is None
+    assert len(w._model.nodes) == n0
+    assert len(w._model.elements) == e0
+    assert w._active_tool is w._tools["select"]
+
+
+def test_esc_then_click_elsewhere_does_not_complete_old_member(qt_app):
+    """After ESC, the next click must start fresh — it must not pick
+    up the stale first-click from the cancelled draw."""
+    from PyQt6.QtCore import Qt, QEvent
+    from PyQt6.QtGui import QKeyEvent
+    from structural_analysis.model import Material, Section
+
+    w = MainWindow()
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3)
+    w._sticky_element = {
+        "kind": "frame", "section_id": 1,
+        "release_i": False, "release_j": False,
+        "material_override_id": None,
+    }
+    w._select_tool("frame")
+    w._on_canvas_click(HitResult(x=0.0, y=0.0), "left")
+    ev = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier,
+    )
+    w.keyPressEvent(ev)
+    n0 = len(w._model.nodes)
+    e0 = len(w._model.elements)
+    # ESC landed us back in Select mode; a fresh click in Select must
+    # not create or complete any member.
+    _click(w, HitResult(x=5.0, y=5.0))
+    assert len(w._model.nodes) == n0
+    assert len(w._model.elements) == e0
+
+
+def test_esc_does_not_push_undo_entry(qt_app):
+    from PyQt6.QtCore import Qt, QEvent
+    from PyQt6.QtGui import QKeyEvent
+
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=1.0, y=0.0, element_id=1))
+    undo_before = list(w._undo)
+    ev = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier,
+    )
+    w.keyPressEvent(ev)
+    # Selection cleared.
+    assert w.canvas.get_selected_elements() == frozenset()
+    # No new undo entry from ESC.
+    assert list(w._undo) == undo_before
+
+
+def test_status_bar_shows_selection_count(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _drag(
+        w,
+        HitResult(x=-0.1, y=-1.0), HitResult(x=4.1, y=1.0),
+        press_px=(0.0, 0.0), release_px=(100.0, 0.0),
+    )
+    text = w._status_label.text().lower()
+    assert "element" in text or "node" in text
+    assert " selected" in text
+
+
+def test_batch_assign_changes_selected_elements_only(qt_app):
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    # Hand-pick elements 1 and 3.
+    _click(w, HitResult(x=1.0, y=0.0, element_id=1))
+    _click(w, HitResult(x=5.0, y=0.0, element_id=3), shift=True)
+    # Apply section=2 via the command (bypassing the modal dialog).
+    from structural_analysis.gui_common.commands import BatchUpdateElementsCmd
+    cmd = BatchUpdateElementsCmd(
+        element_ids=list(w.canvas.get_selected_elements()),
+        section_id=2,
+    )
+    w.execute(cmd)
+    sections = {e.id: e.section_id for e in w._model.elements}
+    assert sections[1] == 2
+    assert sections[3] == 2
+    assert sections[2] == 1  # unselected, untouched
+
+
+def test_batch_assign_undo_restores_sections(qt_app):
+    from structural_analysis.gui_common.commands import BatchUpdateElementsCmd
+
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    before = {e.id: e.section_id for e in w._model.elements}
+    cmd = BatchUpdateElementsCmd(element_ids=[1, 3], section_id=2)
+    w.execute(cmd)
+    assert any(
+        e.section_id != before[e.id] for e in w._model.elements
+    )
+    w._do_undo()
+    after = {e.id: e.section_id for e in w._model.elements}
+    assert after == before
+
+
+def test_batch_assign_empty_selection_shows_info_message(qt_app, monkeypatch):
+    """Triggering the batch action with no selection must NOT execute
+    a command — it just shows an info dialog."""
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    assert w.canvas.get_selected_elements() == frozenset()
+    fired: list[str] = []
+    monkeypatch.setattr(
+        "structural_analysis.gui_qt.app.QMessageBox.information",
+        lambda *a, **kw: fired.append("info"),
+    )
+    n_undo_before = len(w._undo)
+    w._do_batch_assign_selected()
+    assert fired == ["info"]
+    assert len(w._undo) == n_undo_before
+
+
+def test_delete_selected_removes_objects_and_is_undoable(qt_app):
+    from PyQt6.QtCore import Qt, QEvent
+    from PyQt6.QtGui import QKeyEvent
+
+    w = MainWindow()
+    _make_three_element_model(w)
+    w._select_tool("select")
+    _click(w, HitResult(x=1.0, y=0.0, element_id=1))
+    _click(w, HitResult(x=3.0, y=0.0, element_id=2), shift=True)
+    n_elems_before = len(w._model.elements)
+    ev = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier,
+    )
+    w.keyPressEvent(ev)
+    assert len(w._model.elements) == n_elems_before - 2
+    w._do_undo()
+    assert len(w._model.elements) == n_elems_before

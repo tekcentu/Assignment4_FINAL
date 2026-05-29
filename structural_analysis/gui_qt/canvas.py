@@ -93,8 +93,19 @@ class ModelCanvas(QWidget):
         self._element_preview_free: (
             tuple[float, float, float, float, str] | None
         ) = None
-        self._selected_node_id: int | None = None
-        self._selected_element_id: int | None = None
+        # Multi-select state (v0.13.0). Each set holds all currently
+        # selected node / element ids. Single-object selection is just
+        # a one-element set; box-select fills these in bulk.
+        self._selected_node_ids: set[int] = set()
+        self._selected_element_ids: set[int] = set()
+        # Active drag-rectangle for box selection. Tuple:
+        # ``(x0, y0, x1, y1, is_crossing)`` in world coords, or None
+        # when no drag is in progress. ``is_crossing`` is True for
+        # right-to-left drags (Crossing mode) and False for
+        # left-to-right drags (Window mode).
+        self._drag_rect: (
+            tuple[float, float, float, float, bool] | None
+        ) = None
         # Per-element max / min markers on the currently-drawn moment /
         # shear / axial diagram. Populated by _draw_diagrams and fed
         # into the snap engine so the cursor snaps to those points in
@@ -131,8 +142,24 @@ class ModelCanvas(QWidget):
         self._pan_xlim0: tuple[float, float] = (0.0, 1.0)
         self._pan_ylim0: tuple[float, float] = (0.0, 1.0)
 
-        self.on_click: Callable[[HitResult, str], None] | None = None
-        self.on_motion: Callable[[HitResult], None] | None = None
+        # The pixel-coord parameter is passed alongside the world-coord
+        # HitResult so tools (currently SelectTool) can drive direction-
+        # aware drag selection independently of axis flips or zoom.
+        self.on_click: (
+            Callable[[HitResult, str, tuple[float, float], bool], None] | None
+        ) = None
+        self.on_motion: (
+            Callable[[HitResult, tuple[float, float]], None] | None
+        ) = None
+        self.on_release: (
+            Callable[[HitResult, str, tuple[float, float], bool], None] | None
+        ) = None
+        # Cache of the most recent hit + event pixel coords so
+        # _handle_release can route a HitResult without re-running the
+        # full hit-test (mpl release events sometimes arrive with no
+        # xdata/ydata, e.g. when the cursor leaves the axes mid-drag).
+        self._last_hit: HitResult | None = None
+        self._last_event_px: tuple[float, float] | None = None
 
         self.fig = plt.Figure(figsize=(7.5, 6.0), dpi=100)
         self.ax = self.fig.add_subplot(111)
@@ -207,16 +234,48 @@ class ModelCanvas(QWidget):
         self._element_preview_free = None
 
     def select_node(self, node_id: int) -> None:
-        self._selected_node_id = int(node_id)
-        self._selected_element_id = None
+        """Exclusive single-node selection — clears everything else."""
+        self._selected_node_ids = {int(node_id)}
+        self._selected_element_ids = set()
 
     def select_element(self, element_id: int) -> None:
-        self._selected_element_id = int(element_id)
-        self._selected_node_id = None
+        """Exclusive single-element selection — clears everything else."""
+        self._selected_element_ids = {int(element_id)}
+        self._selected_node_ids = set()
+
+    def add_node_to_selection(self, node_id: int) -> None:
+        self._selected_node_ids.add(int(node_id))
+
+    def remove_node_from_selection(self, node_id: int) -> None:
+        self._selected_node_ids.discard(int(node_id))
+
+    def add_element_to_selection(self, element_id: int) -> None:
+        self._selected_element_ids.add(int(element_id))
+
+    def remove_element_from_selection(self, element_id: int) -> None:
+        self._selected_element_ids.discard(int(element_id))
+
+    def get_selected_nodes(self) -> frozenset[int]:
+        return frozenset(self._selected_node_ids)
+
+    def get_selected_elements(self) -> frozenset[int]:
+        return frozenset(self._selected_element_ids)
 
     def clear_selection(self) -> None:
-        self._selected_node_id = None
-        self._selected_element_id = None
+        self._selected_node_ids = set()
+        self._selected_element_ids = set()
+
+    def set_drag_rect(
+        self, x0: float, y0: float, x1: float, y1: float,
+        is_crossing: bool,
+    ) -> None:
+        """Set the active box-select rectangle (world coords + direction)."""
+        self._drag_rect = (
+            float(x0), float(y0), float(x1), float(y1), bool(is_crossing),
+        )
+
+    def clear_drag_rect(self) -> None:
+        self._drag_rect = None
 
     def set_result(self, result) -> None:
         self._result = result
@@ -316,6 +375,7 @@ class ModelCanvas(QWidget):
         else:
             self._diagram_critical_points = []
         self._draw_snap_marker()
+        self._draw_drag_rect()
         self._mpl_canvas.draw_idle()
 
     # ── Qt resize → re-fit while the user hasn't taken the wheel ──
@@ -369,7 +429,11 @@ class ModelCanvas(QWidget):
             return
         hit = self._hit_test(event)
         button_name = {1: "left", 2: "middle", 3: "right"}.get(event.button, "left")
-        self.on_click(hit, button_name)
+        event_px = (float(event.x), float(event.y))
+        self._last_hit = hit
+        self._last_event_px = event_px
+        shift = _shift_pressed()
+        self.on_click(hit, button_name, event_px, shift)
 
     def _handle_motion(self, event) -> None:
         if self._pan_origin is not None:
@@ -398,14 +462,40 @@ class ModelCanvas(QWidget):
         # marker can be drawn even when the snap engine has no
         # candidate (empty space between labeled grid lines).
         self._hover_xy = (hit.x, hit.y)
+        event_px = (float(event.x), float(event.y))
+        self._last_hit = hit
+        self._last_event_px = event_px
         try:
-            self.on_motion(hit)
+            self.on_motion(hit, event_px)
         except Exception:
             pass
 
     def _handle_release(self, event) -> None:
         if event.button == 2:
             self._pan_origin = None
+            return
+        if event.button != 1 or self.on_release is None:
+            return
+        # Release events sometimes lack xdata/ydata (cursor outside
+        # axes). Reuse the last recorded hit + pixel position so the
+        # tool can still finish a drag cleanly.
+        hit = self._last_hit
+        event_px = self._last_event_px
+        if event.xdata is not None and event.ydata is not None:
+            event_px = (float(event.x), float(event.y))
+            try:
+                hit = self._hit_test(event)
+                self._last_hit = hit
+                self._last_event_px = event_px
+            except Exception:
+                pass
+        if hit is None or event_px is None:
+            return
+        shift = _shift_pressed()
+        try:
+            self.on_release(hit, "left", event_px, shift)
+        except Exception:
+            pass
 
     def _handle_scroll(self, event) -> None:
         if event.inaxes is not self.ax or self.toolbar.mode:
@@ -627,30 +717,66 @@ class ModelCanvas(QWidget):
 
     def _draw_selection(self) -> None:
         model = self._model()
-        if self._selected_node_id is not None:
-            node = model.nodes.get(self._selected_node_id)
-            if node is not None:
-                self.ax.plot(
-                    node.x, node.y, marker="o", markersize=13,
-                    markerfacecolor="none", markeredgecolor="#ffbf00",
-                    markeredgewidth=2.4, zorder=11,
-                )
+        # Paint element-band highlights behind the element line so the
+        # crisp element stroke still reads through.
+        for eid in self._selected_element_ids:
+            elem = next((e for e in model.elements if e.id == eid), None)
+            if elem is None:
+                continue
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            self.ax.plot(
+                [ni.x, nj.x], [ni.y, nj.y],
+                color="#ffbf00", linewidth=6.0, alpha=0.45,
+                solid_capstyle="round", zorder=1.5,
+            )
+        # Paint node highlights on top (orange ring).
+        for nid in self._selected_node_ids:
+            node = model.nodes.get(nid)
+            if node is None:
+                continue
+            self.ax.plot(
+                node.x, node.y, marker="o", markersize=13,
+                markerfacecolor="none", markeredgecolor="#ffbf00",
+                markeredgewidth=2.4, zorder=11,
+            )
+
+    def _draw_drag_rect(self) -> None:
+        if self._drag_rect is None:
             return
-        if self._selected_element_id is None:
-            return
-        elem = next((e for e in model.elements
-                     if e.id == self._selected_element_id), None)
-        if elem is None:
-            return
-        ni = model.nodes.get(elem.node_i)
-        nj = model.nodes.get(elem.node_j)
-        if ni is None or nj is None:
-            return
-        self.ax.plot(
-            [ni.x, nj.x], [ni.y, nj.y],
-            color="#ffbf00", linewidth=6.0, alpha=0.45,
-            solid_capstyle="round", zorder=1.5,
+        from matplotlib.patches import Rectangle
+        x0, y0, x1, y1, is_crossing = self._drag_rect
+        rx = min(x0, x1)
+        ry = min(y0, y1)
+        rw = abs(x1 - x0)
+        rh = abs(y1 - y0)
+        if is_crossing:
+            # Right-to-left drag → Crossing mode: dashed green outline,
+            # semi-transparent green fill. Selects anything the rect
+            # touches.
+            edge = "#2da44e"
+            face = "#2da44e"
+            ls = "--"
+        else:
+            # Left-to-right drag → Window mode: solid blue outline,
+            # semi-transparent blue fill. Selects only fully enclosed
+            # objects.
+            edge = "#1f6feb"
+            face = "#1f6feb"
+            ls = "-"
+        rect = Rectangle(
+            (rx, ry), rw, rh,
+            edgecolor=edge, facecolor=face,
+            linestyle=ls, linewidth=1.4, alpha=0.10, fill=True,
+            zorder=12,
         )
+        # Re-apply edge alpha distinctly from face alpha so the outline
+        # stays legible even on busy canvases.
+        rect.set_edgecolor(edge)
+        rect.set_linewidth(1.4)
+        self.ax.add_patch(rect)
 
     def _draw_model(self) -> None:
         model = self._model()
@@ -1265,6 +1391,100 @@ class ModelCanvas(QWidget):
         no longer silently re-fits and throws their view away."""
         if not self._setting_axes_limits:
             self._user_view_dirty = True
+
+
+def _shift_pressed() -> bool:
+    """True if the Shift modifier is currently held.
+
+    Read at click/motion/release time so tools see the live keyboard
+    state — matplotlib's `event.key` is unreliable for modifier-only
+    presses across backends/OSes."""
+    try:
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import Qt
+    except Exception:
+        return False
+    app = QApplication.instance()
+    if app is None:
+        return False
+    return bool(app.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+
+
+def _point_in_world_rect(
+    px: float, py: float,
+    rx0: float, ry0: float, rx1: float, ry1: float,
+) -> bool:
+    """True iff (px, py) lies inside or on the boundary of the axis-
+    aligned rectangle with corners (rx0, ry0)–(rx1, ry1).
+
+    Corner order is not assumed — the rect is normalised here so the
+    caller can pass world coords in any order (e.g. press point and
+    release point of a right-to-left drag)."""
+    lo_x = min(rx0, rx1)
+    hi_x = max(rx0, rx1)
+    lo_y = min(ry0, ry1)
+    hi_y = max(ry0, ry1)
+    return lo_x <= px <= hi_x and lo_y <= py <= hi_y
+
+
+def _segment_intersects_rect(
+    x1: float, y1: float, x2: float, y2: float,
+    rx0: float, ry0: float, rx1: float, ry1: float,
+) -> bool:
+    """True iff the segment (x1,y1)→(x2,y2) intersects or lies inside the
+    rect. Uses Cohen–Sutherland outcodes — both endpoints inside, any
+    endpoint inside, or a clipped segment with positive length all count
+    as a hit. Inclusive on the boundary."""
+    lo_x = min(rx0, rx1)
+    hi_x = max(rx0, rx1)
+    lo_y = min(ry0, ry1)
+    hi_y = max(ry0, ry1)
+
+    LEFT, RIGHT, BOTTOM, TOP = 1, 2, 4, 8
+
+    def code(x: float, y: float) -> int:
+        c = 0
+        if x < lo_x:
+            c |= LEFT
+        elif x > hi_x:
+            c |= RIGHT
+        if y < lo_y:
+            c |= BOTTOM
+        elif y > hi_y:
+            c |= TOP
+        return c
+
+    cx1, cy1 = x1, y1
+    cx2, cy2 = x2, y2
+    c1 = code(cx1, cy1)
+    c2 = code(cx2, cy2)
+    while True:
+        if c1 == 0 or c2 == 0:
+            return True            # at least one endpoint in rect
+        if c1 & c2:
+            return False           # both share an outside region
+        out = c1 or c2
+        nx, ny = cx1, cy1
+        dx = cx2 - cx1
+        dy = cy2 - cy1
+        if out & TOP:
+            nx = cx1 + dx * (hi_y - cy1) / dy if dy else cx1
+            ny = hi_y
+        elif out & BOTTOM:
+            nx = cx1 + dx * (lo_y - cy1) / dy if dy else cx1
+            ny = lo_y
+        elif out & RIGHT:
+            ny = cy1 + dy * (hi_x - cx1) / dx if dx else cy1
+            nx = hi_x
+        elif out & LEFT:
+            ny = cy1 + dy * (lo_x - cx1) / dx if dx else cy1
+            nx = lo_x
+        if out == c1:
+            cx1, cy1 = nx, ny
+            c1 = code(cx1, cy1)
+        else:
+            cx2, cy2 = nx, ny
+            c2 = code(cx2, cy2)
 
 
 def _point_segment_distance_px(px, py, x1, y1, x2, y2,

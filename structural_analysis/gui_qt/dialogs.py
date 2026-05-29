@@ -988,6 +988,97 @@ class ElementDialog(_ModalDialog):
         }
 
 
+# ── batch assign (v0.13.0) ──
+
+
+class BatchAssignDialog(_ModalDialog):
+    """Batch-assign section / material override to many elements.
+
+    Both dropdowns default to "(leave unchanged)" so a mixed selection
+    isn't silently overwritten with a single default. The user only
+    changes the field(s) they explicitly want batched.
+
+    Returns ``{"section_id": int | None, "material_override_id": int | None}``
+    where ``None`` means "do not touch this field". The
+    ``material_override_id`` value :data:`-1` (mapped from the dialog's
+    explicit "Use section default (clear override)" item) is the
+    sentinel ``CLEAR_MATERIAL_OVERRIDE`` that the command translates to
+    "set override = None" — required because plain ``None`` already
+    means "leave alone."
+    """
+
+    def __init__(self, parent: QWidget | None, *,
+                 model: StructuralModel,
+                 element_count: int) -> None:
+        self._model = model
+        self._count = int(element_count)
+        if not model.sections:
+            raise ValueError("No sections defined — add a section first.")
+        super().__init__(parent, "Batch assign element properties")
+
+    def _build_body(self, body: QWidget) -> None:
+        form = QFormLayout(body)
+        heading = QLabel(
+            f"Applying to {self._count} element"
+            f"{'s' if self._count != 1 else ''}.",
+            body,
+        )
+        font = heading.font()
+        font.setBold(True)
+        heading.setFont(font)
+        form.addRow(heading)
+
+        # Section dropdown — first entry is "leave unchanged".
+        self._sec_combo = QComboBox(body)
+        self._sec_combo.addItem("(leave unchanged)", None)
+        for sid in sorted(self._model.sections):
+            s = self._model.sections[sid]
+            mat = self._model.materials.get(s.material_id)
+            mat_name = (mat.name if mat and mat.name
+                        else f"material {s.material_id}")
+            sec_name = s.name if s.name else f"section {sid}"
+            self._sec_combo.addItem(f"{sec_name} / {mat_name}", sid)
+        form.addRow("Section / material:", self._sec_combo)
+
+        # Material override dropdown — three classes of item:
+        # "(leave unchanged)" → None
+        # "Use section default (clear override)" → -1 sentinel
+        # each material id → that material as override
+        self._mat_combo = QComboBox(body)
+        self._mat_combo.addItem("(leave unchanged)", None)
+        self._mat_combo.addItem(
+            "Use section default (clear override)", -1,
+        )
+        for mid in sorted(self._model.materials):
+            m = self._model.materials[mid]
+            self._mat_combo.addItem(
+                f"{m.name or f'material {mid}'}  (id {mid})", mid,
+            )
+        form.addRow("Material override:", self._mat_combo)
+
+        hint = QLabel(
+            "Fields left unchanged keep their per-element value.",
+            body,
+        )
+        hint.setStyleSheet("color: #555; font-style: italic;")
+        form.addRow(hint)
+
+    def _accept(self) -> dict:
+        section_id = self._sec_combo.currentData()
+        mat_override = self._mat_combo.currentData()
+        if section_id is None and mat_override is None:
+            raise ValueError(
+                "Pick a section or a material override before clicking OK "
+                "(both are currently set to 'leave unchanged')."
+            )
+        return {
+            "section_id": (int(section_id) if section_id is not None
+                           else None),
+            "material_override_id": (int(mat_override)
+                                     if mat_override is not None else None),
+        }
+
+
 # ── support ──
 
 

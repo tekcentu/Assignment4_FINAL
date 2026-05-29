@@ -25,6 +25,9 @@ from structural_analysis.element import FrameElement2D, TrussElement2D
 from structural_analysis.gui_common.commands import (
     AddMemberCmd,
     AddNodeCmd,
+    BatchDeleteCmd,
+    BatchUpdateElementsCmd,
+    CLEAR_MATERIAL_OVERRIDE,
     DrawMemberWithSplitsCmd,
     SplitElementCmd,
 )
@@ -816,3 +819,162 @@ def test_split_loaded_element_redo_replays_remapping():
     a2, b2 = m.elements
     assert _summarize(a2) == a1_summary
     assert _summarize(b2) == b1_summary
+
+
+# ── batch ops (v0.13.0) ────────────────────────────────────────
+
+
+def _two_section_model() -> tuple[StructuralModel, list[int]]:
+    """Build a 3-element frame with two sections so batch tests can
+    distinguish per-element identity. Sections 1 and 2 default to
+    material 1; material 2 exists for override tests."""
+    m = StructuralModel(title="batch")
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.materials[2] = Material(id=2, name="Alu", E=7.0e7, density=2700.0)
+    m.sections[1] = Section(id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3)
+    m.sections[2] = Section(id=2, name="S2", material_id=1, A=0.02, I=2e-4, depth=0.4)
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=2.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)
+    AddMemberCmd(x_i=2.0, y_i=0.0, x_j=4.0, y_j=0.0,
+                 kind="frame", section_id=2).do(m)
+    AddMemberCmd(x_i=4.0, y_i=0.0, x_j=6.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)
+    return m, [e.id for e in m.elements]
+
+
+def test_batch_update_changes_section_on_selected_elements_only():
+    m, eids = _two_section_model()
+    # Apply section=2 to only the first and third elements.
+    target = [eids[0], eids[2]]
+    cmd = BatchUpdateElementsCmd(element_ids=target, section_id=2)
+    cmd.do(m)
+    sections = {e.id: e.section_id for e in m.elements}
+    assert sections == {eids[0]: 2, eids[1]: 2, eids[2]: 2}  # 0,2 changed; 1 was already 2
+
+
+def test_batch_update_undo_restores_original_sections():
+    m, eids = _two_section_model()
+    before = {e.id: e.section_id for e in m.elements}
+    cmd = BatchUpdateElementsCmd(element_ids=eids, section_id=2)
+    cmd.do(m)
+    assert all(e.section_id == 2 for e in m.elements)
+    cmd.undo(m)
+    after = {e.id: e.section_id for e in m.elements}
+    assert after == before
+
+
+def test_batch_update_redo_replays_assignment():
+    m, eids = _two_section_model()
+    cmd = BatchUpdateElementsCmd(element_ids=eids, section_id=2)
+    cmd.do(m)
+    cmd.undo(m)
+    cmd.do(m)
+    assert all(e.section_id == 2 for e in m.elements)
+
+
+def test_batch_update_leave_unchanged_does_not_overwrite_mixed_sections():
+    """section_id=None means 'leave each element's section alone'.
+    A user updating only the override across elements of varying
+    sections must not have their distinct sections clobbered."""
+    m, eids = _two_section_model()
+    before_sections = {e.id: e.section_id for e in m.elements}
+    cmd = BatchUpdateElementsCmd(
+        element_ids=eids,
+        section_id=None,
+        material_override_id=2,
+    )
+    cmd.do(m)
+    after_sections = {e.id: e.section_id for e in m.elements}
+    assert after_sections == before_sections  # each section preserved
+    assert all(
+        getattr(e, "material_id_override", None) == 2
+        for e in m.elements
+    )
+
+
+def test_batch_update_clears_material_override_when_sentinel():
+    m, eids = _two_section_model()
+    # First set an override on all elements.
+    BatchUpdateElementsCmd(
+        element_ids=eids, material_override_id=2,
+    ).do(m)
+    assert all(
+        getattr(e, "material_id_override", None) == 2 for e in m.elements
+    )
+    # Now clear it via the sentinel.
+    BatchUpdateElementsCmd(
+        element_ids=eids, material_override_id=CLEAR_MATERIAL_OVERRIDE,
+    ).do(m)
+    assert all(
+        getattr(e, "material_id_override", None) is None
+        for e in m.elements
+    )
+
+
+def test_batch_update_empty_list_is_noop():
+    m, _ = _two_section_model()
+    snapshot = {e.id: e.section_id for e in m.elements}
+    BatchUpdateElementsCmd(element_ids=[], section_id=2).do(m)
+    assert {e.id: e.section_id for e in m.elements} == snapshot
+
+
+def test_batch_update_both_fields_none_is_noop():
+    """When both fields say 'leave unchanged' the command is a no-op
+    and must not push side effects."""
+    m, eids = _two_section_model()
+    before = {e.id: e.section_id for e in m.elements}
+    BatchUpdateElementsCmd(
+        element_ids=eids, section_id=None, material_override_id=None,
+    ).do(m)
+    assert {e.id: e.section_id for e in m.elements} == before
+
+
+def test_batch_update_invalid_section_raises_before_mutating():
+    m, eids = _two_section_model()
+    before = [e.section_id for e in m.elements]
+    with pytest.raises(ValueError):
+        BatchUpdateElementsCmd(
+            element_ids=eids, section_id=99,  # does not exist
+        ).do(m)
+    assert [e.section_id for e in m.elements] == before
+
+
+def test_batch_delete_removes_elements_and_nodes_one_undo_step():
+    m, eids = _two_section_model()
+    node_ids = list(m.nodes.keys())
+    # Delete the middle element and the last node.
+    cmd = BatchDeleteCmd(node_ids=[node_ids[-1]], element_ids=[eids[1]])
+    n_elems_before = len(m.elements)
+    n_nodes_before = len(m.nodes)
+    cmd.do(m)
+    # Middle element gone + last node + its cascade (third element).
+    assert len(m.elements) == n_elems_before - 2  # middle gone + cascade
+    assert len(m.nodes) == n_nodes_before - 1
+    cmd.undo(m)
+    assert len(m.elements) == n_elems_before
+    assert len(m.nodes) == n_nodes_before
+
+
+def test_batch_delete_skips_already_cascade_deleted_node():
+    """When delete_node cascade already removes a node referenced in
+    the batch, the next iteration must skip gracefully (no
+    KeyError)."""
+    m, eids = _two_section_model()
+    node_ids = list(m.nodes.keys())
+    # Delete two adjacent nodes — the second one's connected elements
+    # were already cascade-removed by the first delete.
+    cmd = BatchDeleteCmd(
+        node_ids=[node_ids[0], node_ids[1]], element_ids=[],
+    )
+    cmd.do(m)  # must not raise
+    assert node_ids[0] not in m.nodes
+    assert node_ids[1] not in m.nodes
+
+
+def test_batch_delete_empty_lists_is_noop():
+    m, _ = _two_section_model()
+    n_e = len(m.elements)
+    n_n = len(m.nodes)
+    BatchDeleteCmd(node_ids=[], element_ids=[]).do(m)
+    assert len(m.elements) == n_e
+    assert len(m.nodes) == n_n
