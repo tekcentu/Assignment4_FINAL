@@ -2278,11 +2278,10 @@ def test_node_tool_click_on_element_interior_splits_via_project_snap(qt_app):
     assert len(w._model.nodes) == 2
 
 
-def test_node_tool_split_blocked_when_element_has_member_load(qt_app):
-    """The block-with-warning policy: clicking interior of a loaded
-    element with the Node tool surfaces the message and leaves the
-    model untouched. The original PR #20 disconnected-component bug
-    is preferable to silently breaking the load."""
+def test_node_tool_split_loaded_element_succeeds(qt_app):
+    """v0.12.0: clicking the interior of a loaded element with the
+    Node tool now SUCCEEDS and remaps the load onto both children.
+    Replaces the pre-0.12.0 block-with-warning test."""
     from structural_analysis.model import UniformDistributedLoad
 
     w = MainWindow()
@@ -2291,16 +2290,49 @@ def test_node_tool_split_blocked_when_element_has_member_load(qt_app):
     w._model.elements[0].member_loads.append(
         UniformDistributedLoad(wy=-5.0),
     )
+
+    w._select_tool("node")
+    qt_app.processEvents()
+    w._on_canvas_click(
+        HitResult(
+            x=3.0, y=0.0,
+            element_id=parent_id, snap_kind="project",
+        ),
+        "left",
+    )
+    qt_app.processEvents()
+
+    # Three nodes, two children, both children carry the UDL.
+    assert len(w._model.nodes) == 3
+    assert len(w._model.elements) == 2
+    assert parent_id not in [e.id for e in w._model.elements]
+    for child in w._model.elements:
+        child_udls = [ld for ld in child.member_loads
+                      if isinstance(ld, UniformDistributedLoad)]
+        assert len(child_udls) == 1
+        assert child_udls[0].wy == -5.0
+
+
+def test_node_tool_split_unsupported_load_type_still_blocks(qt_app):
+    """A synthetic, unsupported load type on the parent still surfaces
+    the block-with-warning UX (the ``_remap_member_loads`` guard for
+    future load types). Model must remain untouched."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class _UnsupportedLoad:
+        x: float = 0.0
+
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+    w._model.elements[0].member_loads.append(_UnsupportedLoad())
     nodes_before = sorted(w._model.nodes.keys())
     elem_ids_before = [e.id for e in w._model.elements]
 
     w._select_tool("node")
     qt_app.processEvents()
 
-    # Silence the QMessageBox host.execute pops on ValueError so the
-    # test doesn't block. The error path is the documented contract
-    # of host.execute(cmd) — see app.py: execute() catches ValueError
-    # and shows a warning dialog.
     from PyQt6.QtWidgets import QMessageBox
     seen_warnings: list[str] = []
     real_warning = QMessageBox.warning
@@ -2322,7 +2354,68 @@ def test_node_tool_split_blocked_when_element_has_member_load(qt_app):
 
     assert sorted(w._model.nodes.keys()) == nodes_before
     assert [e.id for e in w._model.elements] == elem_ids_before
-    assert any("member loads" in w for w in seen_warnings)
+    assert any("not yet supported" in w for w in seen_warnings)
+
+
+def test_member_draw_split_on_loaded_element_succeeds_one_undo(qt_app):
+    """Drawing a Frame member whose endpoint lands on a loaded
+    element's interior now SUCCEEDS (Feature B). Both children carry
+    the parent's load, and one Ctrl+Z restores the loaded parent
+    intact."""
+    from structural_analysis.gui_common.commands import AddNodeCmd
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    qt_app.processEvents()
+    parent_id = _stage_c_seed_frame(w, qt_app)
+    w._model.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-5.0),
+    )
+
+    # Free node above the parent bar.
+    w.execute(AddNodeCmd(x=3.0, y=5.0))
+    qt_app.processEvents()
+    free_node = max(w._model.nodes.keys())
+
+    w._select_tool("frame")
+    qt_app.processEvents()
+    free = w._model.nodes[free_node]
+    # Start from free node, end on parent interior at (3, 0).
+    w._on_canvas_click(
+        HitResult(x=free.x, y=free.y, node_id=free_node, snap_kind="node"),
+        "left",
+    )
+    qt_app.processEvents()
+    w._on_canvas_click(
+        HitResult(x=3.0, y=0.0, element_id=parent_id, snap_kind="project"),
+        "left",
+    )
+    qt_app.processEvents()
+
+    # Parent split (2 children) + the new member.
+    assert len(w._model.elements) == 3
+    assert parent_id not in [e.id for e in w._model.elements]
+    # The two children of the split parent both carry the UDL; the
+    # new member does not.
+    children_with_udl = [
+        e for e in w._model.elements
+        if any(isinstance(ld, UniformDistributedLoad)
+               for ld in e.member_loads)
+    ]
+    assert len(children_with_udl) == 2
+    for child in children_with_udl:
+        udls = [ld for ld in child.member_loads
+                if isinstance(ld, UniformDistributedLoad)]
+        assert len(udls) == 1 and udls[0].wy == -5.0
+
+    # One Ctrl+Z restores the loaded parent intact.
+    w._do_undo()
+    qt_app.processEvents()
+    assert [e.id for e in w._model.elements] == [parent_id]
+    restored = w._model.elements[0]
+    udls = [ld for ld in restored.member_loads
+            if isinstance(ld, UniformDistributedLoad)]
+    assert len(udls) == 1 and udls[0].wy == -5.0
 
 
 def test_node_tool_endpoint_click_does_not_split(qt_app):

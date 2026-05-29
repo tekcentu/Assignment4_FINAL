@@ -408,33 +408,10 @@ def test_split_off_the_segment_raises_when_t_outside_unit_interval():
     assert len(m.elements) == 1
 
 
-@pytest.mark.parametrize(
-    "load_factory, kind",
-    [
-        (lambda: UniformDistributedLoad(wy=-5.0), "frame"),
-        (lambda: PointLoad(py=-10.0, a=2.0), "frame"),
-        (lambda: FrameTemperatureLoad(t_top=20.0, t_bottom=10.0), "frame"),
-    ],
-)
-def test_split_blocked_when_frame_has_member_load(load_factory, kind):
-    m, eid = _frame_model_one_member()
-    m.elements[0].member_loads.append(load_factory())
-    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
-    with pytest.raises(ValueError, match="member loads"):
-        cmd.do(m)
-    # Model entirely untouched — same node + element count, no
-    # auto-created node, no children.
-    assert len(m.elements) == 1
-    assert len(m.nodes) == 2
-
-
-def test_split_blocked_when_truss_has_thermal_load():
-    m, eid = _truss_model_one_member()
-    m.elements[0].member_loads.append(TrussTemperatureLoad(delta_T=15.0))
-    with pytest.raises(ValueError, match="member loads"):
-        SplitElementCmd(element_id=eid, x=2.0, y=0.0).do(m)
-    assert len(m.elements) == 1
-    assert len(m.nodes) == 2
+# The pre-0.12.0 "split blocks on member loads" tests were removed;
+# the behavior is now remapping, exercised by the
+# "SplitElementCmd: member-load remap" section below
+# (``test_split_loaded_frame_*`` / ``test_split_loaded_truss_*``).
 
 
 def test_split_missing_element_id_raises():
@@ -589,12 +566,23 @@ def test_draw_member_with_no_split_targets_degenerates_to_add_member():
 
 
 def test_draw_member_rolls_back_first_split_when_second_split_blocked():
-    """If the second split is rejected (loaded parent), the first
-    split is reversed and the model is left exactly as it began —
-    no member, no orphaned split node."""
+    """If the second split is rejected (parent carries an unsupported
+    member-load type), the first split is reversed and the model is
+    left exactly as it began — no member, no orphaned split node.
+
+    v0.12.0 update: UDL / PointLoad / thermal no longer block; this
+    test now uses a synthetic load type to exercise the
+    unsupported-type branch of ``_remap_member_loads``.
+    """
+    from dataclasses import dataclass as _dc
+
+    @_dc
+    class _UnsupportedLoad:
+        x: float = 0.0
+
     m, lower, upper = _two_parallel_bars()
-    # Block the upper bar with a member load.
-    m.elements[1].member_loads.append(UniformDistributedLoad(wy=-5.0))
+    # Block the upper bar with an unsupported member load type.
+    m.elements[1].member_loads.append(_UnsupportedLoad())
 
     cmd = DrawMemberWithSplitsCmd(
         split_target_i=(lower, 3.0, 0.0),
@@ -602,7 +590,7 @@ def test_draw_member_rolls_back_first_split_when_second_split_blocked():
         x_i=3.0, y_i=0.0, x_j=3.0, y_j=4.0,
         kind="frame", section_id=1,
     )
-    with pytest.raises(ValueError, match="member loads"):
+    with pytest.raises(ValueError, match="not yet supported"):
         cmd.do(m)
     # Fully rolled back: both parents whole, no split nodes, no member.
     assert (len(m.nodes), len(m.elements)) == (4, 2)
@@ -641,3 +629,169 @@ def test_draw_member_rolls_back_both_splits_when_member_add_fails():
     assert (len(m.nodes), len(m.elements)) == (4, 2)
     assert horiz in [e.id for e in m.elements]
     assert vert in [e.id for e in m.elements]
+
+
+# ── SplitElementCmd: member-load remap (v0.12.0 — Feature B) ──
+
+
+def test_split_loaded_frame_udl_copies_intensity_to_both_children():
+    m, eid = _frame_model_one_member()
+    udl = UniformDistributedLoad(wy=-10.0)
+    m.elements[0].member_loads.append(udl)
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    a, b = m.elements
+    a_udls = [ld for ld in a.member_loads
+              if isinstance(ld, UniformDistributedLoad)]
+    b_udls = [ld for ld in b.member_loads
+              if isinstance(ld, UniformDistributedLoad)]
+    assert len(a_udls) == 1 and a_udls[0].wy == -10.0
+    assert len(b_udls) == 1 and b_udls[0].wy == -10.0
+
+
+def test_split_loaded_frame_point_load_left_of_split_maps_to_child_a():
+    m, eid = _frame_model_one_member()
+    m.elements[0].member_loads.append(PointLoad(py=-5.0, a=2.0))
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)  # midspan
+    cmd.do(m)
+    a, b = m.elements
+    a_pts = [ld for ld in a.member_loads if isinstance(ld, PointLoad)]
+    b_pts = [ld for ld in b.member_loads if isinstance(ld, PointLoad)]
+    assert len(a_pts) == 1
+    assert a_pts[0].py == -5.0
+    assert a_pts[0].a == 2.0
+    assert b_pts == []
+
+
+def test_split_loaded_frame_point_load_right_of_split_maps_to_child_b_with_shifted_a():
+    m, eid = _frame_model_one_member()
+    m.elements[0].member_loads.append(PointLoad(py=-5.0, a=4.5))
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)  # midspan, L1=3
+    cmd.do(m)
+    a, b = m.elements
+    a_pts = [ld for ld in a.member_loads if isinstance(ld, PointLoad)]
+    b_pts = [ld for ld in b.member_loads if isinstance(ld, PointLoad)]
+    assert a_pts == []
+    assert len(b_pts) == 1
+    assert b_pts[0].py == -5.0
+    assert b_pts[0].a == pytest.approx(1.5)
+
+
+def test_split_loaded_frame_point_load_at_split_assigns_to_child_a_at_its_full_length():
+    m, eid = _frame_model_one_member()
+    m.elements[0].member_loads.append(PointLoad(py=-5.0, a=3.0))
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    a, b = m.elements
+    a_pts = [ld for ld in a.member_loads if isinstance(ld, PointLoad)]
+    b_pts = [ld for ld in b.member_loads if isinstance(ld, PointLoad)]
+    assert b_pts == []
+    assert len(a_pts) == 1
+    # Child A's actual euclidean length.
+    import math as _math
+    ni = m.nodes[a.node_i]
+    nj = m.nodes[a.node_j]
+    L_child_a = _math.hypot(nj.x - ni.x, nj.y - ni.y)
+    assert a_pts[0].a == pytest.approx(L_child_a, abs=1e-12)
+
+
+def test_split_loaded_frame_thermal_copies_to_both_children():
+    m, eid = _frame_model_one_member()
+    tload = FrameTemperatureLoad(t_top=20.0, t_bottom=-20.0)
+    m.elements[0].member_loads.append(tload)
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    a, b = m.elements
+    a_th = [ld for ld in a.member_loads
+            if isinstance(ld, FrameTemperatureLoad)]
+    b_th = [ld for ld in b.member_loads
+            if isinstance(ld, FrameTemperatureLoad)]
+    assert len(a_th) == 1 and a_th[0] == tload
+    assert len(b_th) == 1 and b_th[0] == tload
+
+
+def test_split_loaded_truss_thermal_copies_to_both_children():
+    m, eid = _truss_model_one_member()
+    tload = TrussTemperatureLoad(delta_T=25.0)
+    m.elements[0].member_loads.append(tload)
+    cmd = SplitElementCmd(element_id=eid, x=2.0, y=0.0)
+    cmd.do(m)
+    a, b = m.elements
+    a_th = [ld for ld in a.member_loads
+            if isinstance(ld, TrussTemperatureLoad)]
+    b_th = [ld for ld in b.member_loads
+            if isinstance(ld, TrussTemperatureLoad)]
+    assert len(a_th) == 1 and a_th[0] == tload
+    assert len(b_th) == 1 and b_th[0] == tload
+
+
+def test_split_loaded_element_with_unsupported_load_type_still_blocks():
+    from dataclasses import dataclass as _dc
+
+    @_dc
+    class FakeLoad:
+        x: float = 0.0
+
+    m, eid = _frame_model_one_member()
+    m.elements[0].member_loads.append(FakeLoad())
+    snapshot_nodes = sorted(m.nodes.keys())
+    snapshot_elem_ids = [e.id for e in m.elements]
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    with pytest.raises(ValueError, match="not yet supported"):
+        cmd.do(m)
+    # Model untouched (atomic).
+    assert sorted(m.nodes.keys()) == snapshot_nodes
+    assert [e.id for e in m.elements] == snapshot_elem_ids
+
+
+def test_split_loaded_element_undo_restores_parent_loads_intact():
+    m, eid = _frame_model_one_member()
+    udl = UniformDistributedLoad(wy=-7.0)
+    pt = PointLoad(py=-3.0, a=2.0)
+    m.elements[0].member_loads.extend([udl, pt])
+    saved_loads = list(m.elements[0].member_loads)
+
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    assert len(m.elements) == 2
+    cmd.undo(m)
+    assert len(m.elements) == 1
+    # The parent's member_loads list should still hold the same
+    # entries (by identity or equality).
+    restored = m.elements[0].member_loads
+    assert list(restored) == saved_loads
+
+
+def test_split_loaded_element_redo_replays_remapping():
+    m, eid = _frame_model_one_member()
+    udl = UniformDistributedLoad(wy=-4.0)
+    pt_left = PointLoad(py=-2.0, a=1.0)
+    pt_right = PointLoad(py=-2.5, a=5.0)
+    m.elements[0].member_loads.extend([udl, pt_left, pt_right])
+
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    a1, b1 = m.elements
+
+    def _summarize(elem):
+        return sorted(
+            (
+                type(ld).__name__,
+                tuple(sorted(ld.__dict__.items()))
+                if hasattr(ld, "__dict__")
+                else tuple(),
+                getattr(ld, "wy", None),
+                getattr(ld, "py", None),
+                getattr(ld, "a", None),
+            )
+            for ld in elem.member_loads
+        )
+
+    a1_summary = _summarize(a1)
+    b1_summary = _summarize(b1)
+
+    cmd.undo(m)
+    cmd.do(m)
+    a2, b2 = m.elements
+    assert _summarize(a2) == a1_summary
+    assert _summarize(b2) == b1_summary
