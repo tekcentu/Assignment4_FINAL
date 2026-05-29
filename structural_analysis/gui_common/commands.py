@@ -1077,21 +1077,27 @@ class BatchDeleteCmd(Command):
 
     def do(self, model: StructuralModel) -> None:
         self._sub_cmds = []
-        # Elements first.
-        for eid in list(self.element_ids):
-            if not any(e.id == eid for e in model.elements):
-                continue
-            sub: Command = DeleteElementCmd(elem_id=eid)
-            sub.do(model)
-            self._sub_cmds.append(sub)
-        # Then nodes (cascades remaining connected elements + supports
-        # + nodal loads). Skip ids that no longer exist.
-        for nid in list(self.node_ids):
-            if nid not in model.nodes:
-                continue
-            sub = DeleteNodeCmd(node_id=nid)
-            sub.do(model)
-            self._sub_cmds.append(sub)
+        try:
+            # Elements first.
+            for eid in list(self.element_ids):
+                if not any(e.id == eid for e in model.elements):
+                    continue
+                sub: Command = DeleteElementCmd(elem_id=eid)
+                sub.do(model)
+                self._sub_cmds.append(sub)
+            # Then nodes (cascades remaining connected elements + supports
+            # + nodal loads). Skip ids that no longer exist.
+            for nid in list(self.node_ids):
+                if nid not in model.nodes:
+                    continue
+                sub = DeleteNodeCmd(node_id=nid)
+                sub.do(model)
+                self._sub_cmds.append(sub)
+        except Exception:
+            for cmd in reversed(self._sub_cmds):
+                cmd.undo(model)
+            self._sub_cmds = []
+            raise
 
     def undo(self, model: StructuralModel) -> None:
         for cmd in reversed(self._sub_cmds):

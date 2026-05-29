@@ -1961,12 +1961,14 @@ class MainWindow(QMainWindow):
             return
         cmd = BatchDeleteCmd(node_ids=nodes, element_ids=elems)
         self.execute(cmd)
-        # The model mutation invalidated those ids — clear stale set
-        # entries that survived the cascade.
+        # Only deselect ids that were actually removed from the model;
+        # if execute() failed internally the model may be unchanged.
         for nid in nodes:
-            self.canvas.remove_node_from_selection(nid)
+            if nid not in self._model.nodes:
+                self.canvas.remove_node_from_selection(nid)
         for eid in elems:
-            self.canvas.remove_element_from_selection(eid)
+            if not any(e.id == eid for e in self._model.elements):
+                self.canvas.remove_element_from_selection(eid)
         self._update_selection_status()
         self.canvas.redraw()
 
