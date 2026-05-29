@@ -51,6 +51,7 @@ from ..gui_common.commands import (
     DeleteMaterialCmd,
     DeleteNodeCmd,
     DeleteSectionCmd,
+    DrawMemberWithSplitsCmd,
     ReplaceModelCmd,
     SetGridSystemCmd,
     SetNodalLoadCmd,
@@ -670,6 +671,8 @@ class MainWindow(QMainWindow):
         first_x: float, first_y: float, first_node_id: int | None,
         second_x: float, second_y: float, second_node_id: int | None,
         kind: str | None = None,
+        first_split_target: tuple[int, float, float] | None = None,
+        second_split_target: tuple[int, float, float] | None = None,
     ) -> None:
         """Open the element-properties dialog for a member draw.
 
@@ -677,6 +680,15 @@ class MainWindow(QMainWindow):
         when the click was on empty space; the underlying
         :class:`AddMemberCmd` will reuse a nearby node (within 1e-9
         world units) or allocate a new one.
+
+        v0.11.0 (post-PR21): when ``first_split_target`` or
+        ``second_split_target`` is set, the dispatch builds a
+        :class:`DrawMemberWithSplitsCmd` instead of a plain
+        :class:`AddMemberCmd` — the split(s) and the member-add then
+        share one undo step, and cancelling this dialog leaves the
+        model untouched. When both targets are ``None`` (no element
+        interior involved) the existing :class:`AddMemberCmd` path
+        runs unchanged.
         """
         if not self._model.materials:
             QMessageBox.warning(
@@ -692,13 +704,27 @@ class MainWindow(QMainWindow):
             release_j: bool,
             material_override_id: int | None,
         ) -> None:
-            self.execute(AddMemberCmd(
-                x_i=first_x, y_i=first_y, node_i=first_node_id,
-                x_j=second_x, y_j=second_y, node_j=second_node_id,
-                section_id=section_id,
-                kind=effective_kind,
-                release_i=release_i,
-                release_j=release_j,
+            if first_split_target is None and second_split_target is None:
+                # No splits involved — preserve the exact pre-existing
+                # path so the PR #20 / Stage A acceptance tests stay
+                # behaviour-identical.
+                self.execute(AddMemberCmd(
+                    x_i=first_x, y_i=first_y, node_i=first_node_id,
+                    x_j=second_x, y_j=second_y, node_j=second_node_id,
+                    section_id=section_id,
+                    kind=effective_kind,
+                    release_i=release_i,
+                    release_j=release_j,
+                    material_override_id=material_override_id,
+                ))
+                return
+            self.execute(DrawMemberWithSplitsCmd(
+                split_target_i=first_split_target,
+                split_target_j=second_split_target,
+                x_i=first_x, y_i=first_y, node_i_hint=first_node_id,
+                x_j=second_x, y_j=second_y, node_j_hint=second_node_id,
+                kind=effective_kind, section_id=section_id,
+                release_i=release_i, release_j=release_j,
                 material_override_id=material_override_id,
             ))
 

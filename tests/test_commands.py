@@ -21,12 +21,22 @@ from __future__ import annotations
 
 import pytest
 
+from structural_analysis.element import FrameElement2D, TrussElement2D
 from structural_analysis.gui_common.commands import (
     AddMemberCmd,
     AddNodeCmd,
+    DrawMemberWithSplitsCmd,
+    SplitElementCmd,
 )
 from structural_analysis.model import (
-    Material, Section, StructuralModel, Support,
+    FrameTemperatureLoad,
+    Material,
+    PointLoad,
+    Section,
+    StructuralModel,
+    Support,
+    TrussTemperatureLoad,
+    UniformDistributedLoad,
 )
 
 
@@ -269,3 +279,365 @@ def test_undo_preserves_auto_created_node_if_later_referenced():
     auto_j = cmd_member._created_node_j
     assert auto_j is not None
     assert auto_j not in m.nodes
+
+
+# ── SplitElementCmd (PR #21 Stage C) ─────────────────────────
+
+
+def _frame_model_one_member(
+    *,
+    release_i: bool = False,
+    release_j: bool = False,
+) -> tuple[StructuralModel, int]:
+    """Return (model, element_id) with a single 6 m horizontal frame
+    from (0,0) to (6,0) and a real material+section. Optional release
+    flags so the release-preservation test can flex them."""
+    m = _model_with_material_and_section()
+    AddMemberCmd(
+        x_i=0.0, y_i=0.0, x_j=6.0, y_j=0.0,
+        kind="frame", section_id=1,
+        release_i=release_i, release_j=release_j,
+    ).do(m)
+    assert len(m.elements) == 1
+    return m, m.elements[0].id
+
+
+def _truss_model_one_member() -> tuple[StructuralModel, int]:
+    m = _model_with_material_and_section()
+    AddMemberCmd(
+        x_i=0.0, y_i=0.0, x_j=4.0, y_j=0.0,
+        kind="truss", section_id=1,
+    ).do(m)
+    return m, m.elements[0].id
+
+
+def test_split_frame_at_midspan_creates_two_children_and_one_new_node():
+    m, eid = _frame_model_one_member()
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    # Parent gone, two children present.
+    assert eid not in [e.id for e in m.elements]
+    assert len(m.elements) == 2
+    # One new node at the midpoint.
+    assert len(m.nodes) == 3
+    new_node = m.nodes[cmd._created_node_c]
+    assert (new_node.x, new_node.y) == (3.0, 0.0)
+    # Children chain through the new node.
+    a, b = m.elements
+    assert a.node_j == new_node.id
+    assert b.node_i == new_node.id
+
+
+def test_split_frame_copies_section_material_overrides_and_inner_end_releases():
+    """The user's contract: outer-end releases stay on the matching
+    child, inner ends get no release."""
+    m, eid = _frame_model_one_member(release_i=True, release_j=True)
+    # Add a second material and set it as override on the parent so
+    # we can verify it propagates to the children.
+    m.materials[2] = Material(id=2, name="Alt", E=1.5e8, density=2400.0)
+    parent = m.elements[0]
+    parent.material_id_override = 2
+
+    cmd = SplitElementCmd(element_id=eid, x=2.0, y=0.0)
+    cmd.do(m)
+    a, b = m.elements
+    # Property propagation.
+    assert a.section_id == parent.section_id == 1
+    assert b.section_id == parent.section_id == 1
+    assert a.material_id_override == 2
+    assert b.material_id_override == 2
+    # Inner-end-loses-release: A's outer end (node_i) keeps the
+    # release; A's inner end (node_j == C) loses it. Same for B.
+    assert isinstance(a, FrameElement2D)
+    assert isinstance(b, FrameElement2D)
+    assert (a.release_i, a.release_j) == (True, False)
+    assert (b.release_i, b.release_j) == (False, True)
+
+
+def test_split_truss_preserves_kind():
+    m, eid = _truss_model_one_member()
+    cmd = SplitElementCmd(element_id=eid, x=2.0, y=0.0)
+    cmd.do(m)
+    a, b = m.elements
+    assert isinstance(a, TrussElement2D)
+    assert isinstance(b, TrussElement2D)
+
+
+def test_split_then_undo_restores_parent_and_removes_auto_node():
+    m, eid = _frame_model_one_member()
+    snapshot_nodes = sorted(m.nodes.keys())
+    snapshot_elem_ids = [e.id for e in m.elements]
+    snapshot_elem_ends = [(e.node_i, e.node_j) for e in m.elements]
+
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    cmd.undo(m)
+
+    assert sorted(m.nodes.keys()) == snapshot_nodes
+    assert [e.id for e in m.elements] == snapshot_elem_ids
+    assert [(e.node_i, e.node_j) for e in m.elements] == snapshot_elem_ends
+    # And redo recovers the split state exactly.
+    cmd.do(m)
+    assert len(m.elements) == 2
+
+
+def test_split_too_close_to_endpoint_raises_and_leaves_model_clean():
+    m, eid = _frame_model_one_member()
+    # ELEMENT_SPLIT_TOL is 1e-6 on parametric t; on a 6 m bar that's
+    # 6e-6 m. A click at world-x = 1e-7 puts t ≈ 1.7e-8 — well below
+    # the tolerance.
+    cmd = SplitElementCmd(element_id=eid, x=1e-7, y=0.0)
+    with pytest.raises(ValueError, match="too close to an endpoint"):
+        cmd.do(m)
+    # Model unchanged.
+    assert len(m.elements) == 1
+    assert len(m.nodes) == 2
+
+
+def test_split_off_the_segment_raises_when_t_outside_unit_interval():
+    """The strict-interior tolerance also rejects t < 0 and t > 1
+    (caller may have asked for a split point past either endpoint).
+    The current implementation lumps this under the same 'too close
+    to an endpoint' message — accept either wording."""
+    m, eid = _frame_model_one_member()
+    with pytest.raises(ValueError):
+        SplitElementCmd(element_id=eid, x=-1.0, y=0.0).do(m)
+    assert len(m.elements) == 1
+    with pytest.raises(ValueError):
+        SplitElementCmd(element_id=eid, x=7.0, y=0.0).do(m)
+    assert len(m.elements) == 1
+
+
+@pytest.mark.parametrize(
+    "load_factory, kind",
+    [
+        (lambda: UniformDistributedLoad(wy=-5.0), "frame"),
+        (lambda: PointLoad(py=-10.0, a=2.0), "frame"),
+        (lambda: FrameTemperatureLoad(t_top=20.0, t_bottom=10.0), "frame"),
+    ],
+)
+def test_split_blocked_when_frame_has_member_load(load_factory, kind):
+    m, eid = _frame_model_one_member()
+    m.elements[0].member_loads.append(load_factory())
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    with pytest.raises(ValueError, match="member loads"):
+        cmd.do(m)
+    # Model entirely untouched — same node + element count, no
+    # auto-created node, no children.
+    assert len(m.elements) == 1
+    assert len(m.nodes) == 2
+
+
+def test_split_blocked_when_truss_has_thermal_load():
+    m, eid = _truss_model_one_member()
+    m.elements[0].member_loads.append(TrussTemperatureLoad(delta_T=15.0))
+    with pytest.raises(ValueError, match="member loads"):
+        SplitElementCmd(element_id=eid, x=2.0, y=0.0).do(m)
+    assert len(m.elements) == 1
+    assert len(m.nodes) == 2
+
+
+def test_split_missing_element_id_raises():
+    m = _model_with_material_and_section()
+    with pytest.raises(ValueError, match="does not exist"):
+        SplitElementCmd(element_id=99, x=0.0, y=0.0).do(m)
+
+
+def test_split_undo_preserves_auto_node_if_later_attached():
+    """If the user splits, then attaches a support / nodal load to
+    the auto-created mid node, undoing the split must leave that
+    node alive — same defensive rule as AddMemberCmd."""
+    m, eid = _frame_model_one_member()
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    mid = cmd._created_node_c
+    assert mid is not None
+    # Pretend the user added a support at the mid node.
+    m.supports[mid] = Support(node_id=mid, ux=True, uy=True, rz=True)
+
+    cmd.undo(m)
+    # Parent restored, children gone — but the mid node survives
+    # because the support depended on it.
+    assert mid in m.nodes
+    assert len(m.elements) == 1
+    assert m.elements[0].id == eid
+
+
+def test_split_rejects_node_id_hint_far_from_projected_point():
+    """Defensive guard (PR #21 review): a node_id hint pointing at an
+    off-element node must be rejected, not silently used. Without the
+    coordinate check, _find_or_create_node would accept the hint by id
+    alone and produce geometrically incoherent children."""
+    m, eid = _frame_model_one_member()  # frame 1→2 along y=0
+    # Add a free node far from the segment.
+    free = _add_node(m, 10.0, 10.0)
+    n_nodes_before = len(m.nodes)
+    elem_ids_before = [e.id for e in m.elements]
+
+    with pytest.raises(ValueError, match="does not lie on element"):
+        SplitElementCmd(
+            element_id=eid, x=3.0, y=0.0, node_id=free,
+        ).do(m)
+    # Atomic-rollback: parent intact, free node untouched.
+    assert len(m.nodes) == n_nodes_before
+    assert [e.id for e in m.elements] == elem_ids_before
+
+
+# ── DrawMemberWithSplitsCmd (PR #21 follow-up: grouped undo) ──
+
+
+def _two_parallel_bars() -> tuple[StructuralModel, int, int]:
+    """Return (model, lower_id, upper_id): two horizontal 0..6 frames,
+    the lower at y=0 and the upper at y=4. Drawing a vertical member
+    between their midspans bisects both."""
+    m = _model_with_material_and_section()
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=6.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)
+    lower = m.elements[-1].id
+    AddMemberCmd(x_i=0.0, y_i=4.0, x_j=6.0, y_j=4.0,
+                 kind="frame", section_id=1).do(m)
+    upper = m.elements[-1].id
+    return m, lower, upper
+
+
+def test_draw_member_bisecting_two_elements_runs_two_splits_and_one_member():
+    """Worst case: both endpoints land on element interiors. One
+    composite do() must split both parents and add the connecting
+    member; one undo() must reverse all three; redo replays."""
+    m, lower, upper = _two_parallel_bars()
+    assert (len(m.nodes), len(m.elements)) == (4, 2)
+
+    cmd = DrawMemberWithSplitsCmd(
+        split_target_i=(lower, 3.0, 0.0),
+        split_target_j=(upper, 3.0, 4.0),
+        x_i=3.0, y_i=0.0, x_j=3.0, y_j=4.0,
+        kind="frame", section_id=1,
+    )
+    cmd.do(m)
+    # 4 originals + 2 split nodes; 2 parents → 4 children + 1 member.
+    assert (len(m.nodes), len(m.elements)) == (6, 5)
+    assert lower not in [e.id for e in m.elements]
+    assert upper not in [e.id for e in m.elements]
+    # The new member connects the two freshly-created split nodes.
+    mid_lo = next(n for n in m.nodes.values() if (n.x, n.y) == (3.0, 0.0))
+    mid_hi = next(n for n in m.nodes.values() if (n.x, n.y) == (3.0, 4.0))
+    member = next(
+        e for e in m.elements
+        if {e.node_i, e.node_j} == {mid_lo.id, mid_hi.id}
+    )
+    assert member is not None
+
+    # One undo reverses everything.
+    cmd.undo(m)
+    assert (len(m.nodes), len(m.elements)) == (4, 2)
+    assert lower in [e.id for e in m.elements]
+    assert upper in [e.id for e in m.elements]
+
+    # Redo replays identically.
+    cmd.do(m)
+    assert (len(m.nodes), len(m.elements)) == (6, 5)
+
+
+def test_draw_member_one_interior_one_node_snap_runs_single_split():
+    """One endpoint on an element interior, the other on an existing
+    node: exactly one split + one member, reversed in one step."""
+    m, _, _ = _two_parallel_bars()
+    # Remove the upper bar so only the lower one is interesting, and
+    # add a free node to snap the member's far end onto.
+    upper = m.elements[-1]
+    m.elements.remove(upper)
+    free = _add_node(m, 3.0, 5.0)
+    lower = m.elements[0].id
+    # Now: nodes {0,0; 6,0; 0,4; 6,4; 3,5}; one element (lower bar).
+    n_nodes_before = len(m.nodes)
+    assert len(m.elements) == 1
+
+    cmd = DrawMemberWithSplitsCmd(
+        split_target_i=(lower, 3.0, 0.0),
+        split_target_j=None,
+        x_i=3.0, y_i=0.0, x_j=3.0, y_j=5.0, node_j_hint=free,
+        kind="frame", section_id=1,
+    )
+    cmd.do(m)
+    # One split node added; parent → 2 children + 1 member.
+    assert len(m.nodes) == n_nodes_before + 1
+    assert len(m.elements) == 3
+    mid = next(n for n in m.nodes.values() if (n.x, n.y) == (3.0, 0.0))
+    assert any(
+        {e.node_i, e.node_j} == {mid.id, free} for e in m.elements
+    )
+
+    cmd.undo(m)
+    assert len(m.nodes) == n_nodes_before
+    assert len(m.elements) == 1
+    assert m.elements[0].id == lower
+
+
+def test_draw_member_with_no_split_targets_degenerates_to_add_member():
+    """Both split targets None ⇒ the composite behaves like a plain
+    AddMemberCmd (auto-creates the two endpoint nodes)."""
+    m = _model_with_material_and_section()
+    cmd = DrawMemberWithSplitsCmd(
+        split_target_i=None, split_target_j=None,
+        x_i=0.0, y_i=0.0, x_j=6.0, y_j=0.0,
+        kind="frame", section_id=1,
+    )
+    cmd.do(m)
+    assert (len(m.nodes), len(m.elements)) == (2, 1)
+    cmd.undo(m)
+    assert (len(m.nodes), len(m.elements)) == (0, 0)
+
+
+def test_draw_member_rolls_back_first_split_when_second_split_blocked():
+    """If the second split is rejected (loaded parent), the first
+    split is reversed and the model is left exactly as it began —
+    no member, no orphaned split node."""
+    m, lower, upper = _two_parallel_bars()
+    # Block the upper bar with a member load.
+    m.elements[1].member_loads.append(UniformDistributedLoad(wy=-5.0))
+
+    cmd = DrawMemberWithSplitsCmd(
+        split_target_i=(lower, 3.0, 0.0),
+        split_target_j=(upper, 3.0, 4.0),
+        x_i=3.0, y_i=0.0, x_j=3.0, y_j=4.0,
+        kind="frame", section_id=1,
+    )
+    with pytest.raises(ValueError, match="member loads"):
+        cmd.do(m)
+    # Fully rolled back: both parents whole, no split nodes, no member.
+    assert (len(m.nodes), len(m.elements)) == (4, 2)
+    assert lower in [e.id for e in m.elements]
+    assert upper in [e.id for e in m.elements]
+
+
+def test_draw_member_rolls_back_both_splits_when_member_add_fails():
+    """If the inner AddMemberCmd raises, every preceding split is
+    reversed and the model is untouched.
+
+    Setup: two bars cross at (3,0). Splitting both at that point makes
+    the second split reuse the first's freshly-created node (the
+    coincidence-dedup rule), so the inner member would connect a node
+    to itself → AddMemberCmd raises *after* both splits succeeded.
+    The composite must still unwind both."""
+    m = _model_with_material_and_section()
+    # Two bars crossing at (3,0): one horizontal, one vertical.
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=6.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)
+    horiz = m.elements[-1].id
+    AddMemberCmd(x_i=3.0, y_i=-3.0, x_j=3.0, y_j=3.0,
+                 kind="frame", section_id=1).do(m)
+    vert = m.elements[-1].id
+    assert (len(m.nodes), len(m.elements)) == (4, 2)
+
+    cmd = DrawMemberWithSplitsCmd(
+        split_target_i=(horiz, 3.0, 0.0),
+        split_target_j=(vert, 3.0, 0.0),
+        x_i=3.0, y_i=0.0, x_j=3.0, y_j=0.0,
+        kind="frame", section_id=1,
+    )
+    with pytest.raises(ValueError, match="cannot be the same"):
+        cmd.do(m)
+    # Both splits rolled back: 4 nodes, 2 elements, both parents whole.
+    assert (len(m.nodes), len(m.elements)) == (4, 2)
+    assert horiz in [e.id for e in m.elements]
+    assert vert in [e.id for e in m.elements]

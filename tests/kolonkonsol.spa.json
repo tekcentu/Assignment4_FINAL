@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "title": "Untitled",
+  "units": "kN_m",
+  "grid": {
+    "x": [],
+    "y": []
+  },
+  "view": {
+    "xlim": [
+      -6.049817788936584,
+      20.555011479356097
+    ],
+    "ylim": [
+      -3.163051764150934,
+      12.706948235849069
+    ],
+    "snap_kinds": [
+      "diagram",
+      "endpoint",
+      "grid",
+      "midpoint",
+      "node",
+      "project"
+    ]
+  },
+  "model_txt": "TITLE\nUntitled\n\nNODES 2\n1  0.0  0.0\n2  0.0  9.0\n\nMATERIALS 2\n1  210000000.0  1.2e-05  7850.0  Steel_S275\n2  33000000.0  1e-05  2500.0  Concrete_C30\n\nSECTIONS 3\n1  1  0.00285  1.94e-05  0.2  Steel_IPE200\n2  2  0.15  0.003125  0.5  Concrete_30x50\n3  2  0.25  0.005208333333333333  0.5  5050  width=0.5  shape=square  b=0.5  h=0.5\n\nELEMENTS 1\n1  1  2  3  FRAME\n\nSUPPORTS 1\n1  1  1  1\n\nLOADS 1\n2  5.0  0.0  0.0\n"
+}

@@ -32,6 +32,20 @@ settings panel.
 """
 
 
+NODE_COINCIDENCE_TOL: float = 1e-9
+"""World-unit tolerance for "are these two coordinates the same node?".
+
+Single source of truth shared across the model, GUI commands
+(``gui_common/commands.py``), and the assembler's pre-solve audit
+(``assembler.validate_model``). Lives in this module so the analytic
+core doesn't have to import the GUI layer.
+
+The snap engine in ``gui_qt/snap.py`` uses a separate *pixel*-space
+radius (10 px) for visual targeting — that's a different concern
+(cursor-snap UX) and intentionally not linked to this constant.
+"""
+
+
 # ── Nodes ──────────────────────────────────────────────────────
 
 

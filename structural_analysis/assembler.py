@@ -31,7 +31,13 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .element import Element2D, FrameElement2D, TrussElement2D
-from .model import STANDARD_GRAVITY, StructuralModel
+from .model import NODE_COINCIDENCE_TOL, STANDARD_GRAVITY, StructuralModel
+
+
+# Cap the coincident-pair list shown in the warning to keep the
+# results panel readable on pathological imports. The full set is
+# always available by re-running the check.
+_MAX_COINCIDENT_PAIRS_IN_WARNING: int = 10
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -261,6 +267,46 @@ def _connectivity_components(model: StructuralModel) -> list[set[int]]:
     return components
 
 
+def _find_coincident_node_pairs(
+    model: StructuralModel,
+    *,
+    tol: float = NODE_COINCIDENCE_TOL,
+) -> list[tuple[int, int, float]]:
+    """Return pairs of nodes within ``tol`` of each other (id_a < id_b).
+
+    Returns a list of ``(id_a, id_b, distance)`` tuples. The
+    O(n²) pairwise comparison is fine for typical model sizes
+    (< few hundred nodes); for larger imports a spatial index would
+    help but is out of scope for the Stage B-lite minimal audit.
+
+    Used by :func:`validate_model` to emit a non-fatal warning when
+    the model has duplicate nodes that the add-time block in
+    ``AddNodeCmd`` didn't catch (most commonly: nodes that drifted
+    into coincidence through file import or manual moves).
+    """
+    nodes = list(model.nodes.values())
+    pairs: list[tuple[int, int, float]] = []
+    for i, ni in enumerate(nodes):
+        for nj in nodes[i + 1:]:
+            dx = ni.x - nj.x
+            dy = ni.y - nj.y
+            # Cheap bounding-box pre-filter rules out the obviously-
+            # distant majority before the hypot call. The strict
+            # Euclidean check below is what actually decides whether
+            # the pair counts as coincident — using only the box
+            # check could flag pairs whose Euclidean distance reaches
+            # √2·tol, contradicting the warning message's "Δ ≤ tol"
+            # claim (per gemini PR-21 review).
+            if abs(dx) >= tol or abs(dy) >= tol:
+                continue
+            dist = float(np.hypot(dx, dy))
+            if dist >= tol:
+                continue
+            a, b = (ni.id, nj.id) if ni.id < nj.id else (nj.id, ni.id)
+            pairs.append((a, b, dist))
+    return pairs
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Validation
 # ═══════════════════════════════════════════════════════════════
@@ -310,6 +356,26 @@ def validate_model(model: StructuralModel, dofs: DofManager) -> list[str]:
         raise ValueError(
             f"Isolated nodes with no elements: {isolated}. "
             f"Remove them or connect them."
+        )
+
+    # v0.11.0 Stage B-lite: coincident-node audit. The add-time block
+    # in `AddNodeCmd` prevents new duplicates, but nothing today
+    # catches duplicates introduced by file import or by manual node
+    # moves. Surfaced as a non-fatal warning so existing fatal checks
+    # (orphan / disconnected-unsupported) stay fatal — only the
+    # missing-from-today's-validation case is added.
+    pairs = _find_coincident_node_pairs(model, tol=NODE_COINCIDENCE_TOL)
+    if pairs:
+        shown = pairs[:_MAX_COINCIDENT_PAIRS_IN_WARNING]
+        suffix = (
+            f" …(+{len(pairs) - _MAX_COINCIDENT_PAIRS_IN_WARNING} more)"
+            if len(pairs) > _MAX_COINCIDENT_PAIRS_IN_WARNING
+            else ""
+        )
+        pair_text = ", ".join(f"({a}, {b})" for a, b, _ in shown) + suffix
+        warnings.append(
+            f"Coincident nodes detected "
+            f"(Δ ≤ {NODE_COINCIDENCE_TOL:.0e} m): pairs {pair_text}."
         )
 
     # Connectivity — each component must have at least one support

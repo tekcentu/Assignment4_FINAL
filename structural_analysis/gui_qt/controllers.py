@@ -12,12 +12,15 @@ from typing import Optional, Protocol
 
 from .canvas import HitResult
 from ..gui_common.commands import (
+    ELEMENT_SPLIT_TOL,
     NODE_COINCIDENCE_TOL,
     AddElementCmd,
     AddNodeCmd,
     DeleteElementCmd,
     DeleteNodeCmd,
+    SplitElementCmd,
 )
+from ..gui_common.geometry import project_point_on_segment
 
 
 class _Host(Protocol):
@@ -37,6 +40,8 @@ class _Host(Protocol):
         first_x: float, first_y: float, first_node_id: int | None,
         second_x: float, second_y: float, second_node_id: int | None,
         kind: str | None = None,
+        first_split_target: tuple[int, float, float] | None = None,
+        second_split_target: tuple[int, float, float] | None = None,
     ) -> None: ...
     def set_element_preview(self, start_node_id: int, end_x: float,
                             end_y: float, kind: str) -> None: ...
@@ -94,6 +99,48 @@ class SelectTool(Tool):
             self.host.clear_selection()
 
 
+def _split_target_for(
+    hit: HitResult, host: "_Host",
+) -> tuple[int, float, float] | None:
+    """Resolve a click to a split target ``(element_id, x_world, y_world)``.
+
+    Returns ``None`` when the click is not on an element interior —
+    i.e. either ``hit.element_id`` is missing entirely (click on
+    empty space / grid intersection / a node), or the click's world
+    coordinates project to a parametric position outside the strict
+    interior ``(ELEMENT_SPLIT_TOL, 1 - ELEMENT_SPLIT_TOL)`` of the
+    referenced element.
+
+    The geometric check is necessary because the snap engine
+    (``gui_qt/snap.py``) gives GRID priority 1 and PROJECT priority
+    4 (snap.py:30-37), so most clicks near a grid line win a "grid"
+    snap and never advertise `snap_kind == "project"` even when
+    visually on top of an element. The canvas fallback path
+    (canvas.py:465-484) also sets ``hit.element_id`` without setting
+    ``snap_kind``. Trusting ``hit.element_id`` + a world-space
+    projection covers both paths.
+    """
+    if hit.node_id is not None or hit.element_id is None:
+        return None
+    model = host.model()
+    elem = next(
+        (e for e in model.elements if e.id == hit.element_id),
+        None,
+    )
+    if elem is None:
+        return None
+    ni = model.nodes.get(elem.node_i)
+    nj = model.nodes.get(elem.node_j)
+    if ni is None or nj is None:
+        return None
+    proj_x, proj_y, t = project_point_on_segment(
+        hit.x, hit.y, ni.x, ni.y, nj.x, nj.y,
+    )
+    if t <= ELEMENT_SPLIT_TOL or t >= 1.0 - ELEMENT_SPLIT_TOL:
+        return None
+    return (hit.element_id, proj_x, proj_y)
+
+
 class NodeTool(Tool):
     name = "node"
     description = "Node tool: click on the grid to place a node."
@@ -104,6 +151,21 @@ class NodeTool(Tool):
         if hit.node_id is not None:
             self.host.set_status(f"Node {hit.node_id} already at this location.")
             return
+        # v0.11.0: clicking an existing element's interior splits the
+        # element at the projected point — otherwise the user gets a
+        # node that looks "on" the element but isn't connected to it
+        # (the disconnected-component bug PR #21 fixes). We project
+        # in world space rather than trusting hit.snap_kind because
+        # the snap engine's GRID priority (1) beats PROJECT (4) for
+        # most clicks near a grid line, leaving snap_kind != "project"
+        # even when the cursor is visually on the element.
+        target = _split_target_for(hit, self.host)
+        if target is not None:
+            elem_id, x_world, y_world = target
+            self.host.execute(SplitElementCmd(
+                element_id=elem_id, x=x_world, y=y_world,
+            ))
+            return
         self.host.execute(AddNodeCmd(x=hit.x, y=hit.y))
 
 
@@ -111,9 +173,17 @@ class _PairTool(Tool):
     def __init__(self, host: _Host, kind: str) -> None:
         super().__init__(host)
         self.kind = kind
-        # v0.10.0: clicks can land on empty space, so we remember both
-        # the coordinates and the snapped node id (which may be None).
-        self._first: Optional[tuple[float, float, int | None]] = None
+        # v0.11.0 (post-PR21): the per-endpoint stash carries the
+        # world coords, a node-id hint (None if the click came from a
+        # split target or free space), and an optional split target
+        # `(parent_element_id, projected_x, projected_y)` which gets
+        # plumbed through the dialog so the composite can run the
+        # split on accept rather than eagerly.
+        #
+        # Fields: (x, y, node_id_hint, split_target_or_None)
+        self._first: Optional[
+            tuple[float, float, int | None, tuple[int, float, float] | None]
+        ] = None
 
     @property
     def description(self) -> str:
@@ -122,7 +192,14 @@ class _PairTool(Tool):
                 f"{self.kind.capitalize()} tool: click the start point. "
                 "Snaps to nodes; a new node is created if you click empty space."
             )
-        ref = f"node {self._first[2]}" if self._first[2] is not None else "point"
+        first_id = self._first[2]
+        first_split = self._first[3]
+        if first_id is not None:
+            ref = f"node {first_id}"
+        elif first_split is not None:
+            ref = f"on element {first_split[0]}"
+        else:
+            ref = "point"
         return (
             f"{self.kind.capitalize()} tool: click the end point "
             f"(start = {ref})."
@@ -132,22 +209,61 @@ class _PairTool(Tool):
         self._first = None
         self.host.clear_element_preview()
 
+    def _resolve_endpoint(
+        self, hit: HitResult,
+    ) -> tuple[float, float, int | None, tuple[int, float, float] | None]:
+        """Resolve a member-draw click into ``(x, y, node_id, split_target)``.
+
+        Deferred-split semantics (v0.11.0 follow-up): this helper no
+        longer calls ``host.execute``. It only *classifies* the click
+        and returns the data the dialog flow needs. The actual
+        :class:`SplitElementCmd` and :class:`AddMemberCmd` are bundled
+        into a single :class:`DrawMemberWithSplitsCmd` on dialog
+        accept, so the whole draw collapses to one undo step and
+        cancelling the dialog leaves the model untouched.
+
+        Returns one of:
+
+        - ``(hit.x, hit.y, hit.node_id, None)`` — endpoint is at a
+          snapped node or in free space. No split needed.
+        - ``(proj_x, proj_y, None, (parent_element_id, proj_x, proj_y))``
+          — endpoint will split the named element on dialog accept.
+
+        The previous v0.11.0 cut had a third "None ⇒ cancel" return
+        path for split failures; that no longer applies because we
+        don't execute anything here. Member-load blocks now surface
+        from :class:`DrawMemberWithSplitsCmd.do` via the host's
+        existing ValueError handler.
+        """
+        target = _split_target_for(hit, self.host)
+        if target is None:
+            return (hit.x, hit.y, hit.node_id, None)
+        elem_id, x_world, y_world = target
+        return (x_world, y_world, None, (elem_id, x_world, y_world))
+
     def on_click(self, hit: HitResult, button: str) -> None:
         if button != "left":
             return
         if self._first is None:
-            self._first = (hit.x, hit.y, hit.node_id)
-            if hit.node_id is not None:
+            self._first = self._resolve_endpoint(hit)
+            first_x, first_y, first_id, first_split = self._first
+            if first_id is not None:
                 self.host.set_element_preview(
-                    hit.node_id, hit.x, hit.y, self.kind,
+                    first_id, first_x, first_y, self.kind,
                 )
             else:
+                # Free space OR a deferred split target both anchor
+                # the rubber-band preview from the projected world
+                # coordinate — no node id is needed for the preview.
+                # Visible diff from the eager-split version: the
+                # parent element stays whole during the preview phase
+                # (split happens on dialog accept, not on click 1).
                 self.host.set_element_preview_free(
-                    hit.x, hit.y, hit.x, hit.y, self.kind,
+                    first_x, first_y, first_x, first_y, self.kind,
                 )
             self.host.set_status(self.description)
             return
-        first_x, first_y, first_id = self._first
+        first_x, first_y, first_id, first_split = self._first
         # Guard against "click in the same spot twice" *before* opening
         # the element-properties dialog — otherwise the user fills the
         # dialog in, only to get an "element has zero length" error on
@@ -168,18 +284,21 @@ class _PairTool(Tool):
         if same_node or same_point:
             self.host.set_status("Start and end must be different points.")
             return
+        second_x, second_y, second_id, second_split = self._resolve_endpoint(hit)
         self.host.clear_element_preview()
         self.host.open_element_dialog_for_member(
             first_x=first_x, first_y=first_y, first_node_id=first_id,
-            second_x=hit.x, second_y=hit.y, second_node_id=hit.node_id,
+            second_x=second_x, second_y=second_y, second_node_id=second_id,
             kind=self.kind,
+            first_split_target=first_split,
+            second_split_target=second_split,
         )
         self._first = None
 
     def on_motion(self, hit: HitResult) -> None:
         if self._first is None:
             return
-        first_x, first_y, first_id = self._first
+        first_x, first_y, first_id, _first_split = self._first
         if first_id is not None:
             self.host.set_element_preview(first_id, hit.x, hit.y, self.kind)
         else:
