@@ -434,7 +434,7 @@ def _remap_member_loads(
             if ml.a < L1 - tol_a:
                 a_loads.append(ml)  # unchanged: a stays the same
             elif ml.a > L1 + tol_a:
-                b_loads.append(replace(ml, a=ml.a - L1))
+                b_loads.append(replace(ml, a=min(ml.a - L1, L_child_b)))
             else:
                 # At split point: deterministic assign to child A's
                 # right end. Use child A's ACTUAL length for round-off
