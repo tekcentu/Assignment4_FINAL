@@ -409,12 +409,16 @@ def _remap_member_loads(
     * ``UniformDistributedLoad``: append the same (frozen) instance to
       BOTH children. Resultant w·L = w·L1 + w·L2; FEMs at the shared
       node C cancel.
-    * ``PointLoad(py, a)``: tolerance band ``tol_a = ELEMENT_SPLIT_TOL
-      * L_parent``. If ``a < L1 - tol_a`` → child A (unchanged). If
-      ``a > L1 + tol_a`` → child B with ``a -= L1``. Otherwise (load
-      at split point) → child A with ``a = L_child_a`` (use child A's
-      ACTUAL length so we don't lose the FP race against
-      ``element.py``'s ``a <= L + 1e-10`` guard).
+    * ``PointLoad(py, a)``: FP-roundoff tolerance band ``tol_a =
+      1e-12 * max(L_parent, 1.0)`` — tight enough that a load with
+      any real offset from the split routes to the correct child
+      with its true offset, no matter the parent's length. If ``a <
+      L1 - tol_a`` → child A (unchanged). If ``a > L1 + tol_a`` →
+      child B with ``a -= L1`` (clamped to ``L_child_b`` to survive
+      element.py's ``a <= L + 1e-10`` bounds guard). Otherwise (load
+      at split point in FP) → child A with ``a = L_child_a`` (use
+      child A's ACTUAL length so we don't lose the same FP race on
+      the left).
     * ``FrameTemperatureLoad`` / ``TrussTemperatureLoad``: append
       unchanged to BOTH children — thermal fixed-end forces are
       length-independent and contributions at node C cancel exactly.
@@ -422,7 +426,15 @@ def _remap_member_loads(
       model so atomicity is preserved.
     """
     from dataclasses import replace
-    tol_a = ELEMENT_SPLIT_TOL * L_parent
+    # Pure FP roundoff tolerance: "is `a` the same number as `L1` in
+    # floating point?", NOT "is `a` within some user-meaningful
+    # distance of L1?". Deliberately decoupled from ELEMENT_SPLIT_TOL
+    # (whose 1e-6 value is correct for the parametric-`t` reject at
+    # SplitElementCmd.do() but six orders too loose here — a long
+    # member would have snapped real loads into the at-split branch).
+    # Fall back to 1.0 for sub-metre elements so a 0.1 m bar still
+    # uses a 1e-12 tolerance, not 1e-13.
+    tol_a = 1e-12 * max(L_parent, 1.0)
     a_loads: list = []
     b_loads: list = []
     for ml in parent_loads:

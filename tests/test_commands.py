@@ -695,6 +695,27 @@ def test_split_loaded_frame_point_load_at_split_assigns_to_child_a_at_its_full_l
     assert a_pts[0].a == pytest.approx(L_child_a, abs=1e-12)
 
 
+def test_split_loaded_point_load_just_past_split_routes_to_child_b_not_snapped():
+    """A PointLoad placed a finite (non-FP-roundoff) distance past
+    the split must route to child B with its true offset, not be
+    snapped to child A's endpoint. Regression for codex P2 finding
+    on PR #22: with the old ``ELEMENT_SPLIT_TOL * L_parent`` band, on
+    a long enough member a load within ``1e-6 * L_parent`` of the
+    split was incorrectly snapped to child A's end. The new band is
+    a pure FP-roundoff tolerance, so a 1 mm offset routes cleanly to
+    B regardless of member length."""
+    m, eid = _frame_model_one_member()  # 6 m horizontal frame
+    m.elements[0].member_loads.append(PointLoad(py=-5.0, a=3.0 + 1e-3))
+    cmd = SplitElementCmd(element_id=eid, x=3.0, y=0.0)
+    cmd.do(m)
+    a, b = m.elements
+    a_pts = [ld for ld in a.member_loads if isinstance(ld, PointLoad)]
+    b_pts = [ld for ld in b.member_loads if isinstance(ld, PointLoad)]
+    assert a_pts == []
+    assert len(b_pts) == 1
+    assert b_pts[0].a == pytest.approx(1e-3, abs=1e-12)
+
+
 def test_split_loaded_frame_thermal_copies_to_both_children():
     m, eid = _frame_model_one_member()
     tload = FrameTemperatureLoad(t_top=20.0, t_bottom=-20.0)
