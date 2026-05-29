@@ -1942,7 +1942,12 @@ class MainWindow(QMainWindow):
             event.accept()
             return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            self._delete_selected_objects()
+            inspector_open = (
+                self._element_inspector is not None
+                and self._element_inspector.isVisible()
+            )
+            if not inspector_open:
+                self._delete_selected_objects()
             event.accept()
             return
         super().keyPressEvent(event)
