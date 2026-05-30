@@ -111,12 +111,16 @@ def _format_mechanical_magnitude(
 
 def _local_equivalent_note(
     model: StructuralModel, elem, x_comp: float, y_comp: float,
-    cs: str, unit: str,
+    cs: str, unit: str, kind: str,
 ) -> str:
-    """For non-local loads, compute the (wx_l, wy_l) projection so the
-    user can see the converted local components alongside the original
-    user-entered value. Returns an empty string for local loads or
-    zero-length elements."""
+    """For non-local loads, compute the projected local components so
+    the user can see the converted local equivalent alongside the
+    original user-entered value.
+
+    ``kind`` is ``"udl"`` or ``"point"`` — controls whether the
+    annotation uses ``wx`` / ``wy`` (distributed) or ``px`` / ``py``
+    (point) names. Returns an empty string for local loads or
+    zero-length elements (nothing to convert)."""
     if cs == "local":
         return ""
     ni = model.nodes.get(elem.node_i)
@@ -129,8 +133,9 @@ def _local_equivalent_note(
     c = (nj.x - ni.x) / L
     s = (nj.y - ni.y) / L
     from ..element import _project_load_to_local
-    wx_l, wy_l = _project_load_to_local(x_comp, y_comp, cs, c, s)
-    return f"local eq: wx = {wx_l:g}, wy = {wy_l:g} {unit}"
+    x_l, y_l = _project_load_to_local(x_comp, y_comp, cs, c, s)
+    x_name, y_name = ("wx", "wy") if kind == "udl" else ("px", "py")
+    return f"local eq: {x_name} = {x_l:g}, {y_name} = {y_l:g} {unit}"
 
 
 def format_element_loads(
@@ -156,7 +161,7 @@ def format_element_loads(
                     wx, ld.wy, x_name, y_name, "kN/m",
                 )
             local_eq = _local_equivalent_note(
-                model, elem, wx, ld.wy, cs, "kN/m",
+                model, elem, wx, ld.wy, cs, "kN/m", "udl",
             )
             meaning_base = {
                 "local":   "Transverse / axial line load (local axes)",
@@ -186,7 +191,7 @@ def format_element_loads(
                     px, ld.py, x_name, y_name, "kN",
                 )
             local_eq = _local_equivalent_note(
-                model, elem, px, ld.py, cs, "kN",
+                model, elem, px, ld.py, cs, "kN", "point",
             )
             meaning_base = {
                 "local":   "Transverse / axial point load (local axes)",

@@ -980,10 +980,13 @@ class ModelCanvas(QWidget):
                         if mag == 0.0:
                             continue
                         h = mag * point_scale
+                        # Tail OPPOSITE to load direction so the
+                        # arrowhead at xy=(bx,by) visually points along
+                        # (dx, dy) — matches the nodal-load convention.
                         self.ax.annotate(
                             "",
                             xy=(bx, by),
-                            xytext=(bx + dx * h, by + dy * h),
+                            xytext=(bx - dx * h, by - dy * h),
                             arrowprops=dict(
                                 arrowstyle="->", color="#9467bd", lw=2,
                             ),
@@ -1005,9 +1008,11 @@ class ModelCanvas(QWidget):
     ) -> None:
         """Draw ``n_arrows`` evenly spaced arrows along the element in
         the direction ``(dx, dy)`` with length proportional to
-        ``magnitude * udl_scale``. Sign preserves the existing PointLoad
-        tail-offset convention so visually the strip stays consistent
-        with how the v0.14.0 renderer drew transverse local loads."""
+        ``magnitude * udl_scale``. The arrowhead lands on the member
+        and the tail sits OPPOSITE to the load direction so the visual
+        actually points the way the force acts — matching how nodal
+        loads are drawn (see ``_draw_nodal_load`` which also offsets
+        the tail by ``-`` the force components)."""
         h = magnitude * udl_scale
         if h == 0.0:
             return
@@ -1018,7 +1023,7 @@ class ModelCanvas(QWidget):
             self.ax.annotate(
                 "",
                 xy=(bx, by),
-                xytext=(bx + dx * h, by + dy * h),
+                xytext=(bx - dx * h, by - dy * h),
                 arrowprops=dict(
                     arrowstyle="->", color="#9467bd", lw=1.0, alpha=0.85,
                 ),

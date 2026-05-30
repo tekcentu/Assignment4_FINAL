@@ -3661,6 +3661,52 @@ def test_canvas_pointload_visual_components_global_uses_world_axes(qt_app):
     assert comps == [(1.0, 0.0, 5.0), (0.0, 1.0, -20.0)]
 
 
+def test_canvas_udl_arrow_strip_tail_offset_opposes_load_direction(qt_app):
+    """The arrowhead must land ON the member (xy) with the tail
+    OPPOSITE the load direction so the visual actually points the way
+    the force acts. A +ve gravity load (down) must produce arrows whose
+    tail sits ABOVE the member — Gemini regression on PR #26 first
+    draft, which had tail and head swapped."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, Node, Section, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    e = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e.member_loads.append(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    w._model.elements = [e]
+    w.canvas.redraw()
+    tails_above = 0
+    for ann in w.canvas.ax.findobj():
+        xy = getattr(ann, "xy", None)
+        xytext = getattr(ann, "xyann", None)
+        if xy is None or xytext is None:
+            continue
+        try:
+            head_y = float(xy[1])
+            tail_y = float(xytext[1])
+        except Exception:
+            continue
+        if abs(head_y - 0.0) < 1e-6 and tail_y > head_y + 1e-9:
+            tails_above += 1
+    assert tails_above >= 1, (
+        "Gravity +10 UDL: arrows must have tail ABOVE the member so "
+        "the head at the member visually points DOWN."
+    )
+
+
 def test_canvas_draws_member_loads_without_error_for_each_coord_system(qt_app):
     """End-to-end render: a model with one local, one global, and one
     gravity load must redraw cleanly (no projection errors / asserts)."""

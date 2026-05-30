@@ -1342,26 +1342,35 @@ class MemberLoadDialog(_ModalDialog):
         kind = self._current_kind()
         if kind == "udl":
             cs = self._current_coord_system()
-            wy = parse_float(self._fields["wy"].text(), "wy")
+            # parse_float's error name must match the on-screen field
+            # label so "Invalid number for qY" replaces a confusing
+            # "Invalid number for wy" when Global is selected.
+            y_name = (
+                "magnitude" if cs == "gravity"
+                else ("qY" if cs == "global" else "wy")
+            )
+            wy = parse_float(self._fields["wy"].text(), y_name)
             # Gravity hides the wx field — pass wx=0 so the load class
             # __post_init__ accepts it. Local and global show wx.
             wx = 0.0
             if cs != "gravity":
+                x_name = "qX" if cs == "global" else "wx"
                 wx = parse_float(
-                    self._fields["wx"].text(),
-                    "qX" if cs == "global" else "wx",
-                    allow_blank=True,
+                    self._fields["wx"].text(), x_name, allow_blank=True,
                 ) or 0.0
             return UniformDistributedLoad(wy=wy, wx=wx, coord_system=cs)
         if kind == "point":
             cs = self._current_coord_system()
-            py = parse_float(self._fields["py"].text(), "py")
+            y_name = (
+                "magnitude" if cs == "gravity"
+                else ("pY" if cs == "global" else "py")
+            )
+            py = parse_float(self._fields["py"].text(), y_name)
             px = 0.0
             if cs != "gravity":
+                x_name = "pX" if cs == "global" else "px"
                 px = parse_float(
-                    self._fields["px"].text(),
-                    "pX" if cs == "global" else "px",
-                    allow_blank=True,
+                    self._fields["px"].text(), x_name, allow_blank=True,
                 ) or 0.0
             a = parse_float(self._fields["a"].text(), "a")
             L, _, _ = self._elem.length_cos_sin(self._model.nodes)
