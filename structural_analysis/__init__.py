@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 __what_is_new__ = (
-    "multi-select + Shift-click · "
-    "Window/Crossing box selection · "
-    "ESC cancels draw + batch section/material assign"
+    "element load list in inspector · "
+    "per-row delete + undo · "
+    "split-endpoint label + selection load counts"
 )
 
 from .model import (

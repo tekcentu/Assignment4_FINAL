@@ -29,6 +29,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -1829,6 +1831,14 @@ class ElementPropertiesDialog(QDialog):
         self._outer.addWidget(self._buttons)
 
         self._elem_id: int = elem_id
+        # Host callback for per-row Delete buttons in the loads table.
+        # The host (MainWindow) sets this to its delete_member_load
+        # method after constructing the singleton inspector. Until then
+        # (or in unit tests that construct the dialog directly), the
+        # buttons render as disabled so the model is never mutated
+        # implicitly.
+        self._host_delete_member_load = None
+        self._loads_widget: QWidget | None = None
         self.set_target(model, elem_id, result)
 
     def set_target(
@@ -1952,10 +1962,16 @@ class ElementPropertiesDialog(QDialog):
             form.addRow("Releases:",
                          QLabel(f"i={elem.release_i},  j={elem.release_j}"))
 
-        loads = _member_loads_summary(elem)
-        form.addRow("Member loads:", QLabel(loads[0]))
-        for line in loads[1:]:
-            form.addRow("", QLabel(line))
+        # Loads section — structured table with per-row Delete buttons.
+        # The form layout above ends here; the loads block sits below it
+        # at full width so the four columns (#, Type, Magnitude,
+        # Position/Notes) all read cleanly.
+        loads_header = QLabel("── Member loads ──")
+        loads_header.setStyleSheet("font-weight: bold;")
+        layout.addWidget(loads_header)
+        loads_widget = self._build_loads_table(model, elem)
+        self._loads_widget = loads_widget
+        layout.addWidget(loads_widget)
 
         # Main figure — only sketch + FBD + N + V + M (section is in
         # the side mini-figure above).  Shorter overall so the dialog
@@ -2066,6 +2082,116 @@ class ElementPropertiesDialog(QDialog):
                     )
 
         return body
+
+    # ── Loads table ──────────────────────────────────────────────────
+
+    def _build_loads_table(
+        self, model: StructuralModel, elem,
+    ) -> QWidget:
+        """Build the per-element member-loads table widget.
+
+        Read-only columns + one Delete button per row. Delete is routed
+        through ``self._host_delete_member_load`` (set by the host on
+        the singleton inspector). When the callback is missing — e.g.
+        in unit tests that construct the dialog directly — the buttons
+        are disabled so the model is never mutated implicitly.
+        """
+        from .load_summary import format_element_loads
+
+        rows = format_element_loads(model, elem)
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(
+            ["#", "Type", "Magnitude", "Position / Notes", ""]
+        )
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents,
+        )
+        header.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents,
+        )
+        header.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents,
+        )
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents,
+        )
+        if not rows:
+            table.setRowCount(1)
+            none_item = QTableWidgetItem("(no member loads)")
+            none_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            table.setItem(0, 0, QTableWidgetItem(""))
+            table.setSpan(0, 0, 1, 5)
+            table.setItem(0, 0, none_item)
+        else:
+            table.setRowCount(len(rows))
+            for i, row in enumerate(rows):
+                table.setItem(i, 0, QTableWidgetItem(str(row.index + 1)))
+                t_item = QTableWidgetItem(row.type_label)
+                t_item.setToolTip(row.meaning)
+                table.setItem(i, 1, t_item)
+                table.setItem(i, 2, QTableWidgetItem(row.magnitude))
+                table.setItem(i, 3, QTableWidgetItem(row.position))
+                btn = QPushButton("Delete")
+                btn.setEnabled(
+                    self._host_delete_member_load is not None
+                )
+                # Capture row.index at lambda definition time so a later
+                # row addition / removal doesn't change which load the
+                # button targets.
+                load_idx = row.index
+                btn.clicked.connect(
+                    lambda _checked=False, idx=load_idx:
+                    self._on_delete_load_clicked(idx)
+                )
+                table.setCellWidget(i, 4, btn)
+        # Compact height: header + min(rows, 6) rows.
+        n_visible = max(1, min(len(rows) or 1, 6))
+        row_h = table.verticalHeader().defaultSectionSize()
+        header_h = table.horizontalHeader().height()
+        table.setMaximumHeight(header_h + (row_h * n_visible) + 4)
+        return table
+
+    def _on_delete_load_clicked(self, load_index: int) -> None:
+        """Forward a Delete-button click to the host callback.
+
+        Guarded against missing host (defensive — Delete buttons are
+        also disabled in that case, but a stale slot connection could
+        in principle fire after the host went away)."""
+        if self._host_delete_member_load is None:
+            return
+        self._host_delete_member_load(self._elem_id, load_index)
+
+    def refresh_loads_only(
+        self, model: StructuralModel, result=None,
+    ) -> None:
+        """Re-render just the loads table without rebuilding the whole
+        inspector (which would flash the figure). The host calls this
+        after a successful :class:`DeleteMemberLoadCmd` so the row
+        disappears immediately while the diagrams stay put."""
+        elem = next(
+            (e for e in model.elements if e.id == self._elem_id), None,
+        )
+        if elem is None:
+            # Element vanished (e.g. cascade delete via another path) —
+            # close the inspector so the user isn't staring at stale data.
+            self.close()
+            return
+        new_widget = self._build_loads_table(model, elem)
+        # Find the index of the current loads widget inside the outer
+        # layout and swap it in place.
+        body_layout = self._body_widget.layout()
+        if body_layout is None:
+            self.set_target(model, self._elem_id, result)
+            return
+        body_layout.replaceWidget(self._loads_widget, new_widget)
+        self._loads_widget.setParent(None)
+        self._loads_widget.deleteLater()
+        self._loads_widget = new_widget
 
     # ── Interactive handlers ──────────────────────────────────────────
 

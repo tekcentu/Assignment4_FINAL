@@ -1400,6 +1400,50 @@ class ClearMemberLoadsCmd(Command):
                 return
 
 
+@dataclass
+class DeleteMemberLoadCmd(Command):
+    """Remove a single member-load row from one element.
+
+    Identified by ``elem_id`` + ``load_index`` (position in
+    ``elem.member_loads``). Undo re-inserts the saved load at the same
+    index so undo/redo preserves order relative to the element's other
+    loads. The command is atomic: if the index is out of range the
+    model is left untouched and a ``ValueError`` is raised.
+
+    Note: index identification is safe because undo is LIFO — the
+    immediate inverse re-inserts at the exact position vacated by
+    ``do``. A subsequent unrelated command (e.g. AddMemberLoadCmd on
+    the same element) does not interfere because that command's own
+    undo restores by identity, not by index.
+    """
+
+    elem_id: int
+    load_index: int
+    _saved_load: object = field(default=None, init=False)
+    description: str = "delete member load"
+
+    def do(self, model: StructuralModel) -> None:
+        for elem in model.elements:
+            if elem.id == self.elem_id:
+                if not (0 <= self.load_index < len(elem.member_loads)):
+                    raise ValueError(
+                        f"Load index {self.load_index} out of range "
+                        f"for element {self.elem_id} "
+                        f"(has {len(elem.member_loads)} load"
+                        f"{'s' if len(elem.member_loads) != 1 else ''})."
+                    )
+                self._saved_load = elem.member_loads[self.load_index]
+                del elem.member_loads[self.load_index]
+                return
+        raise ValueError(f"Element {self.elem_id} does not exist.")
+
+    def undo(self, model: StructuralModel) -> None:
+        for elem in model.elements:
+            if elem.id == self.elem_id:
+                elem.member_loads.insert(self.load_index, self._saved_load)
+                return
+
+
 # ── replace whole model (for File→Open) ─────────────────────────────────
 
 
