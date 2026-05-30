@@ -215,23 +215,49 @@ class NodalLoad:
 
 @dataclass(frozen=True)
 class UniformDistributedLoad:
-    """Full-length UDL on a member (local transverse direction).
+    """Full-length distributed line load on a member.
 
-    wy > 0 acts in the positive local-y direction of the element.
+    Components ``wx`` (axial) and ``wy`` (transverse) are interpreted
+    in the chosen ``coord_system``:
+
+    * ``"local"`` (default): ``wx`` is in the element's local +x_local
+      (axial, tip-to-tip), ``wy`` is in the element's local +y_local
+      (transverse). The classic ``UniformDistributedLoad(wy=...)``
+      construction retains its original meaning (wx defaults to 0,
+      coord_system to "local").
+    * ``"global"``: ``wx`` is in global +X, ``wy`` is in global +Y.
+      Both are **force per unit member length** (NOT force per unit
+      horizontal projection). The solver projects the global (wx, wy)
+      onto the element's local axes before computing fixed-end forces,
+      so an inclined member picks up both axial and transverse FEMs.
     """
 
     wy: float
+    wx: float = 0.0
+    coord_system: str = "local"
 
 
 @dataclass(frozen=True)
 class PointLoad:
     """Point load on a member at distance *a* from start node.
 
-    py > 0 acts in the positive local-y direction of the element.
+    Components ``px`` (axial) and ``py`` (transverse) are interpreted
+    in the chosen ``coord_system``:
+
+    * ``"local"`` (default): ``px`` is along +x_local, ``py`` along
+      +y_local. The classic ``PointLoad(py=..., a=...)`` construction
+      retains its original meaning (px defaults to 0, coord_system to
+      "local").
+    * ``"global"``: ``px`` is in global +X, ``py`` in global +Y. The
+      solver projects to local axes before forming the consistent
+      Hermite/linear shape-function FEMs, so a global load on an
+      inclined member produces both axial and transverse end forces.
     """
 
     py: float
     a: float
+    px: float = 0.0
+    coord_system: str = "local"
 
 
 @dataclass(frozen=True)

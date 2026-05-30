@@ -211,8 +211,57 @@ def test_element_load_row_is_frozen_dataclass():
     row = ElementLoadRow(
         index=0, kind="UDL", type_label="UDL",
         magnitude="wy = -10 kN/m",
-        position="Full length, local +y",
+        position="Full length, local axes",
         meaning="Transverse line load (local axes)",
     )
     assert row.index == 0
     assert row.kind == "UDL"
+
+
+# ── PR #25 — coord_system label + axial component formatting ────────
+
+
+def test_format_udl_with_only_wy_keeps_compact_form():
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(UniformDistributedLoad(wy=-10.0))
+    rows = format_element_loads(m, m.elements[0])
+    assert "wy = -10" in rows[0].magnitude
+    # wx component is zero — should NOT appear in the magnitude string.
+    assert "wx" not in rows[0].magnitude
+
+
+def test_format_udl_with_both_wx_and_wy_shows_two_component_form():
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-10.0, wx=4.0)
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert "wx" in rows[0].magnitude and "wy" in rows[0].magnitude
+    assert "4" in rows[0].magnitude
+    assert "-10" in rows[0].magnitude
+
+
+def test_format_local_udl_position_says_local_axes():
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(UniformDistributedLoad(wy=-10.0))
+    rows = format_element_loads(m, m.elements[0])
+    assert "local" in rows[0].position.lower()
+
+
+def test_format_global_udl_position_says_global_axes():
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-10.0, coord_system="global")
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert "global" in rows[0].position.lower()
+
+
+def test_format_global_pointload_labels_global_frame():
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        PointLoad(py=-20.0, a=3.0, px=5.0, coord_system="global")
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert "global" in rows[0].position.lower()
+    assert "px" in rows[0].magnitude and "py" in rows[0].magnitude

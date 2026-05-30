@@ -412,9 +412,17 @@ def read_input_file(filepath: str) -> StructuralModel:
                 a = float(parts[1])
                 px = float(parts[2]) if len(parts) > 2 else 0.0
                 py = float(parts[3]) if len(parts) > 3 else 0.0
+                # Optional trailing coord-system token: "local" (default
+                # if absent) or "global". Anything else is rejected so a
+                # typo doesn't silently parse as the default.
+                coord_system = _parse_coord_system_token(
+                    parts[4] if len(parts) > 4 else None, "MEMBER_POINT_LOADS",
+                )
                 for elem in model.elements:
                     if elem.id == eid:
-                        elem.member_loads.append(PointLoad(py=py, a=a))
+                        elem.member_loads.append(PointLoad(
+                            py=py, a=a, px=px, coord_system=coord_system,
+                        ))
                         break
 
         elif keyword == "MEMBER_UDL":
@@ -427,17 +435,15 @@ def read_input_file(filepath: str) -> StructuralModel:
                 eid = int(parts[0])
                 wx = float(parts[1]) if len(parts) > 1 else 0.0
                 wy = float(parts[2]) if len(parts) > 2 else 0.0
-                if wx != 0.0:
-                    # Axial distributed loads are not implemented. Fail loudly
-                    # rather than silently dropping the value.
-                    raise ValueError(
-                        f"MEMBER_UDL for element {eid}: non-zero wx={wx} is "
-                        "not supported (only transverse wy is implemented). "
-                        "Set wx to 0.0 or remove the column."
-                    )
+                # Optional trailing coord-system token; missing → local.
+                coord_system = _parse_coord_system_token(
+                    parts[3] if len(parts) > 3 else None, "MEMBER_UDL",
+                )
                 for elem in model.elements:
                     if elem.id == eid:
-                        elem.member_loads.append(UniformDistributedLoad(wy=wy))
+                        elem.member_loads.append(UniformDistributedLoad(
+                            wy=wy, wx=wx, coord_system=coord_system,
+                        ))
                         break
 
         elif keyword == "TRUSS_TEMPERATURE":
@@ -520,4 +526,23 @@ def _parse_bool(s: str, key: str) -> bool:
     raise ValueError(
         f"ANALYSIS_OPTIONS {key}={s!r}: expected a boolean "
         "(true/false, 1/0, yes/no, on/off)."
+    )
+
+
+def _parse_coord_system_token(token: str | None, section: str) -> str:
+    """Parse the optional trailing coord-system token on a member-load row.
+
+    Missing token → "local" (preserves byte-identical parsing of every
+    pre-v0.15.0 input file). The only accepted explicit values are
+    ``"local"`` and ``"global"``; anything else raises so a typo
+    doesn't silently degrade to the default.
+    """
+    if token is None:
+        return "local"
+    norm = token.strip().lower()
+    if norm in ("local", "global"):
+        return norm
+    raise ValueError(
+        f"{section}: unknown coord-system token {token!r}; "
+        "expected 'local' or 'global' (or omit for local)."
     )

@@ -3426,3 +3426,85 @@ def test_selection_status_single_element_does_not_show_load_counts(qt_app):
     w._update_selection_status()
     text = w._status_label.text()
     assert "Loads:" not in text
+
+
+# ── PR #25 MemberLoadDialog — coord-system radio ─────────────────────
+
+
+def _frame_model_for_dialog(w):
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Material, Node, Section
+
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )]
+    return 1
+
+
+def test_member_load_dialog_offers_wx_and_coord_radio_for_udl(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._radios["udl"].setChecked(True)
+    d._refresh_fields()
+    assert "wx" in d._fields
+    assert "wy" in d._fields
+    # The coord widget is shown for mechanical loads.
+    assert d._coord_widget.isVisibleTo(d)
+
+
+def test_member_load_dialog_offers_px_and_coord_radio_for_pointload(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._radios["point"].setChecked(True)
+    d._refresh_fields()
+    assert "px" in d._fields
+    assert "py" in d._fields
+    assert "a" in d._fields
+
+
+def test_member_load_dialog_hides_coord_radio_for_thermal(qt_app):
+    """The Local/Global radio is mechanical-only — thermal loads are
+    coordinate-system-independent and must not surface the toggle."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._radios["frame_t"].setChecked(True)
+    d._refresh_fields()
+    # Hidden via setVisible(False); isVisibleTo respects that.
+    assert not d._coord_widget.isVisibleTo(d)
+
+
+def test_member_load_dialog_accept_returns_coord_system(qt_app):
+    """Building a UDL with the Global radio selected must produce a
+    UniformDistributedLoad with coord_system='global' and the wx field."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._radios["udl"].setChecked(True)
+    d._refresh_fields()
+    d._fields["wx"].setText("3.0")
+    d._fields["wy"].setText("-10.0")
+    d._rb_global.setChecked(True)
+    result = d._accept()
+    assert isinstance(result, UniformDistributedLoad)
+    assert result.wx == 3.0
+    assert result.wy == -10.0
+    assert result.coord_system == "global"

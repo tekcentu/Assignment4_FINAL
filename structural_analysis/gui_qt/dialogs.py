@@ -1218,6 +1218,40 @@ class MemberLoadDialog(_ModalDialog):
         v.addWidget(self._field_container)
         self._fields: dict[str, QLineEdit] = {}
 
+        # Coord-system block — only visible for mechanical UDL / PointLoad
+        # rows. Thermal loads are coordinate-system-independent so the
+        # radio block stays hidden for them (see _refresh_fields).
+        self._coord_widget = QWidget(body)
+        coord_layout = QVBoxLayout(self._coord_widget)
+        coord_layout.setContentsMargins(0, 4, 0, 0)
+        coord_layout.addWidget(QLabel("Load direction:", self._coord_widget))
+        self._coord_group = QButtonGroup(self._coord_widget)
+        self._rb_local = QRadioButton(
+            "Local (element axes)", self._coord_widget,
+        )
+        self._rb_local.setToolTip(
+            "wy / py act along the element's local +y_local axis "
+            "(transverse) and wx / px along +x_local (axial). The "
+            "interpretation rotates with the element."
+        )
+        self._rb_global = QRadioButton(
+            "Global (X / Y axes)", self._coord_widget,
+        )
+        self._rb_global.setToolTip(
+            "wx / px are in global +X and wy / py in global +Y. "
+            "Both are FORCE PER UNIT MEMBER LENGTH — not per "
+            "horizontal projection. The solver projects to the "
+            "element's local axes before forming fixed-end forces, "
+            "so inclined members pick up both axial and transverse "
+            "contributions."
+        )
+        self._coord_group.addButton(self._rb_local)
+        self._coord_group.addButton(self._rb_global)
+        coord_layout.addWidget(self._rb_local)
+        coord_layout.addWidget(self._rb_global)
+        self._rb_local.setChecked(True)
+        v.addWidget(self._coord_widget)
+
         # Now safely wire the toggled signal and default-select the first option.
         for val, rb in radio_buttons:
             rb.toggled.connect(self._refresh_fields)
@@ -1231,6 +1265,9 @@ class MemberLoadDialog(_ModalDialog):
                 return key
         return next(iter(self._radios))
 
+    def _current_coord_system(self) -> str:
+        return "global" if self._rb_global.isChecked() else "local"
+
     def _refresh_fields(self) -> None:
         # clear
         while self._field_form.count():
@@ -1240,10 +1277,16 @@ class MemberLoadDialog(_ModalDialog):
                 w.deleteLater()
         self._fields = {}
         kind = self._current_kind()
+        # Mechanical loads get an axial component + the local/global radio.
+        # Thermal loads keep the simpler one/two-field form.
+        mechanical = kind in ("udl", "point")
+        self._coord_widget.setVisible(mechanical)
         if kind == "udl":
-            self._add_field("wy (kN/m, +local-y)", "wy")
+            self._add_field("wx (kN/m, axial / +X)", "wx")
+            self._add_field("wy (kN/m, transverse / +Y)", "wy")
         elif kind == "point":
-            self._add_field("py (kN, +local-y)", "py")
+            self._add_field("px (kN, axial / +X)", "px")
+            self._add_field("py (kN, transverse / +Y)", "py")
             self._add_field("a (m from start node)", "a")
         elif kind == "truss_t":
             self._add_field("ΔT (°C)", "delta_T")
@@ -1260,14 +1303,26 @@ class MemberLoadDialog(_ModalDialog):
     def _accept(self) -> Any:
         kind = self._current_kind()
         if kind == "udl":
-            return UniformDistributedLoad(wy=parse_float(self._fields["wy"].text(), "wy"))
+            wx = parse_float(
+                self._fields["wx"].text(), "wx", allow_blank=True,
+            ) or 0.0
+            wy = parse_float(self._fields["wy"].text(), "wy")
+            return UniformDistributedLoad(
+                wy=wy, wx=wx, coord_system=self._current_coord_system(),
+            )
         if kind == "point":
+            px = parse_float(
+                self._fields["px"].text(), "px", allow_blank=True,
+            ) or 0.0
             py = parse_float(self._fields["py"].text(), "py")
             a = parse_float(self._fields["a"].text(), "a")
             L, _, _ = self._elem.length_cos_sin(self._model.nodes)
             if a < 0 or a > L:
                 raise ValueError(f"a must lie within [0, {L:.3g}] (element length).")
-            return PointLoad(py=py, a=a)
+            return PointLoad(
+                py=py, a=a, px=px,
+                coord_system=self._current_coord_system(),
+            )
         if kind == "truss_t":
             return TrussTemperatureLoad(
                 delta_T=parse_float(self._fields["delta_T"].text(), "ΔT"))

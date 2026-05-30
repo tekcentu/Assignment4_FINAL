@@ -62,6 +62,35 @@ def _rotation_matrix_6x6(c: float, s: float) -> np.ndarray:
     return R
 
 
+def _project_load_to_local(
+    cx: float, cy: float, coord_system: str, c: float, s: float,
+) -> tuple[float, float]:
+    """Project a 2-D mechanical load's (x, y) components into the
+    element's local axes.
+
+    The 2-D transformation matrix from global to local is
+    ``T = [[c, s], [-s, c]]`` (with ``c = cos θ``, ``s = sin θ``,
+    θ the angle of the element's +x_local axis measured from global
+    +X). This mirrors the upper-left 2x2 block of the 6×6 rotation
+    used by ``transformation_matrix``.
+
+    For ``coord_system == "local"`` the components are returned
+    unchanged. For ``"global"`` the components are rotated into local
+    axes, giving BOTH an axial (local-x) and a transverse (local-y)
+    contribution for inclined members. Any other value raises
+    ``ValueError`` (defensive — the only valid strings are documented
+    on :class:`UniformDistributedLoad` and :class:`PointLoad`).
+    """
+    if coord_system == "local":
+        return cx, cy
+    if coord_system == "global":
+        return c * cx + s * cy, -s * cx + c * cy
+    raise ValueError(
+        f"Unknown coord_system {coord_system!r}; "
+        f"expected 'local' or 'global'."
+    )
+
+
 @dataclass
 class Element2D:
     """Abstract base class for 2-D structural elements.
@@ -396,22 +425,47 @@ class FrameElement2D(Element2D):
             TypeError: If a TrussTemperatureLoad is applied to a frame element
                 (use FrameTemperatureLoad with equal t_top/t_bottom instead).
         """
-        L, _, _ = self.length_cos_sin(nodes)
+        L, c, s = self.length_cos_sin(nodes)
         p = np.zeros(6)
         for load in self.member_loads:
             if isinstance(load, UniformDistributedLoad):
-                w = load.wy
-                p += np.array([0, w*L/2, w*L**2/12, 0, w*L/2, -w*L**2/12])
+                wx_l, wy_l = _project_load_to_local(
+                    load.wx, load.wy, load.coord_system, c, s,
+                )
+                # Axial (linear shape functions): half to each end.
+                if wx_l != 0.0:
+                    p += np.array([wx_l*L/2, 0, 0, wx_l*L/2, 0, 0])
+                # Transverse (Hermite cubics): wL/2 and ±wL²/12.
+                if wy_l != 0.0:
+                    p += np.array([
+                        0, wy_l*L/2, wy_l*L**2/12,
+                        0, wy_l*L/2, -wy_l*L**2/12,
+                    ])
             elif isinstance(load, PointLoad):
                 a = float(load.a)
                 if not (0 <= a <= L + 1e-10):
                     raise ValueError(f"Element {self.id}: point load a={a:.3f} outside L={L:.3f}.")
-                xi = a / L if L > 0 else 0
-                n1 = 1 - 3*xi**2 + 2*xi**3
-                n2 = L*(xi - 2*xi**2 + xi**3)
-                n3 = 3*xi**2 - 2*xi**3
-                n4 = L*(-xi**2 + xi**3)
-                p += np.array([0, load.py*n1, load.py*n2, 0, load.py*n3, load.py*n4])
+                px_l, py_l = _project_load_to_local(
+                    load.px, load.py, load.coord_system, c, s,
+                )
+                if L > 0:
+                    # Axial linear shape functions: load splits by lever rule.
+                    if px_l != 0.0:
+                        p += np.array([
+                            px_l*(L - a)/L, 0, 0,
+                            px_l*a/L,       0, 0,
+                        ])
+                    # Transverse: cubic Hermite shape functions.
+                    if py_l != 0.0:
+                        xi = a / L
+                        n1 = 1 - 3*xi**2 + 2*xi**3
+                        n2 = L*(xi - 2*xi**2 + xi**3)
+                        n3 = 3*xi**2 - 2*xi**3
+                        n4 = L*(-xi**2 + xi**3)
+                        p += np.array([
+                            0, py_l*n1, py_l*n2,
+                            0, py_l*n3, py_l*n4,
+                        ])
             elif isinstance(load, FrameTemperatureLoad):
                 # Mean temperature → axial effect
                 dT_mean = 0.5 * (load.t_top + load.t_bottom)

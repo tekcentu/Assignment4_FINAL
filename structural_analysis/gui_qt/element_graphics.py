@@ -32,7 +32,7 @@ from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import MaxNLocator
 
-from ..element import FrameElement2D, TrussElement2D
+from ..element import FrameElement2D, TrussElement2D, _project_load_to_local
 from ..model import (
     AnalysisResult,
     FrameTemperatureLoad,
@@ -73,26 +73,52 @@ def evaluate_internal_force(
         return 0.0, None
     N_i, V_i, M_i, _N_j, _V_j, _M_j = (float(v) for v in f_local)
 
+    # Project each mechanical load onto the element's local axes so the
+    # diagram math sees the same (wx_l, wy_l) / (px_l, py_l) the FEM
+    # math used (see element._project_load_to_local). For local loads
+    # this is a no-op; for global loads inclined members pick up both
+    # axial and transverse contributions.
+    c, s = (nj.x - ni.x) / L, (nj.y - ni.y) / L
+    udl_wx_total = 0.0
+    udl_wy_total = 0.0
+    axial_points: list[tuple[float, float]] = []
+    transverse_points: list[tuple[float, float]] = []
+    for ml in getattr(elem, "member_loads", []):
+        if isinstance(ml, UniformDistributedLoad):
+            wx_l, wy_l = _project_load_to_local(
+                ml.wx, ml.wy, ml.coord_system, c, s,
+            )
+            udl_wx_total += wx_l
+            udl_wy_total += wy_l
+        elif isinstance(ml, PointLoad):
+            px_l, py_l = _project_load_to_local(
+                ml.px, ml.py, ml.coord_system, c, s,
+            )
+            if px_l != 0.0:
+                axial_points.append((ml.a, px_l))
+            if py_l != 0.0:
+                transverse_points.append((ml.a, py_l))
+
     if kind == "axial":
-        n_value = -N_i
-        return L, (lambda _x, _v=n_value: _v)
+        # N(x) tension-positive, derived from left-FBD equilibrium:
+        #   N(x) = -N_i - wx_local * x - Σ px_local for a < x
+        # When there are no axial member loads this collapses to the
+        # constant -N_i used by every existing test.
+        def axial(x):
+            n = -N_i - udl_wx_total * x
+            for a, px in axial_points:
+                if x > a:
+                    n -= px
+            return n
+        return L, axial
 
     if isinstance(elem, TrussElement2D):
         return L, None
 
-    udls: list[float] = []
-    points: list[tuple[float, float]] = []
-    for ml in getattr(elem, "member_loads", []):
-        if isinstance(ml, UniformDistributedLoad):
-            udls.append(ml.wy)
-        elif isinstance(ml, PointLoad):
-            points.append((ml.a, ml.py))
-    w = sum(udls)
-
     if kind == "shear":
         def shear(x):
-            v = V_i - w * x
-            for a, py in points:
+            v = V_i - udl_wy_total * x
+            for a, py in transverse_points:
                 if x > a:
                     v += py
             return v
@@ -100,8 +126,8 @@ def evaluate_internal_force(
 
     if kind == "moment":
         def moment(x):
-            m = -M_i + V_i * x - 0.5 * w * x * x
-            for a, py in points:
+            m = -M_i + V_i * x - 0.5 * udl_wy_total * x * x
+            for a, py in transverse_points:
                 if x > a:
                     m += py * (x - a)
             return m
@@ -293,14 +319,29 @@ def _draw_fbd(ax, elem, ni: Node, nj: Node,
     ax.plot([0, L], [0, 0], marker="o", linestyle="none",
             color=_MEMBER_COLOR, markersize=5, zorder=4)
 
+    # FBD shows arrows perpendicular to the (horizontal-drawn) member;
+    # that's the local-y projection for both local and global loads.
+    # Axial components don't get a perpendicular arrow here — the N
+    # subplot below makes axial behavior unambiguous.
+    if L > 0:
+        c_fbd = (nj.x - ni.x) / L
+        s_fbd = (nj.y - ni.y) / L
+    else:
+        c_fbd, s_fbd = 1.0, 0.0
     udls: list[float] = []
     points_list: list[tuple[float, float]] = []
     thermals: list[str] = []
     for ml in getattr(elem, "member_loads", []):
         if isinstance(ml, UniformDistributedLoad):
-            udls.append(ml.wy)
+            _wx_l, wy_l = _project_load_to_local(
+                ml.wx, ml.wy, ml.coord_system, c_fbd, s_fbd,
+            )
+            udls.append(wy_l)
         elif isinstance(ml, PointLoad):
-            points_list.append((ml.a, ml.py))
+            _px_l, py_l = _project_load_to_local(
+                ml.px, ml.py, ml.coord_system, c_fbd, s_fbd,
+            )
+            points_list.append((ml.a, py_l))
         elif isinstance(ml, FrameTemperatureLoad):
             thermals.append(f"ΔT_top={ml.t_top:g}, ΔT_bot={ml.t_bottom:g}")
         elif isinstance(ml, TrussTemperatureLoad):

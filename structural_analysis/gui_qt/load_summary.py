@@ -65,6 +65,28 @@ def _format_point_load_position(a: float, L: float) -> str:
     return f"a = {a:g} m"
 
 
+def _format_coord_system(cs: str) -> str:
+    return "local axes" if cs == "local" else "global X / Y"
+
+
+def _format_mechanical_magnitude(
+    x_comp: float, y_comp: float, x_name: str, y_name: str, unit: str,
+) -> str:
+    """Show both components when either is non-zero (or both zero).
+
+    Compact form when only one component is non-zero (e.g. ``wy = -10``)
+    so legacy local-y-only loads stay readable. Two-component form
+    when both axes carry load (e.g. ``(wx, wy) = (5, -10)``).
+    """
+    if x_comp == 0.0:
+        return f"{y_name} = {y_comp:g} {unit}"
+    if y_comp == 0.0:
+        return f"{x_name} = {x_comp:g} {unit}"
+    return (
+        f"({x_name}, {y_name}) = ({x_comp:g}, {y_comp:g}) {unit}"
+    )
+
+
 def format_element_loads(
     model: StructuralModel, elem,
 ) -> list[ElementLoadRow]:
@@ -78,22 +100,39 @@ def format_element_loads(
     L = _element_length(model, elem)
     for idx, ld in enumerate(loads):
         if isinstance(ld, UniformDistributedLoad):
+            cs = getattr(ld, "coord_system", "local")
+            wx = getattr(ld, "wx", 0.0)
             rows.append(ElementLoadRow(
                 index=idx,
                 kind="UDL",
                 type_label="UDL",
-                magnitude=f"wy = {ld.wy:g} kN/m",
-                position="Full length, local +y",
-                meaning="Transverse line load (local axes)",
+                magnitude=_format_mechanical_magnitude(
+                    wx, ld.wy, "wx", "wy", "kN/m",
+                ),
+                position=f"Full length, {_format_coord_system(cs)}",
+                meaning=(
+                    "Transverse line load (local axes)" if cs == "local"
+                    else "Global line load — projected to local axes"
+                ),
             ))
         elif isinstance(ld, PointLoad):
+            cs = getattr(ld, "coord_system", "local")
+            px = getattr(ld, "px", 0.0)
             rows.append(ElementLoadRow(
                 index=idx,
                 kind="PointLoad",
                 type_label="PointLoad",
-                magnitude=f"py = {ld.py:g} kN",
-                position=_format_point_load_position(ld.a, L),
-                meaning="Transverse point load (local +y)",
+                magnitude=_format_mechanical_magnitude(
+                    px, ld.py, "px", "py", "kN",
+                ),
+                position=(
+                    f"{_format_point_load_position(ld.a, L)}, "
+                    f"{_format_coord_system(cs)}"
+                ),
+                meaning=(
+                    "Transverse point load (local +y)" if cs == "local"
+                    else "Global point load — projected to local axes"
+                ),
             ))
         elif isinstance(ld, FrameTemperatureLoad):
             mean = 0.5 * (ld.t_top + ld.t_bottom)
