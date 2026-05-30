@@ -269,6 +269,95 @@ def test_writer_rejects_load_case_with_whitespace():
         _case_token("DEAD LOAD")
 
 
+def test_writer_rejects_load_case_with_hash():
+    """``#`` starts a comment in the input-file format. A case name
+    containing ``#`` would be silently truncated on reload, so the
+    writer must refuse to serialise it (Gemini PR #27 finding)."""
+    from structural_analysis.gui_common.file_writer import _case_token
+    with pytest.raises(ValueError, match=r"#"):
+        _case_token("DEAD#1")
+
+
+# ── parser: optional numeric fields omitted but metadata present ────
+
+
+def test_reader_handles_udl_with_only_case_token_no_numeric_fields():
+    """A hand-written ``MEMBER_UDL`` row that omits wx and wy entirely
+    but supplies ``case=`` must NOT try to parse ``case=DEAD`` as a
+    float. Both wx and wy default to 0 in this shape."""
+    legacy = (
+        "TITLE\nmeta-only\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "MEMBER_UDL 1\n1  case=DEAD\n\n"
+    )
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(legacy)
+        m = read_input_file(path)
+    finally:
+        os.unlink(path)
+    ld = m.elements[0].member_loads[0]
+    assert ld.wx == 0.0
+    assert ld.wy == 0.0
+    assert ld.load_case == "DEAD"
+
+
+def test_reader_handles_udl_with_coord_system_only_no_numeric_fields():
+    """Same as above but with the positional coord_system token
+    (``global``) instead of ``case=``."""
+    legacy = (
+        "TITLE\nmeta-only\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "MEMBER_UDL 1\n1  global\n\n"
+    )
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(legacy)
+        m = read_input_file(path)
+    finally:
+        os.unlink(path)
+    ld = m.elements[0].member_loads[0]
+    assert ld.wx == 0.0
+    assert ld.wy == 0.0
+    assert ld.coord_system == "global"
+
+
+def test_reader_handles_pointload_with_only_position_and_case_no_px_py():
+    """``MEMBER_POINT_LOADS`` row that supplies only ``elem_id`` + ``a``
+    + ``case=NAME`` (px / py both default to 0)."""
+    legacy = (
+        "TITLE\nmeta-only\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "MEMBER_POINT_LOADS 1\n1  3.0  case=LIVE\n\n"
+    )
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(legacy)
+        m = read_input_file(path)
+    finally:
+        os.unlink(path)
+    ld = m.elements[0].member_loads[0]
+    assert ld.a == 3.0
+    assert ld.px == 0.0
+    assert ld.py == 0.0
+    assert ld.load_case == "LIVE"
+
+
 # ── split/remap preservation ────────────────────────────────────────
 
 

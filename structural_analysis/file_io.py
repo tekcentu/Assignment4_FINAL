@@ -415,15 +415,25 @@ def read_input_file(filepath: str) -> StructuralModel:
                 parts = lines[i].split("#")[0].split()
                 eid = int(parts[0])
                 a = float(parts[1])
-                px = float(parts[2]) if len(parts) > 2 else 0.0
-                py = float(parts[3]) if len(parts) > 3 else 0.0
                 # Optional trailing tokens: positional coord-system
                 # ("local"|"global"|"gravity") followed by any number of
                 # key=value tokens (today: ``case=NAME``). Missing →
                 # local + DEFAULT, preserving byte-identical parsing of
                 # every pre-v0.17.0 input file.
+                #
+                # The metadata block can start anywhere after the
+                # mandatory ``elem_id  a`` pair (px and py are optional
+                # — they default to 0). Locate the first metadata token
+                # by signature ('=' for key=value, or a known
+                # coord_system keyword) so we don't try to parse
+                # ``case=DEAD`` as a float.
+                start_idx = _find_metadata_start(
+                    parts, mandatory_end=2, accept_coord_system=True,
+                )
+                px = float(parts[2]) if start_idx > 2 else 0.0
+                py = float(parts[3]) if start_idx > 3 else 0.0
                 meta = _parse_load_metadata(
-                    parts, start_idx=4, section="MEMBER_POINT_LOADS",
+                    parts, start_idx=start_idx, section="MEMBER_POINT_LOADS",
                     accept_coord_system=True,
                 )
                 for elem in model.elements:
@@ -443,10 +453,17 @@ def read_input_file(filepath: str) -> StructuralModel:
                     i += 1
                 parts = lines[i].split("#")[0].split()
                 eid = int(parts[0])
-                wx = float(parts[1]) if len(parts) > 1 else 0.0
-                wy = float(parts[2]) if len(parts) > 2 else 0.0
+                # Same dynamic-metadata-start logic as
+                # MEMBER_POINT_LOADS above — wx and wy are optional but
+                # the trailing tokens (coord_system / case=) must not
+                # be parsed as floats.
+                start_idx = _find_metadata_start(
+                    parts, mandatory_end=1, accept_coord_system=True,
+                )
+                wx = float(parts[1]) if start_idx > 1 else 0.0
+                wy = float(parts[2]) if start_idx > 2 else 0.0
                 meta = _parse_load_metadata(
-                    parts, start_idx=3, section="MEMBER_UDL",
+                    parts, start_idx=start_idx, section="MEMBER_UDL",
                     accept_coord_system=True,
                 )
                 for elem in model.elements:
@@ -569,6 +586,39 @@ def _parse_coord_system_token(token: str | None, section: str) -> str:
         f"{section}: unknown coord-system token {token!r}; "
         "expected 'local', 'global', or 'gravity' (or omit for local)."
     )
+
+
+def _find_metadata_start(
+    parts: list[str], *, mandatory_end: int, accept_coord_system: bool,
+) -> int:
+    """Locate the first trailing-metadata token.
+
+    Optional numeric fields (``px`` / ``py`` on MEMBER_POINT_LOADS;
+    ``wx`` / ``wy`` on MEMBER_UDL) can be omitted in hand-written input
+    files. When they are omitted but trailing metadata (``case=NAME``
+    or a positional coord-system keyword) is present, the row index of
+    the metadata block depends on how many numerics the user supplied.
+
+    Scan rule: any token that successfully parses as a float is treated
+    as a positional numeric field; the first non-floatable token starts
+    the metadata block. This means typo'd metadata (e.g. ``globle``)
+    still flows into :func:`_parse_load_metadata`, which raises a clear
+    "unknown coord-system token" / "unknown key=" error rather than
+    being silently skipped.
+
+    Returns ``len(parts)`` when no metadata tokens are present.
+    """
+    # ``accept_coord_system`` is kept in the signature for documentation
+    # symmetry with _parse_load_metadata, but the floatability test
+    # discriminates metadata vs. numeric uniformly across all sections.
+    del accept_coord_system  # not needed by the floatability rule
+    for idx in range(mandatory_end, len(parts)):
+        tok = parts[idx]
+        try:
+            float(tok)
+        except ValueError:
+            return idx
+    return len(parts)
 
 
 def _parse_load_metadata(

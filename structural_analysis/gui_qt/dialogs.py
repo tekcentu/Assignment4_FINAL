@@ -1183,18 +1183,21 @@ def _make_load_case_combo(
 def _normalize_load_case(raw: str | None) -> str:
     """Trim + uppercase a user-entered case name. Empty → 'DEFAULT'.
 
-    Whitespace inside the case name is rejected because the file
-    writer stores it as a single whitespace-delimited token.
+    Whitespace or ``#`` inside the case name is rejected: whitespace
+    would break the writer's single-token storage, and ``#`` starts a
+    comment in the input-file format and would silently truncate the
+    saved row on reload.
     """
     if raw is None:
         return "DEFAULT"
     stripped = raw.strip()
     if not stripped:
         return "DEFAULT"
-    if any(ch.isspace() for ch in stripped):
+    if any(ch.isspace() or ch == "#" for ch in stripped):
         raise ValueError(
-            f"Load case {stripped!r} contains whitespace; case names "
-            "must be a single token. Use underscores or hyphens."
+            f"Load case {stripped!r} contains invalid characters "
+            "(whitespace or '#'); case names must be a single token "
+            "and cannot contain '#'. Use underscores or hyphens."
         )
     return stripped.upper()
 

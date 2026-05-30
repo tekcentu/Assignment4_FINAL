@@ -28,17 +28,18 @@ def _fmt(x: float) -> str:
 
 def _case_token(load_case: str) -> str:
     """Return ``"  case=NAME"`` only when load_case differs from the
-    default. Whitespace in the case name would break the
-    whitespace-tokenised reader, so reject it here rather than
-    silently emit a corrupt file.
+    default. Whitespace or ``#`` would break the reader (whitespace
+    splits the row; ``#`` starts a comment) so reject those here
+    rather than silently emit a corrupt file.
     """
     if not load_case or load_case == "DEFAULT":
         return ""
-    if any(ch.isspace() for ch in load_case):
+    if any(ch.isspace() or ch == "#" for ch in load_case):
         raise ValueError(
-            f"load_case {load_case!r} contains whitespace; the "
-            "input-file format stores it as a single token. Rename "
-            "the case (underscores or hyphens) before saving."
+            f"load_case {load_case!r} contains invalid characters "
+            "(whitespace or '#'); the input-file format stores it as "
+            "a single token and uses '#' for comments. Rename the "
+            "case (underscores or hyphens) before saving."
         )
     return f"  case={load_case}"
 

@@ -4030,6 +4030,25 @@ def test_member_load_dialog_load_case_rejects_whitespace(qt_app):
         d._accept()
 
 
+def test_member_load_dialog_load_case_rejects_hash(qt_app):
+    """``#`` starts a comment in the input-file format; if it leaked
+    into a case name the writer would silently truncate the saved row
+    on reload. The dialog must reject it at entry time."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    import pytest
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._refresh_fields()
+    d._fields["wy"].setText("-10.0")
+    d._case_combo.setEditText("DEAD#1")
+    with pytest.raises(ValueError, match=r"#"):
+        d._accept()
+
+
 def test_nodal_load_dialog_has_load_case_combo(qt_app):
     from structural_analysis.gui_qt.dialogs import NodalLoadDialog
 
