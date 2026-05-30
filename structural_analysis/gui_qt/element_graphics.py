@@ -32,7 +32,7 @@ from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import MaxNLocator
 
-from ..element import FrameElement2D, TrussElement2D
+from ..element import FrameElement2D, TrussElement2D, _project_load_to_local
 from ..model import (
     AnalysisResult,
     FrameTemperatureLoad,
@@ -78,7 +78,6 @@ def evaluate_internal_force(
     # math used (see element._project_load_to_local). For local loads
     # this is a no-op; for global loads inclined members pick up both
     # axial and transverse contributions.
-    from ..element import _project_load_to_local
     c, s = (nj.x - ni.x) / L, (nj.y - ni.y) / L
     udl_wx_total = 0.0
     udl_wy_total = 0.0
@@ -324,7 +323,6 @@ def _draw_fbd(ax, elem, ni: Node, nj: Node,
     # that's the local-y projection for both local and global loads.
     # Axial components don't get a perpendicular arrow here — the N
     # subplot below makes axial behavior unambiguous.
-    from ..element import _project_load_to_local
     if L > 0:
         c_fbd = (nj.x - ni.x) / L
         s_fbd = (nj.y - ni.y) / L
