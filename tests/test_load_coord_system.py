@@ -101,6 +101,60 @@ def test_project_invalid_coord_system_raises():
         _project_load_to_local(1.0, 2.0, "polar", 1.0, 0.0)
 
 
+# ── PR #27 manual-test: local-axis convention on a vertical member ──
+
+
+def test_local_plus_y_on_upward_vertical_member_points_global_minus_x():
+    """Convention confirmation (NOT a behavior change): on a
+    bottom-to-top vertical member (c=0, s=1) the local +y axis points
+    in global -X. Equivalent statement via the projection helper: a
+    global -X load (cx=-1, cy=0) projects to a pure +local-y load
+    (x_l=0, y_l=+1). This is the math the manual tester observed when a
+    +local-y load 'pointed left', and it is correct under our 2D
+    convention local y = (-s, c)."""
+    c, s = 0.0, 1.0  # i→j points up (+Y global)
+    x_l, y_l = _project_load_to_local(-1.0, 0.0, "global", c, s)
+    assert abs(x_l - 0.0) < TOL
+    assert abs(y_l - 1.0) < TOL
+
+
+def test_global_load_is_independent_of_element_ij_direction():
+    """A Global Y load must project to the same *global* effect
+    regardless of whether the member is drawn i→j or j→i. Drawing the
+    column downward (c=0, s=-1) flips the sign of the local-y component
+    relative to the upward case, but the reconstructed global vector is
+    identical — i.e. global directions are absolute."""
+    # Upward member: i→j = +Y  (c=0, s=1)
+    up_x, up_y = _project_load_to_local(0.0, -10.0, "global", 0.0, 1.0)
+    # Downward member: i→j = -Y (c=0, s=-1)
+    dn_x, dn_y = _project_load_to_local(0.0, -10.0, "global", 0.0, -1.0)
+    # Reconstruct global from local via the inverse rotation
+    # (global = R · local with R = [[c, -s], [s, c]]).
+    def _to_global(x_l, y_l, c, s):
+        return (c * x_l - s * y_l, s * x_l + c * y_l)
+    g_up = _to_global(up_x, up_y, 0.0, 1.0)
+    g_dn = _to_global(dn_x, dn_y, 0.0, -1.0)
+    assert abs(g_up[0] - g_dn[0]) < TOL
+    assert abs(g_up[1] - g_dn[1]) < TOL
+    # And both equal the original global (0, -10).
+    assert abs(g_up[0] - 0.0) < TOL
+    assert abs(g_up[1] - (-10.0)) < TOL
+
+
+def test_gravity_load_is_independent_of_element_ij_direction():
+    """Gravity always resolves to global -Y magnitude regardless of the
+    member's i→j sense."""
+    up_x, up_y = _project_load_to_local(0.0, 10.0, "gravity", 0.0, 1.0)
+    dn_x, dn_y = _project_load_to_local(0.0, 10.0, "gravity", 0.0, -1.0)
+    def _to_global(x_l, y_l, c, s):
+        return (c * x_l - s * y_l, s * x_l + c * y_l)
+    g_up = _to_global(up_x, up_y, 0.0, 1.0)
+    g_dn = _to_global(dn_x, dn_y, 0.0, -1.0)
+    # Gravity +10 → global (0, -10) for both orientations.
+    assert abs(g_up[0] - 0.0) < TOL and abs(g_up[1] - (-10.0)) < TOL
+    assert abs(g_dn[0] - 0.0) < TOL and abs(g_dn[1] - (-10.0)) < TOL
+
+
 # ── Backward-compat: existing local-only behavior unchanged ──────────
 
 

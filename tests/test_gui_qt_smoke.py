@@ -4084,6 +4084,135 @@ def test_member_load_dialog_load_case_rejects_hash(qt_app):
         d._accept()
 
 
+# ── PR #27 manual-test review fixes: layout, helper text, labels ────
+
+
+def test_member_load_dialog_no_stale_field_widgets_after_mode_switch(qt_app):
+    """Layout-ghosting regression: switching Mechanical → Thermal must
+    leave NO leftover QLineEdit children parented to the field
+    container. The fix reparents old fields to None immediately
+    (before deleteLater) so they vanish from the display without
+    waiting for the event loop. We deliberately do NOT call
+    processEvents here — the assertion must hold synchronously."""
+    from PyQt6.QtWidgets import QLineEdit
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._refresh_fields()
+    # Mechanical/UDL/local exposes exactly wx + wy.
+    live = d._field_container.findChildren(QLineEdit)
+    assert len(live) == 2
+
+    # Switch to Thermal (uniform) → only a single ΔT field should
+    # remain; the wx/wy edits must be gone, not lingering behind it.
+    d._rb_cat_thermal.setChecked(True)
+    d._rb_t_uniform.setChecked(True)
+    d._refresh_fields()
+    live = d._field_container.findChildren(QLineEdit)
+    assert len(live) == 1, (
+        "stale field widgets still parented to the container after a "
+        "mode switch — layout ghosting bug regressed"
+    )
+
+
+def test_member_load_dialog_no_stale_widgets_after_direction_switch(qt_app):
+    """Same ghosting guard across the Local → Gravity direction switch
+    (local shows wx+wy, gravity shows a single magnitude field)."""
+    from PyQt6.QtWidgets import QLineEdit
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._rb_local.setChecked(True)
+    d._refresh_fields()
+    assert len(d._field_container.findChildren(QLineEdit)) == 2
+    d._rb_gravity.setChecked(True)
+    d._refresh_fields()
+    assert len(d._field_container.findChildren(QLineEdit)) == 1
+
+
+def test_member_load_dialog_local_help_visible_only_in_local_mode(qt_app):
+    """The 'local directions follow i→j' helper text is shown for
+    Local mechanical loads and hidden for Global / Gravity / Thermal."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._rb_local.setChecked(True)
+    d._refresh_fields()
+    assert d._local_help.isVisibleTo(d)
+    assert "i→j" in d._local_help.text()
+
+    d._rb_global.setChecked(True)
+    d._refresh_fields()
+    assert not d._local_help.isVisibleTo(d)
+
+    d._rb_gravity.setChecked(True)
+    d._refresh_fields()
+    assert not d._local_help.isVisibleTo(d)
+
+    d._rb_cat_thermal.setChecked(True)
+    d._refresh_fields()
+    assert not d._local_help.isVisibleTo(d)
+
+
+def test_member_load_dialog_local_labels_mention_ij_orientation(qt_app):
+    """Local field labels must spell out the i→j / transverse
+    orientation so the direction is unambiguous in the dialog itself."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._rb_local.setChecked(True)
+    d._refresh_fields()
+    labels = _form_labels(d._field_form)
+    assert any("i→j" in lbl for lbl in labels)
+    assert any("transverse" in lbl.lower() for lbl in labels)
+
+
+def test_inspector_loads_table_reserves_at_least_three_rows(qt_app):
+    """A single-load element should still render the loads table tall
+    enough to read as a table (≥ 3 rows), not one cramped row."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, Node, Section, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    e = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e.member_loads.append(UniformDistributedLoad(wy=-10.0))
+    w._model.elements = [e]
+    w._open_element_inspector(1)
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    row_h = table.verticalHeader().defaultSectionSize()
+    header_h = table.horizontalHeader().height()
+    # Fixed height should cover at least header + 3 rows.
+    assert table.maximumHeight() >= header_h + row_h * 3
+
+
 def test_nodal_load_dialog_has_load_case_combo(qt_app):
     from structural_analysis.gui_qt.dialogs import NodalLoadDialog
 

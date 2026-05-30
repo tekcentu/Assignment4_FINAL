@@ -1359,6 +1359,21 @@ class MemberLoadDialog(_ModalDialog):
         self._rb_gravity.toggled.connect(self._refresh_fields)
         v.addWidget(self._coord_widget)
 
+        # Helper text shown only when Local direction is active —
+        # reminds the user that local axes rotate with the element's
+        # i→j orientation (so +local-y is NOT "up" on a vertical
+        # member). Use Global / Gravity when an absolute direction is
+        # wanted. Visibility is toggled in _refresh_fields.
+        self._local_help = QLabel(
+            "Local directions follow the element i→j orientation "
+            "(local y rotates with the member). Use Global or Gravity "
+            "for absolute directions.",
+            body,
+        )
+        self._local_help.setWordWrap(True)
+        self._local_help.setStyleSheet("color: #666; font-size: 11px;")
+        v.addWidget(self._local_help)
+
         # ── Thermal Type selector (Uniform ΔT / Gradient) ──────────
         # Gradient is frame-only; on a truss element the gradient
         # radio is disabled with a tooltip explaining why.
@@ -1436,15 +1451,26 @@ class MemberLoadDialog(_ModalDialog):
         return "local"
 
     def _refresh_fields(self) -> None:
-        # clear
+        # Clear the field form. ``setParent(None)`` must run BEFORE
+        # ``deleteLater`` — otherwise the old QLineEdit / QLabel widgets
+        # stay parented to _field_container and remain visible (ghosting
+        # behind the freshly added fields) until the event loop
+        # processes the deferred delete. Reparenting to None removes
+        # them from the display immediately. Same idiom used by
+        # ElementPropertiesDialog.set_target / refresh_loads_only.
         while self._field_form.count():
             item = self._field_form.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.setParent(None)
                 w.deleteLater()
         self._fields = {}
 
         cat = self._current_category()
+        # Helper text is Local-mechanical only.
+        self._local_help.setVisible(
+            cat == "mechanical" and self._current_coord_system() == "local"
+        )
         if cat == "mechanical":
             self._mech_widget.setVisible(True)
             self._coord_widget.setVisible(True)
@@ -1453,8 +1479,12 @@ class MemberLoadDialog(_ModalDialog):
             cs = self._current_coord_system()
             if kind == "udl":
                 if cs == "local":
-                    self._add_field("wx (kN/m, local x / axial)", "wx")
-                    self._add_field("wy (kN/m, local y / transverse)", "wy")
+                    self._add_field(
+                        "wx (kN/m, local x / axial / along i→j)", "wx",
+                    )
+                    self._add_field(
+                        "wy (kN/m, local y / transverse / ⊥ member)", "wy",
+                    )
                 elif cs == "global":
                     self._add_field("qX (kN/m, global X)", "wx")
                     self._add_field("qY (kN/m, global Y)", "wy")
@@ -1464,8 +1494,12 @@ class MemberLoadDialog(_ModalDialog):
                     )
             else:  # point
                 if cs == "local":
-                    self._add_field("Px (kN, local x / axial)", "px")
-                    self._add_field("Py (kN, local y / transverse)", "py")
+                    self._add_field(
+                        "Px (kN, local x / axial / along i→j)", "px",
+                    )
+                    self._add_field(
+                        "Py (kN, local y / transverse / ⊥ member)", "py",
+                    )
                 elif cs == "global":
                     self._add_field("PX (kN, global X)", "px")
                     self._add_field("PY (kN, global Y)", "py")
@@ -2419,6 +2453,15 @@ class ElementPropertiesDialog(QDialog):
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        # Show a scrollbar when the load count exceeds the visible
+        # window, and scroll per-pixel so the mouse wheel scrolls the
+        # table smoothly rather than jumping a whole row at a time.
+        table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+        )
+        table.setVerticalScrollMode(
+            QTableWidget.ScrollMode.ScrollPerPixel,
+        )
         header = table.horizontalHeader()
         header.setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents,
@@ -2475,11 +2518,16 @@ class ElementPropertiesDialog(QDialog):
                     self._on_delete_load_clicked(idx)
                 )
                 table.setCellWidget(i, 5, btn)
-        # Compact height: header + min(rows, 6) rows.
-        n_visible = max(1, min(len(rows) or 1, 6))
+        # Height: always reserve at least 3 rows so a single-load
+        # element still reads as a table (not one cramped row), and cap
+        # at 6 visible rows — beyond that the vertical scrollbar (set
+        # above) takes over so many loads stay inspectable.
+        n_visible = max(3, min(max(len(rows), 1), 6))
         row_h = table.verticalHeader().defaultSectionSize()
         header_h = table.horizontalHeader().height()
-        table.setMaximumHeight(header_h + (row_h * n_visible) + 4)
+        table_h = header_h + (row_h * n_visible) + 4
+        table.setMinimumHeight(table_h)
+        table.setMaximumHeight(table_h)
         return table
 
     def _on_delete_load_clicked(self, load_index: int) -> None:
