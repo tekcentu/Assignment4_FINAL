@@ -53,6 +53,21 @@ class _Host(Protocol):
     def select_node(self, node_id: int) -> None: ...
     def select_element(self, element_id: int) -> None: ...
     def clear_selection(self) -> None: ...
+    # v0.13.0 — multi-select / box-select
+    def toggle_node_in_selection(self, node_id: int) -> None: ...
+    def toggle_element_in_selection(self, element_id: int) -> None: ...
+    def set_drag_rect(
+        self, x0: float, y0: float, x1: float, y1: float,
+        is_crossing: bool,
+    ) -> None: ...
+    def clear_drag_rect(self) -> None: ...
+    def apply_box_select(
+        self,
+        rect: tuple[float, float, float, float],
+        shift: bool,
+        is_crossing: bool,
+    ) -> None: ...
+    def select_to_neutral_mode(self) -> None: ...
 
 
 class Tool:
@@ -68,28 +83,149 @@ class Tool:
     def deactivate(self) -> None:
         pass
 
-    def on_click(self, hit: HitResult, button: str) -> None:
+    def on_click(
+        self, hit: HitResult, button: str,
+        *,
+        press_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
         pass
 
-    def on_motion(self, hit: HitResult) -> None:
+    def on_motion(
+        self, hit: HitResult,
+        *,
+        cursor_px: tuple[float, float] = (0.0, 0.0),
+    ) -> None:
         pass
+
+    def on_release(
+        self, hit: HitResult, button: str,
+        *,
+        release_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
+        pass
+
+    def on_key(self, key: str) -> None:
+        """Handle named key events (currently only ``"escape"``).
+        Tools that have cancellable state should override."""
+        pass
+
+
+_DRAG_THRESHOLD_PX = 4.0
 
 
 class SelectTool(Tool):
+    """Press / drag / release state machine for the Select tool.
+
+    A short click selects a single object exclusively. Shift-click
+    toggles an object in/out of the selection without disturbing the
+    rest. Dragging past the pixel threshold opens a CAD-style box
+    selection — left-to-right is Window (only fully enclosed objects),
+    right-to-left is Crossing (anything the rect touches). ESC clears
+    selection or cancels an active drag.
+    """
+
     name = "select"
     description = (
-        "Select: left-click a node or element to highlight it. "
-        "Right-click an element for its detail inspector (FBD + "
-        "internal-force diagrams)."
+        "Select: click to pick one object, Shift-click to add/remove, "
+        "drag a box (left→right Window, right→left Crossing). "
+        "Right-click an element for the inspector."
     )
 
-    def on_click(self, hit: HitResult, button: str) -> None:
+    def __init__(self, host: _Host) -> None:
+        super().__init__(host)
+        self._press_world: tuple[float, float] | None = None
+        self._press_px: tuple[float, float] | None = None
+        self._press_hit: HitResult | None = None
+        self._press_shift: bool = False
+        self._dragging: bool = False
+
+    def deactivate(self) -> None:
+        self._reset_drag_state()
+        self.host.clear_drag_rect()
+
+    def _reset_drag_state(self) -> None:
+        self._press_world = None
+        self._press_px = None
+        self._press_hit = None
+        self._press_shift = False
+        self._dragging = False
+
+    def on_click(
+        self, hit: HitResult, button: str,
+        *,
+        press_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
         if button == "right":
-            # Right-click routing is owned by MainWindow._on_canvas_click
-            # so the inspector / node-menu paths run even when a
-            # non-select tool is active. Nothing for the tool to do here.
+            # Right-click is routed by MainWindow._on_canvas_click to
+            # the inspector / context menus regardless of active tool.
             return
         if button != "left":
+            return
+        # Record press; the actual select/box-select decision happens
+        # in on_release so a drag isn't double-counted as click+drag.
+        self._press_world = (hit.x, hit.y)
+        self._press_px = press_px
+        self._press_hit = hit
+        self._press_shift = shift
+        self._dragging = False
+
+    def on_motion(
+        self, hit: HitResult,
+        *,
+        cursor_px: tuple[float, float] = (0.0, 0.0),
+    ) -> None:
+        if self._press_world is None or self._press_px is None:
+            return
+        dx = cursor_px[0] - self._press_px[0]
+        dy = cursor_px[1] - self._press_px[1]
+        if not self._dragging and (dx * dx + dy * dy) < (
+            _DRAG_THRESHOLD_PX * _DRAG_THRESHOLD_PX
+        ):
+            return
+        self._dragging = True
+        # Direction in pixel space — robust against axis flips / zoom.
+        is_crossing = cursor_px[0] < self._press_px[0]
+        x0, y0 = self._press_world
+        self.host.set_drag_rect(x0, y0, hit.x, hit.y, is_crossing)
+
+    def on_release(
+        self, hit: HitResult, button: str,
+        *,
+        release_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
+        if button != "left":
+            return
+        if self._press_world is None or self._press_px is None:
+            return
+        was_dragging = self._dragging
+        press_shift = self._press_shift
+        if was_dragging:
+            is_crossing = release_px[0] < self._press_px[0]
+            x0, y0 = self._press_world
+            self.host.clear_drag_rect()
+            self.host.apply_box_select(
+                (x0, y0, hit.x, hit.y), press_shift, is_crossing,
+            )
+            self._reset_drag_state()
+            return
+        # Single click — use the modifier captured at press time so
+        # later modifier changes during the click don't affect the
+        # decision.
+        target_hit = self._press_hit or hit
+        self._reset_drag_state()
+        self._apply_click_select(target_hit, press_shift)
+
+    def _apply_click_select(self, hit: HitResult, shift: bool) -> None:
+        if shift:
+            if hit.node_id is not None:
+                self.host.toggle_node_in_selection(hit.node_id)
+            elif hit.element_id is not None:
+                self.host.toggle_element_in_selection(hit.element_id)
+            # Shift on empty space: keep current selection.
             return
         if hit.node_id is not None:
             self.host.select_node(hit.node_id)
@@ -97,6 +233,17 @@ class SelectTool(Tool):
             self.host.select_element(hit.element_id)
         else:
             self.host.clear_selection()
+
+    def on_key(self, key: str) -> None:
+        if key != "escape":
+            return
+        if self._dragging:
+            # Cancel an in-progress drag without disturbing the
+            # selection that was live before the press.
+            self.host.clear_drag_rect()
+            self._reset_drag_state()
+            return
+        self.host.clear_selection()
 
 
 def _split_target_for(
@@ -145,7 +292,12 @@ class NodeTool(Tool):
     name = "node"
     description = "Node tool: click on the grid to place a node."
 
-    def on_click(self, hit: HitResult, button: str) -> None:
+    def on_click(
+        self, hit: HitResult, button: str,
+        *,
+        press_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
         if button != "left":
             return
         if hit.node_id is not None:
@@ -241,7 +393,21 @@ class _PairTool(Tool):
         elem_id, x_world, y_world = target
         return (x_world, y_world, None, (elem_id, x_world, y_world))
 
-    def on_click(self, hit: HitResult, button: str) -> None:
+    def on_key(self, key: str) -> None:
+        if key != "escape":
+            return
+        # Atomic cancel: drop pending-first state + preview WITHOUT
+        # touching the model or the undo stack. The MainWindow ESC
+        # handler will then switch back to the Select tool.
+        self._first = None
+        self.host.clear_element_preview()
+
+    def on_click(
+        self, hit: HitResult, button: str,
+        *,
+        press_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
         if button != "left":
             return
         if self._first is None:
@@ -295,7 +461,11 @@ class _PairTool(Tool):
         )
         self._first = None
 
-    def on_motion(self, hit: HitResult) -> None:
+    def on_motion(
+        self, hit: HitResult,
+        *,
+        cursor_px: tuple[float, float] = (0.0, 0.0),
+    ) -> None:
         if self._first is None:
             return
         first_x, first_y, first_id, _first_split = self._first
@@ -325,7 +495,12 @@ class SupportTool(Tool):
     name = "support"
     description = "Support tool: click a node to edit its support."
 
-    def on_click(self, hit: HitResult, button: str) -> None:
+    def on_click(
+        self, hit: HitResult, button: str,
+        *,
+        press_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
         if button != "left":
             return
         if hit.node_id is None:
@@ -338,7 +513,12 @@ class NodalLoadTool(Tool):
     name = "nodal_load"
     description = "Nodal load tool: click a node to add/edit its load."
 
-    def on_click(self, hit: HitResult, button: str) -> None:
+    def on_click(
+        self, hit: HitResult, button: str,
+        *,
+        press_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
         if button != "left":
             return
         if hit.node_id is None:
@@ -351,7 +531,12 @@ class MemberLoadTool(Tool):
     name = "member_load"
     description = "Member load tool: click an element to add a load."
 
-    def on_click(self, hit: HitResult, button: str) -> None:
+    def on_click(
+        self, hit: HitResult, button: str,
+        *,
+        press_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
         if button != "left":
             return
         if hit.element_id is None:
@@ -364,7 +549,12 @@ class DeleteTool(Tool):
     name = "delete"
     description = "Delete tool: click a node or element to delete it."
 
-    def on_click(self, hit: HitResult, button: str) -> None:
+    def on_click(
+        self, hit: HitResult, button: str,
+        *,
+        press_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
         if button != "left":
             return
         if hit.node_id is not None:

@@ -45,6 +45,8 @@ from ..gui_common.commands import (
     AddNodeCmd,
     AddOrUpdateMaterialCmd,
     AddOrUpdateSectionCmd,
+    BatchDeleteCmd,
+    BatchUpdateElementsCmd,
     ClearMemberLoadsCmd,
     Command,
     DeleteElementCmd,
@@ -75,6 +77,7 @@ from .controllers import (
 )
 from .dialogs import (
     AnalysisSettingsDialog,
+    BatchAssignDialog,
     BuildingWizardDialog,
     ElementDialog,
     ElementPropertiesDialog,
@@ -235,6 +238,7 @@ class MainWindow(QMainWindow):
 
         self.canvas.on_click = self._on_canvas_click
         self.canvas.on_motion = self._on_canvas_motion
+        self.canvas.on_release = self._on_canvas_release
         self.canvas.on_nav_mode_block = self._on_nav_mode_block
 
         self._update_title()
@@ -303,6 +307,14 @@ class MainWindow(QMainWindow):
             statusTip="Generate a portal-frame building from typed stories, "
                        "bays, and dimensions (Ctrl+B).",
             triggered=self._do_building_wizard,
+        )
+        self.act_batch_assign = QAction(
+            "&Batch assign properties…", self,
+            triggered=self._do_batch_assign_selected,
+        )
+        self.act_batch_assign.setToolTip(
+            "Apply section / material override to all selected elements "
+            "in one undoable step."
         )
         self.act_add_node_coords = QAction(
             "Add node at &coordinates…", self,
@@ -458,6 +470,7 @@ class MainWindow(QMainWindow):
         m_edit.addSeparator()
         m_edit.addAction(self.act_building_wizard)
         m_edit.addAction(self.act_add_node_coords)
+        m_edit.addAction(self.act_batch_assign)
         m_edit.addAction(self.act_materials)
         m_edit.addAction(self.act_forget_elem_defaults)
 
@@ -624,6 +637,95 @@ class MainWindow(QMainWindow):
         self.canvas.clear_selection()
         self.set_status("Selection cleared. Click a node or element to inspect it.")
         self.canvas.redraw()
+
+    # ── v0.13.0 multi-select ────────────────────────────────────────────
+
+    def toggle_node_in_selection(self, node_id: int) -> None:
+        if node_id not in self._model.nodes:
+            return
+        if node_id in self.canvas.get_selected_nodes():
+            self.canvas.remove_node_from_selection(node_id)
+        else:
+            self.canvas.add_node_to_selection(node_id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def toggle_element_in_selection(self, element_id: int) -> None:
+        if not any(e.id == element_id for e in self._model.elements):
+            return
+        if element_id in self.canvas.get_selected_elements():
+            self.canvas.remove_element_from_selection(element_id)
+        else:
+            self.canvas.add_element_to_selection(element_id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def set_drag_rect(
+        self, x0: float, y0: float, x1: float, y1: float,
+        is_crossing: bool,
+    ) -> None:
+        self.canvas.set_drag_rect(x0, y0, x1, y1, is_crossing)
+        self.canvas.redraw()
+
+    def clear_drag_rect(self) -> None:
+        self.canvas.clear_drag_rect()
+        self.canvas.redraw()
+
+    def apply_box_select(
+        self,
+        rect: tuple[float, float, float, float],
+        shift: bool,
+        is_crossing: bool,
+    ) -> None:
+        """Resolve a finished drag rect into a selection update.
+
+        Nodes are picked on point-in-rect (inclusive) in both modes.
+        Elements use Window vs Crossing rules: Window needs both
+        endpoints inside; Crossing also accepts segment-intersects.
+        Without Shift the existing selection is cleared first; with
+        Shift the rect's hits are added to whatever was already selected.
+        """
+        from .canvas import _point_in_world_rect, _segment_intersects_rect
+        if not shift:
+            self.canvas.clear_selection()
+        rx0, ry0, rx1, ry1 = rect
+        for nid, node in self._model.nodes.items():
+            if _point_in_world_rect(node.x, node.y, rx0, ry0, rx1, ry1):
+                self.canvas.add_node_to_selection(nid)
+        for elem in self._model.elements:
+            ni = self._model.nodes.get(elem.node_i)
+            nj = self._model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            i_in = _point_in_world_rect(ni.x, ni.y, rx0, ry0, rx1, ry1)
+            j_in = _point_in_world_rect(nj.x, nj.y, rx0, ry0, rx1, ry1)
+            if is_crossing:
+                hit = i_in or j_in or _segment_intersects_rect(
+                    ni.x, ni.y, nj.x, nj.y, rx0, ry0, rx1, ry1,
+                )
+            else:
+                hit = i_in and j_in
+            if hit:
+                self.canvas.add_element_to_selection(elem.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def select_to_neutral_mode(self) -> None:
+        """Switch the active tool back to Select. Used after ESC."""
+        self._select_tool("select")
+
+    def _update_selection_status(self) -> None:
+        nn = len(self.canvas.get_selected_nodes())
+        ne = len(self.canvas.get_selected_elements())
+        if nn == 0 and ne == 0:
+            self.set_status("No selection.")
+            return
+        parts: list[str] = []
+        if nn:
+            parts.append(f"{nn} node{'s' if nn > 1 else ''}")
+        if ne:
+            parts.append(f"{ne} element{'s' if ne > 1 else ''}")
+        self.set_status(", ".join(parts) + " selected.")
 
     def execute(self, command: Command) -> None:
         try:
@@ -1034,7 +1136,11 @@ class MainWindow(QMainWindow):
         else:
             self._active_tool.activate()
 
-    def _on_canvas_click(self, hit: HitResult, button: str) -> None:
+    def _on_canvas_click(
+        self, hit: HitResult, button: str,
+        press_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
         if button == "right":
             # Right-click on an element shows the context menu (edit /
             # add load / clear loads / delete + the "show details" item
@@ -1049,7 +1155,20 @@ class MainWindow(QMainWindow):
                 self.show_node_menu(hit.node_id)
                 return
         try:
-            self._active_tool.on_click(hit, button)
+            self._active_tool.on_click(hit, button, press_px=press_px, shift=shift)
+        except Exception as e:
+            QMessageBox.critical(self, "Tool error",
+                                  f"{type(e).__name__}: {e}")
+
+    def _on_canvas_release(
+        self, hit: HitResult, button: str,
+        release_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
+        try:
+            self._active_tool.on_release(
+                hit, button, release_px=release_px, shift=shift,
+            )
         except Exception as e:
             QMessageBox.critical(self, "Tool error",
                                   f"{type(e).__name__}: {e}")
@@ -1065,7 +1184,10 @@ class MainWindow(QMainWindow):
             f"work again."
         )
 
-    def _on_canvas_motion(self, hit: HitResult) -> None:
+    def _on_canvas_motion(
+        self, hit: HitResult,
+        cursor_px: tuple[float, float] = (0.0, 0.0),
+    ) -> None:
         parts = [f"({hit.x:.3f}, {hit.y:.3f})"]
         if hit.snap_label:
             parts.append(f"Snap: {hit.snap_label}")
@@ -1091,7 +1213,7 @@ class MainWindow(QMainWindow):
         # Repaint canvas if the snap marker changed.
         self.canvas.redraw()
         try:
-            self._active_tool.on_motion(hit)
+            self._active_tool.on_motion(hit, cursor_px=cursor_px)
         except Exception:
             pass
 
@@ -1372,6 +1494,33 @@ class MainWindow(QMainWindow):
             return
         x, y = d.result_value
         self.execute(AddNodeCmd(x=x, y=y))
+
+    def _do_batch_assign_selected(self) -> None:
+        """Open the BatchAssignDialog for the current element selection."""
+        elems = list(self.canvas.get_selected_elements())
+        if not elems:
+            QMessageBox.information(
+                self, "Batch assign",
+                "Select one or more elements first "
+                "(box-drag in Select mode or Shift-click to multi-pick).",
+            )
+            return
+        try:
+            d = BatchAssignDialog(
+                self, model=self._model, element_count=len(elems),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Batch assign", str(exc))
+            return
+        if d.exec() != BatchAssignDialog.DialogCode.Accepted:
+            return
+        result = d.result_value or {}
+        cmd = BatchUpdateElementsCmd(
+            element_ids=elems,
+            section_id=result.get("section_id"),
+            material_override_id=result.get("material_override_id"),
+        )
+        self.execute(cmd)
 
     def _do_building_wizard(self) -> None:
         try:
@@ -1771,6 +1920,62 @@ class MainWindow(QMainWindow):
                 if self._current_path else "Untitled")
         mark = "*" if self._modified else ""
         self.setWindowTitle(f"{mark}{path} — Structural Analysis GUI (Qt)")
+
+    def keyPressEvent(self, event) -> None:
+        """Route ESC to the active tool and Delete/Backspace to batch-delete.
+
+        ESC ALWAYS lands the user in Select mode after the active tool
+        has cleaned up its own state (pending pair-tool draws, in-progress
+        drag rects, etc.). ESC never touches the model and never pushes
+        an undo entry."""
+        if event.key() == Qt.Key.Key_Escape:
+            try:
+                self._active_tool.on_key("escape")
+            except Exception:
+                pass
+            # Always end in Select mode. _select_tool() is idempotent
+            # when the active tool is already Select (deactivate +
+            # activate just refresh status).
+            if self._active_tool is not self._tools["select"]:
+                self._select_tool("select")
+            self.canvas.redraw()
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            inspector_open = (
+                self._element_inspector is not None
+                and self._element_inspector.isVisible()
+            )
+            if not inspector_open:
+                self._delete_selected_objects()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _delete_selected_objects(self) -> None:
+        """Delete every currently-selected node/element in one undo step.
+
+        Cascade follows existing DeleteNodeCmd semantics — deleting a
+        node still removes its supports, nodal loads, and connected
+        elements. We delete elements first to keep already-marked
+        elements out of the per-node cascade path."""
+        nodes = list(self.canvas.get_selected_nodes())
+        elems = list(self.canvas.get_selected_elements())
+        if not nodes and not elems:
+            self.set_status("Nothing selected to delete.")
+            return
+        cmd = BatchDeleteCmd(node_ids=nodes, element_ids=elems)
+        self.execute(cmd)
+        # Only deselect ids that were actually removed from the model;
+        # if execute() failed internally the model may be unchanged.
+        for nid in nodes:
+            if nid not in self._model.nodes:
+                self.canvas.remove_node_from_selection(nid)
+        for eid in elems:
+            if not any(e.id == eid for e in self._model.elements):
+                self.canvas.remove_element_from_selection(eid)
+        self._update_selection_status()
+        self.canvas.redraw()
 
     def closeEvent(self, event) -> None:
         if not self._confirm_discard():

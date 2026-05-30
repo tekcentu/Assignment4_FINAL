@@ -951,6 +951,159 @@ class UpdateElementCmd(Command):
             model.elements[self._saved_index] = self._saved
 
 
+# ── batch element ops (v0.13.0) ──────────────────────────────────────────
+
+
+# Sentinel sentinel for "clear override" in BatchUpdateElementsCmd's
+# material_override_id field. ``None`` already means "don't touch the
+# override" so we need a distinct value to mean "set override to None".
+CLEAR_MATERIAL_OVERRIDE: int = -1
+
+
+@dataclass
+class BatchUpdateElementsCmd(Command):
+    """Apply section and/or material-override changes to many elements.
+
+    Two-field design (both optional):
+
+    * ``section_id``: if ``None``, each element keeps its current
+      section. If set, every selected element switches to this section.
+    * ``material_override_id``: if ``None``, the override is untouched.
+      If ``CLEAR_MATERIAL_OVERRIDE`` (-1), the override is cleared
+      (falls back to the section's default material). If any positive
+      int, that material id is set as the per-element override.
+
+    The "leave unchanged" semantics protect mixed selections — a user
+    can update only the override across elements of varying sections
+    without overwriting their distinct sections with a single default.
+
+    Implementation: delegates to ``UpdateElementCmd`` per element so
+    propagation of E/A/I/depth/alpha/rho stays in one place. Atomic
+    rollback: if any per-element update raises mid-batch, every
+    successful sub-update is undone in reverse and the model is left
+    untouched.
+    """
+
+    element_ids: list[int]
+    section_id: int | None = None
+    material_override_id: int | None = None
+    description: str = "batch assign properties"
+    _sub_cmds: list[Command] = field(default_factory=list, init=False)
+
+    def do(self, model: StructuralModel) -> None:
+        if not self.element_ids:
+            return
+        if self.section_id is None and self.material_override_id is None:
+            return
+        if (
+            self.section_id is not None
+            and self.section_id not in model.sections
+        ):
+            raise ValueError(
+                f"Section {self.section_id} does not exist."
+            )
+        if (
+            self.material_override_id is not None
+            and self.material_override_id != CLEAR_MATERIAL_OVERRIDE
+            and self.material_override_id not in model.materials
+        ):
+            raise ValueError(
+                f"Material {self.material_override_id} does not exist."
+            )
+        self._sub_cmds = []
+        try:
+            for eid in self.element_ids:
+                elem = next(
+                    (e for e in model.elements if e.id == eid), None,
+                )
+                if elem is None:
+                    # Skip silently — the selection set may have stale
+                    # ids from a deletion that happened in between.
+                    continue
+                kind = getattr(elem, "kind", "").lower() or (
+                    "truss"
+                    if isinstance(elem, TrussElement2D)
+                    else "frame"
+                )
+                new_section = (
+                    self.section_id
+                    if self.section_id is not None
+                    else elem.section_id
+                )
+                if self.material_override_id is None:
+                    new_override = getattr(elem, "material_id_override", None)
+                elif self.material_override_id == CLEAR_MATERIAL_OVERRIDE:
+                    new_override = None
+                else:
+                    new_override = self.material_override_id
+                sub = UpdateElementCmd(
+                    elem_id=eid,
+                    section_id=new_section,
+                    kind=kind,
+                    release_i=bool(getattr(elem, "release_i", False)),
+                    release_j=bool(getattr(elem, "release_j", False)),
+                    material_override_id=new_override,
+                )
+                sub.do(model)
+                self._sub_cmds.append(sub)
+        except Exception:
+            for cmd in reversed(self._sub_cmds):
+                cmd.undo(model)
+            self._sub_cmds = []
+            raise
+
+    def undo(self, model: StructuralModel) -> None:
+        for cmd in reversed(self._sub_cmds):
+            cmd.undo(model)
+
+
+@dataclass
+class BatchDeleteCmd(Command):
+    """Delete every selected node and element in one undo step.
+
+    Elements are deleted before nodes so an element already explicitly
+    marked for deletion never double-fires through the node-cascade
+    path. Nodes use ``DeleteNodeCmd``, which already cascades supports,
+    nodal loads, and any remaining connected elements (mirroring the
+    single-object delete behaviour). A node id that was already
+    cascade-deleted by a prior step is silently skipped — its undo
+    chain is restored by the original cascading command.
+    """
+
+    node_ids: list[int]
+    element_ids: list[int]
+    description: str = "delete selected"
+    _sub_cmds: list[Command] = field(default_factory=list, init=False)
+
+    def do(self, model: StructuralModel) -> None:
+        self._sub_cmds = []
+        try:
+            # Elements first.
+            for eid in list(self.element_ids):
+                if not any(e.id == eid for e in model.elements):
+                    continue
+                sub: Command = DeleteElementCmd(elem_id=eid)
+                sub.do(model)
+                self._sub_cmds.append(sub)
+            # Then nodes (cascades remaining connected elements + supports
+            # + nodal loads). Skip ids that no longer exist.
+            for nid in list(self.node_ids):
+                if nid not in model.nodes:
+                    continue
+                sub = DeleteNodeCmd(node_id=nid)
+                sub.do(model)
+                self._sub_cmds.append(sub)
+        except Exception:
+            for cmd in reversed(self._sub_cmds):
+                cmd.undo(model)
+            self._sub_cmds = []
+            raise
+
+    def undo(self, model: StructuralModel) -> None:
+        for cmd in reversed(self._sub_cmds):
+            cmd.undo(model)
+
+
 # ── materials ────────────────────────────────────────────────────────────
 
 
