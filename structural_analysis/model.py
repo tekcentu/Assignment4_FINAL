@@ -218,23 +218,42 @@ class UniformDistributedLoad:
     """Full-length distributed line load on a member.
 
     Components ``wx`` (axial) and ``wy`` (transverse) are interpreted
-    in the chosen ``coord_system``:
+    per the ``coord_system`` token:
 
-    * ``"local"`` (default): ``wx`` is in the element's local +x_local
-      (axial, tip-to-tip), ``wy`` is in the element's local +y_local
-      (transverse). The classic ``UniformDistributedLoad(wy=...)``
-      construction retains its original meaning (wx defaults to 0,
-      coord_system to "local").
-    * ``"global"``: ``wx`` is in global +X, ``wy`` is in global +Y.
-      Both are **force per unit member length** (NOT force per unit
-      horizontal projection). The solver projects the global (wx, wy)
-      onto the element's local axes before computing fixed-end forces,
-      so an inclined member picks up both axial and transverse FEMs.
+    * ``"local"`` (default): ``wx`` is in the element's local
+      +x_local (axial, tip-to-tip), ``wy`` is in the element's local
+      +y_local (transverse). The classic ``UniformDistributedLoad(wy=...)``
+      construction retains its original meaning.
+    * ``"global"``: ``wx`` is interpreted as ``qX`` (global +X) and
+      ``wy`` as ``qY`` (global +Y) — both **force per unit member
+      length** (NOT per horizontal projection). The solver projects to
+      local axes so inclined members pick up both axial and transverse
+      FEMs. The field NAMES stay ``wx`` / ``wy`` for backward-compat
+      storage even though the semantic name is qX / qY in this mode.
+    * ``"gravity"``: a direction token stored in ``coord_system`` so the
+      same field handles all three cases. Magnitude lives in ``wy``;
+      ``wx`` MUST be 0 (validated in __post_init__). Positive
+      magnitude acts in the global gravity direction — for this 2-D
+      program, ``global -Y``. Internally projected exactly as a
+      global load with components ``(0, -wy)``.
     """
 
     wy: float
     wx: float = 0.0
     coord_system: str = "local"
+
+    def __post_init__(self):
+        if self.coord_system not in ("local", "global", "gravity"):
+            raise ValueError(
+                f"UniformDistributedLoad.coord_system must be 'local', "
+                f"'global', or 'gravity' (got {self.coord_system!r})."
+            )
+        if self.coord_system == "gravity" and self.wx != 0.0:
+            raise ValueError(
+                "UniformDistributedLoad with coord_system='gravity' has a "
+                "single magnitude in wy; wx must be 0 because gravity is "
+                "a 1-D direction (global -Y) by definition."
+            )
 
 
 @dataclass(frozen=True)
@@ -242,22 +261,36 @@ class PointLoad:
     """Point load on a member at distance *a* from start node.
 
     Components ``px`` (axial) and ``py`` (transverse) are interpreted
-    in the chosen ``coord_system``:
+    per the ``coord_system`` token:
 
-    * ``"local"`` (default): ``px`` is along +x_local, ``py`` along
+    * ``"local"`` (default): ``px`` along +x_local, ``py`` along
       +y_local. The classic ``PointLoad(py=..., a=...)`` construction
-      retains its original meaning (px defaults to 0, coord_system to
-      "local").
-    * ``"global"``: ``px`` is in global +X, ``py`` in global +Y. The
-      solver projects to local axes before forming the consistent
-      Hermite/linear shape-function FEMs, so a global load on an
-      inclined member produces both axial and transverse end forces.
+      retains its original meaning.
+    * ``"global"``: ``px`` is interpreted as the global +X force
+      component and ``py`` as the global +Y component. The solver
+      projects to local axes so inclined members pick up both axial
+      and transverse fixed-end forces.
+    * ``"gravity"``: magnitude in ``py``; ``px`` MUST be 0
+      (validated). Positive magnitude acts in global -Y (gravity).
     """
 
     py: float
     a: float
     px: float = 0.0
     coord_system: str = "local"
+
+    def __post_init__(self):
+        if self.coord_system not in ("local", "global", "gravity"):
+            raise ValueError(
+                f"PointLoad.coord_system must be 'local', 'global', or "
+                f"'gravity' (got {self.coord_system!r})."
+            )
+        if self.coord_system == "gravity" and self.px != 0.0:
+            raise ValueError(
+                "PointLoad with coord_system='gravity' has a single "
+                "magnitude in py; px must be 0 because gravity is a "
+                "1-D direction (global -Y) by definition."
+            )
 
 
 @dataclass(frozen=True)

@@ -65,8 +65,30 @@ def _format_point_load_position(a: float, L: float) -> str:
     return f"a = {a:g} m"
 
 
-def _format_coord_system(cs: str) -> str:
-    return "local axes" if cs == "local" else "global X / Y"
+def _coord_system_label(cs: str) -> str:
+    if cs == "local":
+        return "local axes"
+    if cs == "global":
+        return "global X / Y"
+    if cs == "gravity":
+        return "Gravity (global -Y)"
+    return cs
+
+
+def _component_names(cs: str, kind: str) -> tuple[str, str]:
+    """(x_name, y_name) for the magnitude string, per coord_system.
+
+    ``kind`` is "udl" or "point" so we use w / q vs. p / P prefixes
+    consistently with the dialog labels.
+    """
+    if kind == "udl":
+        if cs == "global":
+            return "qX", "qY"
+        return "wx", "wy"
+    # point load
+    if cs == "global":
+        return "pX", "pY"
+    return "px", "py"
 
 
 def _format_mechanical_magnitude(
@@ -87,6 +109,30 @@ def _format_mechanical_magnitude(
     )
 
 
+def _local_equivalent_note(
+    model: StructuralModel, elem, x_comp: float, y_comp: float,
+    cs: str, unit: str,
+) -> str:
+    """For non-local loads, compute the (wx_l, wy_l) projection so the
+    user can see the converted local components alongside the original
+    user-entered value. Returns an empty string for local loads or
+    zero-length elements."""
+    if cs == "local":
+        return ""
+    ni = model.nodes.get(elem.node_i)
+    nj = model.nodes.get(elem.node_j)
+    if ni is None or nj is None:
+        return ""
+    L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+    if L <= 0:
+        return ""
+    c = (nj.x - ni.x) / L
+    s = (nj.y - ni.y) / L
+    from ..element import _project_load_to_local
+    wx_l, wy_l = _project_load_to_local(x_comp, y_comp, cs, c, s)
+    return f"local eq: wx = {wx_l:g}, wy = {wy_l:g} {unit}"
+
+
 def format_element_loads(
     model: StructuralModel, elem,
 ) -> list[ElementLoadRow]:
@@ -102,37 +148,65 @@ def format_element_loads(
         if isinstance(ld, UniformDistributedLoad):
             cs = getattr(ld, "coord_system", "local")
             wx = getattr(ld, "wx", 0.0)
+            x_name, y_name = _component_names(cs, "udl")
+            if cs == "gravity":
+                magnitude = f"magnitude = {ld.wy:+g} kN/m"
+            else:
+                magnitude = _format_mechanical_magnitude(
+                    wx, ld.wy, x_name, y_name, "kN/m",
+                )
+            local_eq = _local_equivalent_note(
+                model, elem, wx, ld.wy, cs, "kN/m",
+            )
+            meaning_base = {
+                "local":   "Transverse / axial line load (local axes)",
+                "global":  "Global line load — projected to local axes",
+                "gravity": "Gravity line load — magnitude in global -Y",
+            }.get(cs, "")
+            meaning = (
+                meaning_base + "  ·  " + local_eq if local_eq
+                else meaning_base
+            )
             rows.append(ElementLoadRow(
                 index=idx,
                 kind="UDL",
                 type_label="UDL",
-                magnitude=_format_mechanical_magnitude(
-                    wx, ld.wy, "wx", "wy", "kN/m",
-                ),
-                position=f"Full length, {_format_coord_system(cs)}",
-                meaning=(
-                    "Transverse line load (local axes)" if cs == "local"
-                    else "Global line load — projected to local axes"
-                ),
+                magnitude=magnitude,
+                position=f"Full length, {_coord_system_label(cs)}",
+                meaning=meaning,
             ))
         elif isinstance(ld, PointLoad):
             cs = getattr(ld, "coord_system", "local")
             px = getattr(ld, "px", 0.0)
+            x_name, y_name = _component_names(cs, "point")
+            if cs == "gravity":
+                magnitude = f"magnitude = {ld.py:+g} kN"
+            else:
+                magnitude = _format_mechanical_magnitude(
+                    px, ld.py, x_name, y_name, "kN",
+                )
+            local_eq = _local_equivalent_note(
+                model, elem, px, ld.py, cs, "kN",
+            )
+            meaning_base = {
+                "local":   "Transverse / axial point load (local axes)",
+                "global":  "Global point load — projected to local axes",
+                "gravity": "Gravity point load — magnitude in global -Y",
+            }.get(cs, "")
+            meaning = (
+                meaning_base + "  ·  " + local_eq if local_eq
+                else meaning_base
+            )
             rows.append(ElementLoadRow(
                 index=idx,
                 kind="PointLoad",
                 type_label="PointLoad",
-                magnitude=_format_mechanical_magnitude(
-                    px, ld.py, "px", "py", "kN",
-                ),
+                magnitude=magnitude,
                 position=(
                     f"{_format_point_load_position(ld.a, L)}, "
-                    f"{_format_coord_system(cs)}"
+                    f"{_coord_system_label(cs)}"
                 ),
-                meaning=(
-                    "Transverse point load (local +y)" if cs == "local"
-                    else "Global point load — projected to local axes"
-                ),
+                meaning=meaning,
             ))
         elif isinstance(ld, FrameTemperatureLoad):
             mean = 0.5 * (ld.t_top + ld.t_bottom)

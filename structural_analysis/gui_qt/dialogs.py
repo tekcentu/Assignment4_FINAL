@@ -1238,18 +1238,35 @@ class MemberLoadDialog(_ModalDialog):
             "Global (X / Y axes)", self._coord_widget,
         )
         self._rb_global.setToolTip(
-            "wx / px are in global +X and wy / py in global +Y. "
+            "qX / qY components in global +X and global +Y. "
             "Both are FORCE PER UNIT MEMBER LENGTH — not per "
             "horizontal projection. The solver projects to the "
             "element's local axes before forming fixed-end forces, "
             "so inclined members pick up both axial and transverse "
             "contributions."
         )
+        self._rb_gravity = QRadioButton(
+            "Gravity (global -Y)", self._coord_widget,
+        )
+        self._rb_gravity.setToolTip(
+            "Single magnitude field — positive acts straight DOWN "
+            "(global -Y), negative acts UP. Distinct from Global Y: "
+            "Global Y +10 means global +Y, Gravity +10 means global "
+            "-Y. The solver projects to the element's local axes "
+            "before forming fixed-end forces."
+        )
         self._coord_group.addButton(self._rb_local)
         self._coord_group.addButton(self._rb_global)
+        self._coord_group.addButton(self._rb_gravity)
         coord_layout.addWidget(self._rb_local)
         coord_layout.addWidget(self._rb_global)
+        coord_layout.addWidget(self._rb_gravity)
         self._rb_local.setChecked(True)
+        # Repaint fields whenever the direction changes so labels track
+        # the active mode (axial / qX / magnitude…).
+        self._rb_local.toggled.connect(self._refresh_fields)
+        self._rb_global.toggled.connect(self._refresh_fields)
+        self._rb_gravity.toggled.connect(self._refresh_fields)
         v.addWidget(self._coord_widget)
 
         # Now safely wire the toggled signal and default-select the first option.
@@ -1266,7 +1283,11 @@ class MemberLoadDialog(_ModalDialog):
         return next(iter(self._radios))
 
     def _current_coord_system(self) -> str:
-        return "global" if self._rb_global.isChecked() else "local"
+        if self._rb_gravity.isChecked():
+            return "gravity"
+        if self._rb_global.isChecked():
+            return "global"
+        return "local"
 
     def _refresh_fields(self) -> None:
         # clear
@@ -1277,16 +1298,33 @@ class MemberLoadDialog(_ModalDialog):
                 w.deleteLater()
         self._fields = {}
         kind = self._current_kind()
-        # Mechanical loads get an axial component + the local/global radio.
+        # Mechanical loads get the coord-system radio + per-mode labels.
         # Thermal loads keep the simpler one/two-field form.
         mechanical = kind in ("udl", "point")
         self._coord_widget.setVisible(mechanical)
+        cs = self._current_coord_system() if mechanical else "local"
         if kind == "udl":
-            self._add_field("wx (kN/m, axial / +X)", "wx")
-            self._add_field("wy (kN/m, transverse / +Y)", "wy")
+            if cs == "local":
+                self._add_field("wx (kN/m, local x / axial)", "wx")
+                self._add_field("wy (kN/m, local y / transverse)", "wy")
+            elif cs == "global":
+                self._add_field("qX (kN/m, global X)", "wx")
+                self._add_field("qY (kN/m, global Y)", "wy")
+            else:  # gravity
+                self._add_field(
+                    "magnitude (kN/m, +ve downward · global -Y)", "wy",
+                )
         elif kind == "point":
-            self._add_field("px (kN, axial / +X)", "px")
-            self._add_field("py (kN, transverse / +Y)", "py")
+            if cs == "local":
+                self._add_field("px (kN, local x / axial)", "px")
+                self._add_field("py (kN, local y / transverse)", "py")
+            elif cs == "global":
+                self._add_field("pX (kN, global X)", "px")
+                self._add_field("pY (kN, global Y)", "py")
+            else:  # gravity
+                self._add_field(
+                    "magnitude (kN, +ve downward · global -Y)", "py",
+                )
             self._add_field("a (m from start node)", "a")
         elif kind == "truss_t":
             self._add_field("ΔT (°C)", "delta_T")
@@ -1303,26 +1341,33 @@ class MemberLoadDialog(_ModalDialog):
     def _accept(self) -> Any:
         kind = self._current_kind()
         if kind == "udl":
-            wx = parse_float(
-                self._fields["wx"].text(), "wx", allow_blank=True,
-            ) or 0.0
+            cs = self._current_coord_system()
             wy = parse_float(self._fields["wy"].text(), "wy")
-            return UniformDistributedLoad(
-                wy=wy, wx=wx, coord_system=self._current_coord_system(),
-            )
+            # Gravity hides the wx field — pass wx=0 so the load class
+            # __post_init__ accepts it. Local and global show wx.
+            wx = 0.0
+            if cs != "gravity":
+                wx = parse_float(
+                    self._fields["wx"].text(),
+                    "qX" if cs == "global" else "wx",
+                    allow_blank=True,
+                ) or 0.0
+            return UniformDistributedLoad(wy=wy, wx=wx, coord_system=cs)
         if kind == "point":
-            px = parse_float(
-                self._fields["px"].text(), "px", allow_blank=True,
-            ) or 0.0
+            cs = self._current_coord_system()
             py = parse_float(self._fields["py"].text(), "py")
+            px = 0.0
+            if cs != "gravity":
+                px = parse_float(
+                    self._fields["px"].text(),
+                    "pX" if cs == "global" else "px",
+                    allow_blank=True,
+                ) or 0.0
             a = parse_float(self._fields["a"].text(), "a")
             L, _, _ = self._elem.length_cos_sin(self._model.nodes)
             if a < 0 or a > L:
                 raise ValueError(f"a must lie within [0, {L:.3g}] (element length).")
-            return PointLoad(
-                py=py, a=a, px=px,
-                coord_system=self._current_coord_system(),
-            )
+            return PointLoad(py=py, a=a, px=px, coord_system=cs)
         if kind == "truss_t":
             return TrussTemperatureLoad(
                 delta_T=parse_float(self._fields["delta_T"].text(), "ΔT"))

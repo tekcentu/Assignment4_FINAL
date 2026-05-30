@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 __what_is_new__ = (
-    "UDL/PointLoad axial components (wx, px) · "
-    "local vs global load direction · "
-    "N diagrams reflect axial member loads"
+    "Gravity load direction · "
+    "canvas draws loads in true global / gravity directions · "
+    "dialog labels match selected direction"
 )
 
 from .model import (
