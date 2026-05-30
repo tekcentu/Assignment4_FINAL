@@ -358,6 +358,49 @@ def test_reader_handles_pointload_with_only_position_and_case_no_px_py():
     assert ld.load_case == "LIVE"
 
 
+def _read_text_or_raise(text: str):
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return read_input_file(path)
+    finally:
+        os.unlink(path)
+
+
+def test_reader_rejects_udl_with_surplus_numeric_token():
+    """``MEMBER_UDL: 1  0  -10  5`` has an extra numeric beyond wx/wy.
+    Before PR #27 the fixed coord-system slot would catch this; the
+    capped metadata-start scan in v0.17 must still reject it rather
+    than silently dropping the ``5`` (Codex P2 finding on PR #27)."""
+    body = (
+        "TITLE\ntoo-many-numerics\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "MEMBER_UDL 1\n1  0.0  -10.0  5\n\n"
+    )
+    with pytest.raises(ValueError):
+        _read_text_or_raise(body)
+
+
+def test_reader_rejects_pointload_with_surplus_numeric_token():
+    """``MEMBER_POINT_LOADS: 1  3  0  -20  99  case=LIVE`` has an
+    extra numeric ``99`` beyond px/py. Must be rejected."""
+    body = (
+        "TITLE\ntoo-many-numerics\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "MEMBER_POINT_LOADS 1\n1  3.0  0.0  -20.0  99  case=LIVE\n\n"
+    )
+    with pytest.raises(ValueError):
+        _read_text_or_raise(body)
+
+
 # ── split/remap preservation ────────────────────────────────────────
 
 

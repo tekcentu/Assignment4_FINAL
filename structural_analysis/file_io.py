@@ -428,7 +428,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                 # coord_system keyword) so we don't try to parse
                 # ``case=DEAD`` as a float.
                 start_idx = _find_metadata_start(
-                    parts, mandatory_end=2, accept_coord_system=True,
+                    parts, mandatory_end=2, optional_count=2,
                 )
                 px = float(parts[2]) if start_idx > 2 else 0.0
                 py = float(parts[3]) if start_idx > 3 else 0.0
@@ -458,7 +458,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                 # the trailing tokens (coord_system / case=) must not
                 # be parsed as floats.
                 start_idx = _find_metadata_start(
-                    parts, mandatory_end=1, accept_coord_system=True,
+                    parts, mandatory_end=1, optional_count=2,
                 )
                 wx = float(parts[1]) if start_idx > 1 else 0.0
                 wy = float(parts[2]) if start_idx > 2 else 0.0
@@ -589,36 +589,38 @@ def _parse_coord_system_token(token: str | None, section: str) -> str:
 
 
 def _find_metadata_start(
-    parts: list[str], *, mandatory_end: int, accept_coord_system: bool,
+    parts: list[str], *, mandatory_end: int, optional_count: int,
 ) -> int:
     """Locate the first trailing-metadata token.
 
-    Optional numeric fields (``px`` / ``py`` on MEMBER_POINT_LOADS;
-    ``wx`` / ``wy`` on MEMBER_UDL) can be omitted in hand-written input
-    files. When they are omitted but trailing metadata (``case=NAME``
-    or a positional coord-system keyword) is present, the row index of
-    the metadata block depends on how many numerics the user supplied.
+    Each load section has a fixed-width body: a known number of
+    mandatory positional fields followed by ``optional_count`` optional
+    positional numeric fields (``wx`` / ``wy`` on MEMBER_UDL;
+    ``px`` / ``py`` on MEMBER_POINT_LOADS; zero on the thermal /
+    nodal-load sections).
 
-    Scan rule: any token that successfully parses as a float is treated
-    as a positional numeric field; the first non-floatable token starts
-    the metadata block. This means typo'd metadata (e.g. ``globle``)
-    still flows into :func:`_parse_load_metadata`, which raises a clear
-    "unknown coord-system token" / "unknown key=" error rather than
-    being silently skipped.
+    Scan rule: walk parts[mandatory_end : mandatory_end + optional_count]
+    and stop at the first non-floatable token — that's where the
+    metadata block starts. If every optional slot is floatable, the
+    cap (``mandatory_end + optional_count``) is the metadata-start;
+    any further tokens MUST be metadata or are rejected by
+    :func:`_parse_load_metadata`.
 
-    Returns ``len(parts)`` when no metadata tokens are present.
+    The cap stops a stray numeric in the surplus slot
+    (e.g. ``MEMBER_UDL  1  0  -10  5``) from being silently dropped:
+    before the cap, ``5`` would be scanned past as "another numeric"
+    and the metadata parser would see no tokens; with the cap, ``5``
+    falls into the metadata range and is rejected as an unknown
+    coord-system token.
     """
-    # ``accept_coord_system`` is kept in the signature for documentation
-    # symmetry with _parse_load_metadata, but the floatability test
-    # discriminates metadata vs. numeric uniformly across all sections.
-    del accept_coord_system  # not needed by the floatability rule
-    for idx in range(mandatory_end, len(parts)):
+    cap = mandatory_end + optional_count
+    for idx in range(mandatory_end, min(len(parts), cap)):
         tok = parts[idx]
         try:
             float(tok)
         except ValueError:
             return idx
-    return len(parts)
+    return cap
 
 
 def _parse_load_metadata(

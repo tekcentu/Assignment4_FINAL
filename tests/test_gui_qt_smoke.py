@@ -3873,6 +3873,41 @@ def test_member_load_dialog_truss_disables_gradient_radio(qt_app):
     assert "truss" in tip and "uniform" in tip
 
 
+def test_member_load_dialog_truss_disables_mechanical_category(qt_app):
+    """v0.17 regression guard (Codex P2 on PR #27): trusses must NOT
+    default to the Mechanical category, because the solver explicitly
+    rejects UDL / PointLoad on truss elements. The Mechanical radio is
+    disabled with an explanatory tooltip and the dialog opens on
+    Thermal."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _truss_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    assert not d._rb_cat_mechanical.isEnabled()
+    assert d._rb_cat_thermal.isChecked()
+    tip = d._rb_cat_mechanical.toolTip().lower()
+    assert "truss" in tip
+
+
+def test_member_load_dialog_truss_rejects_mechanical_in_accept(qt_app):
+    """Defensive: even if the disabled Mechanical radio is checked
+    programmatically (bypassing the UI gate), _accept must refuse to
+    construct a UDL / PointLoad for a truss."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    import pytest
+
+    w = MainWindow()
+    eid = _truss_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)  # bypass the UI disable
+    d._refresh_fields()
+    if "wy" in d._fields:
+        d._fields["wy"].setText("-10.0")
+    with pytest.raises(ValueError, match=r"[Tt]russ"):
+        d._accept()
+
+
 def test_member_load_dialog_truss_thermal_uniform_returns_truss_load(qt_app):
     """Truss + uniform ΔT must emit a TrussTemperatureLoad (NOT a
     FrameTemperatureLoad even though uniform-Δ frame storage uses

@@ -1260,14 +1260,30 @@ class MemberLoadDialog(_ModalDialog):
         # neither half can leak into the other (thermal never sees the
         # mechanical Direction radios; mechanical never sees the
         # Thermal-type radios).
+        #
+        # Truss elements have no bending DOFs and their solver path
+        # explicitly rejects UDL / PointLoad (see
+        # ``TrussElement2D.local_load_vector``). The pre-v0.17 dialog
+        # filtered trusses down to thermal-only; v0.17 preserves that
+        # contract by disabling the Mechanical radio with a tooltip
+        # explaining why, rather than silently letting users build a
+        # load the solver would later reject.
         v.addWidget(QLabel("Load category:", body))
         self._cat_group = QButtonGroup(body)
         self._rb_cat_mechanical = QRadioButton("Mechanical", body)
-        self._rb_cat_mechanical.setToolTip(
-            "Force loads: distributed (UDL) or concentrated (point). "
-            "Choose a Type below and then a Direction (Local / Global "
-            "/ Gravity)."
-        )
+        if self._is_truss:
+            self._rb_cat_mechanical.setEnabled(False)
+            self._rb_cat_mechanical.setToolTip(
+                "Truss elements support thermal loads only. "
+                "Distributed and point loads require frame bending "
+                "DOFs — use a frame element instead."
+            )
+        else:
+            self._rb_cat_mechanical.setToolTip(
+                "Force loads: distributed (UDL) or concentrated "
+                "(point). Choose a Type below and then a Direction "
+                "(Local / Global / Gravity)."
+            )
         self._rb_cat_thermal = QRadioButton("Thermal", body)
         self._rb_cat_thermal.setToolTip(
             "Temperature change. Uniform ΔT produces axial thermal "
@@ -1394,8 +1410,13 @@ class MemberLoadDialog(_ModalDialog):
         self._case_combo = _make_load_case_combo(body, "DEFAULT")
         v.addWidget(self._case_combo)
 
-        # Default to Mechanical category and paint the matching body.
-        self._rb_cat_mechanical.setChecked(True)
+        # Truss elements land on Thermal (Mechanical is disabled
+        # above); frames default to Mechanical so the most common
+        # action ("add a UDL") is one click away.
+        if self._is_truss:
+            self._rb_cat_thermal.setChecked(True)
+        else:
+            self._rb_cat_mechanical.setChecked(True)
         self._refresh_fields()
 
     def _current_category(self) -> str:
@@ -1478,6 +1499,18 @@ class MemberLoadDialog(_ModalDialog):
     def _accept(self) -> Any:
         load_case = _normalize_load_case(self._case_combo.currentText())
         cat = self._current_category()
+        if cat == "mechanical" and self._is_truss:
+            # Defensive: the Mechanical radio is disabled for trusses
+            # (see _build_body) so the user can't reach this branch
+            # through the UI, but a programmatic
+            # ``_rb_cat_mechanical.setChecked(True)`` could. Reject
+            # here too rather than building a load the solver will
+            # later reject.
+            raise ValueError(
+                "Truss elements do not support mechanical loads "
+                "(distributed or point). Switch to Thermal — only "
+                "uniform ΔT is valid on a truss."
+            )
         if cat == "mechanical":
             kind = self._current_mechanical_kind()
             cs = self._current_coord_system()
