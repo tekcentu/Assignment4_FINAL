@@ -3131,3 +3131,298 @@ def test_delete_selected_removes_objects_and_is_undoable(qt_app):
     assert len(w._model.elements) == n_elems_before - 2
     w._do_undo()
     assert len(w._model.elements) == n_elems_before
+
+
+# ── PR #24 element load list / per-row delete ──────────────────────
+
+
+def _make_loaded_frame(w):
+    """Single 6 m frame with UDL + PointLoad + frame thermal — used by
+    the inspector loads-table tests below. Returns the element id."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        FrameTemperatureLoad,
+        Material,
+        Node,
+        PointLoad,
+        Section,
+        UniformDistributedLoad,
+    )
+
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 6.0, 0.0),
+    }
+    elem = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    elem.member_loads.append(UniformDistributedLoad(wy=-10.0))
+    elem.member_loads.append(PointLoad(py=-20.0, a=2.0))
+    elem.member_loads.append(
+        FrameTemperatureLoad(t_top=10.0, t_bottom=30.0)
+    )
+    w._model.elements = [elem]
+    return elem.id
+
+
+def test_inspector_loads_table_shows_one_row_per_load(qt_app):
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid)
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    assert table is not None
+    assert table.rowCount() == 3
+    # Type column readable
+    types = [table.item(i, 1).text() for i in range(3)]
+    assert "UDL" in types[0]
+    assert "PointLoad" in types[1]
+    assert "Thermal" in types[2].lower() or "Thermal" in types[2]
+
+
+def test_inspector_loads_table_empty_state(qt_app):
+    """An element with no loads renders a single (none) row, not zero
+    rows — important so the table is still visible/discoverable."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Material, Node, Section
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 6.0, 0.0),
+    }
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )]
+    w._open_element_inspector(1)
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    assert table.rowCount() == 1
+
+
+def test_inspector_repeated_thermals_show_as_two_rows(qt_app):
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        FrameTemperatureLoad,
+        Material,
+        Node,
+        Section,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 6.0, 0.0),
+    }
+    elem = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    elem.member_loads.append(FrameTemperatureLoad(t_top=10.0, t_bottom=10.0))
+    elem.member_loads.append(FrameTemperatureLoad(t_top=20.0, t_bottom=20.0))
+    w._model.elements = [elem]
+    w._open_element_inspector(1)
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    assert table.rowCount() == 2
+
+
+def test_inspector_delete_button_removes_one_row_only(qt_app):
+    from PyQt6.QtWidgets import QPushButton
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid)
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    btn = table.cellWidget(1, 4)  # Delete button on row index 1 (PointLoad)
+    assert isinstance(btn, QPushButton)
+    btn.click()
+    qt_app.processEvents()
+
+    # Model: PointLoad gone, UDL + Thermal remain.
+    from structural_analysis.model import (
+        FrameTemperatureLoad,
+        PointLoad,
+        UniformDistributedLoad,
+    )
+    loads = w._model.elements[0].member_loads
+    assert len(loads) == 2
+    assert isinstance(loads[0], UniformDistributedLoad)
+    assert isinstance(loads[1], FrameTemperatureLoad)
+    assert not any(isinstance(ld, PointLoad) for ld in loads)
+    # Table refreshed: 2 rows now.
+    assert w._element_inspector._loads_widget.rowCount() == 2
+
+
+def test_inspector_delete_then_undo_restores_row(qt_app):
+    from PyQt6.QtWidgets import QPushButton
+    from structural_analysis.model import PointLoad
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid)
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    btn = table.cellWidget(1, 4)
+    btn.click()
+    qt_app.processEvents()
+    assert len(w._model.elements[0].member_loads) == 2
+
+    w._do_undo()
+    qt_app.processEvents()
+    loads = w._model.elements[0].member_loads
+    assert len(loads) == 3
+    # Restored at the original index.
+    assert isinstance(loads[1], PointLoad)
+    assert loads[1].py == -20.0 and loads[1].a == 2.0
+
+
+def test_inspector_delete_buttons_disabled_when_no_host_callback(qt_app):
+    """ElementPropertiesDialog instantiated directly (without going
+    through MainWindow._open_element_inspector) MUST disable its delete
+    buttons so unit-test code can't accidentally mutate the model."""
+    from structural_analysis.gui_qt.dialogs import ElementPropertiesDialog
+    from PyQt6.QtWidgets import QPushButton
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    d = ElementPropertiesDialog(w, w._model, eid, None)
+    table = d._loads_widget
+    for i in range(table.rowCount()):
+        btn = table.cellWidget(i, 4)
+        assert isinstance(btn, QPushButton)
+        assert not btn.isEnabled(), (
+            f"row {i} Delete button must be disabled without host callback"
+        )
+
+
+def test_split_loaded_inspector_shows_remapped_loads_on_children(qt_app):
+    """End-to-end: load a frame element, split it via the existing
+    SplitElementCmd path, then open the inspector on each child and
+    verify the load list reflects the remap (PR #22 behavior)."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.gui_common.commands import SplitElementCmd
+    from structural_analysis.model import (
+        Material, Node, PointLoad, Section, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 6.0, 0.0),
+    }
+    elem = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    elem.member_loads.append(UniformDistributedLoad(wy=-10.0))
+    # Point load at a=4 m — should land on child B at a=1 m after a
+    # split at x=3.
+    elem.member_loads.append(PointLoad(py=-20.0, a=4.0))
+    w._model.elements = [elem]
+    w.execute(SplitElementCmd(element_id=1, x=3.0, y=0.0))
+    qt_app.processEvents()
+    children = sorted(w._model.elements, key=lambda e: e.id)
+    # Child A: UDL only (point load was at a=4 > split). Both UDLs are
+    # copied; the point load stayed on child B.
+    a_loads = children[0].member_loads
+    b_loads = children[1].member_loads
+    assert any(isinstance(ld, UniformDistributedLoad) for ld in a_loads)
+    assert not any(isinstance(ld, PointLoad) for ld in a_loads)
+    assert any(isinstance(ld, UniformDistributedLoad) for ld in b_loads)
+    assert any(isinstance(ld, PointLoad) for ld in b_loads)
+
+    # Inspector for child B shows both rows.
+    w._open_element_inspector(children[1].id)
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    assert table.rowCount() == 2
+
+
+def test_selection_status_shows_grouped_load_counts(qt_app):
+    """Two elements selected and both carry loads → status text appends
+    grouped counts. Single-element selection does NOT add counts (the
+    inspector itself shows the full table for one element)."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, Node, PointLoad, Section, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 6.0, 0.0),
+        3: Node(3, 12.0, 0.0),
+    }
+    e1 = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e2 = FrameElement2D(
+        id=2, node_i=2, node_j=3, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e1.member_loads.append(UniformDistributedLoad(wy=-5.0))
+    e2.member_loads.append(UniformDistributedLoad(wy=-5.0))
+    e2.member_loads.append(PointLoad(py=-3.0, a=1.0))
+    w._model.elements = [e1, e2]
+    w.canvas.add_element_to_selection(1)
+    w.canvas.add_element_to_selection(2)
+    w._update_selection_status()
+    text = w._status_label.text()
+    assert "2 elements" in text
+    assert "Loads:" in text
+    assert "2 UDL" in text
+    assert "1 PointLoad" in text
+
+
+def test_selection_status_single_element_does_not_show_load_counts(qt_app):
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, Node, Section, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    e1 = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e1.member_loads.append(UniformDistributedLoad(wy=-5.0))
+    w._model.elements = [e1]
+    w.canvas.add_element_to_selection(1)
+    w._update_selection_status()
+    text = w._status_label.text()
+    assert "Loads:" not in text

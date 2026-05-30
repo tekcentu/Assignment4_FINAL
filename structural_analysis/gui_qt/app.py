@@ -51,6 +51,7 @@ from ..gui_common.commands import (
     Command,
     DeleteElementCmd,
     DeleteMaterialCmd,
+    DeleteMemberLoadCmd,
     DeleteNodeCmd,
     DeleteSectionCmd,
     DrawMemberWithSplitsCmd,
@@ -716,7 +717,8 @@ class MainWindow(QMainWindow):
 
     def _update_selection_status(self) -> None:
         nn = len(self.canvas.get_selected_nodes())
-        ne = len(self.canvas.get_selected_elements())
+        elem_ids = self.canvas.get_selected_elements()
+        ne = len(elem_ids)
         if nn == 0 and ne == 0:
             self.set_status("No selection.")
             return
@@ -725,7 +727,19 @@ class MainWindow(QMainWindow):
             parts.append(f"{nn} node{'s' if nn > 1 else ''}")
         if ne:
             parts.append(f"{ne} element{'s' if ne > 1 else ''}")
-        self.set_status(", ".join(parts) + " selected.")
+        text = ", ".join(parts) + " selected."
+        # Grouped load counts only when >1 element is selected — for a
+        # single element the inspector itself shows the full table.
+        if ne > 1:
+            from .load_summary import (
+                format_selection_load_counts,
+                summarize_selection_loads,
+            )
+            counts = summarize_selection_loads(self._model, elem_ids)
+            summary = format_selection_load_counts(counts)
+            if summary:
+                text += f"  Loads: {summary}."
+        self.set_status(text)
 
     def execute(self, command: Command) -> None:
         try:
@@ -1395,6 +1409,16 @@ class MainWindow(QMainWindow):
                 self._element_inspector.finished.connect(
                     self._on_element_inspector_closed
                 )
+                # Per-row Delete in the loads table delegates here.
+                # Wire BEFORE re-rendering the loads table so the
+                # buttons render as enabled rather than greyed out (the
+                # initial __init__ build ran before this assignment).
+                self._element_inspector._host_delete_member_load = (
+                    self.delete_member_load
+                )
+                self._element_inspector.refresh_loads_only(
+                    self._model, self._result,
+                )
             else:
                 self._element_inspector.set_target(
                     self._model, elem_id, self._result,
@@ -1406,6 +1430,25 @@ class MainWindow(QMainWindow):
         self._element_inspector.show()
         self._element_inspector.raise_()
         self._element_inspector.activateWindow()
+
+    def delete_member_load(self, elem_id: int, load_index: int) -> None:
+        """Host-side hook for the inspector's per-row Delete buttons.
+
+        Runs ``DeleteMemberLoadCmd`` through :meth:`execute` so it lands
+        on the undo stack like any other model mutation, then refreshes
+        the inspector. ``execute()`` invalidates ``self._result``, so
+        any previously-displayed end-force block / N·V·M diagrams would
+        otherwise keep painting forces for a load that no longer exists.
+        A full ``refresh()`` rebuilds the body against the now-``None``
+        result, clearing the stale diagrams. The loads table picks up
+        the row removal as part of that rebuild."""
+        cmd = DeleteMemberLoadCmd(
+            elem_id=elem_id, load_index=load_index,
+        )
+        self.execute(cmd)
+        if (self._element_inspector is not None
+                and self._element_inspector.isVisible()):
+            self._element_inspector.refresh(self._model, self._result)
 
     def _on_element_inspector_closed(self, _result_code=None) -> None:
         """Re-enable the editing surface once the user closes the

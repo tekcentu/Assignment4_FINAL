@@ -28,6 +28,7 @@ from structural_analysis.gui_common.commands import (
     BatchDeleteCmd,
     BatchUpdateElementsCmd,
     CLEAR_MATERIAL_OVERRIDE,
+    DeleteMemberLoadCmd,
     DrawMemberWithSplitsCmd,
     SplitElementCmd,
 )
@@ -978,3 +979,117 @@ def test_batch_delete_empty_lists_is_noop():
     BatchDeleteCmd(node_ids=[], element_ids=[]).do(m)
     assert len(m.elements) == n_e
     assert len(m.nodes) == n_n
+
+
+# ── DeleteMemberLoadCmd (PR #24) ────────────────────────────────────
+
+
+def _frame_with_three_loads() -> tuple[StructuralModel, int]:
+    """One frame element with UDL, PointLoad, FrameTemperatureLoad in
+    that order — fixture for the per-row delete tests."""
+    m, eid = _frame_model_one_member()
+    elem = m.elements[0]
+    elem.member_loads.append(UniformDistributedLoad(wy=-10.0))
+    elem.member_loads.append(PointLoad(py=-20.0, a=2.0))
+    elem.member_loads.append(FrameTemperatureLoad(t_top=10.0, t_bottom=30.0))
+    return m, eid
+
+
+def test_delete_member_load_removes_only_target_index():
+    m, eid = _frame_with_three_loads()
+    DeleteMemberLoadCmd(elem_id=eid, load_index=1).do(m)
+    loads = m.elements[0].member_loads
+    assert len(loads) == 2
+    assert isinstance(loads[0], UniformDistributedLoad)
+    assert isinstance(loads[1], FrameTemperatureLoad)
+
+
+def test_delete_member_load_undo_restores_at_same_index():
+    m, eid = _frame_with_three_loads()
+    cmd = DeleteMemberLoadCmd(elem_id=eid, load_index=1)
+    cmd.do(m)
+    cmd.undo(m)
+    loads = m.elements[0].member_loads
+    assert len(loads) == 3
+    assert isinstance(loads[0], UniformDistributedLoad)
+    assert isinstance(loads[1], PointLoad)
+    assert loads[1].py == -20.0 and loads[1].a == 2.0
+    assert isinstance(loads[2], FrameTemperatureLoad)
+
+
+def test_delete_member_load_redo_replays():
+    m, eid = _frame_with_three_loads()
+    cmd = DeleteMemberLoadCmd(elem_id=eid, load_index=0)
+    cmd.do(m)
+    cmd.undo(m)
+    cmd.do(m)
+    loads = m.elements[0].member_loads
+    assert len(loads) == 2
+    assert isinstance(loads[0], PointLoad)
+    assert isinstance(loads[1], FrameTemperatureLoad)
+
+
+def test_delete_member_load_invalid_index_raises_no_mutation():
+    m, eid = _frame_with_three_loads()
+    snapshot = list(m.elements[0].member_loads)
+    with pytest.raises(ValueError):
+        DeleteMemberLoadCmd(elem_id=eid, load_index=99).do(m)
+    assert m.elements[0].member_loads == snapshot
+
+
+def test_delete_member_load_negative_index_raises():
+    m, eid = _frame_with_three_loads()
+    with pytest.raises(ValueError):
+        DeleteMemberLoadCmd(elem_id=eid, load_index=-1).do(m)
+
+
+def test_delete_member_load_unknown_element_raises():
+    m, _ = _frame_with_three_loads()
+    with pytest.raises(ValueError):
+        DeleteMemberLoadCmd(elem_id=9999, load_index=0).do(m)
+
+
+def test_delete_member_load_does_not_affect_other_elements():
+    m, eid_a = _frame_with_three_loads()
+    # Add a second element with its own loads.
+    AddMemberCmd(
+        x_i=10.0, y_i=0.0, x_j=16.0, y_j=0.0,
+        kind="frame", section_id=1,
+    ).do(m)
+    other = next(e for e in m.elements if e.id != eid_a)
+    other.member_loads.append(UniformDistributedLoad(wy=-5.0))
+    other.member_loads.append(PointLoad(py=-3.0, a=1.0))
+    DeleteMemberLoadCmd(elem_id=eid_a, load_index=0).do(m)
+    # Other element's loads untouched.
+    assert len(other.member_loads) == 2
+    assert isinstance(other.member_loads[0], UniformDistributedLoad)
+    assert other.member_loads[0].wy == -5.0
+    assert isinstance(other.member_loads[1], PointLoad)
+
+
+def test_delete_one_thermal_load_keeps_other_thermals():
+    """Two FrameTemperatureLoads in a row — delete one, the other
+    survives at its new (shifted) index."""
+    m, eid = _frame_model_one_member()
+    elem = m.elements[0]
+    elem.member_loads.append(FrameTemperatureLoad(t_top=10.0, t_bottom=10.0))
+    elem.member_loads.append(FrameTemperatureLoad(t_top=20.0, t_bottom=20.0))
+    elem.member_loads.append(FrameTemperatureLoad(t_top=30.0, t_bottom=30.0))
+    DeleteMemberLoadCmd(elem_id=eid, load_index=1).do(m)
+    loads = elem.member_loads
+    assert len(loads) == 2
+    assert loads[0].t_top == 10.0
+    assert loads[1].t_top == 30.0
+
+
+def test_delete_member_load_then_undo_preserves_identity():
+    """The same frozen-dataclass instance is restored on undo —
+    important so subsequent AddMemberLoadCmd undo logic (which removes
+    by identity) is not confused after a delete+undo."""
+    m, eid = _frame_model_one_member()
+    pl = PointLoad(py=-7.0, a=1.5)
+    m.elements[0].member_loads.append(pl)
+    cmd = DeleteMemberLoadCmd(elem_id=eid, load_index=0)
+    cmd.do(m)
+    cmd.undo(m)
+    assert m.elements[0].member_loads[0] is pl
