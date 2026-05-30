@@ -611,3 +611,195 @@ def test_reader_rejects_unknown_coord_system_token():
             read_input_file(tmp)
     finally:
         os.unlink(tmp)
+
+
+# ── PR #26 — Gravity coord_system token ──────────────────────────────
+
+
+def test_gravity_udl_horizontal_beam_projects_to_local_y_negative():
+    """Gravity magnitude wy=+10 on a horizontal beam → local y = -10
+    (force points in -Y, which equals -local-y on a horizontal beam)."""
+    e, nodes = _horizontal_frame(6.0)
+    e.member_loads.append(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    p = e.local_consistent_load(nodes)
+    L = 6.0
+    # Pure transverse: -10 in local y. p[1] = p[4] = -10*L/2 = -30.
+    assert abs(p[1] - (-10.0 * L / 2)) < TOL
+    assert abs(p[4] - (-10.0 * L / 2)) < TOL
+    # No axial.
+    assert abs(p[0]) < TOL
+    assert abs(p[3]) < TOL
+
+
+def test_gravity_udl_vertical_column_projects_to_local_axial_compression():
+    """Gravity wy=+10 on a +Y column (c=0, s=1) → local x = -10,
+    local y = 0. Axial FEMs only, both negative (compression at top
+    and bottom)."""
+    e, nodes = _vertical_column(6.0)
+    e.member_loads.append(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    p = e.local_consistent_load(nodes)
+    L = 6.0
+    # Pure axial: -10 in local x. p[0] = p[3] = -10*L/2 = -30.
+    assert abs(p[0] - (-10.0 * L / 2)) < TOL
+    assert abs(p[3] - (-10.0 * L / 2)) < TOL
+    # No transverse.
+    assert abs(p[1]) < TOL
+    assert abs(p[4]) < TOL
+    assert abs(p[2]) < TOL
+    assert abs(p[5]) < TOL
+
+
+def test_gravity_udl_45_member_splits_evenly():
+    """Gravity wy=+10 on a +45° brace → local x = -10/√2,
+    local y = -10/√2."""
+    L = 6.0
+    e, nodes = _diagonal_45(L)
+    e.member_loads.append(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    p = e.local_consistent_load(nodes)
+    expected = -10.0 / (2 ** 0.5)
+    # Axial and transverse equal magnitude (both compression / -y).
+    assert abs(p[0] - expected * L / 2) < 1e-9
+    assert abs(p[3] - expected * L / 2) < 1e-9
+    assert abs(p[1] - expected * L / 2) < 1e-9
+    assert abs(p[4] - expected * L / 2) < 1e-9
+
+
+def test_gravity_pointload_vertical_column_axial_only():
+    e, nodes = _vertical_column(6.0)
+    e.member_loads.append(PointLoad(
+        py=15.0, a=2.0, coord_system="gravity",
+    ))
+    p = e.local_consistent_load(nodes)
+    L = 6.0
+    a = 2.0
+    # py=+15 gravity on +Y column → local px = -15, local py = 0.
+    # Lever rule on axial:
+    assert abs(p[0] - (-15.0 * (L - a) / L)) < TOL
+    assert abs(p[3] - (-15.0 * a / L)) < TOL
+    # No transverse.
+    assert abs(p[1]) < TOL
+    assert abs(p[4]) < TOL
+    assert abs(p[2]) < TOL
+    assert abs(p[5]) < TOL
+
+
+def test_gravity_udl_with_nonzero_wx_raises():
+    with pytest.raises(ValueError, match="gravity"):
+        UniformDistributedLoad(wy=10.0, wx=3.0, coord_system="gravity")
+
+
+def test_gravity_pointload_with_nonzero_px_raises():
+    with pytest.raises(ValueError, match="gravity"):
+        PointLoad(py=10.0, a=1.0, px=3.0, coord_system="gravity")
+
+
+def test_invalid_coord_system_token_raises():
+    with pytest.raises(ValueError):
+        UniformDistributedLoad(wy=10.0, coord_system="cartesian")
+
+
+def test_solve_gravity_udl_horizontal_beam_total_Ry_equals_wL():
+    """Positive gravity magnitude on a horizontal fixed-fixed beam
+    must produce upward total vertical reaction equal to wy·L."""
+    L = 6.0
+    e, nodes = _horizontal_frame(L)
+    e.member_loads.append(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    m = _model_with_one_member(e, nodes)
+    r = _solve(m)
+    assert r.status == "ok"
+    total_Ry = sum(rxn.get("uy", 0.0) for rxn in r.reactions.values())
+    assert abs(total_Ry - 10.0 * L) < 1e-6, total_Ry
+
+
+def test_split_preserves_gravity_coord_system_on_both_children():
+    from structural_analysis.gui_common.commands import SplitElementCmd
+
+    m = StructuralModel(title="t")
+    m.materials[1] = Material(id=1, name="Steel", E=2.0e8, density=0.0)
+    m.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    e = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.0e8, A=0.02, I=8e-5, section_id=1,
+    )
+    e.member_loads.append(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    m.elements = [e]
+    SplitElementCmd(element_id=1, x=3.0, y=0.0).do(m)
+    a, b = sorted(m.elements, key=lambda el: el.id)
+    for child in (a, b):
+        assert len(child.member_loads) == 1
+        ld = child.member_loads[0]
+        assert isinstance(ld, UniformDistributedLoad)
+        assert ld.coord_system == "gravity"
+        assert ld.wy == 10.0
+        assert ld.wx == 0.0
+
+
+def test_file_roundtrip_gravity_token_preserved():
+    m = _seed_model_with_loaded_member(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    m2 = _roundtrip(m)
+    ld = m2.elements[0].member_loads[0]
+    assert ld.coord_system == "gravity"
+    assert ld.wy == 10.0
+
+
+def test_reader_accepts_gravity_token():
+    """Pre-v0.16 files never had this token; PR #26 adds it to the
+    allowlist."""
+    import os
+    import tempfile
+
+    from structural_analysis.file_io import read_input_file
+
+    body = (
+        "TITLE\ngravity\nNODES 2\n"
+        "1 0 0\n2 6 0\n"
+        "MATERIALS 1\n1  0.02  8e-5  2e8\n"
+        "ELEMENTS 1\n1 1 2 1 FRAME\n"
+        "SUPPORTS 1\n1 1 1 1\n"
+        "LOADS 0\n"
+        "MEMBER_UDL 1\n1  0.0  10.0  gravity\n"
+    )
+    fd, tmp = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with open(tmp, "w") as f:
+            f.write(body)
+        m = read_input_file(tmp)
+        ld = m.elements[0].member_loads[0]
+        assert ld.coord_system == "gravity"
+        assert ld.wy == 10.0
+    finally:
+        os.unlink(tmp)
+
+
+# ── PR #26 — projection helper: gravity handling ─────────────────────
+
+
+def test_project_gravity_on_horizontal_member_pure_transverse():
+    wx_l, wy_l = _project_load_to_local(0.0, 10.0, "gravity", 1.0, 0.0)
+    # Gravity mag = 10. Global components: (0, -10). On horizontal:
+    # local = global → wy_l = -10, wx_l = 0.
+    assert abs(wx_l - 0.0) < TOL
+    assert abs(wy_l - (-10.0)) < TOL
+
+
+def test_project_gravity_on_vertical_column_pure_axial():
+    wx_l, wy_l = _project_load_to_local(0.0, 10.0, "gravity", 0.0, 1.0)
+    # Gravity mag = 10 on +Y column. Global components: (0, -10).
+    # T·(0,-10) for c=0,s=1: local x = s*(-10) = -10, local y = c*(-10) = 0.
+    assert abs(wx_l - (-10.0)) < TOL
+    assert abs(wy_l - 0.0) < TOL

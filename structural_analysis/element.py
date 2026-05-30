@@ -74,20 +74,29 @@ def _project_load_to_local(
     +X). This mirrors the upper-left 2x2 block of the 6×6 rotation
     used by ``transformation_matrix``.
 
-    For ``coord_system == "local"`` the components are returned
-    unchanged. For ``"global"`` the components are rotated into local
-    axes, giving BOTH an axial (local-x) and a transverse (local-y)
-    contribution for inclined members. Any other value raises
-    ``ValueError`` (defensive — the only valid strings are documented
-    on :class:`UniformDistributedLoad` and :class:`PointLoad`).
+    * ``"local"``: components returned unchanged.
+    * ``"global"``: components rotated into local axes, giving BOTH
+      an axial (local-x) and a transverse (local-y) contribution for
+      inclined members.
+    * ``"gravity"``: ``cy`` carries the (signed) gravity magnitude;
+      ``cx`` is expected to be 0 (validated at load-class construction
+      time, but tolerated here without an extra check). The effective
+      global components are ``(0, -cy)`` — positive ``cy`` means a
+      load in the global gravity direction (``-Y``) — and the result
+      is the same as calling this helper with those global components.
     """
     if coord_system == "local":
         return cx, cy
     if coord_system == "global":
         return c * cx + s * cy, -s * cx + c * cy
+    if coord_system == "gravity":
+        # Magnitude in cy, direction global -Y. cx is ignored
+        # (validated to be 0 at construction).
+        gx, gy = 0.0, -cy
+        return c * gx + s * gy, -s * gx + c * gy
     raise ValueError(
         f"Unknown coord_system {coord_system!r}; "
-        f"expected 'local' or 'global'."
+        f"expected 'local', 'global', or 'gravity'."
     )
 
 

@@ -532,17 +532,17 @@ def _parse_bool(s: str, key: str) -> bool:
 def _parse_coord_system_token(token: str | None, section: str) -> str:
     """Parse the optional trailing coord-system token on a member-load row.
 
-    Missing token → "local" (preserves byte-identical parsing of every
-    pre-v0.15.0 input file). The only accepted explicit values are
-    ``"local"`` and ``"global"``; anything else raises so a typo
-    doesn't silently degrade to the default.
+    Missing token → ``"local"`` (preserves byte-identical parsing of
+    every pre-v0.15.0 input file). The accepted explicit values are
+    ``"local"``, ``"global"``, and ``"gravity"`` (v0.16.0); anything
+    else raises so a typo doesn't silently degrade to the default.
     """
     if token is None:
         return "local"
     norm = token.strip().lower()
-    if norm in ("local", "global"):
+    if norm in ("local", "global", "gravity"):
         return norm
     raise ValueError(
         f"{section}: unknown coord-system token {token!r}; "
-        "expected 'local' or 'global' (or omit for local)."
+        "expected 'local', 'global', or 'gravity' (or omit for local)."
     )

@@ -3491,7 +3491,10 @@ def test_member_load_dialog_hides_coord_radio_for_thermal(qt_app):
 
 def test_member_load_dialog_accept_returns_coord_system(qt_app):
     """Building a UDL with the Global radio selected must produce a
-    UniformDistributedLoad with coord_system='global' and the wx field."""
+    UniformDistributedLoad with coord_system='global'. v0.16.0 reset
+    semantics: switching the direction radio clears the field values
+    (since labels change between local-wx/wy and global-qX/qY), so the
+    test sets values AFTER selecting the radio."""
     from structural_analysis.gui_qt.dialogs import MemberLoadDialog
     from structural_analysis.model import UniformDistributedLoad
 
@@ -3499,12 +3502,259 @@ def test_member_load_dialog_accept_returns_coord_system(qt_app):
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
     d._radios["udl"].setChecked(True)
-    d._refresh_fields()
-    d._fields["wx"].setText("3.0")
-    d._fields["wy"].setText("-10.0")
     d._rb_global.setChecked(True)
+    d._refresh_fields()
+    d._fields["wx"].setText("3.0")  # qX (storage field name stays wx)
+    d._fields["wy"].setText("-10.0")  # qY
     result = d._accept()
     assert isinstance(result, UniformDistributedLoad)
     assert result.wx == 3.0
     assert result.wy == -10.0
     assert result.coord_system == "global"
+
+
+# ── PR #26 — Gravity radio + dialog labels ──────────────────────────
+
+
+def test_member_load_dialog_offers_three_direction_radios(qt_app):
+    """v0.16: dialog must expose Local / Global / Gravity for mechanical
+    loads (UDL and PointLoad)."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._radios["udl"].setChecked(True)
+    d._refresh_fields()
+    assert d._rb_local.isVisibleTo(d)
+    assert d._rb_global.isVisibleTo(d)
+    assert d._rb_gravity.isVisibleTo(d)
+
+
+def test_member_load_dialog_local_labels_say_local(qt_app):
+    """Local radio → field labels include 'local x' and 'local y'."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._radios["udl"].setChecked(True)
+    d._rb_local.setChecked(True)
+    d._refresh_fields()
+    labels = _form_labels(d._field_form)
+    assert any("local x" in lbl.lower() for lbl in labels)
+    assert any("local y" in lbl.lower() for lbl in labels)
+
+
+def test_member_load_dialog_global_labels_say_qX_qY(qt_app):
+    """Global radio → labels include qX and qY (uppercase global axes),
+    not wx/wy."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._radios["udl"].setChecked(True)
+    d._rb_global.setChecked(True)
+    d._refresh_fields()
+    labels = _form_labels(d._field_form)
+    assert any("qX" in lbl for lbl in labels)
+    assert any("qY" in lbl for lbl in labels)
+
+
+def test_member_load_dialog_gravity_shows_single_magnitude_field(qt_app):
+    """Gravity hides the second component (only a magnitude field is
+    shown for UDL: no wx, just wy = magnitude)."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._radios["udl"].setChecked(True)
+    d._rb_gravity.setChecked(True)
+    d._refresh_fields()
+    assert "wx" not in d._fields
+    assert "wy" in d._fields
+    labels = _form_labels(d._field_form)
+    assert any("magnitude" in lbl.lower() for lbl in labels)
+    assert any("downward" in lbl.lower() for lbl in labels)
+
+
+def test_member_load_dialog_gravity_accept_emits_correct_load(qt_app):
+    """Building a gravity UDL produces coord_system='gravity' with
+    wx=0 (validated by the load class)."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._radios["udl"].setChecked(True)
+    d._rb_gravity.setChecked(True)
+    d._refresh_fields()
+    d._fields["wy"].setText("12.0")
+    result = d._accept()
+    assert isinstance(result, UniformDistributedLoad)
+    assert result.coord_system == "gravity"
+    assert result.wy == 12.0
+    assert result.wx == 0.0
+
+
+# ── PR #26 — Canvas direction-aware drawing ─────────────────────────
+
+
+def test_canvas_visual_components_local_returns_two_directions(qt_app):
+    """Local UDL has two drawable components: axial (tangent) and
+    transverse (normal)."""
+    from structural_analysis.gui_qt.canvas import _udl_visual_components
+    from structural_analysis.model import UniformDistributedLoad
+
+    # Element tangent (tx, ty), normal (nx, ny).
+    tx, ty = 1.0, 0.0
+    nx, ny = 0.0, 1.0
+    ml = UniformDistributedLoad(wy=-10.0, wx=4.0)
+    comps = _udl_visual_components(ml, tx, ty, nx, ny)
+    assert comps == [(tx, ty, 4.0), (nx, ny, -10.0)]
+
+
+def test_canvas_visual_components_global_uses_world_axes(qt_app):
+    """Global UDL on an inclined member draws in true global X / Y, NOT
+    perpendicular to the member."""
+    from structural_analysis.gui_qt.canvas import _udl_visual_components
+    from structural_analysis.model import UniformDistributedLoad
+
+    # Inclined element: tangent (0.6, 0.8), normal (-0.8, 0.6).
+    tx, ty = 0.6, 0.8
+    nx, ny = -0.8, 0.6
+    ml = UniformDistributedLoad(
+        wy=-10.0, wx=4.0, coord_system="global",
+    )
+    comps = _udl_visual_components(ml, tx, ty, nx, ny)
+    # qX along (1, 0) global, qY along (0, 1) global — NOT (tx, ty) / (nx, ny).
+    assert comps == [(1.0, 0.0, 4.0), (0.0, 1.0, -10.0)]
+
+
+def test_canvas_visual_components_gravity_points_down(qt_app):
+    """Gravity has ONE component: (0, -1) regardless of member."""
+    from structural_analysis.gui_qt.canvas import _udl_visual_components
+    from structural_analysis.model import UniformDistributedLoad
+
+    # Vertical column tangent.
+    tx, ty = 0.0, 1.0
+    nx, ny = -1.0, 0.0
+    ml = UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    comps = _udl_visual_components(ml, tx, ty, nx, ny)
+    assert len(comps) == 1
+    dx, dy, mag = comps[0]
+    assert (dx, dy) == (0.0, -1.0)
+    assert mag == 10.0
+
+
+def test_canvas_pointload_visual_components_global_uses_world_axes(qt_app):
+    from structural_analysis.gui_qt.canvas import _pointload_visual_components
+    from structural_analysis.model import PointLoad
+
+    tx, ty = 0.6, 0.8
+    nx, ny = -0.8, 0.6
+    ml = PointLoad(py=-20.0, a=2.0, px=5.0, coord_system="global")
+    comps = _pointload_visual_components(ml, tx, ty, nx, ny)
+    assert comps == [(1.0, 0.0, 5.0), (0.0, 1.0, -20.0)]
+
+
+def test_canvas_udl_arrow_strip_tail_offset_opposes_load_direction(qt_app):
+    """The arrowhead must land ON the member (xy) with the tail
+    OPPOSITE the load direction so the visual actually points the way
+    the force acts. A +ve gravity load (down) must produce arrows whose
+    tail sits ABOVE the member — Gemini regression on PR #26 first
+    draft, which had tail and head swapped."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, Node, Section, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    e = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e.member_loads.append(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    w._model.elements = [e]
+    w.canvas.redraw()
+    tails_above = 0
+    for ann in w.canvas.ax.findobj():
+        xy = getattr(ann, "xy", None)
+        xytext = getattr(ann, "xyann", None)
+        if xy is None or xytext is None:
+            continue
+        try:
+            head_y = float(xy[1])
+            tail_y = float(xytext[1])
+        except Exception:
+            continue
+        if abs(head_y - 0.0) < 1e-6 and tail_y > head_y + 1e-9:
+            tails_above += 1
+    assert tails_above >= 1, (
+        "Gravity +10 UDL: arrows must have tail ABOVE the member so "
+        "the head at the member visually points DOWN."
+    )
+
+
+def test_canvas_draws_member_loads_without_error_for_each_coord_system(qt_app):
+    """End-to-end render: a model with one local, one global, and one
+    gravity load must redraw cleanly (no projection errors / asserts)."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, Node, Section, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0),
+        3: Node(3, 6.0, 6.0), 4: Node(4, 0.0, 6.0),
+    }
+    e1 = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e1.member_loads.append(UniformDistributedLoad(wy=-10.0))  # local
+    e2 = FrameElement2D(
+        id=2, node_i=2, node_j=3, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e2.member_loads.append(
+        UniformDistributedLoad(wy=-10.0, coord_system="global")
+    )
+    e3 = FrameElement2D(
+        id=3, node_i=3, node_j=4, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e3.member_loads.append(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    w._model.elements = [e1, e2, e3]
+    w.canvas.redraw()  # raises if anything is wrong
+
+
+def _form_labels(form_layout):
+    """Return label texts (left column) of a QFormLayout."""
+    from PyQt6.QtWidgets import QFormLayout
+
+    labels = []
+    for i in range(form_layout.rowCount()):
+        item = form_layout.itemAt(i, QFormLayout.ItemRole.LabelRole)
+        if item is not None:
+            w = item.widget()
+            if w is not None and hasattr(w, "text"):
+                labels.append(w.text())
+    return labels

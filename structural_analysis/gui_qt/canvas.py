@@ -793,9 +793,13 @@ class ModelCanvas(QWidget):
         for elem in model.elements:
             for ml in getattr(elem, "member_loads", []):
                 if isinstance(ml, UniformDistributedLoad):
-                    max_udl = max(max_udl, abs(ml.wy))
+                    max_udl = max(
+                        max_udl, abs(ml.wy), abs(getattr(ml, "wx", 0.0)),
+                    )
                 elif isinstance(ml, PointLoad):
-                    max_point = max(max_point, abs(ml.py))
+                    max_point = max(
+                        max_point, abs(ml.py), abs(getattr(ml, "px", 0.0)),
+                    )
         span = self._model_span()
         # Map the largest load in each family to ~12% of the model
         # span on screen; smaller loads scale linearly down from there.
@@ -924,51 +928,70 @@ class ModelCanvas(QWidget):
                              color="#2ca02c", zorder=6)
 
     def _draw_member_loads(self, elem, ni, nj, load_scales: dict) -> None:
+        """Draw each member load in its TRUE direction:
+
+        * ``coord_system == "local"`` — axial component along the member
+          tangent, transverse component perpendicular to the member.
+        * ``coord_system == "global"`` — qX and qY components in the true
+          global X / Y directions, regardless of the member's
+          orientation.
+        * ``coord_system == "gravity"`` — single component straight along
+          global -Y (positive magnitude = downward), regardless of
+          member orientation.
+
+        Each non-zero (direction, magnitude) pair produces one set of
+        arrows (UDL: six along the element; PointLoad: one at ``a``).
+        The arrow "tail offset" sign convention matches the legacy
+        renderer so visual orientation stays consistent for existing
+        local loads."""
         if not elem.member_loads:
             return
         L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
         if L < 1e-12:
             return
-        # Element local axes for drawing transverse loads on the member.
-        tx, ty = (nj.x - ni.x) / L, (nj.y - ni.y) / L   # axial
-        nx, ny = -ty, tx                                # transverse (+y_local)
+        tx, ty = (nj.x - ni.x) / L, (nj.y - ni.y) / L   # member tangent
+        nx, ny = -ty, tx                                # member +y_local
 
-        labels = []
+        labels: list[str] = []
         udl_scale = load_scales.get("udl", 0.0)
         point_scale = load_scales.get("point", 0.0)
+
         for ml in elem.member_loads:
             if isinstance(ml, UniformDistributedLoad):
-                labels.append(f"UDL {ml.wy:+.3g}")
+                labels.append(_label_for_udl(ml))
                 if udl_scale > 0:
-                    h = ml.wy * udl_scale
-                    # Build a filled polygon showing the UDL band on
-                    # the +y_local side of the element. The band height
-                    # is proportional to the load intensity relative to
-                    # the model maximum.
-                    p0 = (ni.x,             ni.y            )
-                    p1 = (nj.x,             nj.y            )
-                    p2 = (nj.x + nx * h,    nj.y + ny * h    )
-                    p3 = (ni.x + nx * h,    ni.y + ny * h    )
-                    poly = _MplPolygon([p0, p1, p2, p3],
-                                        closed=True,
-                                        facecolor="#9467bd", alpha=0.18,
-                                        edgecolor="#9467bd", linewidth=0.5,
-                                        zorder=1)
-                    self.ax.add_patch(poly)
+                    for dx, dy, mag in _udl_visual_components(
+                        ml, tx, ty, nx, ny,
+                    ):
+                        if mag == 0.0:
+                            continue
+                        self._draw_udl_arrow_strip(
+                            ni, nj, dx, dy, mag, udl_scale,
+                        )
             elif isinstance(ml, PointLoad):
-                labels.append(f"P {ml.py:+.3g}@{ml.a:.3g}")
+                labels.append(_label_for_pointload(ml))
                 if point_scale > 0:
                     a = max(0.0, min(L, float(ml.a)))
                     bx = ni.x + tx * a
                     by = ni.y + ty * a
-                    h = ml.py * point_scale
-                    self.ax.annotate(
-                        "",
-                        xy=(bx, by),
-                        xytext=(bx + nx * h, by + ny * h),
-                        arrowprops=dict(arrowstyle="->", color="#9467bd", lw=2),
-                        zorder=5,
-                    )
+                    for dx, dy, mag in _pointload_visual_components(
+                        ml, tx, ty, nx, ny,
+                    ):
+                        if mag == 0.0:
+                            continue
+                        h = mag * point_scale
+                        # Tail OPPOSITE to load direction so the
+                        # arrowhead at xy=(bx,by) visually points along
+                        # (dx, dy) — matches the nodal-load convention.
+                        self.ax.annotate(
+                            "",
+                            xy=(bx, by),
+                            xytext=(bx - dx * h, by - dy * h),
+                            arrowprops=dict(
+                                arrowstyle="->", color="#9467bd", lw=2,
+                            ),
+                            zorder=5,
+                        )
             elif isinstance(ml, TrussTemperatureLoad):
                 labels.append(f"ΔT {ml.delta_T:+.3g}°")
             elif isinstance(ml, FrameTemperatureLoad):
@@ -978,6 +1001,34 @@ class ModelCanvas(QWidget):
             self.ax.annotate(", ".join(labels), (mx, my),
                              xytext=(0, -12), textcoords="offset points",
                              fontsize=7, color="#9467bd", ha="center", zorder=6)
+
+    def _draw_udl_arrow_strip(
+        self, ni, nj, dx: float, dy: float, magnitude: float,
+        udl_scale: float, n_arrows: int = 6,
+    ) -> None:
+        """Draw ``n_arrows`` evenly spaced arrows along the element in
+        the direction ``(dx, dy)`` with length proportional to
+        ``magnitude * udl_scale``. The arrowhead lands on the member
+        and the tail sits OPPOSITE to the load direction so the visual
+        actually points the way the force acts — matching how nodal
+        loads are drawn (see ``_draw_nodal_load`` which also offsets
+        the tail by ``-`` the force components)."""
+        h = magnitude * udl_scale
+        if h == 0.0:
+            return
+        for i in range(n_arrows):
+            t = (i + 0.5) / n_arrows
+            bx = ni.x + (nj.x - ni.x) * t
+            by = ni.y + (nj.y - ni.y) * t
+            self.ax.annotate(
+                "",
+                xy=(bx, by),
+                xytext=(bx - dx * h, by - dy * h),
+                arrowprops=dict(
+                    arrowstyle="->", color="#9467bd", lw=1.0, alpha=0.85,
+                ),
+                zorder=4,
+            )
 
     def _node_displacement(self, nid: int) -> tuple[float, float]:
         result = self._result
@@ -1391,6 +1442,81 @@ class ModelCanvas(QWidget):
         no longer silently re-fits and throws their view away."""
         if not self._setting_axes_limits:
             self._user_view_dirty = True
+
+
+def _udl_visual_components(
+    ml: UniformDistributedLoad, tx: float, ty: float, nx: float, ny: float,
+) -> list[tuple[float, float, float]]:
+    """Return ``(direction_x, direction_y, magnitude)`` tuples for each
+    drawable component of a UDL, given the element's tangent ``(tx, ty)``
+    and +y_local normal ``(nx, ny)``.
+
+    * ``"local"``: two components — axial along the member tangent
+      (magnitude ``wx``) and transverse perpendicular to it (magnitude
+      ``wy``). Either component may be 0; the caller filters those out.
+    * ``"global"``: two components — ``qX`` along true global X
+      ``(1, 0)`` and ``qY`` along true global Y ``(0, 1)``. The
+      direction vectors are in WORLD axes, independent of the member's
+      orientation, so an inclined member draws horizontally / vertically
+      not perpendicular to itself.
+    * ``"gravity"``: one component straight along global ``-Y`` with
+      magnitude ``wy``. Positive magnitude → arrows pointing down."""
+    cs = getattr(ml, "coord_system", "local")
+    if cs == "local":
+        return [(tx, ty, ml.wx), (nx, ny, ml.wy)]
+    if cs == "global":
+        return [(1.0, 0.0, ml.wx), (0.0, 1.0, ml.wy)]
+    if cs == "gravity":
+        return [(0.0, -1.0, ml.wy)]
+    # Defensive: unknown — fall back to legacy local-y rendering.
+    return [(nx, ny, ml.wy)]
+
+
+def _pointload_visual_components(
+    ml: PointLoad, tx: float, ty: float, nx: float, ny: float,
+) -> list[tuple[float, float, float]]:
+    """Mirror :func:`_udl_visual_components` for a point load."""
+    cs = getattr(ml, "coord_system", "local")
+    if cs == "local":
+        return [(tx, ty, ml.px), (nx, ny, ml.py)]
+    if cs == "global":
+        return [(1.0, 0.0, ml.px), (0.0, 1.0, ml.py)]
+    if cs == "gravity":
+        return [(0.0, -1.0, ml.py)]
+    return [(nx, ny, ml.py)]
+
+
+def _label_for_udl(ml: UniformDistributedLoad) -> str:
+    """Short magnitude-and-direction tag rendered under the element."""
+    cs = getattr(ml, "coord_system", "local")
+    if cs == "gravity":
+        return f"UDL {ml.wy:+.3g} grav"
+    if cs == "global":
+        if ml.wx != 0.0 and ml.wy != 0.0:
+            return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g}) glob"
+        if ml.wx != 0.0:
+            return f"UDL qX={ml.wx:+.3g} glob"
+        return f"UDL qY={ml.wy:+.3g} glob"
+    # local
+    if ml.wx != 0.0 and ml.wy != 0.0:
+        return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g})"
+    if ml.wx != 0.0:
+        return f"UDL wx={ml.wx:+.3g}"
+    return f"UDL {ml.wy:+.3g}"
+
+
+def _label_for_pointload(ml: PointLoad) -> str:
+    cs = getattr(ml, "coord_system", "local")
+    suffix = ""
+    if cs == "gravity":
+        return f"P {ml.py:+.3g}@{ml.a:.3g} grav"
+    if cs == "global":
+        suffix = " glob"
+    if ml.px != 0.0 and ml.py != 0.0:
+        return f"P ({ml.px:+.3g},{ml.py:+.3g})@{ml.a:.3g}{suffix}"
+    if ml.px != 0.0:
+        return f"P px={ml.px:+.3g}@{ml.a:.3g}{suffix}"
+    return f"P {ml.py:+.3g}@{ml.a:.3g}{suffix}"
 
 
 def _shift_pressed() -> bool:

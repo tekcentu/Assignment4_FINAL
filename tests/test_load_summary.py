@@ -258,10 +258,70 @@ def test_format_global_udl_position_says_global_axes():
 
 
 def test_format_global_pointload_labels_global_frame():
+    """In global mode, components surface as pX / pY (uppercase axes)
+    rather than the local px / py — v0.16.0 semantic distinction."""
     m, _ = _model_with_one_frame()
     m.elements[0].member_loads.append(
         PointLoad(py=-20.0, a=3.0, px=5.0, coord_system="global")
     )
     rows = format_element_loads(m, m.elements[0])
     assert "global" in rows[0].position.lower()
-    assert "px" in rows[0].magnitude and "py" in rows[0].magnitude
+    assert "pX" in rows[0].magnitude and "pY" in rows[0].magnitude
+
+
+# ── PR #26 — gravity label + qX/qY semantic naming + local-eq note ──
+
+
+def test_format_global_udl_uses_qX_qY_naming():
+    """v0.16: global mode says 'qY' (uppercase Y), not 'wy', to make
+    the distinction from local-axis components obvious in the load list."""
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-10.0, coord_system="global")
+    )
+    rows = format_element_loads(m, m.elements[0])
+    # Compact form when only one global component is non-zero.
+    assert "qY" in rows[0].magnitude
+    assert "wy" not in rows[0].magnitude
+
+
+def test_format_gravity_udl_shows_magnitude_and_label():
+    """Gravity loads use a single 'magnitude' string and the position
+    column says 'Gravity (global -Y)'."""
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert "magnitude" in rows[0].magnitude.lower()
+    assert "gravity" in rows[0].position.lower()
+    assert "-y" in rows[0].position.lower()
+
+
+def test_format_local_load_has_no_local_eq_note():
+    """Local loads should NOT carry a 'local eq:' annotation — they ARE
+    in local coords already."""
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(UniformDistributedLoad(wy=-10.0))
+    rows = format_element_loads(m, m.elements[0])
+    assert "local eq" not in rows[0].meaning.lower()
+
+
+def test_format_global_load_includes_local_eq_note():
+    """Global / Gravity loads should show the projected (wx_l, wy_l)
+    in the meaning column so the user can verify the conversion."""
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-10.0, coord_system="global")
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert "local eq" in rows[0].meaning.lower()
+
+
+def test_format_gravity_load_includes_local_eq_note():
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert "local eq" in rows[0].meaning.lower()
