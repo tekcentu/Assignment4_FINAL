@@ -2189,6 +2189,10 @@ class ElementPropertiesDialog(QDialog):
             self.set_target(model, self._elem_id, result)
             return
         body_layout.replaceWidget(self._loads_widget, new_widget)
+        # Newly created widgets are hidden by default after
+        # replaceWidget — without an explicit show() the table goes
+        # invisible the moment a row is deleted.
+        new_widget.show()
         self._loads_widget.setParent(None)
         self._loads_widget.deleteLater()
         self._loads_widget = new_widget

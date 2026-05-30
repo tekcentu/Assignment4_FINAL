@@ -1436,16 +1436,19 @@ class MainWindow(QMainWindow):
 
         Runs ``DeleteMemberLoadCmd`` through :meth:`execute` so it lands
         on the undo stack like any other model mutation, then refreshes
-        the inspector's loads table in place (no figure flicker)."""
+        the inspector. ``execute()`` invalidates ``self._result``, so
+        any previously-displayed end-force block / N·V·M diagrams would
+        otherwise keep painting forces for a load that no longer exists.
+        A full ``refresh()`` rebuilds the body against the now-``None``
+        result, clearing the stale diagrams. The loads table picks up
+        the row removal as part of that rebuild."""
         cmd = DeleteMemberLoadCmd(
             elem_id=elem_id, load_index=load_index,
         )
         self.execute(cmd)
         if (self._element_inspector is not None
                 and self._element_inspector.isVisible()):
-            self._element_inspector.refresh_loads_only(
-                self._model, self._result,
-            )
+            self._element_inspector.refresh(self._model, self._result)
 
     def _on_element_inspector_closed(self, _result_code=None) -> None:
         """Re-enable the editing surface once the user closes the
