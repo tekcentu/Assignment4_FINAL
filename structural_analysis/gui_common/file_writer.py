@@ -192,12 +192,21 @@ def write_input_file(model: StructuralModel, path: str) -> None:
     if udls:
         out.append(f"MEMBER_UDL {len(udls)}")
         for eid, u in udls:
-            out.append(f"{eid}  0.0  {_fmt(u.wy)}")
+            row = f"{eid}  {_fmt(u.wx)}  {_fmt(u.wy)}"
+            # Emit the coord-system token only when it differs from the
+            # default. Legacy files (no global loads) round-trip
+            # byte-identical to pre-v0.15.0 output.
+            if u.coord_system != "local":
+                row += f"  {u.coord_system}"
+            out.append(row)
         out.append("")
     if points:
         out.append(f"MEMBER_POINT_LOADS {len(points)}")
         for eid, p in points:
-            out.append(f"{eid}  {_fmt(p.a)}  0.0  {_fmt(p.py)}")
+            row = f"{eid}  {_fmt(p.a)}  {_fmt(p.px)}  {_fmt(p.py)}"
+            if p.coord_system != "local":
+                row += f"  {p.coord_system}"
+            out.append(row)
         out.append("")
     if truss_temps:
         out.append(f"TRUSS_TEMPERATURE {len(truss_temps)}")
