@@ -1016,8 +1016,10 @@ class MainWindow(QMainWindow):
         d = NodalLoadDialog(self, existing=existing, node_id=node_id)
         if d.exec() != QDialog.DialogCode.Accepted:
             return
-        fx, fy, mz = d.result_value
-        self.execute(SetNodalLoadCmd(node_id=node_id, fx=fx, fy=fy, mz=mz))
+        fx, fy, mz, load_case = d.result_value
+        self.execute(SetNodalLoadCmd(
+            node_id=node_id, fx=fx, fy=fy, mz=mz, load_case=load_case,
+        ))
 
     def _add_member_load(self, elem_id: int) -> None:
         try:

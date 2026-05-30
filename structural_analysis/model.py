@@ -211,6 +211,7 @@ class NodalLoad:
     fx: float = 0.0   # force in x (kN)
     fy: float = 0.0   # force in y (kN)
     mz: float = 0.0   # moment about z (kN·m)
+    load_case: str = "DEFAULT"
 
 
 @dataclass(frozen=True)
@@ -241,6 +242,7 @@ class UniformDistributedLoad:
     wy: float
     wx: float = 0.0
     coord_system: str = "local"
+    load_case: str = "DEFAULT"
 
     def __post_init__(self):
         if self.coord_system not in ("local", "global", "gravity"):
@@ -278,6 +280,7 @@ class PointLoad:
     a: float
     px: float = 0.0
     coord_system: str = "local"
+    load_case: str = "DEFAULT"
 
     def __post_init__(self):
         if self.coord_system not in ("local", "global", "gravity"):
@@ -305,6 +308,7 @@ class TrussTemperatureLoad:
     """
 
     delta_T: float
+    load_case: str = "DEFAULT"
 
 
 @dataclass(frozen=True)
@@ -329,6 +333,7 @@ class FrameTemperatureLoad:
 
     t_top: float = 0.0
     t_bottom: float = 0.0
+    load_case: str = "DEFAULT"
 
 
 MemberLoad = (

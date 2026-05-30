@@ -100,7 +100,10 @@ def test_format_frame_thermal_uniform_says_axial():
     )
     rows = format_element_loads(m, m.elements[0])
     assert rows[0].kind == "Thermal"
-    assert "frame" in rows[0].type_label.lower()
+    # v0.17: frame thermal with t_top == t_bottom is recognised as a
+    # uniform-ΔT load (instead of being lumped under a generic
+    # "Thermal (frame)" label).
+    assert "uniform" in rows[0].type_label.lower()
     assert "axial" in rows[0].meaning.lower()
 
 
@@ -325,3 +328,92 @@ def test_format_gravity_load_includes_local_eq_note():
     )
     rows = format_element_loads(m, m.elements[0])
     assert "local eq" in rows[0].meaning.lower()
+
+
+# ── PR #27 — load_case foundation + tighter thermal meanings ────────
+
+
+def test_format_udl_default_case_is_DEFAULT():
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(UniformDistributedLoad(wy=-10.0))
+    rows = format_element_loads(m, m.elements[0])
+    assert rows[0].load_case == "DEFAULT"
+
+
+def test_format_udl_with_non_default_case_propagates_to_row():
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-10.0, load_case="DEAD")
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert rows[0].load_case == "DEAD"
+
+
+def test_format_pointload_carries_load_case():
+    m, _ = _model_with_one_frame(length=6.0)
+    m.elements[0].member_loads.append(
+        PointLoad(py=-20.0, a=2.5, load_case="LIVE")
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert rows[0].load_case == "LIVE"
+
+
+def test_format_frame_thermal_uniform_label_says_uniform():
+    """Frame ΔT with t_top == t_bottom is classified as 'uniform ΔT' in
+    v0.17 (not the generic 'Thermal (frame)' lump label of earlier
+    versions). The meaning still mentions axial."""
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        FrameTemperatureLoad(t_top=25.0, t_bottom=25.0)
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert "uniform" in rows[0].type_label.lower()
+    # Magnitude collapses to a single ΔT for uniform loads.
+    assert "ΔT" in rows[0].magnitude
+    assert "t_top" not in rows[0].magnitude
+    assert "axial" in rows[0].meaning.lower()
+    assert "curv" not in rows[0].meaning.lower()
+
+
+def test_format_frame_thermal_pure_gradient_label_says_gradient():
+    """Anti-symmetric gradient (mean == 0) → gradient label,
+    curvature-only meaning."""
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        FrameTemperatureLoad(t_top=10.0, t_bottom=-10.0)
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert "gradient" in rows[0].type_label.lower()
+    assert "curv" in rows[0].meaning.lower()
+
+
+def test_format_frame_thermal_mixed_label_says_uniform_and_gradient():
+    """Non-zero mean AND non-zero gradient → mixed label."""
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        FrameTemperatureLoad(t_top=10.0, t_bottom=30.0)
+    )
+    rows = format_element_loads(m, m.elements[0])
+    label = rows[0].type_label.lower()
+    assert "uniform" in label and "gradient" in label
+    assert "axial" in rows[0].meaning.lower()
+    assert "curv" in rows[0].meaning.lower()
+
+
+def test_format_truss_thermal_carries_load_case():
+    m, _ = _model_with_one_truss()
+    m.elements[0].member_loads.append(
+        TrussTemperatureLoad(delta_T=15.0, load_case="THERMAL")
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert rows[0].load_case == "THERMAL"
+    assert "truss" in rows[0].type_label.lower()
+
+
+def test_format_frame_thermal_carries_load_case():
+    m, _ = _model_with_one_frame()
+    m.elements[0].member_loads.append(
+        FrameTemperatureLoad(t_top=10.0, t_bottom=-10.0, load_case="THERMAL")
+    )
+    rows = format_element_loads(m, m.elements[0])
+    assert rows[0].load_case == "THERMAL"

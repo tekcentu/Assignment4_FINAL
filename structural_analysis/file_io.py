@@ -397,8 +397,13 @@ def read_input_file(filepath: str) -> StructuralModel:
                 while i < len(lines) and (not lines[i] or lines[i].startswith("#")):
                     i += 1
                 parts = lines[i].split("#")[0].split()
+                meta = _parse_load_metadata(
+                    parts, start_idx=4, section="LOADS",
+                    accept_coord_system=False,
+                )
                 model.nodal_loads.append(NodalLoad(
-                    int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+                    int(parts[0]), float(parts[1]), float(parts[2]),
+                    float(parts[3]), load_case=meta["load_case"],
                 ))
 
         elif keyword == "MEMBER_POINT_LOADS":
@@ -412,16 +417,21 @@ def read_input_file(filepath: str) -> StructuralModel:
                 a = float(parts[1])
                 px = float(parts[2]) if len(parts) > 2 else 0.0
                 py = float(parts[3]) if len(parts) > 3 else 0.0
-                # Optional trailing coord-system token: "local" (default
-                # if absent) or "global". Anything else is rejected so a
-                # typo doesn't silently parse as the default.
-                coord_system = _parse_coord_system_token(
-                    parts[4] if len(parts) > 4 else None, "MEMBER_POINT_LOADS",
+                # Optional trailing tokens: positional coord-system
+                # ("local"|"global"|"gravity") followed by any number of
+                # key=value tokens (today: ``case=NAME``). Missing →
+                # local + DEFAULT, preserving byte-identical parsing of
+                # every pre-v0.17.0 input file.
+                meta = _parse_load_metadata(
+                    parts, start_idx=4, section="MEMBER_POINT_LOADS",
+                    accept_coord_system=True,
                 )
                 for elem in model.elements:
                     if elem.id == eid:
                         elem.member_loads.append(PointLoad(
-                            py=py, a=a, px=px, coord_system=coord_system,
+                            py=py, a=a, px=px,
+                            coord_system=meta["coord_system"],
+                            load_case=meta["load_case"],
                         ))
                         break
 
@@ -435,19 +445,21 @@ def read_input_file(filepath: str) -> StructuralModel:
                 eid = int(parts[0])
                 wx = float(parts[1]) if len(parts) > 1 else 0.0
                 wy = float(parts[2]) if len(parts) > 2 else 0.0
-                # Optional trailing coord-system token; missing → local.
-                coord_system = _parse_coord_system_token(
-                    parts[3] if len(parts) > 3 else None, "MEMBER_UDL",
+                meta = _parse_load_metadata(
+                    parts, start_idx=3, section="MEMBER_UDL",
+                    accept_coord_system=True,
                 )
                 for elem in model.elements:
                     if elem.id == eid:
                         elem.member_loads.append(UniformDistributedLoad(
-                            wy=wy, wx=wx, coord_system=coord_system,
+                            wy=wy, wx=wx,
+                            coord_system=meta["coord_system"],
+                            load_case=meta["load_case"],
                         ))
                         break
 
         elif keyword == "TRUSS_TEMPERATURE":
-            # Format: elem_id  delta_T
+            # Format: elem_id  delta_T  [case=NAME]
             count = int(tokens[1])
             for _ in range(count):
                 i += 1
@@ -456,13 +468,19 @@ def read_input_file(filepath: str) -> StructuralModel:
                 parts = lines[i].split("#")[0].split()
                 eid = int(parts[0])
                 dT = float(parts[1])
+                meta = _parse_load_metadata(
+                    parts, start_idx=2, section="TRUSS_TEMPERATURE",
+                    accept_coord_system=False,
+                )
                 for elem in model.elements:
                     if elem.id == eid:
-                        elem.member_loads.append(TrussTemperatureLoad(delta_T=dT))
+                        elem.member_loads.append(TrussTemperatureLoad(
+                            delta_T=dT, load_case=meta["load_case"],
+                        ))
                         break
 
         elif keyword == "FRAME_TEMPERATURE":
-            # Format: elem_id  t_top  t_bottom
+            # Format: elem_id  t_top  t_bottom  [case=NAME]
             count = int(tokens[1])
             for _ in range(count):
                 i += 1
@@ -472,10 +490,15 @@ def read_input_file(filepath: str) -> StructuralModel:
                 eid = int(parts[0])
                 t_top = float(parts[1])
                 t_bottom = float(parts[2])
+                meta = _parse_load_metadata(
+                    parts, start_idx=3, section="FRAME_TEMPERATURE",
+                    accept_coord_system=False,
+                )
                 for elem in model.elements:
                     if elem.id == eid:
                         elem.member_loads.append(FrameTemperatureLoad(
                             t_top=t_top, t_bottom=t_bottom,
+                            load_case=meta["load_case"],
                         ))
                         break
 
@@ -546,3 +569,57 @@ def _parse_coord_system_token(token: str | None, section: str) -> str:
         f"{section}: unknown coord-system token {token!r}; "
         "expected 'local', 'global', or 'gravity' (or omit for local)."
     )
+
+
+def _parse_load_metadata(
+    parts: list[str], *, start_idx: int, section: str,
+    accept_coord_system: bool,
+) -> dict:
+    """Parse optional trailing tokens after the mandatory numeric fields.
+
+    Two flavours of trailing token (in this order if both present):
+
+    * ``coord_system`` — bare positional token ``local`` / ``global`` /
+      ``gravity`` (only for mechanical loads where
+      ``accept_coord_system=True``). Missing → ``"local"``.
+    * ``key=value`` — recognised today: ``case=<name>``. Missing →
+      ``"DEFAULT"``. Unknown keys raise so typos can't degrade silently.
+
+    Returns ``{"coord_system": str, "load_case": str}``. ``coord_system``
+    is always returned (set to ``"local"`` even on rows that don't carry
+    one, so callers can pass it through unconditionally).
+    """
+    coord_system = "local"
+    load_case = "DEFAULT"
+    seen_coord = False
+    for tok in parts[start_idx:]:
+        if "=" in tok:
+            key, _, val = tok.partition("=")
+            key_norm = key.strip().lower()
+            val_norm = val.strip()
+            if key_norm == "case":
+                if not val_norm:
+                    raise ValueError(
+                        f"{section}: empty case= value in row {parts!r}."
+                    )
+                load_case = val_norm
+            else:
+                raise ValueError(
+                    f"{section}: unknown key={key!r} in trailing token "
+                    f"{tok!r}. Allowed keys: ['case']."
+                )
+        else:
+            if not accept_coord_system:
+                raise ValueError(
+                    f"{section}: unexpected trailing token {tok!r} "
+                    "(no positional coord_system token allowed here; "
+                    "use key=value for metadata)."
+                )
+            if seen_coord:
+                raise ValueError(
+                    f"{section}: more than one positional "
+                    f"coord_system token in row {parts!r}."
+                )
+            coord_system = _parse_coord_system_token(tok, section)
+            seen_coord = True
+    return {"coord_system": coord_system, "load_case": load_case}

@@ -12,6 +12,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -1148,6 +1149,56 @@ class SupportDialog(_ModalDialog):
         ))
 
 
+# ── load_case combo (shared by Nodal + Member dialogs) ──
+
+#: Built-in suggestions for the load-case combo. The combo is editable
+#: so users can type custom case names; these are just convenient
+#: starting points.
+_LOAD_CASE_SUGGESTIONS = ("DEFAULT", "DEAD", "LIVE", "WIND", "THERMAL")
+
+
+def _make_load_case_combo(
+    parent: QWidget, current: str = "DEFAULT",
+) -> QComboBox:
+    """Return a populated, editable load-case combo with a sensible
+    initial value. Callers normalize the final value via
+    :func:`_normalize_load_case` on accept."""
+    combo = QComboBox(parent)
+    combo.setEditable(True)
+    combo.addItems(_LOAD_CASE_SUGGESTIONS)
+    current_norm = _normalize_load_case(current)
+    if current_norm in _LOAD_CASE_SUGGESTIONS:
+        combo.setCurrentText(current_norm)
+    else:
+        # Custom case name that isn't in the built-in suggestions.
+        combo.setEditText(current_norm)
+    combo.setToolTip(
+        "User-facing tag for this load (foundation for future load "
+        "cases & combinations). Editable — type custom cases here. "
+        "Blank / whitespace falls back to DEFAULT."
+    )
+    return combo
+
+
+def _normalize_load_case(raw: str | None) -> str:
+    """Trim + uppercase a user-entered case name. Empty → 'DEFAULT'.
+
+    Whitespace inside the case name is rejected because the file
+    writer stores it as a single whitespace-delimited token.
+    """
+    if raw is None:
+        return "DEFAULT"
+    stripped = raw.strip()
+    if not stripped:
+        return "DEFAULT"
+    if any(ch.isspace() for ch in stripped):
+        raise ValueError(
+            f"Load case {stripped!r} contains whitespace; case names "
+            "must be a single token. Use underscores or hyphens."
+        )
+    return stripped.upper()
+
+
 # ── nodal load ──
 
 
@@ -1168,12 +1219,19 @@ class NodalLoadDialog(_ModalDialog):
                 e.setText("0.0")
             form.addRow(label, e)
             self._entries[key] = e
+        existing_case = (
+            getattr(self._existing, "load_case", "DEFAULT")
+            if self._existing is not None else "DEFAULT"
+        )
+        self._case_combo = _make_load_case_combo(body, existing_case)
+        form.addRow("Load case:", self._case_combo)
 
-    def _accept(self) -> tuple[float, float, float]:
+    def _accept(self) -> tuple[float, float, float, str]:
         fx = parse_float(self._entries["fx"].text(), "Fx", allow_blank=True) or 0.0
         fy = parse_float(self._entries["fy"].text(), "Fy", allow_blank=True) or 0.0
         mz = parse_float(self._entries["mz"].text(), "Mz", allow_blank=True) or 0.0
-        return (fx, fy, mz)
+        load_case = _normalize_load_case(self._case_combo.currentText())
+        return (fx, fy, mz, load_case)
 
 
 # ── member load ──
@@ -1191,69 +1249,84 @@ class MemberLoadDialog(_ModalDialog):
 
     def _build_body(self, body: QWidget) -> None:
         v = QVBoxLayout(body)
-        is_truss = isinstance(self._elem, TrussElement2D)
-        choices = [("UDL (transverse)", "udl"),
-                   ("Point load", "point"),
-                   ("Thermal (truss ΔT)", "truss_t"),
-                   ("Thermal (frame top/bottom)", "frame_t")]
-        if is_truss:
-            choices = [c for c in choices if c[1] == "truss_t"]
-        else:
-            choices = [c for c in choices if c[1] != "truss_t"]
+        self._is_truss = isinstance(self._elem, TrussElement2D)
 
-        # Create field container first — the toggled signal handler reads it.
-        v.addWidget(QLabel("Type:", body))
-        self._group = QButtonGroup(body)
-        self._radios: dict[str, QRadioButton] = {}
-        radio_buttons: list[tuple[str, QRadioButton]] = []
-        for label, val in choices:
-            rb = QRadioButton(label, body)
-            v.addWidget(rb)
-            self._group.addButton(rb)
-            self._radios[val] = rb
-            radio_buttons.append((val, rb))
+        # ── Load category: Mechanical vs Thermal ───────────────────
+        # One radio per top-level category. The body swap below hides
+        # all controls that don't belong to the active category so
+        # neither half can leak into the other (thermal never sees the
+        # mechanical Direction radios; mechanical never sees the
+        # Thermal-type radios).
+        v.addWidget(QLabel("Load category:", body))
+        self._cat_group = QButtonGroup(body)
+        self._rb_cat_mechanical = QRadioButton("Mechanical", body)
+        self._rb_cat_mechanical.setToolTip(
+            "Force loads: distributed (UDL) or concentrated (point). "
+            "Choose a Type below and then a Direction (Local / Global "
+            "/ Gravity)."
+        )
+        self._rb_cat_thermal = QRadioButton("Thermal", body)
+        self._rb_cat_thermal.setToolTip(
+            "Temperature change. Uniform ΔT produces axial thermal "
+            "strain. A top/bottom gradient produces curvature "
+            "(bending if restrained) and requires a frame element."
+        )
+        self._cat_group.addButton(self._rb_cat_mechanical)
+        self._cat_group.addButton(self._rb_cat_thermal)
+        v.addWidget(self._rb_cat_mechanical)
+        v.addWidget(self._rb_cat_thermal)
+        self._rb_cat_mechanical.toggled.connect(self._refresh_fields)
+        self._rb_cat_thermal.toggled.connect(self._refresh_fields)
 
-        self._field_container = QWidget(body)
-        self._field_form = QFormLayout(self._field_container)
-        v.addWidget(self._field_container)
-        self._fields: dict[str, QLineEdit] = {}
+        # ── Mechanical Type selector (UDL / Point Load) ────────────
+        self._mech_widget = QWidget(body)
+        mech_layout = QVBoxLayout(self._mech_widget)
+        mech_layout.setContentsMargins(0, 4, 0, 0)
+        mech_layout.addWidget(QLabel("Type:", self._mech_widget))
+        self._mech_group = QButtonGroup(self._mech_widget)
+        self._rb_udl = QRadioButton(
+            "Uniform Distributed Load", self._mech_widget,
+        )
+        self._rb_point = QRadioButton("Point Load", self._mech_widget)
+        self._mech_group.addButton(self._rb_udl)
+        self._mech_group.addButton(self._rb_point)
+        mech_layout.addWidget(self._rb_udl)
+        mech_layout.addWidget(self._rb_point)
+        self._rb_udl.setChecked(True)
+        self._rb_udl.toggled.connect(self._refresh_fields)
+        self._rb_point.toggled.connect(self._refresh_fields)
+        v.addWidget(self._mech_widget)
 
-        # Coord-system block — only visible for mechanical UDL / PointLoad
-        # rows. Thermal loads are coordinate-system-independent so the
-        # radio block stays hidden for them (see _refresh_fields).
+        # ── Mechanical Direction (Local / Global / Gravity) ────────
         self._coord_widget = QWidget(body)
         coord_layout = QVBoxLayout(self._coord_widget)
         coord_layout.setContentsMargins(0, 4, 0, 0)
-        coord_layout.addWidget(QLabel("Load direction:", self._coord_widget))
+        coord_layout.addWidget(QLabel("Direction:", self._coord_widget))
         self._coord_group = QButtonGroup(self._coord_widget)
         self._rb_local = QRadioButton(
             "Local (element axes)", self._coord_widget,
         )
         self._rb_local.setToolTip(
-            "wy / py act along the element's local +y_local axis "
-            "(transverse) and wx / px along +x_local (axial). The "
-            "interpretation rotates with the element."
+            "Components act along the element's local axes — qy / py "
+            "transverse, qx / px axial. The interpretation rotates "
+            "with the element."
         )
         self._rb_global = QRadioButton(
             "Global (X / Y axes)", self._coord_widget,
         )
         self._rb_global.setToolTip(
-            "qX / qY components in global +X and global +Y. "
-            "Both are FORCE PER UNIT MEMBER LENGTH — not per "
-            "horizontal projection. The solver projects to the "
-            "element's local axes before forming fixed-end forces, "
-            "so inclined members pick up both axial and transverse "
-            "contributions."
+            "Components act along global X / Y. Force per unit MEMBER "
+            "length (not per horizontal projection). The solver "
+            "projects to local axes so inclined members pick up both "
+            "axial and transverse fixed-end forces."
         )
         self._rb_gravity = QRadioButton(
             "Gravity (global -Y)", self._coord_widget,
         )
         self._rb_gravity.setToolTip(
-            "Single magnitude field — positive acts straight DOWN "
-            "(global -Y), negative acts UP. Distinct from Global Y: "
-            "Global Y +10 means global +Y, Gravity +10 means global "
-            "-Y. The solver projects to the element's local axes "
-            "before forming fixed-end forces."
+            "Single magnitude — positive acts DOWN (global -Y). "
+            "Distinct from Global Y: Global Y +10 means global +Y; "
+            "Gravity +10 means global -Y."
         )
         self._coord_group.addButton(self._rb_local)
         self._coord_group.addButton(self._rb_global)
@@ -1262,25 +1335,74 @@ class MemberLoadDialog(_ModalDialog):
         coord_layout.addWidget(self._rb_global)
         coord_layout.addWidget(self._rb_gravity)
         self._rb_local.setChecked(True)
-        # Repaint fields whenever the direction changes so labels track
-        # the active mode (axial / qX / magnitude…).
         self._rb_local.toggled.connect(self._refresh_fields)
         self._rb_global.toggled.connect(self._refresh_fields)
         self._rb_gravity.toggled.connect(self._refresh_fields)
         v.addWidget(self._coord_widget)
 
-        # Now safely wire the toggled signal and default-select the first option.
-        for val, rb in radio_buttons:
-            rb.toggled.connect(self._refresh_fields)
-        first_key = choices[0][1]
-        self._radios[first_key].setChecked(True)
+        # ── Thermal Type selector (Uniform ΔT / Gradient) ──────────
+        # Gradient is frame-only; on a truss element the gradient
+        # radio is disabled with a tooltip explaining why.
+        self._thermal_widget = QWidget(body)
+        therm_layout = QVBoxLayout(self._thermal_widget)
+        therm_layout.setContentsMargins(0, 4, 0, 0)
+        therm_layout.addWidget(QLabel("Thermal type:", self._thermal_widget))
+        self._therm_group = QButtonGroup(self._thermal_widget)
+        self._rb_t_uniform = QRadioButton(
+            "Uniform ΔT", self._thermal_widget,
+        )
+        self._rb_t_uniform.setToolTip(
+            "Single temperature change applied uniformly through the "
+            "section. Produces axial thermal strain N_T = E·A·α·ΔT."
+        )
+        self._rb_t_gradient = QRadioButton(
+            "Top / bottom gradient", self._thermal_widget,
+        )
+        if self._is_truss:
+            self._rb_t_gradient.setEnabled(False)
+            self._rb_t_gradient.setToolTip(
+                "Thermal gradient requires frame bending DOFs. "
+                "Truss elements support uniform ΔT only."
+            )
+        else:
+            self._rb_t_gradient.setToolTip(
+                "Specify top and bottom fiber temperatures. The mean "
+                "produces axial strain; the difference produces "
+                "curvature (bending if restrained)."
+            )
+        self._therm_group.addButton(self._rb_t_uniform)
+        self._therm_group.addButton(self._rb_t_gradient)
+        therm_layout.addWidget(self._rb_t_uniform)
+        therm_layout.addWidget(self._rb_t_gradient)
+        self._rb_t_uniform.setChecked(True)
+        self._rb_t_uniform.toggled.connect(self._refresh_fields)
+        self._rb_t_gradient.toggled.connect(self._refresh_fields)
+        v.addWidget(self._thermal_widget)
+
+        # ── Numeric field container (rebuilt on every selection) ────
+        self._field_container = QWidget(body)
+        self._field_form = QFormLayout(self._field_container)
+        v.addWidget(self._field_container)
+        self._fields: dict[str, QLineEdit] = {}
+
+        # ── Load case combo (always visible) ───────────────────────
+        case_label = QLabel("Load case:", body)
+        v.addWidget(case_label)
+        self._case_combo = _make_load_case_combo(body, "DEFAULT")
+        v.addWidget(self._case_combo)
+
+        # Default to Mechanical category and paint the matching body.
+        self._rb_cat_mechanical.setChecked(True)
         self._refresh_fields()
 
-    def _current_kind(self) -> str:
-        for key, rb in self._radios.items():
-            if rb.isChecked():
-                return key
-        return next(iter(self._radios))
+    def _current_category(self) -> str:
+        return "thermal" if self._rb_cat_thermal.isChecked() else "mechanical"
+
+    def _current_mechanical_kind(self) -> str:
+        return "point" if self._rb_point.isChecked() else "udl"
+
+    def _current_thermal_kind(self) -> str:
+        return "gradient" if self._rb_t_gradient.isChecked() else "uniform"
 
     def _current_coord_system(self) -> str:
         if self._rb_gravity.isChecked():
@@ -1297,40 +1419,52 @@ class MemberLoadDialog(_ModalDialog):
             if w is not None:
                 w.deleteLater()
         self._fields = {}
-        kind = self._current_kind()
-        # Mechanical loads get the coord-system radio + per-mode labels.
-        # Thermal loads keep the simpler one/two-field form.
-        mechanical = kind in ("udl", "point")
-        self._coord_widget.setVisible(mechanical)
-        cs = self._current_coord_system() if mechanical else "local"
-        if kind == "udl":
-            if cs == "local":
-                self._add_field("wx (kN/m, local x / axial)", "wx")
-                self._add_field("wy (kN/m, local y / transverse)", "wy")
-            elif cs == "global":
-                self._add_field("qX (kN/m, global X)", "wx")
-                self._add_field("qY (kN/m, global Y)", "wy")
-            else:  # gravity
-                self._add_field(
-                    "magnitude (kN/m, +ve downward · global -Y)", "wy",
-                )
-        elif kind == "point":
-            if cs == "local":
-                self._add_field("px (kN, local x / axial)", "px")
-                self._add_field("py (kN, local y / transverse)", "py")
-            elif cs == "global":
-                self._add_field("pX (kN, global X)", "px")
-                self._add_field("pY (kN, global Y)", "py")
-            else:  # gravity
-                self._add_field(
-                    "magnitude (kN, +ve downward · global -Y)", "py",
-                )
-            self._add_field("a (m from start node)", "a")
-        elif kind == "truss_t":
-            self._add_field("ΔT (°C)", "delta_T")
-        elif kind == "frame_t":
-            self._add_field("t_top (°C)", "t_top")
-            self._add_field("t_bottom (°C)", "t_bottom")
+
+        cat = self._current_category()
+        if cat == "mechanical":
+            self._mech_widget.setVisible(True)
+            self._coord_widget.setVisible(True)
+            self._thermal_widget.setVisible(False)
+            kind = self._current_mechanical_kind()
+            cs = self._current_coord_system()
+            if kind == "udl":
+                if cs == "local":
+                    self._add_field("wx (kN/m, local x / axial)", "wx")
+                    self._add_field("wy (kN/m, local y / transverse)", "wy")
+                elif cs == "global":
+                    self._add_field("qX (kN/m, global X)", "wx")
+                    self._add_field("qY (kN/m, global Y)", "wy")
+                else:  # gravity
+                    self._add_field(
+                        "qg (kN/m, +ve downward · global -Y)", "wy",
+                    )
+            else:  # point
+                if cs == "local":
+                    self._add_field("Px (kN, local x / axial)", "px")
+                    self._add_field("Py (kN, local y / transverse)", "py")
+                elif cs == "global":
+                    self._add_field("PX (kN, global X)", "px")
+                    self._add_field("PY (kN, global Y)", "py")
+                else:  # gravity
+                    self._add_field(
+                        "Pg (kN, +ve downward · global -Y)", "py",
+                    )
+                self._add_field("a (m from start node)", "a")
+        else:  # thermal
+            self._mech_widget.setVisible(False)
+            self._coord_widget.setVisible(False)
+            self._thermal_widget.setVisible(True)
+            # Truss elements may not use the gradient mode; force
+            # uniform back on if the user (or a previous selection)
+            # somehow landed on gradient.
+            if self._is_truss and self._rb_t_gradient.isChecked():
+                self._rb_t_uniform.setChecked(True)
+            tkind = self._current_thermal_kind()
+            if tkind == "uniform":
+                self._add_field("ΔT (°C, uniform through depth)", "delta_T")
+            else:
+                self._add_field("t_top (°C)", "t_top")
+                self._add_field("t_bottom (°C)", "t_bottom")
 
     def _add_field(self, label: str, key: str) -> None:
         e = QLineEdit(self._field_container)
@@ -1339,53 +1473,80 @@ class MemberLoadDialog(_ModalDialog):
         self._fields[key] = e
 
     def _accept(self) -> Any:
-        kind = self._current_kind()
-        if kind == "udl":
+        load_case = _normalize_load_case(self._case_combo.currentText())
+        cat = self._current_category()
+        if cat == "mechanical":
+            kind = self._current_mechanical_kind()
             cs = self._current_coord_system()
-            # parse_float's error name must match the on-screen field
-            # label so "Invalid number for qY" replaces a confusing
-            # "Invalid number for wy" when Global is selected.
-            y_name = (
-                "magnitude" if cs == "gravity"
-                else ("qY" if cs == "global" else "wy")
-            )
-            wy = parse_float(self._fields["wy"].text(), y_name)
-            # Gravity hides the wx field — pass wx=0 so the load class
-            # __post_init__ accepts it. Local and global show wx.
-            wx = 0.0
-            if cs != "gravity":
-                x_name = "qX" if cs == "global" else "wx"
-                wx = parse_float(
-                    self._fields["wx"].text(), x_name, allow_blank=True,
-                ) or 0.0
-            return UniformDistributedLoad(wy=wy, wx=wx, coord_system=cs)
-        if kind == "point":
-            cs = self._current_coord_system()
-            y_name = (
-                "magnitude" if cs == "gravity"
-                else ("pY" if cs == "global" else "py")
-            )
-            py = parse_float(self._fields["py"].text(), y_name)
-            px = 0.0
-            if cs != "gravity":
-                x_name = "pX" if cs == "global" else "px"
-                px = parse_float(
-                    self._fields["px"].text(), x_name, allow_blank=True,
-                ) or 0.0
-            a = parse_float(self._fields["a"].text(), "a")
-            L, _, _ = self._elem.length_cos_sin(self._model.nodes)
-            if a < 0 or a > L:
-                raise ValueError(f"a must lie within [0, {L:.3g}] (element length).")
-            return PointLoad(py=py, a=a, px=px, coord_system=cs)
-        if kind == "truss_t":
-            return TrussTemperatureLoad(
-                delta_T=parse_float(self._fields["delta_T"].text(), "ΔT"))
-        if kind == "frame_t":
+            if kind == "udl":
+                # parse_float's error name must match the on-screen field
+                # label so "Invalid number for qY" replaces a confusing
+                # "Invalid number for wy" when Global is selected.
+                y_name = (
+                    "qg" if cs == "gravity"
+                    else ("qY" if cs == "global" else "wy")
+                )
+                wy = parse_float(self._fields["wy"].text(), y_name)
+                # Gravity hides the wx field — pass wx=0 so the load
+                # class __post_init__ accepts it. Local and global
+                # show wx.
+                wx = 0.0
+                if cs != "gravity":
+                    x_name = "qX" if cs == "global" else "wx"
+                    wx = parse_float(
+                        self._fields["wx"].text(), x_name, allow_blank=True,
+                    ) or 0.0
+                return UniformDistributedLoad(
+                    wy=wy, wx=wx, coord_system=cs, load_case=load_case,
+                )
+            else:  # point
+                y_name = (
+                    "Pg" if cs == "gravity"
+                    else ("PY" if cs == "global" else "Py")
+                )
+                py = parse_float(self._fields["py"].text(), y_name)
+                px = 0.0
+                if cs != "gravity":
+                    x_name = "PX" if cs == "global" else "Px"
+                    px = parse_float(
+                        self._fields["px"].text(), x_name, allow_blank=True,
+                    ) or 0.0
+                a = parse_float(self._fields["a"].text(), "a")
+                L, _, _ = self._elem.length_cos_sin(self._model.nodes)
+                if a < 0 or a > L:
+                    raise ValueError(
+                        f"a must lie within [0, {L:.3g}] (element length)."
+                    )
+                return PointLoad(
+                    py=py, a=a, px=px, coord_system=cs,
+                    load_case=load_case,
+                )
+        # thermal
+        tkind = self._current_thermal_kind()
+        if tkind == "uniform":
+            dT = parse_float(self._fields["delta_T"].text(), "ΔT")
+            if self._is_truss:
+                return TrussTemperatureLoad(
+                    delta_T=dT, load_case=load_case,
+                )
+            # Frame uniform ΔT → store as FrameTemperatureLoad with
+            # t_top == t_bottom == ΔT so the rest of the pipeline
+            # (solver, format_element_loads) treats it as a pure
+            # uniform load.
             return FrameTemperatureLoad(
-                t_top=parse_float(self._fields["t_top"].text(), "t_top"),
-                t_bottom=parse_float(self._fields["t_bottom"].text(), "t_bottom"),
+                t_top=dT, t_bottom=dT, load_case=load_case,
             )
-        raise ValueError(f"Unknown load type {kind!r}.")
+        # gradient — guarded by truss-disable above; defensive raise.
+        if self._is_truss:
+            raise ValueError(
+                "Thermal gradient requires frame bending DOFs. "
+                "Truss elements support uniform ΔT only."
+            )
+        return FrameTemperatureLoad(
+            t_top=parse_float(self._fields["t_top"].text(), "t_top"),
+            t_bottom=parse_float(self._fields["t_bottom"].text(), "t_bottom"),
+            load_case=load_case,
+        )
 
 
 # ── labeled grid system ──
@@ -1794,7 +1955,14 @@ def _nodal_load_summary(model: StructuralModel, node_id: int) -> str:
     load = next((ld for ld in model.nodal_loads if ld.node_id == node_id), None)
     if load is None:
         return "(none)"
-    return f"Fx = {load.fx:g} kN,  Fy = {load.fy:g} kN,  Mz = {load.mz:g} kN·m"
+    base = (
+        f"Fx = {load.fx:g} kN,  Fy = {load.fy:g} kN,  "
+        f"Mz = {load.mz:g} kN·m"
+    )
+    case = getattr(load, "load_case", "DEFAULT")
+    if case and case != "DEFAULT":
+        base += f"  ·  case: {case}"
+    return base
 
 
 def _member_loads_summary(elem) -> list[str]:
@@ -2208,9 +2376,9 @@ class ElementPropertiesDialog(QDialog):
         from .load_summary import format_element_loads
 
         rows = format_element_loads(model, elem)
-        table = QTableWidget(0, 5)
+        table = QTableWidget(0, 6)
         table.setHorizontalHeaderLabels(
-            ["#", "Type", "Magnitude", "Position / Notes", ""]
+            ["#", "Type", "Magnitude", "Position / Notes", "Case", ""]
         )
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -2229,12 +2397,15 @@ class ElementPropertiesDialog(QDialog):
         header.setSectionResizeMode(
             4, QHeaderView.ResizeMode.ResizeToContents,
         )
+        header.setSectionResizeMode(
+            5, QHeaderView.ResizeMode.ResizeToContents,
+        )
         if not rows:
             table.setRowCount(1)
             none_item = QTableWidgetItem("(no member loads)")
             none_item.setFlags(Qt.ItemFlag.NoItemFlags)
             table.setItem(0, 0, QTableWidgetItem(""))
-            table.setSpan(0, 0, 1, 5)
+            table.setSpan(0, 0, 1, 6)
             table.setItem(0, 0, none_item)
         else:
             table.setRowCount(len(rows))
@@ -2245,6 +2416,16 @@ class ElementPropertiesDialog(QDialog):
                 table.setItem(i, 1, t_item)
                 table.setItem(i, 2, QTableWidgetItem(row.magnitude))
                 table.setItem(i, 3, QTableWidgetItem(row.position))
+                # Case column: dim "—" placeholder for the default case
+                # so legacy data doesn't visually shout a case tag it
+                # never had.
+                case_text = (
+                    "—" if row.load_case == "DEFAULT" else row.load_case
+                )
+                case_item = QTableWidgetItem(case_text)
+                if row.load_case == "DEFAULT":
+                    case_item.setForeground(QColor("#888"))
+                table.setItem(i, 4, case_item)
                 btn = QPushButton("Delete")
                 btn.setEnabled(
                     self._host_delete_member_load is not None
@@ -2257,7 +2438,7 @@ class ElementPropertiesDialog(QDialog):
                     lambda _checked=False, idx=load_idx:
                     self._on_delete_load_clicked(idx)
                 )
-                table.setCellWidget(i, 4, btn)
+                table.setCellWidget(i, 5, btn)
         # Compact height: header + min(rows, 6) rows.
         n_visible = max(1, min(len(rows) or 1, 6))
         row_h = table.verticalHeader().defaultSectionSize()

@@ -26,6 +26,23 @@ def _fmt(x: float) -> str:
     return repr(float(x))
 
 
+def _case_token(load_case: str) -> str:
+    """Return ``"  case=NAME"`` only when load_case differs from the
+    default. Whitespace in the case name would break the
+    whitespace-tokenised reader, so reject it here rather than
+    silently emit a corrupt file.
+    """
+    if not load_case or load_case == "DEFAULT":
+        return ""
+    if any(ch.isspace() for ch in load_case):
+        raise ValueError(
+            f"load_case {load_case!r} contains whitespace; the "
+            "input-file format stores it as a single token. Rename "
+            "the case (underscores or hyphens) before saving."
+        )
+    return f"  case={load_case}"
+
+
 def _check_name(kind: str, obj_id: int, name: str) -> None:
     # The parser reads name as a single whitespace-delimited token, so any
     # embedded whitespace would silently truncate on reload.
@@ -171,7 +188,11 @@ def write_input_file(model: StructuralModel, path: str) -> None:
 
     out.append(f"LOADS {len(model.nodal_loads)}")
     for ld in model.nodal_loads:
-        out.append(f"{ld.node_id}  {_fmt(ld.fx)}  {_fmt(ld.fy)}  {_fmt(ld.mz)}")
+        out.append(
+            f"{ld.node_id}  {_fmt(ld.fx)}  {_fmt(ld.fy)}  "
+            f"{_fmt(ld.mz)}"
+            + _case_token(getattr(ld, "load_case", "DEFAULT"))
+        )
     out.append("")
 
     udls: list[tuple[int, UniformDistributedLoad]] = []
@@ -198,6 +219,7 @@ def write_input_file(model: StructuralModel, path: str) -> None:
             # byte-identical to pre-v0.15.0 output.
             if u.coord_system != "local":
                 row += f"  {u.coord_system}"
+            row += _case_token(getattr(u, "load_case", "DEFAULT"))
             out.append(row)
         out.append("")
     if points:
@@ -206,17 +228,24 @@ def write_input_file(model: StructuralModel, path: str) -> None:
             row = f"{eid}  {_fmt(p.a)}  {_fmt(p.px)}  {_fmt(p.py)}"
             if p.coord_system != "local":
                 row += f"  {p.coord_system}"
+            row += _case_token(getattr(p, "load_case", "DEFAULT"))
             out.append(row)
         out.append("")
     if truss_temps:
         out.append(f"TRUSS_TEMPERATURE {len(truss_temps)}")
         for eid, t in truss_temps:
-            out.append(f"{eid}  {_fmt(t.delta_T)}")
+            out.append(
+                f"{eid}  {_fmt(t.delta_T)}"
+                + _case_token(getattr(t, "load_case", "DEFAULT"))
+            )
         out.append("")
     if frame_temps:
         out.append(f"FRAME_TEMPERATURE {len(frame_temps)}")
         for eid, t in frame_temps:
-            out.append(f"{eid}  {_fmt(t.t_top)}  {_fmt(t.t_bottom)}")
+            out.append(
+                f"{eid}  {_fmt(t.t_top)}  {_fmt(t.t_bottom)}"
+                + _case_token(getattr(t, "load_case", "DEFAULT"))
+            )
         out.append("")
 
     # ANALYSIS_OPTIONS — only when at least one option differs from
