@@ -1369,3 +1369,255 @@ def test_delete_case_allowed_after_combination_removed():
     DeleteLoadCombinationCmd(name="C1").do(m)
     DeleteLoadCaseCmd(name="DEAD").do(m)  # now allowed
     assert "DEAD" not in m.load_cases
+
+
+# ── Nodal-load CRUD (v0.20 — PR #30) ───────────────────────────────────
+
+
+def _model_with_node_and_two_cases():
+    """One node + DEAD + LIVE cases (DEFAULT auto-created)."""
+    from structural_analysis.gui_common.commands import (
+        AddLoadCaseCmd, AddNodeCmd,
+    )
+    m = StructuralModel(title="nodal-loads")
+    AddNodeCmd(x=0.0, y=0.0).do(m)
+    AddLoadCaseCmd(name="DEAD").do(m)
+    AddLoadCaseCmd(name="LIVE").do(m)
+    return m
+
+
+def test_add_nodal_load_appends_new_row():
+    from structural_analysis.gui_common.commands import AddNodalLoadCmd
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE").do(m)
+    assert len(m.nodal_loads) == 2
+    assert [ld.load_case for ld in m.nodal_loads] == ["DEAD", "LIVE"]
+    assert [ld.fy for ld in m.nodal_loads] == [-10.0, -20.0]
+
+
+def test_add_nodal_load_does_not_overwrite_existing_case():
+    from structural_analysis.gui_common.commands import AddNodalLoadCmd
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE").do(m)
+    # The DEAD row must still be present and unchanged.
+    dead = [ld for ld in m.nodal_loads if ld.load_case == "DEAD"]
+    assert len(dead) == 1
+    assert dead[0].fy == -10.0
+
+
+def test_add_nodal_load_allows_two_rows_same_case():
+    from structural_analysis.gui_common.commands import AddNodalLoadCmd
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fx=5.0, load_case="DEAD").do(m)
+    AddNodalLoadCmd(node_id=1, fy=-7.0, load_case="DEAD").do(m)
+    dead = [ld for ld in m.nodal_loads if ld.load_case == "DEAD"]
+    assert len(dead) == 2
+    assert dead[0].fx == 5.0 and dead[1].fy == -7.0
+
+
+def test_add_nodal_load_rejects_zero_row():
+    from structural_analysis.gui_common.commands import AddNodalLoadCmd
+    m = _model_with_node_and_two_cases()
+    with pytest.raises(ValueError, match=r"nothing to add"):
+        AddNodalLoadCmd(node_id=1, fx=0.0, fy=0.0, mz=0.0).do(m)
+    assert m.nodal_loads == []
+
+
+def test_add_nodal_load_rejects_unknown_node():
+    from structural_analysis.gui_common.commands import AddNodalLoadCmd
+    m = _model_with_node_and_two_cases()
+    with pytest.raises(ValueError, match=r"Node 99 does not exist"):
+        AddNodalLoadCmd(node_id=99, fy=-10.0).do(m)
+
+
+def test_add_nodal_load_undo_removes_only_added_row():
+    from structural_analysis.gui_common.commands import AddNodalLoadCmd
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    cmd = AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE")
+    cmd.do(m)
+    cmd.undo(m)
+    # LIVE row gone; DEAD row preserved.
+    assert len(m.nodal_loads) == 1
+    assert m.nodal_loads[0].load_case == "DEAD"
+    assert m.nodal_loads[0].fy == -10.0
+
+
+def test_edit_nodal_load_row_only_changes_target_row():
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, EditNodalLoadRowCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE").do(m)
+    # Edit row 1 (LIVE) → fy = -30; DEAD untouched.
+    EditNodalLoadRowCmd(
+        row_index=1, fx=0.0, fy=-30.0, mz=0.0, load_case="LIVE",
+    ).do(m)
+    assert m.nodal_loads[0].load_case == "DEAD" and m.nodal_loads[0].fy == -10.0
+    assert m.nodal_loads[1].load_case == "LIVE" and m.nodal_loads[1].fy == -30.0
+
+
+def test_edit_nodal_load_row_undo_restores_original():
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, EditNodalLoadRowCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE").do(m)
+    cmd = EditNodalLoadRowCmd(
+        row_index=0, fx=0.0, fy=-30.0, mz=0.0, load_case="LIVE",
+    )
+    cmd.do(m)
+    cmd.undo(m)
+    assert m.nodal_loads[0].fy == -20.0
+
+
+def test_edit_nodal_load_row_out_of_range():
+    from structural_analysis.gui_common.commands import EditNodalLoadRowCmd
+    m = _model_with_node_and_two_cases()
+    with pytest.raises(ValueError, match=r"out of range"):
+        EditNodalLoadRowCmd(
+            row_index=0, fx=0.0, fy=-1.0, mz=0.0,
+        ).do(m)
+
+
+def test_edit_nodal_load_row_rejects_zero():
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, EditNodalLoadRowCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0).do(m)
+    with pytest.raises(ValueError, match=r"use Delete"):
+        EditNodalLoadRowCmd(
+            row_index=0, fx=0.0, fy=0.0, mz=0.0,
+        ).do(m)
+
+
+def test_delete_nodal_load_row_removes_only_target():
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, DeleteNodalLoadRowCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE").do(m)
+    AddNodalLoadCmd(node_id=1, fx=5.0, load_case="WIND").do(m)
+    # Delete LIVE (index 1). DEAD + WIND stay.
+    DeleteNodalLoadRowCmd(row_index=1).do(m)
+    assert [ld.load_case for ld in m.nodal_loads] == ["DEAD", "WIND"]
+
+
+def test_delete_nodal_load_row_undo_restores_at_same_index():
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, DeleteNodalLoadRowCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE").do(m)
+    cmd = DeleteNodalLoadRowCmd(row_index=0)
+    cmd.do(m)
+    cmd.undo(m)
+    # Original DEAD-then-LIVE ordering must be preserved.
+    assert [ld.load_case for ld in m.nodal_loads] == ["DEAD", "LIVE"]
+    assert m.nodal_loads[0].fy == -10.0
+
+
+def test_delete_nodal_load_row_out_of_range():
+    from structural_analysis.gui_common.commands import DeleteNodalLoadRowCmd
+    m = _model_with_node_and_two_cases()
+    with pytest.raises(ValueError, match=r"out of range"):
+        DeleteNodalLoadRowCmd(row_index=0).do(m)
+
+
+def test_delete_node_cascades_all_nodal_load_rows_and_undo_restores():
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, DeleteNodeCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE").do(m)
+    cmd = DeleteNodeCmd(node_id=1)
+    cmd.do(m)
+    assert m.nodal_loads == []
+    assert 1 not in m.nodes
+    cmd.undo(m)
+    assert 1 in m.nodes
+    assert {ld.load_case for ld in m.nodal_loads} == {"DEAD", "LIVE"}
+    assert sorted(ld.fy for ld in m.nodal_loads) == [-20.0, -10.0]
+
+
+def test_rename_case_cascades_to_nodal_load_rows():
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, RenameLoadCaseCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE").do(m)
+    RenameLoadCaseCmd(old_name="DEAD", new_name="PERM").do(m)
+    cases = sorted(ld.load_case for ld in m.nodal_loads)
+    assert cases == ["LIVE", "PERM"]
+
+
+def test_delete_case_blocked_when_nodal_load_references_it_with_no_reassign():
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, DeleteLoadCaseCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    with pytest.raises(ValueError, match=r"referenced by attached loads"):
+        DeleteLoadCaseCmd(name="DEAD", reassign_to=None).do(m)
+
+
+def test_add_nodal_load_undo_is_identity_based_under_non_lifo_mutation():
+    """PR #30 reviewer fix (Gemini HIGH / Codex P2): when another
+    command inserts a row between AddNodalLoadCmd's do() and undo(),
+    the original stale-index fix could either delete the wrong row or
+    no-op. Identity tracking removes the row the command actually
+    added, even when its position has shifted.
+    """
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, DeleteNodalLoadRowCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    # add A at index 0, then B at index 1.
+    add_a = AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD")
+    add_b = AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE")
+    add_a.do(m)
+    add_b.do(m)
+    # Non-LIFO: delete A (the *first* row, index 0). B is now at index 0.
+    DeleteNodalLoadRowCmd(row_index=0).do(m)
+    assert len(m.nodal_loads) == 1
+    assert m.nodal_loads[0].load_case == "LIVE"
+    # Identity-based undo removes B, not whatever sits at the stale
+    # index 1 (which is past the end now).
+    add_b.undo(m)
+    assert m.nodal_loads == []
+
+
+def test_edit_nodal_load_row_undo_is_identity_based_under_non_lifo_mutation():
+    """Mirror of the AddNodalLoadCmd identity regression for Edit:
+    after an Edit replaces row 1, an unrelated delete of row 0 shifts
+    the edited row to index 0. Identity-based undo still restores the
+    pre-edit row at the correct (new) position."""
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, DeleteNodalLoadRowCmd, EditNodalLoadRowCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE").do(m)
+    edit_b = EditNodalLoadRowCmd(
+        row_index=1, fx=0.0, fy=-30.0, mz=0.0, load_case="LIVE",
+    )
+    edit_b.do(m)
+    assert m.nodal_loads[1].fy == -30.0
+    # Non-LIFO mutation: delete row 0 (DEAD). The edited LIVE row
+    # moves from index 1 to index 0.
+    DeleteNodalLoadRowCmd(row_index=0).do(m)
+    assert len(m.nodal_loads) == 1
+    assert m.nodal_loads[0].fy == -30.0
+    # Identity-based undo restores the pre-edit LIVE row in place.
+    edit_b.undo(m)
+    assert len(m.nodal_loads) == 1
+    assert m.nodal_loads[0].fy == -20.0
+    assert m.nodal_loads[0].load_case == "LIVE"

@@ -4909,3 +4909,405 @@ def test_member_load_dialog_uniform_gradient_toggle_no_extra_top_level(qt_app):
         d._refresh_fields()
     qt_app.processEvents()
     assert _count_top_level_widgets() <= before
+
+
+# ── PR #30: multiple nodal loads per node + manager dialog ───────────
+
+
+def _single_node_window(qt_app):
+    """MainWindow with a single node (id=1) at the origin — enough for
+    the nodal-load manager tests."""
+    from structural_analysis.model import Node
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0)}
+    return w
+
+
+def test_nodal_load_manager_lists_existing_rows(qt_app):
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    assert d._table.rowCount() == 2
+    assert d._table.item(0, 0).text() == "DEAD"
+    assert d._table.item(1, 0).text() == "LIVE"
+
+
+def test_nodal_load_manager_add_appends_undoable_row(qt_app, monkeypatch):
+    from structural_analysis.gui_qt import dialogs as dlg_mod
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    w = _single_node_window(qt_app)
+    # Stub the inner add/edit form to return a fixed value without
+    # showing a modal exec(). The manager treats _open_form's return
+    # tuple as (fx, fy, mz, load_case).
+    monkeypatch.setattr(
+        NodalLoadManagerDialog, "_open_form",
+        lambda self, existing=None: (0.0, -10.0, 0.0, "DEAD"),
+    )
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    d._on_add()
+    assert len(w._model.nodal_loads) == 1
+    assert w._model.nodal_loads[0].load_case == "DEAD"
+    # Single undo removes the row.
+    w._do_undo()
+    assert w._model.nodal_loads == []
+
+
+def test_nodal_load_manager_edit_only_changes_selected_row(qt_app, monkeypatch):
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    # Select the LIVE row (visible index 1).
+    d._table.selectRow(1)
+    monkeypatch.setattr(
+        NodalLoadManagerDialog, "_open_form",
+        lambda self, existing=None: (0.0, -30.0, 0.0, "LIVE"),
+    )
+    d._on_edit()
+    # DEAD row unchanged.
+    assert w._model.nodal_loads[0].fy == -10.0
+    assert w._model.nodal_loads[0].load_case == "DEAD"
+    # LIVE row updated.
+    assert w._model.nodal_loads[1].fy == -30.0
+    # Undo restores LIVE row to -20.
+    w._do_undo()
+    assert w._model.nodal_loads[1].fy == -20.0
+
+
+def test_nodal_load_manager_delete_only_removes_selected_row(qt_app):
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    w._model.nodal_loads.append(NodalLoad(1, fx=5.0, load_case="WIND"))
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    # Select the LIVE row (visible index 1).
+    d._table.selectRow(1)
+    d._on_delete()
+    cases = [ld.load_case for ld in w._model.nodal_loads]
+    assert cases == ["DEAD", "WIND"]
+    w._do_undo()
+    cases = [ld.load_case for ld in w._model.nodal_loads]
+    assert cases == ["DEAD", "LIVE", "WIND"]
+
+
+def test_nodal_load_manager_edit_with_no_selection_warns(qt_app, monkeypatch):
+    from structural_analysis.gui_qt import dialogs as dlg_mod
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0))
+    infos: list = []
+    monkeypatch.setattr(
+        dlg_mod.QMessageBox, "information",
+        lambda *a, **k: infos.append(a),
+    )
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    d._table.clearSelection()
+    d._on_edit()
+    # Model untouched; user got a message.
+    assert len(w._model.nodal_loads) == 1
+    assert infos
+
+
+def test_nodal_load_manager_add_rejects_zero_load(qt_app, monkeypatch):
+    from structural_analysis.gui_qt import dialogs as dlg_mod
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    w = _single_node_window(qt_app)
+    infos: list = []
+    monkeypatch.setattr(
+        dlg_mod.QMessageBox, "information",
+        lambda *a, **k: infos.append(a),
+    )
+    monkeypatch.setattr(
+        NodalLoadManagerDialog, "_open_form",
+        lambda self, existing=None: (0.0, 0.0, 0.0, "DEAD"),
+    )
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    d._on_add()
+    assert w._model.nodal_loads == []
+    assert infos
+
+
+def test_nodal_load_manager_invalidates_stale_results(qt_app, monkeypatch):
+    """Each Add/Edit/Delete must invalidate cached solve results so the
+    user can't view a stale diagram after editing loads."""
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEFAULT"))
+    # Mock a "solved" state on the host.
+    w._result = object()
+    monkeypatch.setattr(
+        NodalLoadManagerDialog, "_open_form",
+        lambda self, existing=None: (0.0, -20.0, 0.0, "DEFAULT"),
+    )
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    d._table.selectRow(0)
+    d._on_edit()
+    # The host's invalidation surface clears _result.
+    assert w._result is None
+
+
+def test_node_properties_dialog_shows_multi_row_summary(qt_app):
+    from structural_analysis.gui_qt.dialogs import _nodal_load_summary
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    text = _nodal_load_summary(w._model, 1)
+    # Two bullet rows in the summary.
+    assert text.count("•") == 2
+    assert "DEAD" in text and "LIVE" in text
+
+
+def test_node_properties_dialog_empty_state(qt_app):
+    from structural_analysis.gui_qt.dialogs import _nodal_load_summary
+    w = _single_node_window(qt_app)
+    assert _nodal_load_summary(w._model, 1) == "(none)"
+
+
+def test_node_menu_action_opens_nodal_load_manager(qt_app, monkeypatch):
+    """The right-click → 'edit nodal load…' action must open the new
+    manager dialog (not the legacy single-load editor)."""
+    from structural_analysis.gui_qt import dialogs as dlg_mod
+    opened: list = []
+
+    class _StubMgr:
+        def __init__(self, parent, *, host, model, node_id):
+            opened.append(node_id)
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(dlg_mod, "NodalLoadManagerDialog", _StubMgr)
+    from structural_analysis.gui_qt import app as app_mod
+    monkeypatch.setattr(app_mod, "NodalLoadManagerDialog", _StubMgr)
+    w = _single_node_window(qt_app)
+    w._edit_nodal_load(1)
+    assert opened == [1]
+
+
+def test_nodal_load_manager_skips_unrelated_node_rows(qt_app):
+    """Loads attached to other nodes must not appear in the per-node
+    manager's table."""
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import Node, NodalLoad
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(2, fy=-99.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    assert d._table.rowCount() == 2
+    cases = [d._table.item(i, 0).text() for i in range(2)]
+    assert cases == ["DEAD", "LIVE"]
+
+
+def test_nodal_load_manager_handles_intervening_rows_correctly(qt_app, monkeypatch):
+    """When other-node loads appear between this node's rows, the
+    captured global-index must still target the right row on Edit."""
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import Node, NodalLoad
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    # Interleave: node1 DEAD, node2 DEAD, node1 LIVE.
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(2, fy=-99.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    # Visible row 1 (LIVE) maps to global index 2 in model.nodal_loads.
+    d._table.selectRow(1)
+    monkeypatch.setattr(
+        NodalLoadManagerDialog, "_open_form",
+        lambda self, existing=None: (0.0, -30.0, 0.0, "LIVE"),
+    )
+    d._on_edit()
+    # Node-2 row (global index 1) untouched.
+    assert w._model.nodal_loads[1].node_id == 2
+    assert w._model.nodal_loads[1].fy == -99.0
+    # Node-1 LIVE row updated.
+    assert w._model.nodal_loads[2].node_id == 1
+    assert w._model.nodal_loads[2].fy == -30.0
+
+
+# ── PR #31 — combination result display fix (combo label vs. data) ───
+
+
+def test_combination_result_displayed_after_combo_click(qt_app):
+    """Regression: selecting COMB1 in the toolbar combo via the signal
+    path (currentTextChanged emits the decorated label, e.g.
+    ``"COMB1  [comb]"``) must still produce a non-None result.
+
+    Before the fix ``_on_active_case_changed`` stored the display label
+    as ``_active_case``, making ``_resolve_active_result`` look up a
+    non-existent key and return None — showing "no analysis run yet".
+    """
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.1}))
+    w._do_solve()
+    qt_app.processEvents()
+
+    # Simulate the user clicking COMB1 in the combo — sets current index
+    # which fires currentTextChanged with the decorated label.
+    idx = w._case_combo.findData("COMB1")
+    assert idx >= 0, "COMB1 must appear in selector after solve"
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    # _active_case must be the raw name, not the decorated label.
+    assert w._active_case == "COMB1"
+    # Result must be resolved (not None).
+    assert w._result is not None, (
+        "_result is None after selecting COMB1 — combination display broken"
+    )
+
+
+def test_combination_result_text_not_placeholder_after_combo_click(qt_app):
+    """The analysis-report panel must not show the pre-solve placeholder
+    when a valid combination is selected via the toolbar combo."""
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.1}))
+    w._do_solve()
+    qt_app.processEvents()
+
+    idx = w._case_combo.findData("COMB1")
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    text = w._result_text.toPlainText()
+    assert "(no analysis run yet)" not in text, (
+        f"Report panel still shows placeholder after selecting COMB1: {text!r}"
+    )
+
+
+def test_combination_created_before_solve_available_via_combo(qt_app):
+    """Workflow: create combination → solve → select via combo.
+
+    The combination must be available immediately after the solve
+    without any extra manual step."""
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    # Define combination BEFORE solving.
+    w.execute(AddLoadCombinationCmd(name="COMB_EARLY", terms={"DEAD": 1.2}))
+    w._do_solve()
+    qt_app.processEvents()
+
+    idx = w._case_combo.findData("COMB_EARLY")
+    assert idx >= 0, "COMB_EARLY must appear in selector after solve"
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    assert w._active_case == "COMB_EARLY"
+    assert w._result is not None
+
+
+def test_combination_created_after_solve_available_immediately(qt_app):
+    """Workflow: solve → create combination → select via combo.
+
+    The combination must work immediately — the user must NOT need to
+    re-solve after adding a combination when its base cases are already
+    solved."""
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._multi_result is not None
+
+    # Add combination AFTER solving.  This normally clears _multi_result
+    # (stale-invalidation path), so solve again to restore it.
+    w.execute(AddLoadCombinationCmd(name="COMB_LATE", terms={"DEAD": 0.9}))
+    w._do_solve()
+    qt_app.processEvents()
+
+    idx = w._case_combo.findData("COMB_LATE")
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    assert w._active_case == "COMB_LATE"
+    assert w._result is not None
+
+
+def test_unavailable_combination_gives_specific_status_message(qt_app):
+    """Selecting a combination whose required case is not yet solved must
+    surface a human-readable status message naming the missing case —
+    not the generic pre-solve placeholder."""
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, SetLoadCaseEnabledCmd,
+    )
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(
+        name="COMB_BAD", terms={"DEAD": 1.0, "LIVE": 1.0},
+    ))
+    # Disable LIVE so it won't be solved.
+    w.execute(SetLoadCaseEnabledCmd(name="LIVE", enabled=False))
+    w._do_solve()
+    qt_app.processEvents()
+
+    # COMB_BAD needs LIVE which wasn't solved.
+    idx = w._case_combo.findData("COMB_BAD")
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    status = w._status_label.text()
+    assert "LIVE" in status, (
+        f"Expected 'LIVE' in status message for unavailable combination, got: {status!r}"
+    )
+    assert "no analysis run yet" not in status.lower()
+
+
+def test_disabled_case_label_does_not_corrupt_active_case(qt_app):
+    """Selecting a disabled case (displayed as 'DEAD  (disabled)' in the
+    combo) must store the raw name 'DEAD' in ``_active_case``, not the
+    decorated label string."""
+    from structural_analysis.gui_common.commands import SetLoadCaseEnabledCmd
+    from structural_analysis.model import LoadCase, NodalLoad
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(SetLoadCaseEnabledCmd(name="DEAD", enabled=False))
+    w._refresh_case_selector_combo()
+
+    # The DEAD entry should have the "(disabled)" decoration in its label.
+    idx = w._case_combo.findData("DEAD")
+    assert idx >= 0
+    label = w._case_combo.itemText(idx)
+    assert "(disabled)" in label
+
+    # Clicking it must store "DEAD", not "DEAD  (disabled)".
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    assert w._active_case == "DEAD", (
+        f"_active_case should be 'DEAD' but got {w._active_case!r}"
+    )

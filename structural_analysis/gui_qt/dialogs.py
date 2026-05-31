@@ -1265,6 +1265,222 @@ class NodalLoadDialog(_ModalDialog):
         return (fx, fy, mz, load_case)
 
 
+# ── nodal-load manager (v0.20 — PR #30) ──
+
+
+class NodalLoadManagerDialog(QDialog):
+    """List + Add / Edit / Delete the nodal loads at a single node.
+
+    Unlike most editors in this module the manager does **not** collect
+    a batch of intents on accept; each Add / Edit / Delete is dispatched
+    immediately through ``host.execute()`` so every row mutation
+    becomes an individually undoable command on the host's stack — that
+    matches the user-facing promise (PR #30) that each row action is
+    independently undoable / redoable.
+
+    The dialog re-reads ``model.nodal_loads`` after every action so the
+    table is always in sync with the live model. Row → global index
+    mapping is captured at render time and stored on each
+    :class:`QTableWidgetItem` so Edit / Delete know which entry in
+    ``model.nodal_loads`` to address.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        host: Any,
+        model: StructuralModel,
+        node_id: int,
+    ) -> None:
+        super().__init__(parent)
+        if node_id not in model.nodes:
+            raise ValueError(f"Node {node_id} does not exist.")
+        self._host = host
+        self._model = model
+        self._node_id = node_id
+        self.setWindowTitle(f"Nodal loads at node {node_id}")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"Each row is one independent nodal load at node {node_id}. "
+            "Add appends a row; Edit / Delete operate on the selected "
+            "row. Every action is individually undoable.",
+            self,
+        ))
+
+        self._table = QTableWidget(0, 4, self)
+        self._table.setHorizontalHeaderLabels(
+            ["Case", "Fx (kN)", "Fy (kN)", "Mz (kN·m)"]
+        )
+        self._table.verticalHeader().setVisible(False)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self._table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self._table)
+
+        btn_row = QHBoxLayout()
+        self._add_btn = QPushButton("Add Load…", self)
+        self._add_btn.clicked.connect(self._on_add)
+        btn_row.addWidget(self._add_btn)
+        self._edit_btn = QPushButton("Edit Selected Load…", self)
+        self._edit_btn.clicked.connect(self._on_edit)
+        btn_row.addWidget(self._edit_btn)
+        self._delete_btn = QPushButton("Delete Selected Load", self)
+        self._delete_btn.clicked.connect(self._on_delete)
+        btn_row.addWidget(self._delete_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Close, parent=self,
+        )
+        close_btn = buttons.button(QDialogButtonBox.StandardButton.Close)
+        if close_btn is not None:
+            close_btn.clicked.connect(self.accept)
+        buttons.rejected.connect(self.accept)
+        layout.addWidget(buttons)
+
+        self._table.itemSelectionChanged.connect(self._refresh_buttons)
+        self._rebuild_table()
+
+    # ── table sync ──
+
+    def _rows_for_node(self) -> list[tuple[int, NodalLoad]]:
+        """Return (global_index, NodalLoad) pairs for this node only.
+
+        The global index — position in ``model.nodal_loads`` — is what
+        :class:`EditNodalLoadRowCmd` / :class:`DeleteNodalLoadRowCmd`
+        need as their ``row_index`` argument.
+        """
+        return [
+            (i, ld) for i, ld in enumerate(self._model.nodal_loads)
+            if ld.node_id == self._node_id
+        ]
+
+    def _rebuild_table(self) -> None:
+        rows = self._rows_for_node()
+        self._table.setRowCount(len(rows))
+        for visible_idx, (global_idx, ld) in enumerate(rows):
+            case_item = QTableWidgetItem(
+                getattr(ld, "load_case", "DEFAULT") or "DEFAULT"
+            )
+            # Stash the global index on the first cell so Edit / Delete
+            # can read it back without re-deriving from the visible row.
+            case_item.setData(Qt.ItemDataRole.UserRole, global_idx)
+            self._table.setItem(visible_idx, 0, case_item)
+            self._table.setItem(
+                visible_idx, 1, QTableWidgetItem(f"{ld.fx:g}")
+            )
+            self._table.setItem(
+                visible_idx, 2, QTableWidgetItem(f"{ld.fy:g}")
+            )
+            self._table.setItem(
+                visible_idx, 3, QTableWidgetItem(f"{ld.mz:g}")
+            )
+        self._refresh_buttons()
+
+    def _selected_global_index(self) -> int | None:
+        rows = self._table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self._table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        return int(item.data(Qt.ItemDataRole.UserRole))
+
+    def _refresh_buttons(self) -> None:
+        has_selection = self._selected_global_index() is not None
+        self._edit_btn.setEnabled(has_selection)
+        self._delete_btn.setEnabled(has_selection)
+
+    # ── actions ──
+
+    def _open_form(
+        self, existing: NodalLoad | None,
+    ) -> tuple[float, float, float, str] | None:
+        d = NodalLoadDialog(
+            self,
+            existing=existing,
+            node_id=self._node_id,
+            model=self._model,
+        )
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return d.result_value
+
+    def _on_add(self) -> None:
+        from ..gui_common.commands import AddNodalLoadCmd
+        values = self._open_form(existing=None)
+        if values is None:
+            return
+        fx, fy, mz, load_case = values
+        if fx == 0.0 and fy == 0.0 and mz == 0.0:
+            QMessageBox.information(
+                self, "Empty load",
+                "Fx, Fy, Mz are all zero — nothing to add.",
+            )
+            return
+        # PR-A: ensure unknown load-case names appear in model.load_cases
+        # before pushing the load command, mirroring _edit_nodal_load.
+        ensure = getattr(self._host, "_ensure_load_case_exists", None)
+        if callable(ensure):
+            ensure(load_case)
+        self._host.execute(AddNodalLoadCmd(
+            node_id=self._node_id, fx=fx, fy=fy, mz=mz,
+            load_case=load_case,
+        ))
+        self._rebuild_table()
+
+    def _on_edit(self) -> None:
+        from ..gui_common.commands import EditNodalLoadRowCmd
+        global_idx = self._selected_global_index()
+        if global_idx is None:
+            QMessageBox.information(
+                self, "No selection",
+                "Select a row in the table before clicking Edit.",
+            )
+            return
+        existing = self._model.nodal_loads[global_idx]
+        values = self._open_form(existing=existing)
+        if values is None:
+            return
+        fx, fy, mz, load_case = values
+        if fx == 0.0 and fy == 0.0 and mz == 0.0:
+            QMessageBox.information(
+                self, "Empty load",
+                "Fx, Fy, Mz are all zero — use Delete to remove the row.",
+            )
+            return
+        ensure = getattr(self._host, "_ensure_load_case_exists", None)
+        if callable(ensure):
+            ensure(load_case)
+        self._host.execute(EditNodalLoadRowCmd(
+            row_index=global_idx, fx=fx, fy=fy, mz=mz,
+            load_case=load_case,
+        ))
+        self._rebuild_table()
+
+    def _on_delete(self) -> None:
+        from ..gui_common.commands import DeleteNodalLoadRowCmd
+        global_idx = self._selected_global_index()
+        if global_idx is None:
+            QMessageBox.information(
+                self, "No selection",
+                "Select a row in the table before clicking Delete.",
+            )
+            return
+        self._host.execute(DeleteNodalLoadRowCmd(row_index=global_idx))
+        self._rebuild_table()
+
+
 # ── member load ──
 
 
@@ -2653,17 +2869,30 @@ def _support_summary(support: Support | None) -> str:
 
 
 def _nodal_load_summary(model: StructuralModel, node_id: int) -> str:
-    load = next((ld for ld in model.nodal_loads if ld.node_id == node_id), None)
-    if load is None:
+    """Multi-row summary of every nodal load attached to ``node_id``.
+
+    Pre-v0.20 the inspector only showed a single load per node (the
+    storage layer allowed multiples but the GUI consolidated). The
+    manager dialog now exposes the full list; this helper formats it
+    for the read-only :class:`NodePropertiesDialog` view.
+    """
+    loads = [ld for ld in model.nodal_loads if ld.node_id == node_id]
+    if not loads:
         return "(none)"
-    base = (
-        f"Fx = {load.fx:g} kN,  Fy = {load.fy:g} kN,  "
-        f"Mz = {load.mz:g} kN·m"
-    )
-    case = getattr(load, "load_case", "DEFAULT")
-    if case and case != "DEFAULT":
-        base += f"  ·  case: {case}"
-    return base
+
+    def _row(ld: NodalLoad) -> str:
+        base = (
+            f"Fx = {ld.fx:g} kN,  Fy = {ld.fy:g} kN,  "
+            f"Mz = {ld.mz:g} kN·m"
+        )
+        case = getattr(ld, "load_case", "DEFAULT")
+        if case and case != "DEFAULT":
+            base += f"  ·  case: {case}"
+        return base
+
+    if len(loads) == 1:
+        return _row(loads[0])
+    return "\n".join(f"• {_row(ld)}" for ld in loads)
 
 
 def _member_loads_summary(elem) -> list[str]:

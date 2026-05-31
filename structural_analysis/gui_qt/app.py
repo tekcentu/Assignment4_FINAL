@@ -62,7 +62,6 @@ from ..gui_common.commands import (
     DrawMemberWithSplitsCmd,
     ReplaceModelCmd,
     SetGridSystemCmd,
-    SetNodalLoadCmd,
     SetSupportCmd,
     UpdateElementCmd,
 )
@@ -92,7 +91,7 @@ from .dialogs import (
     GridSpacingDialog,
     MaterialListDialog,
     MemberLoadDialog,
-    NodalLoadDialog,
+    NodalLoadManagerDialog,
     NodePropertiesDialog,
     SupportDialog,
 )
@@ -1107,18 +1106,22 @@ class MainWindow(QMainWindow):
         self.execute(SetSupportCmd(support=support, node_id=node_id))
 
     def _edit_nodal_load(self, node_id: int) -> None:
-        existing = next((ld for ld in self._model.nodal_loads
-                         if ld.node_id == node_id), None)
-        d = NodalLoadDialog(
-            self, existing=existing, node_id=node_id, model=self._model,
-        )
-        if d.exec() != QDialog.DialogCode.Accepted:
+        """Open the per-node nodal-load manager (v0.20 — PR #30).
+
+        Replaces the pre-v0.20 single-load editor: a node can now carry
+        multiple independent rows (one per case, several per case…), and
+        each Add / Edit / Delete is an individual undoable command. The
+        dialog dispatches commands immediately through ``self.execute``
+        so the model stays in sync with the table while it's open.
+        """
+        try:
+            d = NodalLoadManagerDialog(
+                self, host=self, model=self._model, node_id=node_id,
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Node not found", str(e))
             return
-        fx, fy, mz, load_case = d.result_value
-        self._ensure_load_case_exists(load_case)
-        self.execute(SetNodalLoadCmd(
-            node_id=node_id, fx=fx, fy=fy, mz=mz, load_case=load_case,
-        ))
+        d.exec()
 
     def _ensure_load_case_exists(self, case_name: str) -> None:
         """Auto-create the named load case if the user typed a new one
@@ -2065,12 +2068,20 @@ class MainWindow(QMainWindow):
         """Toolbar combo signal handler.
 
         Empty signals are dropped (combo is repopulated by clearing →
-        adding items, which emits an empty currentTextChanged)."""
+        adding items, which emits an empty currentTextChanged).
+
+        ``currentTextChanged`` emits the display label, which may carry
+        decorations such as ``"  [comb]"`` or ``"  (disabled)"``.  Read
+        the combo's ``currentData()`` (the UserData set by ``addItem``)
+        so ``_active_case`` always holds the bare case / combination
+        name, not a decorated label string."""
         if not new_name:
             return
-        if new_name == self._active_case:
+        # Display labels have decorations — userData is always the raw name.
+        raw_name: str = self._case_combo.currentData() or new_name
+        if raw_name == self._active_case:
             return
-        self._active_case = new_name
+        self._active_case = raw_name
         self._push_active_case_to_canvas()
         self._update_window_title_with_case()
         if (
@@ -2082,19 +2093,19 @@ class MainWindow(QMainWindow):
         # explain WHY there's no result rather than leaving a bare
         # placeholder.
         if (
-            new_name in self._model.load_combinations
+            raw_name in self._model.load_combinations
             and self._result is None
         ):
-            comb = self._model.load_combinations[new_name]
+            comb = self._model.load_combinations[raw_name]
             if self._multi_result is None:
                 self.set_status(
-                    f"Combination {new_name} needs a solve first (F5)."
+                    f"Combination {raw_name} needs a solve first (F5)."
                 )
             else:
                 missing = self._multi_result.missing_cases_for(comb.terms)
                 if missing:
                     self.set_status(
-                        f"Combination {new_name} requires solved results "
+                        f"Combination {raw_name} requires solved results "
                         f"for {', '.join(missing)}."
                     )
 
