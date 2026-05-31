@@ -35,8 +35,13 @@ from PyQt6.QtWidgets import (
 )
 
 from ..file_io import read_input_file
-from ..main import run_analysis
+from ..main import run_analysis, run_multi_case_analysis
 from ..model import AnalysisResult, Material, Section, StructuralModel
+from ..multi_case_result import (
+    SUM_ALL_KEY,
+    MultiCaseAnalysisResult,
+    make_active_case_safe,
+)
 from .. import __version__, __what_is_new__
 from ..gui_common.commands import (
     AddElementCmd,
@@ -199,7 +204,23 @@ class MainWindow(QMainWindow):
         self._redo: list[Command] = []
         self._modified = False
         self._current_path: Optional[str] = None
+        # Single-case "active" result (kept as a plain attribute so all
+        # existing consumers — canvas, inspector, overlay handlers —
+        # keep working). It's a *view* into ``_multi_result.cases``
+        # selected by ``_active_case``; ``_push_active_case_to_canvas``
+        # is the canonical write path.
         self._result: Optional[AnalysisResult] = None
+        # PR-A: wrapper holding one AnalysisResult per solved case
+        # plus the SUM_ALL view machinery. None pre-solve.
+        self._multi_result: Optional[MultiCaseAnalysisResult] = None
+        # Active case name shown in the toolbar combo / window title.
+        # Initialises to DEFAULT — guaranteed to exist on every model
+        # (see StructuralModel.__post_init__).
+        self._active_case: str = "DEFAULT"
+        # PR-A canvas overlay: when True, dim all non-active loads;
+        # when False, draw all loads at full intensity. Wired to the
+        # View → "Active case loads only" toggle.
+        self._active_case_loads_only: bool = True
         self._modal_result = None
         self._modal_results_dialog = None
         self._view3d_window = None
@@ -399,8 +420,15 @@ class MainWindow(QMainWindow):
             deformed_scale_group.addAction(a)
             self._deformed_scale_actions[v] = a
 
-        self.act_solve = QAction("&Solve", self, shortcut="F5",
+        self.act_solve = QAction("&Solve all cases", self, shortcut="F5",
                                    triggered=self._do_solve)
+        # Shift+F5 runs only the currently-selected case — useful for
+        # iterative model edits on a multi-case model where running
+        # every case each time is overkill.
+        self.act_solve_active = QAction(
+            "Solve &active case only", self, shortcut="Shift+F5",
+            triggered=self._do_solve_active_only,
+        )
         self.act_modal = QAction("&Modal analysis…", self, shortcut="F6",
                                    triggered=self._do_modal)
         self.act_analysis_settings = QAction(
@@ -512,9 +540,33 @@ class MainWindow(QMainWindow):
         deformed_scale_menu.setStatusTip(self._deformed_scale_tooltip)
         for a in self._deformed_scale_actions.values():
             deformed_scale_menu.addAction(a)
+        m_view.addSeparator()
+        # Active-case loads-only toggle (PR-A v0.18).
+        self.act_active_case_loads_only = QAction(
+            "&Active case loads only", self, checkable=True,
+            checked=self._active_case_loads_only,
+            triggered=self._on_active_case_loads_only_toggled,
+        )
+        self.act_active_case_loads_only.setToolTip(
+            "When on, loads attached to non-active load cases render "
+            "dimmed on the canvas. When off, every load draws at full "
+            "intensity regardless of which case is active."
+        )
+        m_view.addAction(self.act_active_case_loads_only)
+        # Load Case Manager dialog (View → Load &cases…).
+        self.act_load_cases = QAction(
+            "Load &cases…", self,
+            triggered=self._show_load_case_manager,
+        )
+        self.act_load_cases.setToolTip(
+            "Add, rename, delete, enable/disable load cases. Also sets "
+            "which case absorbs the self-weight contribution."
+        )
+        m_view.addAction(self.act_load_cases)
 
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)
+        m_run.addAction(self.act_solve_active)
         m_run.addAction(self.act_modal)
         m_run.addSeparator()
         m_run.addAction(self.act_analysis_settings)
@@ -532,7 +584,34 @@ class MainWindow(QMainWindow):
             tb.addAction(self._tool_actions[name])
         tb.addSeparator()
         tb.addAction(self.act_building_wizard)
+
+        # Case selector — sits IMMEDIATELY above Solve so the
+        # toolbar reads "[case combo] → Solve". The combo is hidden
+        # behind a thin wrapper widget that adds a label; the combo
+        # itself lives on ``self._case_combo`` so tests and code can
+        # toggle it directly.
+        from PyQt6.QtWidgets import QComboBox
+        self._case_combo = QComboBox(self)
+        self._case_combo.setToolTip(
+            "Active load case — which solved result is shown on the "
+            "canvas and in the element-detail inspector. Switching "
+            "here updates diagrams, deformed shape, and reactions."
+        )
+        self._case_combo.setMinimumWidth(110)
+        self._case_combo.currentTextChanged.connect(
+            self._on_active_case_changed
+        )
+        case_wrap = QWidget(self)
+        case_wrap_layout = QVBoxLayout(case_wrap)
+        case_wrap_layout.setContentsMargins(2, 0, 2, 0)
+        case_wrap_layout.setSpacing(1)
+        case_wrap_layout.addWidget(QLabel("Case:", case_wrap))
+        case_wrap_layout.addWidget(self._case_combo)
+        tb.addWidget(case_wrap)
+        self._refresh_case_selector_combo()
+
         tb.addAction(self.act_solve)
+        tb.addAction(self.act_solve_active)
         tb.addAction(self.act_materials)
         tb.addSeparator()
 
@@ -755,6 +834,12 @@ class MainWindow(QMainWindow):
         self._redo.clear()
         self._modified = True
         self._invalidate_result()
+        # Load-case CRUD (or any command that mutates ``model.load_cases``
+        # / ``self_weight_case`` / load ``load_case`` tags) needs the
+        # toolbar combo to repaint even on a fresh model where
+        # ``_invalidate_result`` was a no-op. Cheap call, runs after
+        # every execute so the source of truth stays the model.
+        self._refresh_case_selector_combo()
         self._update_title()
         self.canvas.redraw()
 
@@ -1013,13 +1098,25 @@ class MainWindow(QMainWindow):
     def _edit_nodal_load(self, node_id: int) -> None:
         existing = next((ld for ld in self._model.nodal_loads
                          if ld.node_id == node_id), None)
-        d = NodalLoadDialog(self, existing=existing, node_id=node_id)
+        d = NodalLoadDialog(
+            self, existing=existing, node_id=node_id, model=self._model,
+        )
         if d.exec() != QDialog.DialogCode.Accepted:
             return
         fx, fy, mz, load_case = d.result_value
+        self._ensure_load_case_exists(load_case)
         self.execute(SetNodalLoadCmd(
             node_id=node_id, fx=fx, fy=fy, mz=mz, load_case=load_case,
         ))
+
+    def _ensure_load_case_exists(self, case_name: str) -> None:
+        """Auto-create the named load case if the user typed a new one
+        in the dialog combo (PR-A redirect #10). DEFAULT is always
+        present so no-op for it."""
+        if case_name in self._model.load_cases:
+            return
+        from ..gui_common.commands import AddLoadCaseCmd
+        self.execute(AddLoadCaseCmd(name=case_name))
 
     def _add_member_load(self, elem_id: int) -> None:
         try:
@@ -1029,7 +1126,9 @@ class MainWindow(QMainWindow):
             return
         if d.exec() != QDialog.DialogCode.Accepted:
             return
-        self.execute(AddMemberLoadCmd(elem_id=elem_id, load=d.result_value))
+        load = d.result_value
+        self._ensure_load_case_exists(getattr(load, "load_case", "DEFAULT"))
+        self.execute(AddMemberLoadCmd(elem_id=elem_id, load=load))
 
     def _edit_element(self, elem_id: int) -> None:
         elem = next((e for e in self._model.elements if e.id == elem_id), None)
@@ -1813,6 +1912,18 @@ class MainWindow(QMainWindow):
     # ── solve ──
 
     def _do_solve(self) -> None:
+        """F5 — run every enabled load case."""
+        self._run_static_solve(active_only=False)
+
+    def _do_solve_active_only(self) -> None:
+        """Shift+F5 — run only the currently-selected case.
+
+        Replaces only that case's slot in ``_multi_result`` (or builds
+        a fresh wrapper containing just that case if there is none)
+        so the remaining solved cases stay valid."""
+        self._run_static_solve(active_only=True)
+
+    def _run_static_solve(self, *, active_only: bool) -> None:
         if not self._model.elements:
             QMessageBox.warning(
                 self, "Cannot solve",
@@ -1840,27 +1951,210 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Ok:
                 return
         try:
-            self._result = run_analysis(self._model, verbose=False)
+            if active_only:
+                # Solve only the active case. If a previous multi-result
+                # exists, merge in the fresh single-case result so the
+                # other cases stay valid.
+                active = self._active_case
+                if active == SUM_ALL_KEY:
+                    # SUM_ALL isn't a real case to solve. Fall back to
+                    # full re-run.
+                    new_multi = run_multi_case_analysis(
+                        self._model, verbose=False,
+                    )
+                else:
+                    fresh = run_multi_case_analysis(
+                        self._model, verbose=False, cases=[active],
+                        active_case=active,
+                    )
+                    if self._multi_result is not None:
+                        prev = self._multi_result
+                        # Build a merged result: prior solved cases +
+                        # the fresh single-case one.
+                        merged_cases = dict(prev.cases)
+                        merged_failed = dict(prev.failed_cases)
+                        merged_requested = list(prev.requested_cases)
+                        if active in merged_failed:
+                            merged_failed.pop(active, None)
+                        if active in fresh.cases:
+                            merged_cases[active] = fresh.cases[active]
+                        if active in fresh.failed_cases:
+                            merged_failed[active] = fresh.failed_cases[active]
+                        if active not in merged_requested:
+                            merged_requested.append(active)
+                        new_multi = MultiCaseAnalysisResult(
+                            cases=merged_cases,
+                            active_case=active,
+                            failed_cases=merged_failed,
+                            requested_cases=merged_requested,
+                        )
+                    else:
+                        new_multi = fresh
+            else:
+                new_multi = run_multi_case_analysis(
+                    self._model, verbose=False,
+                )
         except Exception as e:
             QMessageBox.critical(
                 self, "Analysis failed",
                 f"{type(e).__name__}: {e}\n\nThe model is unchanged.",
             )
             return
-        self.canvas.set_result(self._result)
-        self._update_result_text()
-        # If the user solved while the element-detail inspector is
-        # open, push the new diagrams into it without making them
-        # close-and-reopen the window.
+        self._multi_result = new_multi
+        # Pick a sensible active case for the freshly-solved result
+        # (may differ from the one the user was looking at if e.g. they
+        # had SUM_ALL and an enabled case just failed).
+        self._active_case = make_active_case_safe(
+            self._multi_result, self._active_case,
+        )
+        self._refresh_case_selector_combo()
+        self._push_active_case_to_canvas()
+        self._update_window_title_with_case()
+        # Push the active case's result into an open inspector so
+        # the user doesn't have to close-and-reopen after a solve.
         if (self._element_inspector is not None
                 and self._element_inspector.isVisible()):
             self._element_inspector.refresh(self._model, self._result)
-        if self._result.status == "ok":
+        n_solved = len(new_multi.cases)
+        n_failed = len(new_multi.failed_cases)
+        if n_failed:
+            failed_names = ", ".join(sorted(new_multi.failed_cases))
             self.set_status(
-                f"Analysis complete · residual = {self._result.residual:.2e}"
+                f"Solved {n_solved}/{len(new_multi.requested_cases)} "
+                f"case(s); failed: {failed_names}"
             )
+        elif n_solved == 0:
+            self.set_status("No cases were solved.")
         else:
-            self.set_status(f"Analysis status: {self._result.status}")
+            active_r = new_multi.get(self._active_case)
+            if active_r is not None and getattr(active_r, "residual", None) is not None:
+                self.set_status(
+                    f"Solved {n_solved} case(s) · active = "
+                    f"{self._active_case} · "
+                    f"residual = {active_r.residual:.2e}"
+                )
+            else:
+                self.set_status(
+                    f"Solved {n_solved} case(s) · active = "
+                    f"{self._active_case}"
+                )
+
+    # ── PR-A: active case + multi-result plumbing ──────────────────
+
+    def _on_active_case_changed(self, new_name: str) -> None:
+        """Toolbar combo signal handler.
+
+        Empty signals are dropped (combo is repopulated by clearing →
+        adding items, which emits an empty currentTextChanged)."""
+        if not new_name:
+            return
+        if new_name == self._active_case:
+            return
+        self._active_case = new_name
+        self._push_active_case_to_canvas()
+        self._update_window_title_with_case()
+        if (
+            self._element_inspector is not None
+            and self._element_inspector.isVisible()
+        ):
+            self._element_inspector.refresh(self._model, self._result)
+
+    def _refresh_case_selector_combo(self) -> None:
+        """Repopulate the toolbar combo from the model's case dict.
+
+        Includes SUM_ALL last when a multi_result with sum_all_available()
+        is in hand. Blocks signals during repopulation so the
+        currentTextChanged dance doesn't trigger a spurious
+        ``_on_active_case_changed`` mid-rebuild."""
+        if not hasattr(self, "_case_combo"):
+            return
+        combo = self._case_combo
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            # Real cases — sorted alphabetically with DEFAULT pinned
+            # to the front so it's always visible at index 0.
+            ordered = (
+                (["DEFAULT"] if "DEFAULT" in self._model.load_cases else [])
+                + sorted(
+                    n for n in self._model.load_cases
+                    if n != "DEFAULT"
+                )
+            )
+            for name in ordered:
+                lc = self._model.load_cases[name]
+                label = name if lc.enabled else f"{name}  (disabled)"
+                combo.addItem(label, name)
+            # SUM_ALL — only when every requested case has solved.
+            if (
+                self._multi_result is not None
+                and self._multi_result.sum_all_available()
+                and len(self._multi_result.cases) >= 2
+            ):
+                combo.addItem(SUM_ALL_KEY, SUM_ALL_KEY)
+            # Restore selection by matching the userData (the raw
+            # case name, not the "(disabled)" label).
+            idx = combo.findData(self._active_case)
+            if idx < 0:
+                # Fall back to DEFAULT (or the first item).
+                idx = combo.findData("DEFAULT")
+                if idx < 0 and combo.count() > 0:
+                    idx = 0
+                if idx >= 0:
+                    self._active_case = combo.itemData(idx)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        finally:
+            combo.blockSignals(False)
+
+    def _push_active_case_to_canvas(self) -> None:
+        """Sync ``self._result`` (the legacy single-case view) and the
+        canvas to whatever the active case currently resolves to."""
+        if self._multi_result is None:
+            self._result = None
+        else:
+            self._result = self._multi_result.get(self._active_case)
+        self.canvas.set_result(self._result)
+        if hasattr(self.canvas, "set_active_case"):
+            self.canvas.set_active_case(self._active_case)
+        self._update_result_text()
+
+    def _on_active_case_loads_only_toggled(self, on: bool) -> None:
+        """View → Active case loads only slot."""
+        self._active_case_loads_only = bool(on)
+        if hasattr(self.canvas, "set_active_case_loads_only"):
+            self.canvas.set_active_case_loads_only(self._active_case_loads_only)
+
+    def _show_load_case_manager(self) -> None:
+        """Open the Load Case Manager dialog and apply its result.
+
+        The dialog returns a list of CRUD commands the host executes
+        through the standard ``execute()`` pipeline so every change is
+        undoable and goes through the invalidation surface (which
+        clears the multi-case result)."""
+        from .dialogs import LoadCaseManagerDialog
+        d = LoadCaseManagerDialog(self, model=self._model)
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        for cmd in d.result_value or []:
+            try:
+                self.execute(cmd)
+            except ValueError as e:
+                QMessageBox.warning(self, "Load case", str(e))
+                return
+        self._refresh_case_selector_combo()
+
+    def _update_window_title_with_case(self) -> None:
+        """Reflect the active case in the window title when it differs
+        from DEFAULT (so a single-case workflow's title stays clean)."""
+        base = getattr(self, "_base_window_title", None)
+        if base is None:
+            base = self.windowTitle().split(" — case: ")[0]
+            self._base_window_title = base
+        if self._active_case == "DEFAULT" or self._multi_result is None:
+            self.setWindowTitle(base)
+        else:
+            self.setWindowTitle(f"{base} — case: {self._active_case}")
 
     def _do_modal(self) -> None:
         if not self._model.elements:
@@ -1919,15 +2213,21 @@ class MainWindow(QMainWindow):
 
     def _clear_result(self) -> None:
         self._result = None
+        self._multi_result = None
         self._modal_result = None
         self.canvas.clear_result()
         self.canvas.clear_modal_result()
+        self._refresh_case_selector_combo()
+        self._update_window_title_with_case()
         self._update_result_text()
 
     def _invalidate_result(self) -> None:
-        if self._result is not None:
+        if self._result is not None or self._multi_result is not None:
             self._result = None
+            self._multi_result = None
             self.canvas.clear_result()
+            self._refresh_case_selector_combo()
+            self._update_window_title_with_case()
             self._update_result_text()
         if self._modal_result is not None:
             self._modal_result = None

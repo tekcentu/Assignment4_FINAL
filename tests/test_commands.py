@@ -1093,3 +1093,156 @@ def test_delete_member_load_then_undo_preserves_identity():
     cmd.do(m)
     cmd.undo(m)
     assert m.elements[0].member_loads[0] is pl
+
+
+# ── PR-A — load case CRUD commands ───────────────────────────────────
+
+
+def _model_with_default_case():
+    from structural_analysis.model import StructuralModel
+    return StructuralModel(title="case-cmds")
+
+
+def test_add_load_case_undo_restores_dict():
+    from structural_analysis.gui_common.commands import AddLoadCaseCmd
+    m = _model_with_default_case()
+    cmd = AddLoadCaseCmd(name="DEAD")
+    cmd.do(m)
+    assert "DEAD" in m.load_cases
+    cmd.undo(m)
+    assert "DEAD" not in m.load_cases
+    assert "DEFAULT" in m.load_cases  # untouched
+
+
+def test_add_load_case_duplicate_raises():
+    from structural_analysis.gui_common.commands import AddLoadCaseCmd
+    m = _model_with_default_case()
+    AddLoadCaseCmd(name="DEAD").do(m)
+    with pytest.raises(ValueError, match=r"already exists"):
+        AddLoadCaseCmd(name="DEAD").do(m)
+
+
+def test_rename_load_case_cascades_to_attached_loads():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCaseCmd, RenameLoadCaseCmd,
+    )
+    from structural_analysis.model import UniformDistributedLoad
+    m, eid = _frame_model_one_member()
+    AddLoadCaseCmd(name="DEAD").do(m)
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-10.0, load_case="DEAD")
+    )
+    RenameLoadCaseCmd(old_name="DEAD", new_name="LIVE").do(m)
+    assert "DEAD" not in m.load_cases
+    assert "LIVE" in m.load_cases
+    assert m.elements[0].member_loads[0].load_case == "LIVE"
+
+
+def test_rename_load_case_undo_restores_load_attachments():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCaseCmd, RenameLoadCaseCmd,
+    )
+    from structural_analysis.model import UniformDistributedLoad
+    m, eid = _frame_model_one_member()
+    AddLoadCaseCmd(name="DEAD").do(m)
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-10.0, load_case="DEAD")
+    )
+    cmd = RenameLoadCaseCmd(old_name="DEAD", new_name="LIVE")
+    cmd.do(m)
+    cmd.undo(m)
+    assert "DEAD" in m.load_cases
+    assert "LIVE" not in m.load_cases
+    assert m.elements[0].member_loads[0].load_case == "DEAD"
+
+
+def test_rename_default_blocked():
+    from structural_analysis.gui_common.commands import RenameLoadCaseCmd
+    m = _model_with_default_case()
+    with pytest.raises(ValueError, match=r"DEFAULT.*cannot be renamed"):
+        RenameLoadCaseCmd(old_name="DEFAULT", new_name="BASE").do(m)
+
+
+def test_delete_load_case_default_blocked():
+    from structural_analysis.gui_common.commands import DeleteLoadCaseCmd
+    m = _model_with_default_case()
+    with pytest.raises(ValueError, match=r"DEFAULT.*cannot be deleted"):
+        DeleteLoadCaseCmd(name="DEFAULT").do(m)
+
+
+def test_delete_load_case_reassigns_loads_to_default():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCaseCmd, DeleteLoadCaseCmd,
+    )
+    from structural_analysis.model import UniformDistributedLoad
+    m, eid = _frame_model_one_member()
+    AddLoadCaseCmd(name="DEAD").do(m)
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-10.0, load_case="DEAD")
+    )
+    DeleteLoadCaseCmd(name="DEAD").do(m)
+    assert "DEAD" not in m.load_cases
+    # Load was reassigned to DEFAULT, not deleted.
+    assert m.elements[0].member_loads[0].load_case == "DEFAULT"
+
+
+def test_delete_load_case_undo_restores_dict_and_loads():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCaseCmd, DeleteLoadCaseCmd,
+    )
+    from structural_analysis.model import UniformDistributedLoad
+    m, eid = _frame_model_one_member()
+    AddLoadCaseCmd(name="DEAD").do(m)
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-10.0, load_case="DEAD")
+    )
+    cmd = DeleteLoadCaseCmd(name="DEAD")
+    cmd.do(m)
+    cmd.undo(m)
+    assert "DEAD" in m.load_cases
+    assert m.elements[0].member_loads[0].load_case == "DEAD"
+
+
+def test_delete_load_case_resets_self_weight_case_to_default():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCaseCmd, DeleteLoadCaseCmd, SetSelfWeightCaseCmd,
+    )
+    m = _model_with_default_case()
+    AddLoadCaseCmd(name="DEAD").do(m)
+    SetSelfWeightCaseCmd(case_name="DEAD").do(m)
+    assert m.self_weight_case == "DEAD"
+    DeleteLoadCaseCmd(name="DEAD").do(m)
+    assert m.self_weight_case == "DEFAULT"
+
+
+def test_set_load_case_enabled_toggle_undo():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCaseCmd, SetLoadCaseEnabledCmd,
+    )
+    m = _model_with_default_case()
+    AddLoadCaseCmd(name="WIND", enabled=True).do(m)
+    cmd = SetLoadCaseEnabledCmd(name="WIND", enabled=False)
+    cmd.do(m)
+    assert m.load_cases["WIND"].enabled is False
+    cmd.undo(m)
+    assert m.load_cases["WIND"].enabled is True
+
+
+def test_set_self_weight_case_undo():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCaseCmd, SetSelfWeightCaseCmd,
+    )
+    m = _model_with_default_case()
+    AddLoadCaseCmd(name="DEAD").do(m)
+    cmd = SetSelfWeightCaseCmd(case_name="DEAD")
+    cmd.do(m)
+    assert m.self_weight_case == "DEAD"
+    cmd.undo(m)
+    assert m.self_weight_case == "DEFAULT"
+
+
+def test_set_self_weight_case_unknown_raises():
+    from structural_analysis.gui_common.commands import SetSelfWeightCaseCmd
+    m = _model_with_default_case()
+    with pytest.raises(ValueError, match=r"does not exist"):
+        SetSelfWeightCaseCmd(case_name="GHOST").do(m)

@@ -4309,3 +4309,274 @@ def test_nodal_load_summary_omits_case_when_default(qt_app):
     m.nodal_loads.append(NodalLoad(node_id=1, fx=10.0))
     text = _nodal_load_summary(m, 1)
     assert "case" not in text.lower()
+
+
+# ── PR-A — Load Case Manager + toolbar combo + active-case display ──
+
+
+def _multi_case_loaded_frame(w):
+    """Set up a cantilever with DEAD nodal load + LIVE UDL so a multi
+    case solve produces distinct per-case results."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        LoadCase, Material, NodalLoad, Node, Section, Support,
+        UniformDistributedLoad,
+    )
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1,
+    )]
+    w._model.supports[1] = Support(
+        node_id=1, ux=True, uy=True, rz=True,
+    )
+    w._model.nodal_loads.append(NodalLoad(
+        node_id=2, fy=-10.0, load_case="DEAD",
+    ))
+    w._model.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-5.0, load_case="LIVE")
+    )
+    w._model.load_cases["DEAD"] = LoadCase(name="DEAD")
+    w._model.load_cases["LIVE"] = LoadCase(name="LIVE")
+    return 1
+
+
+def test_toolbar_has_case_combo(qt_app):
+    """PR-A: a Case combobox lives in the left toolbar."""
+    w = MainWindow()
+    assert hasattr(w, "_case_combo")
+    # Empty model still has DEFAULT, so the combo has at least one entry.
+    items = [w._case_combo.itemData(i) for i in range(w._case_combo.count())]
+    assert "DEFAULT" in items
+
+
+def test_case_combo_lists_model_cases_after_solve(qt_app):
+    """After a multi-case solve every case in model.load_cases must
+    appear in the combo. SUM_ALL is appended last when ≥ 2 cases solved."""
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._refresh_case_selector_combo()
+    # Pre-solve: DEFAULT + DEAD + LIVE.
+    pre = [
+        w._case_combo.itemData(i) for i in range(w._case_combo.count())
+    ]
+    assert {"DEFAULT", "DEAD", "LIVE"} <= set(pre)
+    assert "SUM_ALL" not in pre
+    # Solve all.
+    w._do_solve()
+    qt_app.processEvents()
+    post = [
+        w._case_combo.itemData(i) for i in range(w._case_combo.count())
+    ]
+    # DEFAULT solves to a zero-load case but it still counts as a
+    # solved case; with DEAD + LIVE solved → SUM_ALL must be present.
+    assert "SUM_ALL" in post
+    # SUM_ALL appears LAST (per the PR-A approval).
+    assert post[-1] == "SUM_ALL"
+
+
+def test_solve_active_only_keeps_other_cases_in_combo(qt_app):
+    """Shift+F5 (run active only) merges the freshly-solved case into
+    any existing multi-result, keeping previously-solved cases."""
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._refresh_case_selector_combo()
+    w._do_solve()
+    qt_app.processEvents()
+    n_solved_before = len(w._multi_result.cases)
+    # Switch to LIVE and re-run only that case.
+    w._active_case = "LIVE"
+    w._do_solve_active_only()
+    qt_app.processEvents()
+    # LIVE should still be solved, DEAD should still be solved.
+    assert "DEAD" in w._multi_result.cases
+    assert "LIVE" in w._multi_result.cases
+    # And the multi result should contain at least as many cases.
+    assert len(w._multi_result.cases) >= n_solved_before
+
+
+def test_changing_active_case_updates_canvas_result(qt_app):
+    """Switching the toolbar combo must push the new active-case
+    AnalysisResult into the canvas."""
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._refresh_case_selector_combo()
+    w._do_solve()
+    qt_app.processEvents()
+    # Get canvas displacement before switch (DEAD by default).
+    w._active_case = "DEAD"
+    w._push_active_case_to_canvas()
+    dead_result = w.canvas._result
+    w._active_case = "LIVE"
+    w._push_active_case_to_canvas()
+    live_result = w.canvas._result
+    assert dead_result is not None
+    assert live_result is not None
+    assert dead_result is not live_result
+
+
+def test_active_case_in_window_title_when_non_default(qt_app):
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._refresh_case_selector_combo()
+    w._active_case = "DEAD"
+    w._update_window_title_with_case()
+    # No solve yet → no multi result → title stays clean (per impl).
+    # Trigger a solve first.
+    w._do_solve()
+    qt_app.processEvents()
+    w._active_case = "DEAD"
+    w._update_window_title_with_case()
+    assert "case: DEAD" in w.windowTitle()
+
+
+def test_window_title_clean_for_default_case(qt_app):
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._refresh_case_selector_combo()
+    w._do_solve()
+    qt_app.processEvents()
+    w._active_case = "DEFAULT"
+    w._update_window_title_with_case()
+    assert "case:" not in w.windowTitle()
+
+
+def test_edit_invalidates_multi_case_result(qt_app):
+    """Per the PR-A redirect #11: any load-case CRUD, load assignment
+    change, enable/disable, or self-weight-case change must invalidate
+    the multi-case result."""
+    from structural_analysis.gui_common.commands import AddLoadCaseCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._refresh_case_selector_combo()
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._multi_result is not None
+    w.execute(AddLoadCaseCmd(name="WIND"))
+    assert w._multi_result is None
+    assert w._result is None
+
+
+def test_combo_includes_disabled_case_with_label(qt_app):
+    """Disabled cases stay visible in the combo (with a label hint)
+    so the user can re-enable them via the case manager."""
+    from structural_analysis.gui_common.commands import (
+        AddLoadCaseCmd, SetLoadCaseEnabledCmd,
+    )
+    w = MainWindow()
+    w.execute(AddLoadCaseCmd(name="WIND"))
+    w.execute(SetLoadCaseEnabledCmd(name="WIND", enabled=False))
+    # The data is still the raw name; the label has the disabled tag.
+    items_data = [
+        w._case_combo.itemData(i) for i in range(w._case_combo.count())
+    ]
+    items_text = [
+        w._case_combo.itemText(i) for i in range(w._case_combo.count())
+    ]
+    assert "WIND" in items_data
+    wind_label = items_text[items_data.index("WIND")]
+    assert "disabled" in wind_label.lower()
+
+
+def test_member_load_dialog_combo_lists_model_cases(qt_app):
+    """MemberLoadDialog's case combo must include the model's
+    user-defined case names in addition to the built-in suggestions."""
+    from structural_analysis.gui_common.commands import AddLoadCaseCmd
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    w.execute(AddLoadCaseCmd(name="WIND_X"))
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    items = [
+        d._case_combo.itemText(i)
+        for i in range(d._case_combo.count())
+    ]
+    assert "WIND_X" in items
+
+
+def test_nodal_load_dialog_combo_lists_model_cases(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCaseCmd
+    from structural_analysis.gui_qt.dialogs import NodalLoadDialog
+    w = MainWindow()
+    w.execute(AddLoadCaseCmd(name="WIND_X"))
+    d = NodalLoadDialog(
+        w, existing=None, node_id=1, model=w._model,
+    )
+    items = [
+        d._case_combo.itemText(i)
+        for i in range(d._case_combo.count())
+    ]
+    assert "WIND_X" in items
+
+
+def test_load_case_manager_dialog_lists_existing_cases(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCaseCmd
+    from structural_analysis.gui_qt.dialogs import LoadCaseManagerDialog
+    w = MainWindow()
+    w.execute(AddLoadCaseCmd(name="DEAD"))
+    d = LoadCaseManagerDialog(w, model=w._model)
+    names = [r["name"] for r in d._rows]
+    assert "DEFAULT" in names and "DEAD" in names
+
+
+def test_load_case_manager_blocks_default_delete(qt_app):
+    from structural_analysis.gui_qt.dialogs import LoadCaseManagerDialog
+    w = MainWindow()
+    d = LoadCaseManagerDialog(w, model=w._model)
+    # The DEFAULT row has no Delete button — verify via the underlying
+    # state machine.
+    default_row = next(r for r in d._rows if r["name"] == "DEFAULT")
+    # The dialog's _on_delete_clicked is a no-op on DEFAULT.
+    d._on_delete_clicked(default_row)
+    assert default_row["deleted"] is False
+
+
+def test_load_case_manager_accept_emits_add_command(qt_app):
+    from structural_analysis.gui_qt.dialogs import LoadCaseManagerDialog
+    from structural_analysis.gui_common.commands import AddLoadCaseCmd
+    w = MainWindow()
+    d = LoadCaseManagerDialog(w, model=w._model)
+    # Simulate typing a new name + click Add.
+    d._new_name.setText("WIND_X")
+    d._on_add_clicked()
+    cmds = d._accept()
+    assert any(
+        isinstance(c, AddLoadCaseCmd) and c.name == "WIND_X" for c in cmds
+    )
+
+
+def test_canvas_dims_inactive_case_loads(qt_app):
+    """When the active-case-loads-only toggle is on, loads attached to
+    inactive cases must render at the lower (~0.35) alpha; active-case
+    loads stay at 1.0."""
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    # DEFAULT is active by default; DEAD/LIVE loads should be dim.
+    w.canvas.set_active_case("DEFAULT")
+    w.canvas.set_active_case_loads_only(True)
+    w.canvas.redraw()
+    qt_app.processEvents()
+    # Find arrow annotations that belong to dimmed loads. We assert the
+    # canvas records the inactive alpha through _load_case_alpha for a
+    # DEAD-tagged nodal load.
+    from structural_analysis.model import NodalLoad
+    dead_load = NodalLoad(node_id=2, fy=-10.0, load_case="DEAD")
+    live_load = NodalLoad(node_id=2, fy=-10.0, load_case="DEFAULT")
+    assert w.canvas._load_case_alpha(dead_load) < 1.0
+    assert w.canvas._load_case_alpha(live_load) == 1.0
+
+
+def test_canvas_active_case_loads_only_off_shows_all_full_alpha(qt_app):
+    """Toggle off → every load draws at full alpha."""
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.canvas.set_active_case("DEFAULT")
+    w.canvas.set_active_case_loads_only(False)
+    from structural_analysis.model import NodalLoad
+    dead_load = NodalLoad(node_id=2, fy=-10.0, load_case="DEAD")
+    assert w.canvas._load_case_alpha(dead_load) == 1.0

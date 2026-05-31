@@ -43,6 +43,7 @@ from PyQt6.QtWidgets import QTabWidget
 from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     FrameTemperatureLoad,
+    LoadCase,
     Material,
     NodalLoad,
     Node,
@@ -1159,22 +1160,38 @@ _LOAD_CASE_SUGGESTIONS = ("DEFAULT", "DEAD", "LIVE", "WIND", "THERMAL")
 
 def _make_load_case_combo(
     parent: QWidget, current: str = "DEFAULT",
+    *,
+    model: "StructuralModel | None" = None,
 ) -> QComboBox:
     """Return a populated, editable load-case combo with a sensible
     initial value. Callers normalize the final value via
-    :func:`_normalize_load_case` on accept."""
+    :func:`_normalize_load_case` on accept.
+
+    PR-A: when ``model`` is provided, the existing case names from
+    ``model.load_cases`` are appended after the built-in suggestions
+    (deduplicated, sorted) so a user assigning a load to a custom case
+    can pick it from the dropdown instead of retyping. Typing a new
+    case name still works — the dialog auto-creates it on accept via
+    :class:`AddLoadCaseCmd`."""
     combo = QComboBox(parent)
     combo.setEditable(True)
-    combo.addItems(_LOAD_CASE_SUGGESTIONS)
+    # Built-in suggestions first (DEFAULT, DEAD, LIVE, WIND, THERMAL),
+    # then any model-defined case names that aren't already listed.
+    items = list(_LOAD_CASE_SUGGESTIONS)
+    if model is not None:
+        for name in sorted(model.load_cases.keys()):
+            if name not in items:
+                items.append(name)
+    combo.addItems(items)
     current_norm = _normalize_load_case(current)
-    if current_norm in _LOAD_CASE_SUGGESTIONS:
+    if current_norm in items:
         combo.setCurrentText(current_norm)
     else:
         # Custom case name that isn't in the built-in suggestions.
         combo.setEditText(current_norm)
     combo.setToolTip(
-        "User-facing tag for this load (foundation for future load "
-        "cases & combinations). Editable — type custom cases here. "
+        "User-facing tag for this load. Pick an existing case or type "
+        "a new name — typing a new name auto-creates the case on OK. "
         "Blank / whitespace falls back to DEFAULT."
     )
     return combo
@@ -1206,9 +1223,18 @@ def _normalize_load_case(raw: str | None) -> str:
 
 
 class NodalLoadDialog(_ModalDialog):
-    def __init__(self, parent, *, existing: NodalLoad | None, node_id: int):
+    def __init__(
+        self, parent, *, existing: NodalLoad | None, node_id: int,
+        model: "StructuralModel | None" = None,
+    ):
         self._existing = existing
         self._node_id = node_id
+        # PR-A: when ``model`` is provided, the load-case combo lists
+        # the model's case names in addition to the built-in
+        # suggestions. None preserves the v0.17 behaviour for any
+        # legacy caller / unit-test that constructs the dialog
+        # without a model.
+        self._model_for_cases = model
         super().__init__(parent, f"Nodal load at node {node_id}")
 
     def _build_body(self, body: QWidget) -> None:
@@ -1226,7 +1252,9 @@ class NodalLoadDialog(_ModalDialog):
             getattr(self._existing, "load_case", "DEFAULT")
             if self._existing is not None else "DEFAULT"
         )
-        self._case_combo = _make_load_case_combo(body, existing_case)
+        self._case_combo = _make_load_case_combo(
+            body, existing_case, model=self._model_for_cases,
+        )
         form.addRow("Load case:", self._case_combo)
 
     def _accept(self) -> tuple[float, float, float, str]:
@@ -1422,7 +1450,9 @@ class MemberLoadDialog(_ModalDialog):
         # ── Load case combo (always visible) ───────────────────────
         case_label = QLabel("Load case:", body)
         v.addWidget(case_label)
-        self._case_combo = _make_load_case_combo(body, "DEFAULT")
+        self._case_combo = _make_load_case_combo(
+            body, "DEFAULT", model=self._model,
+        )
         v.addWidget(self._case_combo)
 
         # Truss elements land on Thermal (Mechanical is disabled
@@ -1768,6 +1798,273 @@ class GridSpacingDialog(_ModalDialog):
 
 
 # ── material list editor ──
+
+
+class LoadCaseManagerDialog(_ModalDialog):
+    """CRUD + enable/disable + self-weight-case selection for the
+    model's :class:`LoadCase` objects (PR-A — v0.18).
+
+    The dialog NEVER mutates the model directly. It collects a list of
+    commands describing the user's intent and exposes it via
+    ``result_value`` on accept. The host (``MainWindow``) dispatches
+    each command through ``execute()`` so every change is undoable and
+    the standard invalidation surface runs (clears the multi-case
+    result, refreshes the toolbar combo).
+    """
+
+    def __init__(self, parent, *, model: StructuralModel):
+        self._model = model
+        # Working copy keyed by current-name -> {name, enabled,
+        # description, original_name}. ``original_name`` is None for
+        # rows the user has freshly added (so we know to emit an
+        # AddLoadCaseCmd rather than a Rename + Set).
+        self._rows: list[dict] = [
+            {
+                "name": name,
+                "enabled": lc.enabled,
+                "description": lc.description,
+                "original_name": name,
+                "deleted": False,
+            }
+            for name, lc in sorted(model.load_cases.items())
+        ]
+        self._self_weight_case_initial = model.self_weight_case
+        super().__init__(parent, "Load cases")
+
+    def _build_body(self, body: QWidget) -> None:
+        v = QVBoxLayout(body)
+        v.addWidget(QLabel(
+            "User-defined load cases for the multi-case static run. "
+            "Disabled cases are skipped by 'Solve all cases' (F5).",
+            body,
+        ))
+        # Table: Name · Enabled · Self-weight · Notes (DEFAULT is
+        # decorated with a (default) marker and isn't deletable).
+        from PyQt6.QtWidgets import QPushButton
+        self._table = QTableWidget(0, 4, body)
+        self._table.setHorizontalHeaderLabels(
+            ["Name", "Enabled", "Self-weight", "Notes"]
+        )
+        self._table.verticalHeader().setVisible(False)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        v.addWidget(self._table)
+        # Edit row: name field + Add / Rename / Delete / Toggle buttons
+        # operate on the row currently highlighted via "Edit" links per
+        # row. To keep the dialog simple we expose just an Add button
+        # and per-row Delete / Enable-toggle controls; renaming is done
+        # in place via the Name column (the cell is editable).
+        self._table.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked
+            | QTableWidget.EditTrigger.SelectedClicked
+        )
+        # Self-weight chooser as a single combo below the table.
+        from PyQt6.QtWidgets import QHBoxLayout
+        sw_row = QHBoxLayout()
+        sw_row.addWidget(QLabel("Self-weight applied to:", body))
+        self._sw_combo = QComboBox(body)
+        sw_row.addWidget(self._sw_combo)
+        sw_row.addStretch()
+        v.addLayout(sw_row)
+        # Add new case row.
+        add_row = QHBoxLayout()
+        add_row.addWidget(QLabel("Add case:", body))
+        self._new_name = QLineEdit(body)
+        self._new_name.setPlaceholderText("e.g. WIND_X")
+        add_row.addWidget(self._new_name)
+        add_btn = QPushButton("Add", body)
+        add_btn.clicked.connect(self._on_add_clicked)
+        add_row.addWidget(add_btn)
+        v.addLayout(add_row)
+        # Populate the table from the current row list + sw combo.
+        self._rebuild_table()
+
+    def _rebuild_table(self) -> None:
+        """Render ``self._rows`` into the table widget."""
+        from PyQt6.QtWidgets import QPushButton, QCheckBox
+        # Block table itemChanged during rebuild so synthetic
+        # setItem calls don't fire spurious rename intents.
+        try:
+            self._table.itemChanged.disconnect(self._on_item_changed)
+        except (TypeError, RuntimeError):
+            pass
+        live_rows = [r for r in self._rows if not r["deleted"]]
+        self._table.setRowCount(len(live_rows))
+        for i, row in enumerate(live_rows):
+            name_item = QTableWidgetItem(row["name"])
+            if row["name"] == "DEFAULT":
+                # DEFAULT cannot be renamed.
+                name_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                )
+                name_item.setForeground(QColor("#444"))
+            self._table.setItem(i, 0, name_item)
+            cb = QCheckBox()
+            cb.setChecked(row["enabled"])
+            cb.stateChanged.connect(
+                lambda state, r=row: r.update(enabled=bool(state))
+            )
+            self._table.setCellWidget(i, 1, cb)
+            sw_label = QLabel(
+                "✓" if self._sw_combo_value() == row["name"] else ""
+            )
+            sw_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setCellWidget(i, 2, sw_label)
+            if row["name"] == "DEFAULT":
+                self._table.setItem(i, 3, QTableWidgetItem("(default — cannot delete)"))
+            else:
+                del_btn = QPushButton("Delete")
+                del_btn.clicked.connect(
+                    lambda _checked=False, r=row: self._on_delete_clicked(r)
+                )
+                self._table.setCellWidget(i, 3, del_btn)
+        # Repopulate self-weight combo with all live names.
+        existing = self._sw_combo_value() or self._self_weight_case_initial
+        self._sw_combo.blockSignals(True)
+        self._sw_combo.clear()
+        names = [r["name"] for r in live_rows]
+        self._sw_combo.addItems(names)
+        if existing in names:
+            self._sw_combo.setCurrentText(existing)
+        elif "DEFAULT" in names:
+            self._sw_combo.setCurrentText("DEFAULT")
+        self._sw_combo.blockSignals(False)
+        self._table.itemChanged.connect(self._on_item_changed)
+
+    def _sw_combo_value(self) -> str:
+        if not hasattr(self, "_sw_combo"):
+            return self._self_weight_case_initial
+        return self._sw_combo.currentText() or self._self_weight_case_initial
+
+    def _on_add_clicked(self) -> None:
+        raw = self._new_name.text()
+        try:
+            name = _normalize_load_case(raw)
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid case name", str(e))
+            return
+        if name == "DEFAULT":
+            QMessageBox.warning(
+                self, "Invalid case name",
+                "DEFAULT already exists.",
+            )
+            return
+        live_names = {r["name"] for r in self._rows if not r["deleted"]}
+        if name in live_names:
+            QMessageBox.warning(
+                self, "Invalid case name",
+                f"Case {name!r} is already defined.",
+            )
+            return
+        self._rows.append({
+            "name": name,
+            "enabled": True,
+            "description": "",
+            "original_name": None,   # freshly added
+            "deleted": False,
+        })
+        self._new_name.clear()
+        self._rebuild_table()
+
+    def _on_delete_clicked(self, row: dict) -> None:
+        if row["name"] == "DEFAULT":
+            return
+        ans = QMessageBox.question(
+            self, "Delete load case",
+            f"Delete load case {row['name']!r}? Loads tagged with this "
+            "case will be re-tagged to DEFAULT.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+        )
+        if ans != QMessageBox.StandardButton.Ok:
+            return
+        row["deleted"] = True
+        self._rebuild_table()
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        # Only the Name column (0) is editable, and only for non-DEFAULT.
+        if item.column() != 0:
+            return
+        live_rows = [r for r in self._rows if not r["deleted"]]
+        r = live_rows[item.row()]
+        new_text = item.text()
+        try:
+            normalised = _normalize_load_case(new_text)
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid case name", str(e))
+            item.setText(r["name"])
+            return
+        if normalised == r["name"]:
+            return
+        if normalised == "DEFAULT":
+            QMessageBox.warning(
+                self, "Invalid case name",
+                "DEFAULT already exists.",
+            )
+            item.setText(r["name"])
+            return
+        live_names = {row["name"] for row in live_rows if row is not r}
+        if normalised in live_names:
+            QMessageBox.warning(
+                self, "Invalid case name",
+                f"Case {normalised!r} is already defined.",
+            )
+            item.setText(r["name"])
+            return
+        r["name"] = normalised
+        item.setText(normalised)
+
+    def _accept(self) -> list:
+        """Return the list of commands needed to apply the dialog's
+        edits. The host dispatches them in order."""
+        from ..gui_common.commands import (
+            AddLoadCaseCmd,
+            DeleteLoadCaseCmd,
+            RenameLoadCaseCmd,
+            SetLoadCaseEnabledCmd,
+            SetSelfWeightCaseCmd,
+        )
+        cmds: list = []
+        # 1. Deletes first (so a rename can't collide with a deleted
+        # name that's about to come back).
+        for r in self._rows:
+            if r["deleted"] and r["original_name"] is not None:
+                cmds.append(DeleteLoadCaseCmd(name=r["original_name"]))
+        # 2. Renames + Adds, then enable-toggles.
+        for r in self._rows:
+            if r["deleted"]:
+                continue
+            orig = r["original_name"]
+            if orig is None:
+                cmds.append(AddLoadCaseCmd(
+                    name=r["name"], enabled=r["enabled"],
+                ))
+            elif orig != r["name"]:
+                cmds.append(RenameLoadCaseCmd(
+                    old_name=orig, new_name=r["name"],
+                ))
+                # Apply enabled-flag too in case it also changed.
+                if (
+                    r["name"] in self._model.load_cases
+                    and r["enabled"] != self._model.load_cases[orig].enabled
+                ):
+                    cmds.append(SetLoadCaseEnabledCmd(
+                        name=r["name"], enabled=r["enabled"],
+                    ))
+            else:
+                # Pure enable toggle.
+                if orig in self._model.load_cases:
+                    if (
+                        self._model.load_cases[orig].enabled != r["enabled"]
+                    ):
+                        cmds.append(SetLoadCaseEnabledCmd(
+                            name=r["name"], enabled=r["enabled"],
+                        ))
+        # 3. Self-weight case (after deletes/renames so the target
+        # exists post-cascade).
+        sw = self._sw_combo_value()
+        if sw and sw != self._self_weight_case_initial:
+            cmds.append(SetSelfWeightCaseCmd(case_name=sw))
+        return cmds
 
 
 class MaterialListDialog(_ModalDialog):

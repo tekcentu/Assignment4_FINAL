@@ -7,7 +7,10 @@ from __future__ import annotations
 import sys
 import numpy as np
 
+from contextlib import contextmanager
+
 from .model import StructuralModel, AnalysisResult
+from .multi_case_result import MultiCaseAnalysisResult
 from .element import FrameElement2D, TrussElement2D
 from .file_io import read_input_file
 from .assembler import assemble_global_system, DofManager
@@ -15,17 +18,65 @@ from .solver import solve_system
 from .postprocessor import compute_member_forces, compute_reactions, equilibrium_check
 
 
-def run_analysis(model: StructuralModel, verbose: bool = True) -> AnalysisResult:
+@contextmanager
+def _filter_loads_to_case(model: StructuralModel, case: str):
+    """Temporarily restrict ``model``'s nodal + member loads to the
+    given case, and toggle ``include_self_weight`` so self-weight is
+    applied only for ``model.self_weight_case``. Restored on exit, even
+    on exception (PR-A item 9 — never mutate the model permanently)."""
+    saved_nodal = model.nodal_loads
+    saved_member: dict[int, list] = {}
+    for elem in model.elements:
+        saved_member[id(elem)] = elem.member_loads
+    saved_sw = model.include_self_weight
+    try:
+        model.nodal_loads = [
+            ld for ld in saved_nodal
+            if getattr(ld, "load_case", "DEFAULT") == case
+        ]
+        for elem in model.elements:
+            elem.member_loads = [
+                ld for ld in saved_member[id(elem)]
+                if getattr(ld, "load_case", "DEFAULT") == case
+            ]
+        # Self-weight is included only for the designated case.
+        model.include_self_weight = (
+            saved_sw and case == model.self_weight_case
+        )
+        yield model
+    finally:
+        model.nodal_loads = saved_nodal
+        for elem in model.elements:
+            elem.member_loads = saved_member[id(elem)]
+        model.include_self_weight = saved_sw
+
+
+def run_analysis(
+    model: StructuralModel,
+    verbose: bool = True,
+    *,
+    case: str | None = None,
+) -> AnalysisResult:
     """Run the complete structural analysis (Steps A–G).
 
     Args:
         model: The structural model to analyse.
         verbose: If True, print formatted output to stdout.
+        case: If given, filter ``model.nodal_loads`` and every
+            ``elem.member_loads`` to that ``load_case`` (and toggle
+            self-weight to only contribute when ``case ==
+            model.self_weight_case``) for the duration of the solve.
+            Restored on exit via try/finally — the model is never
+            permanently mutated.
 
     Returns:
         AnalysisResult containing all outputs (displacements, forces,
         reactions) or partial results with error messages if analysis fails.
     """
+    if case is not None:
+        with _filter_loads_to_case(model, case):
+            return run_analysis(model, verbose=verbose, case=None)
+
     lines: list[str] = []
 
     def log(msg: str = ""):
@@ -218,6 +269,73 @@ def run_analysis(model: StructuralModel, verbose: bool = True) -> AnalysisResult
         member_results=member_results,
         reactions=reactions, eq_residual=eq_res,
         elem_data=elem_data,
+    )
+
+
+def run_multi_case_analysis(
+    model: StructuralModel,
+    verbose: bool = True,
+    *,
+    cases: list[str] | None = None,
+    active_case: str | None = None,
+) -> MultiCaseAnalysisResult:
+    """Solve every requested load case independently and bundle the
+    results (PR-A — v0.18).
+
+    Args:
+        model: The structural model. ``model.load_cases`` defines which
+            cases exist and whether each is enabled. Any case the user
+            tagged on a load that isn't in ``load_cases`` is treated as
+            DEFAULT (defensive — should not happen after file_io's
+            auto-create pass).
+        verbose: Forwarded to each per-case ``run_analysis`` call —
+            note that on a 5-case model with verbose=True you get five
+            "Analysis complete" blocks; the GUI calls with False.
+        cases: Explicit list of case names to solve. ``None`` →
+            "every enabled case in ``model.load_cases``". Disabled
+            cases are NEVER auto-included; pass an explicit list to
+            override the enabled flag.
+        active_case: Initial ``active_case`` on the result wrapper.
+            Defaults to DEFAULT if it's in the requested set, otherwise
+            the alphabetically-first solved case.
+
+    Returns:
+        :class:`MultiCaseAnalysisResult` containing one AnalysisResult
+        per case that solved successfully, plus ``failed_cases`` for
+        any that errored, plus ``requested_cases`` so SUM_ALL
+        availability is decidable.
+    """
+    if cases is None:
+        cases = sorted(
+            name for name, lc in model.load_cases.items() if lc.enabled
+        )
+    # Always keep the requested-list deterministic.
+    requested = list(cases)
+    solved: dict[str, AnalysisResult] = {}
+    failed: dict[str, str] = {}
+    for name in requested:
+        try:
+            r = run_analysis(model, verbose=verbose, case=name)
+        except Exception as e:  # noqa: BLE001
+            failed[name] = f"{type(e).__name__}: {e}"
+            continue
+        if r.status != "ok":
+            failed[name] = ", ".join(r.warnings) or "(no message)"
+            continue
+        solved[name] = r
+    # Pick a sensible initial active_case for the GUI.
+    if active_case is None:
+        if "DEFAULT" in solved:
+            active_case = "DEFAULT"
+        elif solved:
+            active_case = sorted(solved.keys())[0]
+        else:
+            active_case = "DEFAULT"
+    return MultiCaseAnalysisResult(
+        cases=solved,
+        active_case=active_case,
+        failed_cases=failed,
+        requested_cases=requested,
     )
 
 

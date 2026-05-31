@@ -33,6 +33,7 @@ from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     NODE_COINCIDENCE_TOL,
     FrameTemperatureLoad,
+    LoadCase,
     Material,
     Node,
     NodalLoad,
@@ -1445,6 +1446,252 @@ class DeleteMemberLoadCmd(Command):
             if elem.id == self.elem_id:
                 elem.member_loads.insert(self.load_index, self._saved_load)
                 return
+
+
+# ── load cases (v0.18 — PR-A) ───────────────────────────────────────────
+#
+# All five commands invalidate any cached multi-case result the host
+# holds (the host's ``_invalidate_result`` runs after every ``execute``
+# call). Rename cascades through every attached load's ``load_case``
+# field via ``dataclasses.replace`` since the loads are frozen.
+
+
+def _replace_load_case_on_loads(
+    model: StructuralModel, old: str, new: str,
+) -> tuple[list, dict[int, list]]:
+    """Replace ``load_case == old`` with ``new`` on every attached load.
+
+    Returns the **previous** (nodal_loads_snapshot, member_loads_snapshot)
+    so the caller can restore on ``undo``. Member-load snapshot is keyed
+    by ``element.id``."""
+    from dataclasses import replace
+    prev_nodal = list(model.nodal_loads)
+    prev_member: dict[int, list] = {
+        elem.id: list(elem.member_loads) for elem in model.elements
+    }
+    model.nodal_loads = [
+        replace(ld, load_case=new) if ld.load_case == old else ld
+        for ld in model.nodal_loads
+    ]
+    for elem in model.elements:
+        elem.member_loads[:] = [
+            replace(ld, load_case=new) if ld.load_case == old else ld
+            for ld in elem.member_loads
+        ]
+    return prev_nodal, prev_member
+
+
+def _restore_load_attachments(
+    model: StructuralModel,
+    prev_nodal: list,
+    prev_member: dict[int, list],
+) -> None:
+    model.nodal_loads = list(prev_nodal)
+    for elem in model.elements:
+        if elem.id in prev_member:
+            elem.member_loads[:] = list(prev_member[elem.id])
+
+
+@dataclass
+class AddLoadCaseCmd(Command):
+    """Create a new load case. ``name`` is normalised by the caller
+    (uppercase, no whitespace, no '#')."""
+    name: str
+    enabled: bool = True
+    description: str = "add load case"
+
+    def do(self, model: StructuralModel) -> None:
+        if self.name in model.load_cases:
+            raise ValueError(
+                f"Load case {self.name!r} already exists."
+            )
+        # LoadCase.__post_init__ validates the name shape.
+        model.load_cases[self.name] = LoadCase(
+            name=self.name, enabled=self.enabled,
+        )
+
+    def undo(self, model: StructuralModel) -> None:
+        model.load_cases.pop(self.name, None)
+
+
+@dataclass
+class DeleteLoadCaseCmd(Command):
+    """Delete a load case. Either reassigns its loads to ``reassign_to``
+    (default DEFAULT) or refuses to run if any load references it AND
+    ``reassign_to`` is None.
+
+    Deletion of ``DEFAULT`` is always blocked. If ``model.self_weight_case``
+    points at this case it is reset to DEFAULT on do() and restored on
+    undo()."""
+    name: str
+    reassign_to: str | None = "DEFAULT"
+    description: str = "delete load case"
+
+    _saved_case: LoadCase | None = field(default=None, init=False)
+    _saved_nodal: list = field(default_factory=list, init=False)
+    _saved_member: dict[int, list] = field(default_factory=dict, init=False)
+    _saved_self_weight_case: str | None = field(default=None, init=False)
+
+    def do(self, model: StructuralModel) -> None:
+        if self.name == "DEFAULT":
+            raise ValueError(
+                "The DEFAULT load case cannot be deleted; it is the "
+                "fallback case for every load."
+            )
+        if self.name not in model.load_cases:
+            raise ValueError(f"Load case {self.name!r} does not exist.")
+        referenced = any(
+            ld.load_case == self.name for ld in model.nodal_loads
+        ) or any(
+            ld.load_case == self.name
+            for elem in model.elements
+            for ld in elem.member_loads
+        )
+        if referenced and self.reassign_to is None:
+            raise ValueError(
+                f"Load case {self.name!r} is referenced by attached "
+                "loads. Pass reassign_to= to reassign them, or remove "
+                "the loads first."
+            )
+        if (
+            self.reassign_to is not None
+            and self.reassign_to not in model.load_cases
+        ):
+            raise ValueError(
+                f"reassign_to={self.reassign_to!r} is not an existing "
+                "load case."
+            )
+        # Snapshot for undo BEFORE any mutation.
+        self._saved_case = model.load_cases[self.name]
+        self._saved_self_weight_case = model.self_weight_case
+        if referenced and self.reassign_to is not None:
+            self._saved_nodal, self._saved_member = (
+                _replace_load_case_on_loads(
+                    model, self.name, self.reassign_to,
+                )
+            )
+        else:
+            self._saved_nodal = list(model.nodal_loads)
+            self._saved_member = {
+                elem.id: list(elem.member_loads)
+                for elem in model.elements
+            }
+        if model.self_weight_case == self.name:
+            model.self_weight_case = "DEFAULT"
+        del model.load_cases[self.name]
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._saved_case is not None:
+            model.load_cases[self.name] = self._saved_case
+        _restore_load_attachments(
+            model, self._saved_nodal, self._saved_member,
+        )
+        if self._saved_self_weight_case is not None:
+            model.self_weight_case = self._saved_self_weight_case
+
+
+@dataclass
+class RenameLoadCaseCmd(Command):
+    """Rename a load case and cascade the new name to every attached
+    load's ``load_case`` field. Renaming DEFAULT is blocked (it's a
+    sentinel relied on by the file reader's auto-create pass)."""
+    old_name: str
+    new_name: str
+    description: str = "rename load case"
+
+    _saved_case: LoadCase | None = field(default=None, init=False)
+    _saved_nodal: list = field(default_factory=list, init=False)
+    _saved_member: dict[int, list] = field(default_factory=dict, init=False)
+    _saved_self_weight_case: str | None = field(default=None, init=False)
+
+    def do(self, model: StructuralModel) -> None:
+        if self.old_name == "DEFAULT":
+            raise ValueError(
+                "The DEFAULT load case cannot be renamed."
+            )
+        if self.old_name not in model.load_cases:
+            raise ValueError(
+                f"Load case {self.old_name!r} does not exist."
+            )
+        if self.new_name in model.load_cases:
+            raise ValueError(
+                f"Load case {self.new_name!r} already exists."
+            )
+        self._saved_case = model.load_cases[self.old_name]
+        self._saved_self_weight_case = model.self_weight_case
+        # Construct via dataclass to validate the new name's shape.
+        renamed = LoadCase(
+            name=self.new_name, enabled=self._saved_case.enabled,
+            description=self._saved_case.description,
+        )
+        self._saved_nodal, self._saved_member = (
+            _replace_load_case_on_loads(model, self.old_name, self.new_name)
+        )
+        del model.load_cases[self.old_name]
+        model.load_cases[self.new_name] = renamed
+        if model.self_weight_case == self.old_name:
+            model.self_weight_case = self.new_name
+
+    def undo(self, model: StructuralModel) -> None:
+        model.load_cases.pop(self.new_name, None)
+        if self._saved_case is not None:
+            model.load_cases[self.old_name] = self._saved_case
+        _restore_load_attachments(
+            model, self._saved_nodal, self._saved_member,
+        )
+        if self._saved_self_weight_case is not None:
+            model.self_weight_case = self._saved_self_weight_case
+
+
+@dataclass
+class SetLoadCaseEnabledCmd(Command):
+    """Toggle the ``enabled`` flag on a load case."""
+    name: str
+    enabled: bool
+    description: str = "toggle load case"
+
+    _saved_enabled: bool | None = field(default=None, init=False)
+
+    def do(self, model: StructuralModel) -> None:
+        if self.name not in model.load_cases:
+            raise ValueError(f"Load case {self.name!r} does not exist.")
+        old = model.load_cases[self.name]
+        self._saved_enabled = old.enabled
+        model.load_cases[self.name] = LoadCase(
+            name=old.name, enabled=self.enabled,
+            description=old.description,
+        )
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._saved_enabled is None:
+            return
+        old = model.load_cases[self.name]
+        model.load_cases[self.name] = LoadCase(
+            name=old.name, enabled=self._saved_enabled,
+            description=old.description,
+        )
+
+
+@dataclass
+class SetSelfWeightCaseCmd(Command):
+    """Change ``model.self_weight_case`` (which case absorbs the
+    self-weight contribution when ``include_self_weight=True``)."""
+    case_name: str
+    description: str = "set self-weight case"
+
+    _saved: str | None = field(default=None, init=False)
+
+    def do(self, model: StructuralModel) -> None:
+        if self.case_name not in model.load_cases:
+            raise ValueError(
+                f"Load case {self.case_name!r} does not exist."
+            )
+        self._saved = model.self_weight_case
+        model.self_weight_case = self.case_name
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._saved is not None:
+            model.self_weight_case = self._saved
 
 
 # ── replace whole model (for File→Open) ─────────────────────────────────

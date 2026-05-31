@@ -13,6 +13,7 @@ from .model import (
     StructuralModel, Node, Material, Section, Support, NodalLoad,
     UniformDistributedLoad, PointLoad,
     TrussTemperatureLoad, FrameTemperatureLoad,
+    LoadCase,
 )
 from .element import FrameElement2D, TrussElement2D
 
@@ -521,10 +522,12 @@ def read_input_file(filepath: str) -> StructuralModel:
 
         elif keyword == "ANALYSIS_OPTIONS":
             # Format: ANALYSIS_OPTIONS <count> followed by count
-            # key=value lines. v0.9.0 recognises only
-            # ``include_self_weight=<bool>``; unknown keys raise
-            # ``ValueError`` so typos surface (mirrors the per-element
-            # override-key strictness already in this parser).
+            # key=value lines. v0.18 recognises:
+            #   * include_self_weight=<bool>  (v0.9)
+            #   * self_weight_case=<NAME>     (v0.18 — PR-A)
+            # Unknown keys raise ``ValueError`` so typos surface
+            # (mirrors the per-element override-key strictness already
+            # in this parser).
             count = int(tokens[1])
             for _ in range(count):
                 i += 1
@@ -546,13 +549,91 @@ def read_input_file(filepath: str) -> StructuralModel:
                 val = val.strip()
                 if key == "include_self_weight":
                     model.include_self_weight = _parse_bool(val, key)
+                elif key == "self_weight_case":
+                    if not val:
+                        raise ValueError(
+                            "ANALYSIS_OPTIONS self_weight_case= requires "
+                            "a case name."
+                        )
+                    model.self_weight_case = val
                 else:
                     raise ValueError(
                         f"Unknown ANALYSIS_OPTIONS key {key!r}. "
-                        f"Allowed: ['include_self_weight']."
+                        "Allowed: ['include_self_weight', "
+                        "'self_weight_case']."
+                    )
+
+        elif keyword == "LOAD_CASES":
+            # Format: LOAD_CASES <count> followed by count rows of
+            #   <name>  [enabled=<bool>]
+            # Names normalise to the same single-token rule used by the
+            # dialog (no whitespace, no '#'); LoadCase.__post_init__
+            # enforces it. Missing ``enabled=`` defaults to True. The
+            # DEFAULT case is auto-created by StructuralModel.__post_init__
+            # so the block needn't emit it explicitly; a duplicate
+            # DEFAULT row simply overrides its ``enabled`` value.
+            count = int(tokens[1])
+            for _ in range(count):
+                i += 1
+                while i < len(lines) and (
+                    not lines[i] or lines[i].startswith("#")
+                ):
+                    i += 1
+                if i >= len(lines):
+                    raise ValueError(
+                        "Unexpected end of file inside LOAD_CASES "
+                        f"block (expected {count} rows)."
+                    )
+                parts = lines[i].split("#")[0].split()
+                if not parts:
+                    raise ValueError(
+                        "LOAD_CASES: encountered a blank row inside "
+                        "the block."
+                    )
+                name = parts[0]
+                enabled = True
+                for tok in parts[1:]:
+                    if "=" not in tok:
+                        raise ValueError(
+                            f"LOAD_CASES row {parts!r}: unexpected "
+                            f"trailing token {tok!r} (use key=value)."
+                        )
+                    k, _, v = tok.partition("=")
+                    k = k.strip().lower()
+                    v = v.strip()
+                    if k == "enabled":
+                        enabled = _parse_bool(v, k)
+                    else:
+                        raise ValueError(
+                            f"LOAD_CASES row {parts!r}: unknown "
+                            f"key={k!r}. Allowed: ['enabled']."
+                        )
+                if name in model.load_cases:
+                    # Override the auto-created DEFAULT (or a duplicate
+                    # row) — keep the user's enabled flag.
+                    model.load_cases[name] = LoadCase(
+                        name=name, enabled=enabled,
+                    )
+                else:
+                    model.load_cases[name] = LoadCase(
+                        name=name, enabled=enabled,
                     )
 
         i += 1
+
+    # Final sweep: auto-create any case referenced by a load tag that
+    # the LOAD_CASES block (or its absence) didn't define. Keeps
+    # legacy files that carry per-load ``case=NAME`` tokens — without
+    # a LOAD_CASES block — fully self-describing.
+    referenced: set[str] = set()
+    for ld in model.nodal_loads:
+        referenced.add(getattr(ld, "load_case", "DEFAULT"))
+    for elem in model.elements:
+        for ld in getattr(elem, "member_loads", []) or []:
+            referenced.add(getattr(ld, "load_case", "DEFAULT"))
+    for name in referenced:
+        if name not in model.load_cases:
+            model.load_cases[name] = LoadCase(name=name)
 
     return model
 

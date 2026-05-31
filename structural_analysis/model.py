@@ -342,6 +342,45 @@ MemberLoad = (
 )
 
 
+# ── Load Cases (v0.18) ────────────────────────────────────────
+
+
+@dataclass
+class LoadCase:
+    """A named bucket that user-created loads can be tagged with.
+
+    PR-A foundation: each load (nodal / member-mechanical / member-thermal)
+    carries a ``load_case`` string (added in PR #27); ``LoadCase`` is the
+    object the model holds for each unique name. Per-case solving filters
+    the load list by this tag at ``main.run_analysis`` time — the solver
+    itself stays case-agnostic.
+
+    Attributes:
+        name: Unique key in ``StructuralModel.load_cases`` (also the
+            ``load_case`` string on attached loads). Must not contain
+            whitespace or ``#`` — matches the load-case combo
+            normalisation in ``gui_qt.dialogs._normalize_load_case``.
+        enabled: When True, ``run_multi_case_analysis`` solves this
+            case. Disabled cases are skipped (and excluded from the
+            SUM_ALL view).
+        description: Free-text. Reserved for future PR-B; not written
+            to the input-file format in v0.18.
+    """
+
+    name: str
+    enabled: bool = True
+    description: str = ""
+
+    def __post_init__(self):
+        if not self.name:
+            raise ValueError("LoadCase.name must be non-empty.")
+        if any(ch.isspace() or ch == "#" for ch in self.name):
+            raise ValueError(
+                f"LoadCase.name {self.name!r} contains invalid characters "
+                "(whitespace or '#'); case names must be a single token."
+            )
+
+
 # ── Structural Model ──────────────────────────────────────────
 
 
@@ -369,6 +408,35 @@ class StructuralModel:
     # The loads are applied during assembly only — never persisted into
     # ``nodal_loads`` or any element's ``member_loads``.
     include_self_weight: bool = False
+
+    # ── load cases (v0.18 — PR-A) ──
+    # Every user-created load (nodal_loads + each elem.member_loads
+    # entry) carries a ``load_case: str`` tag (added in PR #27). The
+    # ``load_cases`` dict here defines which case names exist on this
+    # model and whether each is currently enabled for the multi-case
+    # static solve.
+    #
+    # Invariant: ``"DEFAULT"`` always exists. The Load Case Manager
+    # dialog blocks deletion of DEFAULT; the file reader auto-creates
+    # any case name it encounters in a load row that isn't already in
+    # the dict. ``StructuralModel.__post_init__`` injects DEFAULT into
+    # freshly-constructed models so a from-scratch model is never in an
+    # invalid "no cases" state.
+    load_cases: dict[str, "LoadCase"] = field(default_factory=dict)
+
+    # When the static run includes self-weight, that contribution is
+    # bundled into exactly this case. SUM_ALL therefore includes
+    # self-weight exactly once (avoiding double-count when multiple
+    # cases are superposed). Must be the name of an entry in
+    # ``load_cases``.
+    self_weight_case: str = "DEFAULT"
+
+    def __post_init__(self):
+        # Guarantee the DEFAULT case exists. file_io / new-from-blank
+        # paths both rely on this so they never have to insert it
+        # themselves.
+        if "DEFAULT" not in self.load_cases:
+            self.load_cases["DEFAULT"] = LoadCase(name="DEFAULT")
 
     # ── convenience helpers ──
 

@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 __what_is_new__ = (
-    "Load case tag on all user loads · "
-    "cleaner mechanical & thermal dialogs · "
-    "uniform vs gradient thermal selector"
+    "Load case manager · "
+    "case-by-case static run with SUM_ALL view · "
+    "per-case result switching from the toolbar"
 )
 
 from .model import (
