@@ -1,9 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 __what_is_new__ = (
-    "Combination results now display correctly · "
-    "fix: case selector read label instead of data"
+    "Pre-solve validation + canvas highlighting · "
+    "truss free-end mechanism detection · "
+    "Solve All skips empty load cases"
 )
 
 from .model import (

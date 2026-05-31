@@ -67,6 +67,11 @@ from ..gui_common.commands import (
 )
 from ..gui_common.file_writer import write_input_file
 from ..gui_common.results_view import format_result
+from ..gui_common.validation import (
+    ModelValidationResult,
+    cases_with_loads,
+    validate_model,
+)
 
 from .canvas import HitResult, ModelCanvas
 from .controllers import (
@@ -115,54 +120,21 @@ def _make_building_icon() -> QIcon:
     return QIcon(pm)
 
 
-def _validate_model_for_solve(model: StructuralModel) -> tuple[list[str], list[str]]:
-    """Run lightweight pre-solve checks. Returns (fatal, warnings).
-
-    Fatal issues block the solve outright; warnings are non-blocking.
-    The solver itself does a more thorough pass during assembly — this
-    pass exists so the GUI can show a friendly summary first.
+def _push_validation_to_canvas(
+    canvas, result: ModelValidationResult,
+) -> None:
+    """Plumb a :class:`ModelValidationResult` to the canvas highlight
+    layer so problem nodes and elements light up while the user reads
+    the report.  Pre-PR-#31 we had no way to surface *which* node was
+    broken; now the canvas paints amber (warning) and red (error)
+    markers that map straight back to the report bullets.
     """
-    fatal: list[str] = []
-    warnings: list[str] = []
-
-    if not model.materials:
-        fatal.append("No materials defined.")
-    if not model.sections:
-        fatal.append("No sections defined.")
-    for sec in model.sections.values():
-        if sec.material_id not in model.materials:
-            fatal.append(
-                f"Section {sec.id} references missing material "
-                f"{sec.material_id}."
-            )
-    if not model.elements:
-        fatal.append("Model has no elements.")
-    for elem in model.elements:
-        if elem.node_i not in model.nodes:
-            fatal.append(f"Element {elem.id} references missing start "
-                         f"node {elem.node_i}.")
-        if elem.node_j not in model.nodes:
-            fatal.append(f"Element {elem.id} references missing end "
-                         f"node {elem.node_j}.")
-    used_nodes = set()
-    for elem in model.elements:
-        used_nodes.add(elem.node_i)
-        used_nodes.add(elem.node_j)
-    isolated = sorted(set(model.nodes) - used_nodes)
-    if isolated:
-        warnings.append(
-            f"Isolated nodes (not connected to any element): {isolated}."
-        )
-    if not model.supports:
-        warnings.append(
-            "No supports defined — the stiffness matrix will be singular."
-        )
-    for ld in model.nodal_loads:
-        if ld.node_id not in model.nodes:
-            fatal.append(
-                f"Nodal load references missing node {ld.node_id}."
-            )
-    return fatal, warnings
+    canvas.set_validation_highlights(
+        warning_node_ids=result.warning_node_ids,
+        error_node_ids=result.error_node_ids,
+        warning_element_ids=result.warning_element_ids,
+        error_element_ids=result.error_element_ids,
+    )
 
 
 def _build_starter_model() -> StructuralModel:
@@ -1945,24 +1917,63 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Pre-solve validation — collect both fatal and warning issues.
-        fatal, warnings = _validate_model_for_solve(self._model)
-        if fatal:
+        # PR #31 — pre-solve validation.  Errors block the solve, surface
+        # the report in the result panel, and paint problem nodes/elements
+        # on the canvas.  Warnings prompt the user to proceed.  Failed
+        # validation also blanks any stale solved result so the user can't
+        # mistake a previous run's diagrams for current state.
+        v_result = validate_model(self._model)
+        if v_result.has_errors:
+            self._clear_stale_result_state()
+            _push_validation_to_canvas(self.canvas, v_result)
+            self._show_validation_in_report(v_result)
             QMessageBox.critical(
                 self, "Model not ready to solve",
-                "The following problems must be fixed first:\n\n  - "
-                + "\n  - ".join(fatal),
+                v_result.format_report()
+                or "Validation failed for an unknown reason.",
             )
             return
-        if warnings:
+        if v_result.has_warnings:
+            warnings_text = "\n".join(
+                f"  - {i.message}" for i in v_result.issues
+                if i.severity == "warning"
+            )
             ans = QMessageBox.question(
                 self, "Warnings before solve",
-                "The model has these warnings:\n\n  - "
-                + "\n  - ".join(warnings)
+                "The model has these warnings:\n\n"
+                + warnings_text
                 + "\n\nSolve anyway?",
                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             )
             if ans != QMessageBox.StandardButton.Ok:
+                _push_validation_to_canvas(self.canvas, v_result)
+                return
+        # Validation passed (or user dismissed warnings).  Drop any
+        # leftover problem highlights from a prior failed pass.
+        self.canvas.clear_validation_highlights()
+        # PR #31 — for "Solve All Cases", restrict the request to cases
+        # that carry at least one load source.  This skips empty
+        # placeholders (WIND with no wind loads, THERMAL with no thermal
+        # loads, etc.) so the solver never wastes a factorisation on a
+        # zero force vector.  Active-only solve is untouched: the user
+        # picked that case explicitly.
+        skipped_cases: list[str] = []
+        if not active_only:
+            all_enabled = sorted(
+                n for n, lc in self._model.load_cases.items() if lc.enabled
+            )
+            active_cases = cases_with_loads(self._model)
+            skipped_cases = sorted(set(all_enabled) - set(active_cases))
+            if not active_cases:
+                self._clear_stale_result_state()
+                QMessageBox.warning(
+                    self, "Nothing to solve",
+                    "No active loads found. Add loads or enable "
+                    "self-weight before running analysis.",
+                )
+                self.set_status(
+                    "No active loads found — solve skipped."
+                )
                 return
         try:
             if active_only:
@@ -2012,9 +2023,21 @@ class MainWindow(QMainWindow):
                         new_multi = fresh
             else:
                 new_multi = run_multi_case_analysis(
-                    self._model, verbose=False,
+                    self._model, verbose=False, cases=active_cases,
                 )
         except Exception as e:
+            # PR #31 — solve crashed.  Treat this as a hard validation
+            # failure: clear stale results, surface the problem in the
+            # report, paint any pre-solve warnings/errors that we
+            # already know about, and tell the user.  Old result
+            # diagrams must NOT linger on the canvas.
+            self._clear_stale_result_state()
+            _push_validation_to_canvas(self.canvas, v_result)
+            self._result_text.setPlainText(
+                f"Analysis failed: {type(e).__name__}: {e}\n\n"
+                "The model is unchanged. Fix the highlighted problems "
+                "and try again."
+            )
             QMessageBox.critical(
                 self, "Analysis failed",
                 f"{type(e).__name__}: {e}\n\nThe model is unchanged.",
@@ -2040,11 +2063,15 @@ class MainWindow(QMainWindow):
             self._element_inspector.refresh(self._model, self._result)
         n_solved = len(new_multi.cases)
         n_failed = len(new_multi.failed_cases)
+        skipped_suffix = (
+            f" · skipped empty: {', '.join(skipped_cases)}"
+            if skipped_cases else ""
+        )
         if n_failed:
             failed_names = ", ".join(sorted(new_multi.failed_cases))
             self.set_status(
                 f"Solved {n_solved}/{len(new_multi.requested_cases)} "
-                f"case(s); failed: {failed_names}"
+                f"case(s); failed: {failed_names}{skipped_suffix}"
             )
         elif n_solved == 0:
             self.set_status("No cases were solved.")
@@ -2054,12 +2081,12 @@ class MainWindow(QMainWindow):
                 self.set_status(
                     f"Solved {n_solved} case(s) · active = "
                     f"{self._active_case} · "
-                    f"residual = {active_r.residual:.2e}"
+                    f"residual = {active_r.residual:.2e}{skipped_suffix}"
                 )
             else:
                 self.set_status(
                     f"Solved {n_solved} case(s) · active = "
-                    f"{self._active_case}"
+                    f"{self._active_case}{skipped_suffix}"
                 )
 
     # ── PR-A: active case + multi-result plumbing ──────────────────
@@ -2342,7 +2369,54 @@ class MainWindow(QMainWindow):
         self._update_window_title_with_case()
         self._update_result_text()
 
+    def _clear_stale_result_state(self) -> None:
+        """PR #31 — wipe every cached result surface after a failed
+        validation or failed solve so the user doesn't see stale
+        diagrams that look current.
+
+        Touches: ``_result`` (single-case view), ``_multi_result``
+        (multi-case bundle), canvas overlays, the case selector combo,
+        the window title, the element-inspector result, the modal
+        results dialog, and the result text panel (caller overwrites
+        that with the new validation report if there is one)."""
+        self._result = None
+        self._multi_result = None
+        self.canvas.clear_result()
+        self._refresh_case_selector_combo()
+        self._update_window_title_with_case()
+        if (
+            self._element_inspector is not None
+            and self._element_inspector.isVisible()
+        ):
+            self._element_inspector.refresh(self._model, None)
+        if self._modal_result is not None:
+            self._modal_result = None
+            self.canvas.clear_modal_result()
+            if self._modal_results_dialog is not None:
+                self._modal_results_dialog.close()
+                self._modal_results_dialog = None
+        self._update_result_text()
+
+    def _show_validation_in_report(
+        self, v_result: ModelValidationResult,
+    ) -> None:
+        """Render the validation report in the result text panel and
+        echo a one-line summary in the status bar."""
+        self._result_text.setPlainText(v_result.format_report())
+        n_err = sum(1 for i in v_result.issues if i.severity == "error")
+        n_warn = sum(1 for i in v_result.issues if i.severity == "warning")
+        self.set_status(
+            f"Analysis blocked — {n_err} error(s), {n_warn} warning(s) "
+            "found by pre-solve validation."
+        )
+
     def _invalidate_result(self) -> None:
+        # PR #31 — any model mutation invalidates validation highlights
+        # too: the offending node might have just been deleted, the
+        # support added, or the truss promoted to a frame.  Re-run
+        # validation on the next solve attempt.
+        if hasattr(self, "canvas"):
+            self.canvas.clear_validation_highlights()
         if self._result is not None or self._multi_result is not None:
             self._result = None
             self._multi_result = None

@@ -5311,3 +5311,371 @@ def test_disabled_case_label_does_not_corrupt_active_case(qt_app):
     assert w._active_case == "DEAD", (
         f"_active_case should be 'DEAD' but got {w._active_case!r}"
     )
+
+
+# ── PR #31 — pre-solve validation, highlighting, active-case filter ─
+
+
+def _unsupported_truss_free_end_model(w) -> None:
+    """Truss from supported node 1 to unsupported free node 2 — the
+    classic single-truss free-end mechanism PR #31 must detect."""
+    from structural_analysis.element import TrussElement2D
+    from structural_analysis.model import (
+        Material, NodalLoad, Node, Section, Support,
+    )
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.elements = [TrussElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.02, section_id=1,
+    )]
+    w._model.supports[1] = Support(
+        node_id=1, ux=True, uy=True, rz=True,
+    )
+    w._model.nodal_loads.append(NodalLoad(
+        node_id=2, fy=-10.0, load_case="DEFAULT",
+    ))
+
+
+def test_failed_validation_blocks_solve_and_blanks_stale_result(
+    qt_app, monkeypatch,
+):
+    """Solve a valid model, then break it (turn the frame into a single
+    truss to a free node), then attempt to solve again — the prior
+    result must be cleared so the canvas doesn't display a stale
+    diagram while the validation report says the model is unstable.
+    """
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._result is not None
+
+    # Replace the frame with a single truss to a free node — mechanism.
+    _unsupported_truss_free_end_model(w)
+
+    # Suppress modal dialog popups.
+    monkeypatch.setattr(
+        app_mod.QMessageBox, "critical", lambda *a, **k: None,
+    )
+
+    w._do_solve()
+    qt_app.processEvents()
+
+    # Stale result must be gone — canvas, multi-result, single-case.
+    assert w._result is None
+    assert w._multi_result is None
+
+
+def test_failed_validation_writes_report_to_result_text(qt_app, monkeypatch):
+    """When validation blocks the solve, the result panel shows the
+    validation report (not the legacy 'no analysis run yet' placeholder
+    and not a stale post-solve dump)."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _unsupported_truss_free_end_model(w)
+    monkeypatch.setattr(
+        app_mod.QMessageBox, "critical", lambda *a, **k: None,
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    text = w._result_text.toPlainText()
+    assert "unconstrained transverse DOF" in text
+    assert "no analysis run yet" not in text
+
+
+def test_validation_highlights_problem_node_on_canvas(qt_app, monkeypatch):
+    """After a failed validation pass, the canvas highlight layer must
+    name the problem node so the user can SEE where the issue is."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _unsupported_truss_free_end_model(w)
+    monkeypatch.setattr(
+        app_mod.QMessageBox, "critical", lambda *a, **k: None,
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    # Node 2 is the free-end mechanism.
+    assert 2 in w.canvas._error_node_ids
+    assert w.canvas.has_validation_highlights()
+
+
+def test_validation_highlights_problem_element(qt_app, monkeypatch):
+    """Truss element 1 (the single truss to the free node) should be
+    in the canvas error-element band."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _unsupported_truss_free_end_model(w)
+    monkeypatch.setattr(
+        app_mod.QMessageBox, "critical", lambda *a, **k: None,
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert 1 in w.canvas._error_element_ids
+
+
+def test_validation_highlights_cleared_after_successful_solve(
+    qt_app, monkeypatch,
+):
+    """Highlights left over from a prior failed solve must be wiped
+    when a subsequent solve succeeds."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _unsupported_truss_free_end_model(w)
+    monkeypatch.setattr(
+        app_mod.QMessageBox, "critical", lambda *a, **k: None,
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert w.canvas.has_validation_highlights()
+
+    # Now repair the model — frame instead of truss.
+    from structural_analysis.element import FrameElement2D
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1,
+    )]
+    w._do_solve()
+    qt_app.processEvents()
+    assert not w.canvas.has_validation_highlights()
+
+
+def test_validation_highlights_cleared_after_model_mutation(qt_app, monkeypatch):
+    """Any model-mutating ``execute()`` call must blank validation
+    highlights — the offending node might have just been deleted."""
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.gui_common.commands import SetSupportCmd
+    from structural_analysis.model import Support
+    w = MainWindow()
+    _unsupported_truss_free_end_model(w)
+    monkeypatch.setattr(
+        app_mod.QMessageBox, "critical", lambda *a, **k: None,
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert w.canvas.has_validation_highlights()
+
+    # Add a support at the formerly-free node 2 — model has changed.
+    w.execute(SetSupportCmd(
+        support=Support(node_id=2, ux=True, uy=True, rz=False),
+    ))
+    assert not w.canvas.has_validation_highlights()
+
+
+# ── active-case filtering (Solve All Cases skips empty cases) ────────
+
+
+def _three_case_model(w) -> None:
+    """DEAD has a nodal load, LIVE has a member load, WIND has
+    nothing (empty placeholder).  DEFAULT disabled so SUM_ALL is
+    decidable."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        LoadCase, Material, NodalLoad, Node, Section, Support,
+        UniformDistributedLoad,
+    )
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1,
+    )]
+    w._model.supports[1] = Support(
+        node_id=1, ux=True, uy=True, rz=True,
+    )
+    w._model.nodal_loads.append(NodalLoad(
+        node_id=2, fy=-10.0, load_case="DEAD",
+    ))
+    w._model.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-5.0, load_case="LIVE"),
+    )
+    w._model.load_cases["DEAD"] = LoadCase(name="DEAD")
+    w._model.load_cases["LIVE"] = LoadCase(name="LIVE")
+    w._model.load_cases["WIND"] = LoadCase(name="WIND")
+    w._model.load_cases["DEFAULT"].enabled = False
+
+
+def test_solve_all_skips_empty_load_case(qt_app):
+    """WIND has no loads — Solve All must not request it from the
+    multi-case solver, so it's absent from ``_multi_result.cases``."""
+    w = MainWindow()
+    _three_case_model(w)
+    w._do_solve()
+    qt_app.processEvents()
+    assert "DEAD" in w._multi_result.cases
+    assert "LIVE" in w._multi_result.cases
+    assert "WIND" not in w._multi_result.cases
+    assert "WIND" not in w._multi_result.requested_cases
+
+
+def test_solve_all_skipped_cases_status_message(qt_app):
+    """The skip notice surfaces in the status bar so the user knows
+    WIND wasn't quietly solved as a zero-result."""
+    w = MainWindow()
+    _three_case_model(w)
+    w._do_solve()
+    qt_app.processEvents()
+    status = w._status_label.text()
+    assert "WIND" in status
+    assert "skipped" in status.lower()
+
+
+def test_solve_all_includes_self_weight_case_with_no_manual_loads(qt_app):
+    """If self-weight is enabled and assigned to DEAD, DEAD counts as
+    an active case even with zero manual DEAD loads."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        LoadCase, Material, Node, Section, Support,
+    )
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1,
+    )]
+    w._model.supports[1] = Support(
+        node_id=1, ux=True, uy=True, rz=True,
+    )
+    w._model.load_cases["DEAD"] = LoadCase(name="DEAD")
+    w._model.load_cases["LIVE"] = LoadCase(name="LIVE")
+    w._model.load_cases["DEFAULT"].enabled = False
+    w._model.include_self_weight = True
+    w._model.self_weight_case = "DEAD"
+
+    w._do_solve()
+    qt_app.processEvents()
+    # DEAD solved because self-weight makes it active.
+    assert "DEAD" in w._multi_result.cases
+    # LIVE has nothing — skipped.
+    assert "LIVE" not in w._multi_result.cases
+
+
+def test_solve_all_no_active_loads_shows_warning_and_keeps_results_none(
+    qt_app, monkeypatch,
+):
+    """A model with cases defined but zero loads tells the user
+    explicitly instead of silently doing nothing."""
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        LoadCase, Material, Node, Section, Support,
+    )
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1,
+    )]
+    w._model.supports[1] = Support(
+        node_id=1, ux=True, uy=True, rz=True,
+    )
+    w._model.load_cases["DEAD"] = LoadCase(name="DEAD")
+    w._model.load_cases["DEFAULT"].enabled = False
+
+    warned: list = []
+    monkeypatch.setattr(
+        app_mod.QMessageBox, "warning",
+        lambda *a, **k: warned.append(a),
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert warned, "expected a 'no active loads' warning dialog"
+    assert w._result is None
+    assert w._multi_result is None
+    # Status surfaces the same message.
+    assert "no active loads" in w._status_label.text().lower()
+
+
+def test_combination_referencing_skipped_case_unavailable(qt_app):
+    """A combination that references WIND (skipped because empty)
+    must be unavailable; selecting it should not produce a result."""
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _three_case_model(w)
+    w.execute(AddLoadCombinationCmd(
+        name="COMB_WIND", terms={"DEAD": 1.0, "WIND": 1.0},
+    ))
+    w._do_solve()
+    qt_app.processEvents()
+    assert not w._multi_result.combination_available({"DEAD": 1.0, "WIND": 1.0})
+    w._active_case = "COMB_WIND"
+    assert w._resolve_active_result() is None
+
+
+def test_combination_referencing_only_solved_cases_is_available(qt_app):
+    """COMB_LIVE = 1.2*DEAD + 1.6*LIVE is available because both
+    cases get solved (neither is empty)."""
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _three_case_model(w)
+    w.execute(AddLoadCombinationCmd(
+        name="COMB_LIVE", terms={"DEAD": 1.2, "LIVE": 1.6},
+    ))
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._multi_result.combination_available(
+        {"DEAD": 1.2, "LIVE": 1.6},
+    )
+
+
+def test_solve_all_only_solves_cases_with_loads_no_extra_solves(qt_app):
+    """Sanity: requested_cases on the result wrapper equals exactly
+    the cases that had loads (DEAD, LIVE) — WIND is neither requested
+    nor failed."""
+    w = MainWindow()
+    _three_case_model(w)
+    w._do_solve()
+    qt_app.processEvents()
+    assert sorted(w._multi_result.requested_cases) == ["DEAD", "LIVE"]
+    assert "WIND" not in w._multi_result.failed_cases
+
+
+def test_explicit_active_only_solve_still_works_on_empty_default(qt_app):
+    """Active-only (Shift+F5) is intentionally NOT filtered: the user
+    picked that case, so even if it's empty we attempt the solve.
+
+    Here DEFAULT is selected and has no loads; the solve will produce
+    an analysis result with all-zero loads but should not be rejected
+    by the active-load filter (which only guards Solve All Cases)."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, Node, Section, Support,
+    )
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1,
+    )]
+    w._model.supports[1] = Support(
+        node_id=1, ux=True, uy=True, rz=True,
+    )
+    w._active_case = "DEFAULT"
+    w._do_solve_active_only()
+    qt_app.processEvents()
+    # DEFAULT solved (zero displacements, but a valid result wrapper).
+    assert w._multi_result is not None
+    assert "DEFAULT" in w._multi_result.cases
