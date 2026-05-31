@@ -842,9 +842,18 @@ class ModelCanvas(QWidget):
         nodes get a coloured ring/cross marker.  Error styling is
         bolder than warning styling so the user can read severity at
         a glance.
+
+        Every same-severity band/marker is plotted in a single
+        ``ax.plot`` call (segments separated by ``None``s for lines;
+        marker arrays for nodes) so a model with dozens of flagged
+        elements still adds only one ``Line2D`` artist per severity
+        instead of N — matters for redraw / pan / zoom responsiveness
+        on larger models.
         """
         model = self._model()
         # ── elements: behind selection (zorder < _draw_selection's 1.5) ──
+        warn_xs: list[float | None] = []
+        warn_ys: list[float | None] = []
         for eid in self._warning_element_ids:
             elem = next((e for e in model.elements if e.id == eid), None)
             if elem is None:
@@ -853,11 +862,16 @@ class ModelCanvas(QWidget):
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
+            warn_xs.extend([ni.x, nj.x, None])
+            warn_ys.extend([ni.y, nj.y, None])
+        if warn_xs:
             self.ax.plot(
-                [ni.x, nj.x], [ni.y, nj.y],
+                warn_xs, warn_ys,
                 color="#f0a030", linewidth=5.0, alpha=0.55,
                 solid_capstyle="round", zorder=1.4,
             )
+        err_xs: list[float | None] = []
+        err_ys: list[float | None] = []
         for eid in self._error_element_ids:
             elem = next((e for e in model.elements if e.id == eid), None)
             if elem is None:
@@ -866,27 +880,42 @@ class ModelCanvas(QWidget):
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
+            err_xs.extend([ni.x, nj.x, None])
+            err_ys.extend([ni.y, nj.y, None])
+        if err_xs:
             self.ax.plot(
-                [ni.x, nj.x], [ni.y, nj.y],
+                err_xs, err_ys,
                 color="#e03030", linewidth=5.5, alpha=0.65,
                 solid_capstyle="round", zorder=1.45,
             )
         # ── nodes: behind selection rings (selection is zorder 11) ──
+        warn_nx: list[float] = []
+        warn_ny: list[float] = []
         for nid in self._warning_node_ids:
             node = model.nodes.get(nid)
             if node is None:
                 continue
+            warn_nx.append(node.x)
+            warn_ny.append(node.y)
+        if warn_nx:
             self.ax.plot(
-                node.x, node.y, marker="D", markersize=13,
+                warn_nx, warn_ny, marker="D", markersize=13,
+                linestyle="None",
                 markerfacecolor="none", markeredgecolor="#f0a030",
                 markeredgewidth=2.2, zorder=9.5,
             )
+        err_nx: list[float] = []
+        err_ny: list[float] = []
         for nid in self._error_node_ids:
             node = model.nodes.get(nid)
             if node is None:
                 continue
+            err_nx.append(node.x)
+            err_ny.append(node.y)
+        if err_nx:
             self.ax.plot(
-                node.x, node.y, marker="X", markersize=15,
+                err_nx, err_ny, marker="X", markersize=15,
+                linestyle="None",
                 markerfacecolor="#e03030", markeredgecolor="#7a1818",
                 markeredgewidth=1.6, zorder=10,
             )

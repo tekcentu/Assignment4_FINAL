@@ -415,13 +415,18 @@ def _find_structural_basics(model: "StructuralModel") -> list[ValidationIssue]:
 def validate_model(model: "StructuralModel") -> ModelValidationResult:
     """Run every validator and bundle the results.
 
-    The order is significant only for human-readable reporting: basic
-    sanity first (so missing materials surface before mechanism
-    geometry that depends on element kinds), then orphan nodes,
-    unsupported components, and finally truss mechanisms.
+    Basic structural sanity runs first.  If it finds any errors —
+    e.g. an element referencing a missing node — the geometry-based
+    checks (orphan / component / truss mechanism) would dereference
+    invalid ids and crash with ``KeyError``, so we return early.  The
+    basic-sanity report alone is enough to tell the user what to fix
+    before geometry-level validation can meaningfully run.
     """
     issues: list[ValidationIssue] = []
-    issues.extend(_find_structural_basics(model))
+    basics = _find_structural_basics(model)
+    issues.extend(basics)
+    if any(i.severity == "error" for i in basics):
+        return ModelValidationResult(issues=issues)
     issues.extend(_find_orphan_nodes(model))
     issues.extend(_find_unsupported_components(model))
     issues.extend(_find_truss_mechanisms(model))

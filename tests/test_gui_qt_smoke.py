@@ -5679,3 +5679,48 @@ def test_explicit_active_only_solve_still_works_on_empty_default(qt_app):
     # DEFAULT solved (zero displacements, but a valid result wrapper).
     assert w._multi_result is not None
     assert "DEFAULT" in w._multi_result.cases
+
+
+def test_cancelling_warnings_clears_stale_result_and_shows_report(
+    qt_app, monkeypatch,
+):
+    """Regression (Gemini PR #31 MEDIUM finding): when the user
+    cancels a solve from the warnings prompt, stale results must be
+    cleared and the warning report must remain visible in the
+    result-text panel so the warnings don't vanish with the dialog.
+    """
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        LoadCase, Material, NodalLoad, Node, Section, Support,
+    )
+    w = MainWindow()
+    # First, build a valid model and solve it so we have a stale
+    # result to be cleared.
+    _multi_case_loaded_frame(w)
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._result is not None
+
+    # Now mutate the model into one that triggers a WARNING (orphan
+    # node — no errors).  Then cancel the warning prompt.
+    w._model.nodes[99] = Node(99, 50.0, 50.0)  # orphan
+    # Note: invalidation already fires on the model mutation if it
+    # went through execute().  Here we mutated directly so _result is
+    # still set — exactly the stale-result scenario the fix targets.
+
+    monkeypatch.setattr(
+        app_mod.QMessageBox, "question",
+        lambda *a, **k: app_mod.QMessageBox.StandardButton.Cancel,
+    )
+    w._do_solve()
+    qt_app.processEvents()
+
+    # Stale result cleared.
+    assert w._result is None
+    assert w._multi_result is None
+    # Warning is visible in the report panel.
+    text = w._result_text.toPlainText()
+    assert "not connected" in text or "orphan" in text.lower() or "Node 99" in text
+    # Canvas has the warning highlight.
+    assert 99 in w.canvas._warning_node_ids

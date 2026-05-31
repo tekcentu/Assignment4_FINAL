@@ -1946,7 +1946,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             )
             if ans != QMessageBox.StandardButton.Ok:
+                # User cancelled — keep the warnings visible after the
+                # modal closes: highlights on the canvas, report in the
+                # text panel, and wipe any stale numeric result so a
+                # prior solve's diagrams don't confuse the picture.
+                self._clear_stale_result_state()
                 _push_validation_to_canvas(self.canvas, v_result)
+                self._show_validation_in_report(v_result)
                 return
         # Validation passed (or user dismissed warnings).  Drop any
         # leftover problem highlights from a prior failed pass.

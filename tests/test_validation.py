@@ -307,6 +307,27 @@ def test_missing_materials_is_error():
     assert any("No materials" in s for s in errs)
 
 
+def test_element_referencing_missing_node_does_not_crash():
+    """Regression (Gemini PR #31 HIGH finding): an element whose
+    ``node_j`` doesn't exist in ``model.nodes`` used to crash
+    ``_find_truss_mechanisms`` with a ``KeyError`` because the
+    geometry checks dereferenced the invalid id directly.  The
+    validator must instead surface the broken reference as a basic-
+    sanity error and stop before geometry checks run."""
+    m = StructuralModel(title="bad")
+    _seed_materials_sections(m)
+    m.nodes = {1: Node(1, 0.0, 0.0)}  # only node 1 exists
+    # Truss references node 999 which is NOT in model.nodes — would
+    # have crashed _bar_direction_from_node previously.
+    m.elements.append(_truss(1, 999, elem_id=1))
+    # Must not raise.
+    res = validate_model(m)
+    errs = [i.message for i in res.issues if i.severity == "error"]
+    assert any("missing end node 999" in s for s in errs)
+    # And no mechanism check should have run (those would crash too).
+    assert not any("transverse DOF" in s for s in errs)
+
+
 def test_no_supports_is_warning_not_error():
     m = StructuralModel(title="empty-supports")
     _seed_materials_sections(m)
