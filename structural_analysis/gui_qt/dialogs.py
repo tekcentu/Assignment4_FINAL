@@ -1980,6 +1980,21 @@ class LoadCaseManagerDialog(_ModalDialog):
         row["deleted"] = True
         self._rebuild_table()
 
+    def _set_item_text_silent(
+        self, item: QTableWidgetItem, text: str,
+    ) -> None:
+        """Update a table item's text without re-firing
+        ``itemChanged`` — used by ``_on_item_changed`` to roll back
+        invalid edits or to write the normalised name back. Defensive
+        block-signals-on-table during the setText so the recursive
+        call doesn't even need to early-return (Gemini PR #28
+        finding)."""
+        self._table.blockSignals(True)
+        try:
+            item.setText(text)
+        finally:
+            self._table.blockSignals(False)
+
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         # Only the Name column (0) is editable, and only for non-DEFAULT.
         if item.column() != 0:
@@ -1991,7 +2006,7 @@ class LoadCaseManagerDialog(_ModalDialog):
             normalised = _normalize_load_case(new_text)
         except ValueError as e:
             QMessageBox.warning(self, "Invalid case name", str(e))
-            item.setText(r["name"])
+            self._set_item_text_silent(item, r["name"])
             return
         if normalised == r["name"]:
             return
@@ -2000,7 +2015,7 @@ class LoadCaseManagerDialog(_ModalDialog):
                 self, "Invalid case name",
                 "DEFAULT already exists.",
             )
-            item.setText(r["name"])
+            self._set_item_text_silent(item, r["name"])
             return
         live_names = {row["name"] for row in live_rows if row is not r}
         if normalised in live_names:
@@ -2008,10 +2023,10 @@ class LoadCaseManagerDialog(_ModalDialog):
                 self, "Invalid case name",
                 f"Case {normalised!r} is already defined.",
             )
-            item.setText(r["name"])
+            self._set_item_text_silent(item, r["name"])
             return
         r["name"] = normalised
-        item.setText(normalised)
+        self._set_item_text_silent(item, normalised)
 
     def _accept(self) -> list:
         """Return the list of commands needed to apply the dialog's

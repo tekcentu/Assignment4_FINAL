@@ -641,3 +641,26 @@ def test_split_frame_thermal_preserves_load_case_on_both_children():
     ]
     assert len(thermals) == 2
     assert all(ld.load_case == "THERMAL" for ld in thermals)
+
+
+# ── Gemini PR #28 — comment-skip strips leading whitespace ──────────
+
+
+def test_reader_load_cases_block_skips_indented_comments():
+    """``  # comment`` rows with leading whitespace inside the block
+    must be skipped without raising. Pre-fix the loop only checked
+    ``startswith('#')`` after a no-strip ``not lines[i]`` test, so an
+    indented comment would fall through and the parser would try to
+    parse it as a case row (Gemini PR #28 medium finding)."""
+    body = (
+        "TITLE\nindented-comment\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "LOAD_CASES 1\n"
+        "    # indented comment - must be skipped\n"
+        "WIND\n\n"
+    )
+    m = _read_file(body)
+    assert "WIND" in m.load_cases

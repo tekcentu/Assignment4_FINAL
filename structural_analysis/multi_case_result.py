@@ -123,15 +123,14 @@ class MultiCaseAnalysisResult:
         D_sum = None
         member_keys = first.member_results.keys()
         reactions_sum: dict[int, dict[str, float]] = {}
-        f_local_sum: dict[int, np.ndarray] = {
-            eid: np.zeros(6) for eid in member_keys
-        }
-        d_local_sum: dict[int, np.ndarray] = {
-            eid: np.zeros(6) for eid in member_keys
-        }
-        d_global_sum: dict[int, np.ndarray] = {
-            eid: np.zeros(6) for eid in member_keys
-        }
+        # Sum buckets are lazily sized from the first concrete value
+        # per element. Hardcoding a size-6 vector here would crash on
+        # 2D truss elements whose ``f_local`` is 4-element rather than
+        # 6 (Gemini PR #28 finding). ``np.zeros_like`` matches the
+        # incoming array's shape and dtype exactly.
+        f_local_sum: dict[int, np.ndarray] = {}
+        d_local_sum: dict[int, np.ndarray] = {}
+        d_global_sum: dict[int, np.ndarray] = {}
         for r in self.cases.values():
             D_sum = (
                 np.asarray(r.D) if D_sum is None
@@ -144,19 +143,30 @@ class MultiCaseAnalysisResult:
             for eid in member_keys:
                 mr = r.member_results.get(eid, {})
                 if "f_local" in mr:
-                    f_local_sum[eid] += np.asarray(mr["f_local"])
+                    val = np.asarray(mr["f_local"])
+                    if eid not in f_local_sum:
+                        f_local_sum[eid] = np.zeros_like(val)
+                    f_local_sum[eid] = f_local_sum[eid] + val
                 if "d_local" in mr:
-                    d_local_sum[eid] += np.asarray(mr["d_local"])
+                    val = np.asarray(mr["d_local"])
+                    if eid not in d_local_sum:
+                        d_local_sum[eid] = np.zeros_like(val)
+                    d_local_sum[eid] = d_local_sum[eid] + val
                 if "d_global" in mr:
-                    d_global_sum[eid] += np.asarray(mr["d_global"])
-        summed_member_results = {
-            eid: {
-                "f_local": f_local_sum[eid],
-                "d_local": d_local_sum[eid],
-                "d_global": d_global_sum[eid],
-            }
-            for eid in member_keys
-        }
+                    val = np.asarray(mr["d_global"])
+                    if eid not in d_global_sum:
+                        d_global_sum[eid] = np.zeros_like(val)
+                    d_global_sum[eid] = d_global_sum[eid] + val
+        summed_member_results: dict[int, dict] = {}
+        for eid in member_keys:
+            entry: dict = {}
+            if eid in f_local_sum:
+                entry["f_local"] = f_local_sum[eid]
+            if eid in d_local_sum:
+                entry["d_local"] = d_local_sum[eid]
+            if eid in d_global_sum:
+                entry["d_global"] = d_global_sum[eid]
+            summed_member_results[eid] = entry
         # eq_residual / residual aren't superposable in a meaningful
         # way (they're norms of independent solves); report the max
         # so a SUM_ALL view that's still well-conditioned shows

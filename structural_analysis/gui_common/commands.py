@@ -1458,25 +1458,31 @@ class DeleteMemberLoadCmd(Command):
 
 def _replace_load_case_on_loads(
     model: StructuralModel, old: str, new: str,
-) -> tuple[list, dict[int, list]]:
+) -> tuple[list, dict[int, list | None]]:
     """Replace ``load_case == old`` with ``new`` on every attached load.
 
     Returns the **previous** (nodal_loads_snapshot, member_loads_snapshot)
     so the caller can restore on ``undo``. Member-load snapshot is keyed
-    by ``element.id``."""
+    by ``element.id``; the value is ``None`` for elements whose
+    ``member_loads`` attribute is missing (defensive — today's
+    Element2D always has the list, but a future subclass might not)."""
     from dataclasses import replace
     prev_nodal = list(model.nodal_loads)
-    prev_member: dict[int, list] = {
-        elem.id: list(elem.member_loads) for elem in model.elements
-    }
+    prev_member: dict[int, list | None] = {}
+    for elem in model.elements:
+        m_loads = getattr(elem, "member_loads", None)
+        prev_member[elem.id] = list(m_loads) if m_loads is not None else None
     model.nodal_loads = [
         replace(ld, load_case=new) if ld.load_case == old else ld
         for ld in model.nodal_loads
     ]
     for elem in model.elements:
+        m_loads = getattr(elem, "member_loads", None)
+        if m_loads is None:
+            continue
         elem.member_loads[:] = [
             replace(ld, load_case=new) if ld.load_case == old else ld
-            for ld in elem.member_loads
+            for ld in m_loads
         ]
     return prev_nodal, prev_member
 
@@ -1484,12 +1490,18 @@ def _replace_load_case_on_loads(
 def _restore_load_attachments(
     model: StructuralModel,
     prev_nodal: list,
-    prev_member: dict[int, list],
+    prev_member: dict[int, list | None],
 ) -> None:
     model.nodal_loads = list(prev_nodal)
     for elem in model.elements:
-        if elem.id in prev_member:
-            elem.member_loads[:] = list(prev_member[elem.id])
+        if elem.id not in prev_member:
+            continue
+        snapshot = prev_member[elem.id]
+        if snapshot is None:
+            continue
+        if getattr(elem, "member_loads", None) is None:
+            continue
+        elem.member_loads[:] = list(snapshot)
 
 
 @dataclass
@@ -1545,7 +1557,7 @@ class DeleteLoadCaseCmd(Command):
         ) or any(
             ld.load_case == self.name
             for elem in model.elements
-            for ld in elem.member_loads
+            for ld in (getattr(elem, "member_loads", None) or [])
         )
         if referenced and self.reassign_to is None:
             raise ValueError(

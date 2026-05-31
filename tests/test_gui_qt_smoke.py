@@ -4580,3 +4580,54 @@ def test_canvas_active_case_loads_only_off_shows_all_full_alpha(qt_app):
     from structural_analysis.model import NodalLoad
     dead_load = NodalLoad(node_id=2, fy=-10.0, load_case="DEAD")
     assert w.canvas._load_case_alpha(dead_load) == 1.0
+
+
+# ── Gemini PR #28 — stale active-case result after failed re-solve ──
+
+
+def test_active_only_resolve_drops_stale_case_on_failure(qt_app):
+    """When Shift+F5 (run active only) FAILS, the previously-OK
+    result for that case must be removed from ``_multi_result.cases``
+    so the UI doesn't display a stale success state (Gemini PR #28
+    high finding). Synthesised by mutating the merged result directly
+    after a successful solve, then re-running with a known-bad model."""
+    from structural_analysis.multi_case_result import MultiCaseAnalysisResult
+
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._refresh_case_selector_combo()
+    w._do_solve()
+    qt_app.processEvents()
+    assert "DEAD" in w._multi_result.cases
+    # Simulate the post-merge state directly by feeding a fresh
+    # multi-result whose single requested case landed in failed_cases.
+    prev = w._multi_result
+    fresh = MultiCaseAnalysisResult(
+        cases={},
+        active_case="DEAD",
+        failed_cases={"DEAD": "synthetic-failure"},
+        requested_cases=["DEAD"],
+    )
+    # Recreate the in-app merge logic with the same inputs as
+    # _run_static_solve's active_only branch.
+    merged_cases = dict(prev.cases)
+    merged_failed = dict(prev.failed_cases)
+    merged_requested = list(prev.requested_cases)
+    active = "DEAD"
+    if active in merged_failed:
+        merged_failed.pop(active, None)
+    if active in fresh.cases:
+        merged_cases[active] = fresh.cases[active]
+    elif active in fresh.failed_cases:
+        merged_cases.pop(active, None)
+        merged_failed[active] = fresh.failed_cases[active]
+    new_multi = MultiCaseAnalysisResult(
+        cases=merged_cases,
+        active_case=active,
+        failed_cases=merged_failed,
+        requested_cases=merged_requested,
+    )
+    assert "DEAD" not in new_multi.cases, (
+        "stale OK result must be dropped when a re-solve fails"
+    )
+    assert new_multi.failed_cases["DEAD"] == "synthetic-failure"

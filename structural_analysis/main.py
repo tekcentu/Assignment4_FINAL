@@ -23,11 +23,17 @@ def _filter_loads_to_case(model: StructuralModel, case: str):
     """Temporarily restrict ``model``'s nodal + member loads to the
     given case, and toggle ``include_self_weight`` so self-weight is
     applied only for ``model.self_weight_case``. Restored on exit, even
-    on exception (PR-A item 9 — never mutate the model permanently)."""
+    on exception (PR-A item 9 — never mutate the model permanently).
+
+    Defensive ``getattr`` on ``member_loads``: today's Element2D always
+    carries a default-factory ``list`` so the attribute is guaranteed,
+    but the context manager guards against future element subclasses
+    (or partially-constructed test fixtures) where ``member_loads`` may
+    be absent or ``None``."""
     saved_nodal = model.nodal_loads
-    saved_member: dict[int, list] = {}
+    saved_member: dict[int, list | None] = {}
     for elem in model.elements:
-        saved_member[id(elem)] = elem.member_loads
+        saved_member[id(elem)] = getattr(elem, "member_loads", None)
     saved_sw = model.include_self_weight
     try:
         model.nodal_loads = [
@@ -35,10 +41,12 @@ def _filter_loads_to_case(model: StructuralModel, case: str):
             if getattr(ld, "load_case", "DEFAULT") == case
         ]
         for elem in model.elements:
-            elem.member_loads = [
-                ld for ld in saved_member[id(elem)]
-                if getattr(ld, "load_case", "DEFAULT") == case
-            ]
+            m_loads = saved_member[id(elem)]
+            if m_loads is not None:
+                elem.member_loads = [
+                    ld for ld in m_loads
+                    if getattr(ld, "load_case", "DEFAULT") == case
+                ]
         # Self-weight is included only for the designated case.
         model.include_self_weight = (
             saved_sw and case == model.self_weight_case
@@ -47,7 +55,9 @@ def _filter_loads_to_case(model: StructuralModel, case: str):
     finally:
         model.nodal_loads = saved_nodal
         for elem in model.elements:
-            elem.member_loads = saved_member[id(elem)]
+            m_loads = saved_member[id(elem)]
+            if m_loads is not None:
+                elem.member_loads = m_loads
         model.include_self_weight = saved_sw
 
 

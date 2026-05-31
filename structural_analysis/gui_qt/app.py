@@ -1970,7 +1970,12 @@ class MainWindow(QMainWindow):
                     if self._multi_result is not None:
                         prev = self._multi_result
                         # Build a merged result: prior solved cases +
-                        # the fresh single-case one.
+                        # the fresh single-case one. When the
+                        # active-only re-solve FAILS we must drop the
+                        # prior result for the active case — otherwise
+                        # the canvas would keep showing a stale
+                        # success result while the wrapper claims the
+                        # case failed (Gemini PR #28 finding).
                         merged_cases = dict(prev.cases)
                         merged_failed = dict(prev.failed_cases)
                         merged_requested = list(prev.requested_cases)
@@ -1978,7 +1983,8 @@ class MainWindow(QMainWindow):
                             merged_failed.pop(active, None)
                         if active in fresh.cases:
                             merged_cases[active] = fresh.cases[active]
-                        if active in fresh.failed_cases:
+                        elif active in fresh.failed_cases:
+                            merged_cases.pop(active, None)
                             merged_failed[active] = fresh.failed_cases[active]
                         if active not in merged_requested:
                             merged_requested.append(active)

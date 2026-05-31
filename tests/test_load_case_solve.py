@@ -297,3 +297,50 @@ def test_make_active_case_safe_falls_back_to_DEFAULT_for_invalid():
 def test_make_active_case_safe_with_none_multi_returns_desired():
     from structural_analysis.multi_case_result import make_active_case_safe
     assert make_active_case_safe(None, "WHATEVER") == "WHATEVER"
+
+
+# ── Gemini PR #28 regression — sum_all on heterogeneous DOF widths ──
+
+
+def test_sum_all_handles_truss_element_with_4_dof_f_local():
+    """Regression for the hardcoded ``np.zeros(6)`` initialiser that
+    crashed on truss elements where member_results.f_local is
+    4-element. The lazy ``np.zeros_like`` init must accept whatever
+    shape the per-case result delivers."""
+    import numpy as np
+    from structural_analysis.model import AnalysisResult
+    from structural_analysis.multi_case_result import MultiCaseAnalysisResult
+
+    def _mock_case(value: float) -> AnalysisResult:
+        return AnalysisResult(
+            status="ok",
+            title="mock",
+            E_map={},
+            num_eq=4,
+            G_vectors={},
+            D=np.array([value, value, value, value]),
+            residual=0.0,
+            member_results={
+                1: {
+                    # 4-element f_local (truss-like)
+                    "f_local": np.array([value, 0.0, -value, 0.0]),
+                    "d_local": np.array([value, 0.0, value, 0.0]),
+                    "d_global": np.array([value, 0.0, value, 0.0]),
+                },
+            },
+            reactions={},
+            eq_residual=0.0,
+        )
+
+    multi = MultiCaseAnalysisResult(
+        cases={"DEAD": _mock_case(1.0), "LIVE": _mock_case(2.0)},
+        active_case="DEAD",
+        requested_cases=["DEAD", "LIVE"],
+    )
+    sa = multi.sum_all()
+    assert sa is not None
+    assert sa.member_results[1]["f_local"].shape == (4,)
+    np.testing.assert_allclose(
+        sa.member_results[1]["f_local"],
+        np.array([3.0, 0.0, -3.0, 0.0]),
+    )

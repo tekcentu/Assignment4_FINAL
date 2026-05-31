@@ -575,8 +575,13 @@ def read_input_file(filepath: str) -> StructuralModel:
             count = int(tokens[1])
             for _ in range(count):
                 i += 1
+                # Strip before the leading-'#' check so a comment line
+                # with indentation ("  # comment") is still skipped
+                # (Gemini PR #28 finding — without the strip the loop
+                # would fall through and ``parts`` would be empty).
                 while i < len(lines) and (
-                    not lines[i] or lines[i].startswith("#")
+                    not lines[i].strip()
+                    or lines[i].lstrip().startswith("#")
                 ):
                     i += 1
                 if i >= len(lines):
