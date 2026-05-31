@@ -1,10 +1,9 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.20.0"
+__version__ = "0.21.0"
 __what_is_new__ = (
-    "Multiple nodal loads per node · "
-    "per-row Add/Edit/Delete · "
-    "individually undoable"
+    "Combination results now display correctly · "
+    "fix: case selector read label instead of data"
 )
 
 from .model import (

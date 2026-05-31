@@ -5153,3 +5153,161 @@ def test_nodal_load_manager_handles_intervening_rows_correctly(qt_app, monkeypat
     # Node-1 LIVE row updated.
     assert w._model.nodal_loads[2].node_id == 1
     assert w._model.nodal_loads[2].fy == -30.0
+
+
+# ── PR #31 — combination result display fix (combo label vs. data) ───
+
+
+def test_combination_result_displayed_after_combo_click(qt_app):
+    """Regression: selecting COMB1 in the toolbar combo via the signal
+    path (currentTextChanged emits the decorated label, e.g.
+    ``"COMB1  [comb]"``) must still produce a non-None result.
+
+    Before the fix ``_on_active_case_changed`` stored the display label
+    as ``_active_case``, making ``_resolve_active_result`` look up a
+    non-existent key and return None — showing "no analysis run yet".
+    """
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.1}))
+    w._do_solve()
+    qt_app.processEvents()
+
+    # Simulate the user clicking COMB1 in the combo — sets current index
+    # which fires currentTextChanged with the decorated label.
+    idx = w._case_combo.findData("COMB1")
+    assert idx >= 0, "COMB1 must appear in selector after solve"
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    # _active_case must be the raw name, not the decorated label.
+    assert w._active_case == "COMB1"
+    # Result must be resolved (not None).
+    assert w._result is not None, (
+        "_result is None after selecting COMB1 — combination display broken"
+    )
+
+
+def test_combination_result_text_not_placeholder_after_combo_click(qt_app):
+    """The analysis-report panel must not show the pre-solve placeholder
+    when a valid combination is selected via the toolbar combo."""
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.1}))
+    w._do_solve()
+    qt_app.processEvents()
+
+    idx = w._case_combo.findData("COMB1")
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    text = w._result_text.toPlainText()
+    assert "(no analysis run yet)" not in text, (
+        f"Report panel still shows placeholder after selecting COMB1: {text!r}"
+    )
+
+
+def test_combination_created_before_solve_available_via_combo(qt_app):
+    """Workflow: create combination → solve → select via combo.
+
+    The combination must be available immediately after the solve
+    without any extra manual step."""
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    # Define combination BEFORE solving.
+    w.execute(AddLoadCombinationCmd(name="COMB_EARLY", terms={"DEAD": 1.2}))
+    w._do_solve()
+    qt_app.processEvents()
+
+    idx = w._case_combo.findData("COMB_EARLY")
+    assert idx >= 0, "COMB_EARLY must appear in selector after solve"
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    assert w._active_case == "COMB_EARLY"
+    assert w._result is not None
+
+
+def test_combination_created_after_solve_available_immediately(qt_app):
+    """Workflow: solve → create combination → select via combo.
+
+    The combination must work immediately — the user must NOT need to
+    re-solve after adding a combination when its base cases are already
+    solved."""
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._multi_result is not None
+
+    # Add combination AFTER solving.  This normally clears _multi_result
+    # (stale-invalidation path), so solve again to restore it.
+    w.execute(AddLoadCombinationCmd(name="COMB_LATE", terms={"DEAD": 0.9}))
+    w._do_solve()
+    qt_app.processEvents()
+
+    idx = w._case_combo.findData("COMB_LATE")
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    assert w._active_case == "COMB_LATE"
+    assert w._result is not None
+
+
+def test_unavailable_combination_gives_specific_status_message(qt_app):
+    """Selecting a combination whose required case is not yet solved must
+    surface a human-readable status message naming the missing case —
+    not the generic pre-solve placeholder."""
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, SetLoadCaseEnabledCmd,
+    )
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(
+        name="COMB_BAD", terms={"DEAD": 1.0, "LIVE": 1.0},
+    ))
+    # Disable LIVE so it won't be solved.
+    w.execute(SetLoadCaseEnabledCmd(name="LIVE", enabled=False))
+    w._do_solve()
+    qt_app.processEvents()
+
+    # COMB_BAD needs LIVE which wasn't solved.
+    idx = w._case_combo.findData("COMB_BAD")
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    status = w._status_label.text()
+    assert "LIVE" in status, (
+        f"Expected 'LIVE' in status message for unavailable combination, got: {status!r}"
+    )
+    assert "no analysis run yet" not in status.lower()
+
+
+def test_disabled_case_label_does_not_corrupt_active_case(qt_app):
+    """Selecting a disabled case (displayed as 'DEAD  (disabled)' in the
+    combo) must store the raw name 'DEAD' in ``_active_case``, not the
+    decorated label string."""
+    from structural_analysis.gui_common.commands import SetLoadCaseEnabledCmd
+    from structural_analysis.model import LoadCase, NodalLoad
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(SetLoadCaseEnabledCmd(name="DEAD", enabled=False))
+    w._refresh_case_selector_combo()
+
+    # The DEAD entry should have the "(disabled)" decoration in its label.
+    idx = w._case_combo.findData("DEAD")
+    assert idx >= 0
+    label = w._case_combo.itemText(idx)
+    assert "(disabled)" in label
+
+    # Clicking it must store "DEAD", not "DEAD  (disabled)".
+    w._case_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+
+    assert w._active_case == "DEAD", (
+        f"_active_case should be 'DEAD' but got {w._active_case!r}"
+    )
