@@ -1567,3 +1567,57 @@ def test_delete_case_blocked_when_nodal_load_references_it_with_no_reassign():
     AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
     with pytest.raises(ValueError, match=r"referenced by attached loads"):
         DeleteLoadCaseCmd(name="DEAD", reassign_to=None).do(m)
+
+
+def test_add_nodal_load_undo_is_identity_based_under_non_lifo_mutation():
+    """PR #30 reviewer fix (Gemini HIGH / Codex P2): when another
+    command inserts a row between AddNodalLoadCmd's do() and undo(),
+    the original stale-index fix could either delete the wrong row or
+    no-op. Identity tracking removes the row the command actually
+    added, even when its position has shifted.
+    """
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, DeleteNodalLoadRowCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    # add A at index 0, then B at index 1.
+    add_a = AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD")
+    add_b = AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE")
+    add_a.do(m)
+    add_b.do(m)
+    # Non-LIFO: delete A (the *first* row, index 0). B is now at index 0.
+    DeleteNodalLoadRowCmd(row_index=0).do(m)
+    assert len(m.nodal_loads) == 1
+    assert m.nodal_loads[0].load_case == "LIVE"
+    # Identity-based undo removes B, not whatever sits at the stale
+    # index 1 (which is past the end now).
+    add_b.undo(m)
+    assert m.nodal_loads == []
+
+
+def test_edit_nodal_load_row_undo_is_identity_based_under_non_lifo_mutation():
+    """Mirror of the AddNodalLoadCmd identity regression for Edit:
+    after an Edit replaces row 1, an unrelated delete of row 0 shifts
+    the edited row to index 0. Identity-based undo still restores the
+    pre-edit row at the correct (new) position."""
+    from structural_analysis.gui_common.commands import (
+        AddNodalLoadCmd, DeleteNodalLoadRowCmd, EditNodalLoadRowCmd,
+    )
+    m = _model_with_node_and_two_cases()
+    AddNodalLoadCmd(node_id=1, fy=-10.0, load_case="DEAD").do(m)
+    AddNodalLoadCmd(node_id=1, fy=-20.0, load_case="LIVE").do(m)
+    edit_b = EditNodalLoadRowCmd(
+        row_index=1, fx=0.0, fy=-30.0, mz=0.0, load_case="LIVE",
+    )
+    edit_b.do(m)
+    assert m.nodal_loads[1].fy == -30.0
+    # Non-LIFO mutation: delete row 0 (DEAD). The edited LIVE row
+    # moves from index 1 to index 0.
+    DeleteNodalLoadRowCmd(row_index=0).do(m)
+    assert len(m.nodal_loads) == 1
+    assert m.nodal_loads[0].fy == -30.0
+    # Identity-based undo restores the pre-edit LIVE row in place.
+    edit_b.undo(m)
+    assert len(m.nodal_loads) == 1
+    assert m.nodal_loads[0].fy == -20.0
+    assert m.nodal_loads[0].load_case == "LIVE"

@@ -1362,13 +1362,20 @@ class AddNodalLoadCmd(Command):
 
     All-zero rows (fx == fy == mz == 0) are rejected; an empty load has
     no solver effect and would only clutter the inspector.
+
+    The appended row is tracked by **object identity**, not by index,
+    so undo correctly removes only this command's row even when
+    unrelated commands have inserted / deleted other rows between the
+    do() and undo() calls (the LIFO controller never triggers that,
+    but the command-layer tests do, and the same identity discipline
+    is used by :class:`AddMemberLoadCmd`).
     """
     node_id: int
     fx: float = 0.0
     fy: float = 0.0
     mz: float = 0.0
     load_case: str = "DEFAULT"
-    _appended_index: int | None = field(default=None, init=False)
+    _appended_load: NodalLoad | None = field(default=None, init=False)
     description: str = "add nodal load"
 
     def do(self, model: StructuralModel) -> None:
@@ -1378,25 +1385,19 @@ class AddNodalLoadCmd(Command):
             raise ValueError(
                 "Nodal load has Fx = Fy = Mz = 0 — nothing to add."
             )
-        self._appended_index = len(model.nodal_loads)
-        model.nodal_loads.append(NodalLoad(
+        self._appended_load = NodalLoad(
             self.node_id, float(self.fx), float(self.fy),
             float(self.mz), load_case=self.load_case,
-        ))
+        )
+        model.nodal_loads.append(self._appended_load)
 
     def undo(self, model: StructuralModel) -> None:
-        # do() always appends at the tail, so the inverse is a simple
-        # tail-pop *iff* the appended row is still there. We verify
-        # identity (node_id + values) to stay safe if some intervening
-        # command (e.g. another undoable mutation) ran between this
-        # command's do() and undo(); the controller pushes commands
-        # serially today so the simple pop covers the LIFO case.
-        if (
-            self._appended_index is None
-            or self._appended_index >= len(model.nodal_loads)
-        ):
+        if self._appended_load is None:
             return
-        del model.nodal_loads[self._appended_index]
+        for i, ld in enumerate(model.nodal_loads):
+            if ld is self._appended_load:
+                del model.nodal_loads[i]
+                return
 
 
 @dataclass
@@ -1404,10 +1405,11 @@ class EditNodalLoadRowCmd(Command):
     """Replace one row in ``model.nodal_loads`` by index (v0.20 — PR #30).
 
     ``row_index`` is the row's position in the flat ``model.nodal_loads``
-    list at the moment the GUI captures it. The command is intended for
-    immediate use after row selection — the LIFO undo stack means the
-    saved row goes back to the same index on undo, preserving order
-    relative to other loads.
+    list at the moment the GUI captures it. The captured index is only
+    used by ``do()``; ``undo()`` finds the replacement row by object
+    identity and swaps the saved row back in, so an unrelated insert /
+    delete between do() and undo() (non-LIFO usage) can't corrupt a
+    different load.
 
     Editing the row's ``node_id`` is intentionally not supported: a
     user who wants to move a load to a different node should delete
@@ -1419,6 +1421,7 @@ class EditNodalLoadRowCmd(Command):
     mz: float
     load_case: str = "DEFAULT"
     _saved: NodalLoad | None = field(default=None, init=False)
+    _new_load: NodalLoad | None = field(default=None, init=False)
     description: str = "edit nodal load row"
 
     def do(self, model: StructuralModel) -> None:
@@ -1433,17 +1436,19 @@ class EditNodalLoadRowCmd(Command):
                 "Nodal load has Fx = Fy = Mz = 0 — use Delete to remove it."
             )
         self._saved = model.nodal_loads[self.row_index]
-        model.nodal_loads[self.row_index] = NodalLoad(
+        self._new_load = NodalLoad(
             self._saved.node_id, float(self.fx), float(self.fy),
             float(self.mz), load_case=self.load_case,
         )
+        model.nodal_loads[self.row_index] = self._new_load
 
     def undo(self, model: StructuralModel) -> None:
-        if self._saved is None:
+        if self._saved is None or self._new_load is None:
             return
-        if not (0 <= self.row_index < len(model.nodal_loads)):
-            return
-        model.nodal_loads[self.row_index] = self._saved
+        for i, ld in enumerate(model.nodal_loads):
+            if ld is self._new_load:
+                model.nodal_loads[i] = self._saved
+                return
 
 
 @dataclass
@@ -1451,9 +1456,16 @@ class DeleteNodalLoadRowCmd(Command):
     """Remove one row from ``model.nodal_loads`` by index (v0.20 — PR #30).
 
     Mirrors :class:`DeleteMemberLoadCmd`: undo re-inserts the saved row
-    at the same index, so subsequent rows shift back to their original
-    positions and any later Edit commands referencing later rows still
-    address the right load under LIFO undo.
+    at the same index, so under LIFO undo the row goes back to its
+    original position and any later Edit commands referencing later
+    rows still address the right load.
+
+    Identity-based undo is not used here because the saved row must
+    re-occupy a *position* in the list, not be looked up — and after
+    a successful delete the saved row is no longer in the list to
+    locate by identity. Callers exercising commands outside LIFO order
+    on this list must restore the surrounding state themselves before
+    invoking undo (the same constraint applies to DeleteMemberLoadCmd).
     """
     row_index: int
     _saved: NodalLoad | None = field(default=None, init=False)
