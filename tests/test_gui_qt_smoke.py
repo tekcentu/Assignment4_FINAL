@@ -3252,7 +3252,7 @@ def test_inspector_delete_button_removes_one_row_only(qt_app):
     w._open_element_inspector(eid)
     qt_app.processEvents()
     table = w._element_inspector._loads_widget
-    btn = table.cellWidget(1, 4)  # Delete button on row index 1 (PointLoad)
+    btn = table.cellWidget(1, 5)  # Delete button on row index 1 (PointLoad)
     assert isinstance(btn, QPushButton)
     btn.click()
     qt_app.processEvents()
@@ -3281,7 +3281,7 @@ def test_inspector_delete_then_undo_restores_row(qt_app):
     w._open_element_inspector(eid)
     qt_app.processEvents()
     table = w._element_inspector._loads_widget
-    btn = table.cellWidget(1, 4)
+    btn = table.cellWidget(1, 5)
     btn.click()
     qt_app.processEvents()
     assert len(w._model.elements[0].member_loads) == 2
@@ -3307,7 +3307,7 @@ def test_inspector_delete_buttons_disabled_when_no_host_callback(qt_app):
     d = ElementPropertiesDialog(w, w._model, eid, None)
     table = d._loads_widget
     for i in range(table.rowCount()):
-        btn = table.cellWidget(i, 4)
+        btn = table.cellWidget(i, 5)
         assert isinstance(btn, QPushButton)
         assert not btn.isEnabled(), (
             f"row {i} Delete button must be disabled without host callback"
@@ -3454,7 +3454,8 @@ def test_member_load_dialog_offers_wx_and_coord_radio_for_udl(qt_app):
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
-    d._radios["udl"].setChecked(True)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
     d._refresh_fields()
     assert "wx" in d._fields
     assert "wy" in d._fields
@@ -3468,7 +3469,8 @@ def test_member_load_dialog_offers_px_and_coord_radio_for_pointload(qt_app):
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
-    d._radios["point"].setChecked(True)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_point.setChecked(True)
     d._refresh_fields()
     assert "px" in d._fields
     assert "py" in d._fields
@@ -3483,7 +3485,7 @@ def test_member_load_dialog_hides_coord_radio_for_thermal(qt_app):
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
-    d._radios["frame_t"].setChecked(True)
+    d._rb_cat_thermal.setChecked(True)
     d._refresh_fields()
     # Hidden via setVisible(False); isVisibleTo respects that.
     assert not d._coord_widget.isVisibleTo(d)
@@ -3501,7 +3503,8 @@ def test_member_load_dialog_accept_returns_coord_system(qt_app):
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
-    d._radios["udl"].setChecked(True)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
     d._rb_global.setChecked(True)
     d._refresh_fields()
     d._fields["wx"].setText("3.0")  # qX (storage field name stays wx)
@@ -3524,7 +3527,8 @@ def test_member_load_dialog_offers_three_direction_radios(qt_app):
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
-    d._radios["udl"].setChecked(True)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
     d._refresh_fields()
     assert d._rb_local.isVisibleTo(d)
     assert d._rb_global.isVisibleTo(d)
@@ -3538,7 +3542,8 @@ def test_member_load_dialog_local_labels_say_local(qt_app):
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
-    d._radios["udl"].setChecked(True)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
     d._rb_local.setChecked(True)
     d._refresh_fields()
     labels = _form_labels(d._field_form)
@@ -3554,7 +3559,8 @@ def test_member_load_dialog_global_labels_say_qX_qY(qt_app):
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
-    d._radios["udl"].setChecked(True)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
     d._rb_global.setChecked(True)
     d._refresh_fields()
     labels = _form_labels(d._field_form)
@@ -3570,13 +3576,16 @@ def test_member_load_dialog_gravity_shows_single_magnitude_field(qt_app):
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
-    d._radios["udl"].setChecked(True)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
     d._rb_gravity.setChecked(True)
     d._refresh_fields()
     assert "wx" not in d._fields
     assert "wy" in d._fields
     labels = _form_labels(d._field_form)
-    assert any("magnitude" in lbl.lower() for lbl in labels)
+    # v0.17 renamed the gravity-UDL field from "magnitude" to "qg" and
+    # added a "+ve downward" qualifier so the direction stays obvious.
+    assert any("qg" in lbl for lbl in labels)
     assert any("downward" in lbl.lower() for lbl in labels)
 
 
@@ -3589,7 +3598,8 @@ def test_member_load_dialog_gravity_accept_emits_correct_load(qt_app):
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
-    d._radios["udl"].setChecked(True)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
     d._rb_gravity.setChecked(True)
     d._refresh_fields()
     d._fields["wy"].setText("12.0")
@@ -3758,3 +3768,544 @@ def _form_labels(form_layout):
             if w is not None and hasattr(w, "text"):
                 labels.append(w.text())
     return labels
+
+
+# ── PR #27 — MemberLoadDialog reorganization + load_case combo ──────
+
+
+def _truss_model_for_dialog(w):
+    """Set up a truss element so tests can exercise the truss-thermal
+    gating in MemberLoadDialog."""
+    from structural_analysis.element import TrussElement2D
+    from structural_analysis.model import Material, Node, Section
+
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.elements = [TrussElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, section_id=1,
+    )]
+    return 1
+
+
+def test_member_load_dialog_has_mechanical_and_thermal_category(qt_app):
+    """v0.17: the top-level radio splits the dialog into Mechanical and
+    Thermal halves — neither set of controls leaks into the other."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    assert d._rb_cat_mechanical.isVisibleTo(d)
+    assert d._rb_cat_thermal.isVisibleTo(d)
+
+
+def test_member_load_dialog_category_mechanical_shows_direction_block(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._refresh_fields()
+    assert d._mech_widget.isVisibleTo(d)
+    assert d._coord_widget.isVisibleTo(d)
+    assert not d._thermal_widget.isVisibleTo(d)
+
+
+def test_member_load_dialog_category_thermal_hides_mechanical_blocks(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_thermal.setChecked(True)
+    d._refresh_fields()
+    assert not d._mech_widget.isVisibleTo(d)
+    assert not d._coord_widget.isVisibleTo(d)
+    assert d._thermal_widget.isVisibleTo(d)
+
+
+def test_member_load_dialog_thermal_uniform_shows_single_DT_field(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_thermal.setChecked(True)
+    d._rb_t_uniform.setChecked(True)
+    d._refresh_fields()
+    assert "delta_T" in d._fields
+    assert "t_top" not in d._fields
+    assert "t_bottom" not in d._fields
+    labels = _form_labels(d._field_form)
+    assert any("uniform" in lbl.lower() for lbl in labels)
+
+
+def test_member_load_dialog_thermal_gradient_shows_top_and_bottom(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_thermal.setChecked(True)
+    d._rb_t_gradient.setChecked(True)
+    d._refresh_fields()
+    assert "t_top" in d._fields
+    assert "t_bottom" in d._fields
+    assert "delta_T" not in d._fields
+
+
+def test_member_load_dialog_truss_disables_gradient_radio(qt_app):
+    """On a truss element the gradient option must be disabled (truss has
+    no bending DOFs) with a tooltip explaining why."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _truss_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    assert not d._rb_t_gradient.isEnabled()
+    tip = d._rb_t_gradient.toolTip().lower()
+    assert "truss" in tip and "uniform" in tip
+
+
+def test_member_load_dialog_truss_disables_mechanical_category(qt_app):
+    """v0.17 regression guard (Codex P2 on PR #27): trusses must NOT
+    default to the Mechanical category, because the solver explicitly
+    rejects UDL / PointLoad on truss elements. The Mechanical radio is
+    disabled with an explanatory tooltip and the dialog opens on
+    Thermal."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _truss_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    assert not d._rb_cat_mechanical.isEnabled()
+    assert d._rb_cat_thermal.isChecked()
+    tip = d._rb_cat_mechanical.toolTip().lower()
+    assert "truss" in tip
+
+
+def test_member_load_dialog_truss_rejects_mechanical_in_accept(qt_app):
+    """Defensive: even if the disabled Mechanical radio is checked
+    programmatically (bypassing the UI gate), _accept must refuse to
+    construct a UDL / PointLoad for a truss."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    import pytest
+
+    w = MainWindow()
+    eid = _truss_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)  # bypass the UI disable
+    d._refresh_fields()
+    if "wy" in d._fields:
+        d._fields["wy"].setText("-10.0")
+    with pytest.raises(ValueError, match=r"[Tt]russ"):
+        d._accept()
+
+
+def test_member_load_dialog_truss_thermal_uniform_returns_truss_load(qt_app):
+    """Truss + uniform ΔT must emit a TrussTemperatureLoad (NOT a
+    FrameTemperatureLoad even though uniform-Δ frame storage uses
+    t_top == t_bottom)."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import TrussTemperatureLoad
+
+    w = MainWindow()
+    eid = _truss_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_thermal.setChecked(True)
+    d._rb_t_uniform.setChecked(True)
+    d._refresh_fields()
+    d._fields["delta_T"].setText("30.0")
+    result = d._accept()
+    assert isinstance(result, TrussTemperatureLoad)
+    assert result.delta_T == 30.0
+
+
+def test_member_load_dialog_frame_thermal_uniform_returns_frame_load(qt_app):
+    """Frame + uniform ΔT → FrameTemperatureLoad with t_top==t_bottom so
+    the existing solver/load-summary recognises it as 'uniform'."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import FrameTemperatureLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_thermal.setChecked(True)
+    d._rb_t_uniform.setChecked(True)
+    d._refresh_fields()
+    d._fields["delta_T"].setText("25.0")
+    result = d._accept()
+    assert isinstance(result, FrameTemperatureLoad)
+    assert result.t_top == 25.0
+    assert result.t_bottom == 25.0
+
+
+def test_member_load_dialog_point_local_label_uses_capital_P(qt_app):
+    """v0.17 renamed PointLoad component labels to Px / Py to mirror the
+    Pg gravity label."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_point.setChecked(True)
+    d._rb_local.setChecked(True)
+    d._refresh_fields()
+    labels = _form_labels(d._field_form)
+    assert any("Px" in lbl for lbl in labels)
+    assert any("Py" in lbl for lbl in labels)
+
+
+def test_member_load_dialog_point_gravity_label_uses_Pg(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_point.setChecked(True)
+    d._rb_gravity.setChecked(True)
+    d._refresh_fields()
+    labels = _form_labels(d._field_form)
+    assert any("Pg" in lbl for lbl in labels)
+    assert any("downward" in lbl.lower() for lbl in labels)
+
+
+def test_member_load_dialog_has_load_case_combo_with_DEFAULT(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    assert d._case_combo.isEditable()
+    assert d._case_combo.currentText() == "DEFAULT"
+
+
+def test_member_load_dialog_load_case_combo_offers_built_in_suggestions(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    items = [d._case_combo.itemText(i) for i in range(d._case_combo.count())]
+    for expected in ("DEFAULT", "DEAD", "LIVE", "WIND", "THERMAL"):
+        assert expected in items
+
+
+def test_member_load_dialog_accept_emits_load_case_on_udl(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._rb_local.setChecked(True)
+    d._refresh_fields()
+    d._fields["wy"].setText("-10.0")
+    d._case_combo.setEditText("DEAD")
+    result = d._accept()
+    assert isinstance(result, UniformDistributedLoad)
+    assert result.load_case == "DEAD"
+
+
+def test_member_load_dialog_load_case_normalizes_to_uppercase(qt_app):
+    """User typing 'dead' or '  Dead  ' must produce 'DEAD' so the file
+    format stays consistent regardless of casing."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._refresh_fields()
+    d._fields["wy"].setText("-10.0")
+    d._case_combo.setEditText("  dead  ")
+    result = d._accept()
+    assert result.load_case == "DEAD"
+
+
+def test_member_load_dialog_load_case_blank_falls_back_to_DEFAULT(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._refresh_fields()
+    d._fields["wy"].setText("-10.0")
+    d._case_combo.setEditText("   ")
+    result = d._accept()
+    assert result.load_case == "DEFAULT"
+
+
+def test_member_load_dialog_load_case_rejects_whitespace(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    import pytest
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._refresh_fields()
+    d._fields["wy"].setText("-10.0")
+    d._case_combo.setEditText("DEAD LOAD")
+    with pytest.raises(ValueError, match=r"whitespace"):
+        d._accept()
+
+
+def test_member_load_dialog_load_case_rejects_hash(qt_app):
+    """``#`` starts a comment in the input-file format; if it leaked
+    into a case name the writer would silently truncate the saved row
+    on reload. The dialog must reject it at entry time."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    import pytest
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._refresh_fields()
+    d._fields["wy"].setText("-10.0")
+    d._case_combo.setEditText("DEAD#1")
+    with pytest.raises(ValueError, match=r"#"):
+        d._accept()
+
+
+# ── PR #27 manual-test review fixes: layout, helper text, labels ────
+
+
+def test_member_load_dialog_no_stale_field_widgets_after_mode_switch(qt_app):
+    """Layout-ghosting regression: switching Mechanical → Thermal must
+    leave NO leftover QLineEdit children parented to the field
+    container. The fix reparents old fields to None immediately
+    (before deleteLater) so they vanish from the display without
+    waiting for the event loop. We deliberately do NOT call
+    processEvents here — the assertion must hold synchronously."""
+    from PyQt6.QtWidgets import QLineEdit
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._refresh_fields()
+    # Mechanical/UDL/local exposes exactly wx + wy.
+    live = d._field_container.findChildren(QLineEdit)
+    assert len(live) == 2
+
+    # Switch to Thermal (uniform) → only a single ΔT field should
+    # remain; the wx/wy edits must be gone, not lingering behind it.
+    d._rb_cat_thermal.setChecked(True)
+    d._rb_t_uniform.setChecked(True)
+    d._refresh_fields()
+    live = d._field_container.findChildren(QLineEdit)
+    assert len(live) == 1, (
+        "stale field widgets still parented to the container after a "
+        "mode switch — layout ghosting bug regressed"
+    )
+
+
+def test_member_load_dialog_no_stale_widgets_after_direction_switch(qt_app):
+    """Same ghosting guard across the Local → Gravity direction switch
+    (local shows wx+wy, gravity shows a single magnitude field)."""
+    from PyQt6.QtWidgets import QLineEdit
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._rb_local.setChecked(True)
+    d._refresh_fields()
+    assert len(d._field_container.findChildren(QLineEdit)) == 2
+    d._rb_gravity.setChecked(True)
+    d._refresh_fields()
+    assert len(d._field_container.findChildren(QLineEdit)) == 1
+
+
+def test_member_load_dialog_local_help_visible_only_in_local_mode(qt_app):
+    """The 'local directions follow i→j' helper text is shown for
+    Local mechanical loads and hidden for Global / Gravity / Thermal."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._rb_local.setChecked(True)
+    d._refresh_fields()
+    assert d._local_help.isVisibleTo(d)
+    assert "i→j" in d._local_help.text()
+
+    d._rb_global.setChecked(True)
+    d._refresh_fields()
+    assert not d._local_help.isVisibleTo(d)
+
+    d._rb_gravity.setChecked(True)
+    d._refresh_fields()
+    assert not d._local_help.isVisibleTo(d)
+
+    d._rb_cat_thermal.setChecked(True)
+    d._refresh_fields()
+    assert not d._local_help.isVisibleTo(d)
+
+
+def test_member_load_dialog_local_labels_mention_ij_orientation(qt_app):
+    """Local field labels must spell out the i→j / transverse
+    orientation so the direction is unambiguous in the dialog itself."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._rb_local.setChecked(True)
+    d._refresh_fields()
+    labels = _form_labels(d._field_form)
+    assert any("i→j" in lbl for lbl in labels)
+    assert any("transverse" in lbl.lower() for lbl in labels)
+
+
+def test_inspector_loads_table_reserves_at_least_three_rows(qt_app):
+    """A single-load element should still render the loads table tall
+    enough to read as a table (≥ 3 rows), not one cramped row."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, Node, Section, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    e = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e.member_loads.append(UniformDistributedLoad(wy=-10.0))
+    w._model.elements = [e]
+    w._open_element_inspector(1)
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    row_h = table.verticalHeader().defaultSectionSize()
+    header_h = table.horizontalHeader().height()
+    # Fixed height should cover at least header + 3 rows.
+    assert table.maximumHeight() >= header_h + row_h * 3
+
+
+def test_nodal_load_dialog_has_load_case_combo(qt_app):
+    from structural_analysis.gui_qt.dialogs import NodalLoadDialog
+
+    w = MainWindow()
+    d = NodalLoadDialog(w, existing=None, node_id=1)
+    assert d._case_combo.isEditable()
+    assert d._case_combo.currentText() == "DEFAULT"
+
+
+def test_nodal_load_dialog_accept_returns_load_case_in_tuple(qt_app):
+    """v0.17 widened the NodalLoadDialog result tuple from (fx,fy,mz) to
+    (fx,fy,mz,load_case). app._edit_nodal_load was updated to unpack four
+    values; this test pins the contract."""
+    from structural_analysis.gui_qt.dialogs import NodalLoadDialog
+
+    w = MainWindow()
+    d = NodalLoadDialog(w, existing=None, node_id=1)
+    d._entries["fx"].setText("10.0")
+    d._entries["fy"].setText("-5.0")
+    d._entries["mz"].setText("0.0")
+    d._case_combo.setEditText("WIND")
+    result = d._accept()
+    assert result == (10.0, -5.0, 0.0, "WIND")
+
+
+def test_nodal_load_dialog_existing_load_prefills_case(qt_app):
+    from structural_analysis.gui_qt.dialogs import NodalLoadDialog
+    from structural_analysis.model import NodalLoad
+
+    w = MainWindow()
+    existing = NodalLoad(node_id=1, fx=10.0, load_case="LIVE")
+    d = NodalLoadDialog(w, existing=existing, node_id=1)
+    assert d._case_combo.currentText() == "LIVE"
+
+
+def test_inspector_loads_table_shows_case_column(qt_app):
+    """v0.17: the inspector loads table gained a 'Case' column (5th
+    position, index 4). Loads with DEFAULT case render the dim '—'
+    placeholder; non-default cases render the case name verbatim."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, Node, Section, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    e = FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )
+    e.member_loads.append(UniformDistributedLoad(wy=-10.0))  # default
+    e.member_loads.append(
+        UniformDistributedLoad(wy=-5.0, load_case="DEAD")
+    )
+    w._model.elements = [e]
+    w._open_element_inspector(1)
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    assert table.columnCount() == 6
+    headers = [
+        table.horizontalHeaderItem(i).text()
+        for i in range(table.columnCount())
+    ]
+    assert headers[4] == "Case"
+    # Default row shows the dim placeholder; named row shows the case.
+    assert table.item(0, 4).text() == "—"
+    assert table.item(1, 4).text() == "DEAD"
+
+
+def test_nodal_load_summary_includes_case_when_non_default(qt_app):
+    """_nodal_load_summary appends '· case: NAME' only when the load is
+    tagged with a non-default case."""
+    from structural_analysis.gui_qt.dialogs import _nodal_load_summary
+    from structural_analysis.model import NodalLoad, StructuralModel
+
+    m = StructuralModel(title="t")
+    m.nodes = {1: object()}  # presence-only — _nodal_load_summary ignores nodes
+    m.nodal_loads.append(NodalLoad(node_id=1, fx=10.0, load_case="DEAD"))
+    text = _nodal_load_summary(m, 1)
+    assert "case: DEAD" in text
+
+
+def test_nodal_load_summary_omits_case_when_default(qt_app):
+    from structural_analysis.gui_qt.dialogs import _nodal_load_summary
+    from structural_analysis.model import NodalLoad, StructuralModel
+
+    m = StructuralModel(title="t")
+    m.nodes = {1: object()}
+    m.nodal_loads.append(NodalLoad(node_id=1, fx=10.0))
+    text = _nodal_load_summary(m, 1)
+    assert "case" not in text.lower()

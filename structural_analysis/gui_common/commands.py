@@ -1324,6 +1324,7 @@ class SetNodalLoadCmd(Command):
     fx: float = 0.0
     fy: float = 0.0
     mz: float = 0.0
+    load_case: str = "DEFAULT"
     _saved: list[NodalLoad] = field(default_factory=list)
     description: str = "edit nodal load"
 
@@ -1333,8 +1334,10 @@ class SetNodalLoadCmd(Command):
         self._saved = [ld for ld in model.nodal_loads if ld.node_id == self.node_id]
         model.nodal_loads = [ld for ld in model.nodal_loads if ld.node_id != self.node_id]
         if self.fx or self.fy or self.mz:
-            model.nodal_loads.append(NodalLoad(self.node_id, float(self.fx),
-                                               float(self.fy), float(self.mz)))
+            model.nodal_loads.append(NodalLoad(
+                self.node_id, float(self.fx), float(self.fy),
+                float(self.mz), load_case=self.load_case,
+            ))
 
     def undo(self, model: StructuralModel) -> None:
         model.nodal_loads = [ld for ld in model.nodal_loads if ld.node_id != self.node_id]

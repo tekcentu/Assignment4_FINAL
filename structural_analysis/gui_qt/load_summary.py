@@ -47,6 +47,7 @@ class ElementLoadRow:
     magnitude: str     # display in the Magnitude column
     position: str      # display in the Position / Notes column
     meaning: str       # short physical interpretation
+    load_case: str = "DEFAULT"  # user tag (v0.17) for future load cases
 
 
 def _element_length(model: StructuralModel, elem) -> float:
@@ -179,6 +180,7 @@ def format_element_loads(
                 magnitude=magnitude,
                 position=f"Full length, {_coord_system_label(cs)}",
                 meaning=meaning,
+                load_case=getattr(ld, "load_case", "DEFAULT"),
             ))
         elif isinstance(ld, PointLoad):
             cs = getattr(ld, "coord_system", "local")
@@ -212,34 +214,55 @@ def format_element_loads(
                     f"{_coord_system_label(cs)}"
                 ),
                 meaning=meaning,
+                load_case=getattr(ld, "load_case", "DEFAULT"),
             ))
         elif isinstance(ld, FrameTemperatureLoad):
             mean = 0.5 * (ld.t_top + ld.t_bottom)
             grad = ld.t_bottom - ld.t_top
             if abs(grad) <= _ENDPOINT_TOL:
-                meaning = "Uniform → axial thermal strain"
+                # Uniform ΔT across the depth → axial strain only.
+                type_label = "Thermal (uniform ΔT)"
+                magnitude = f"ΔT = {mean:g} °C"
+                meaning = "Uniform ΔT → axial thermal strain"
             elif abs(mean) <= _ENDPOINT_TOL:
-                meaning = "Gradient only → bending (no axial)"
+                # Pure top/bottom gradient → curvature (bending if restrained).
+                type_label = "Thermal (gradient)"
+                magnitude = (
+                    f"t_top = {ld.t_top:g} °C, "
+                    f"t_bottom = {ld.t_bottom:g} °C"
+                )
+                meaning = (
+                    "Top/bottom gradient → curvature "
+                    "(bending if restrained)"
+                )
             else:
-                meaning = "Uniform + gradient → axial + bending"
+                # Mixed uniform + gradient.
+                type_label = "Thermal (uniform + gradient)"
+                magnitude = (
+                    f"t_top = {ld.t_top:g} °C, "
+                    f"t_bottom = {ld.t_bottom:g} °C"
+                )
+                meaning = (
+                    "Uniform + gradient → axial + curvature"
+                )
             rows.append(ElementLoadRow(
                 index=idx,
                 kind="Thermal",
-                type_label="Thermal (frame)",
-                magnitude=(
-                    f"t_top = {ld.t_top:g} °C, t_bottom = {ld.t_bottom:g} °C"
-                ),
+                type_label=type_label,
+                magnitude=magnitude,
                 position=f"ΔT̄ = {mean:g} °C, Δ(b−t) = {grad:g} °C",
                 meaning=meaning,
+                load_case=getattr(ld, "load_case", "DEFAULT"),
             ))
         elif isinstance(ld, TrussTemperatureLoad):
             rows.append(ElementLoadRow(
                 index=idx,
                 kind="Thermal",
-                type_label="Thermal (truss)",
+                type_label="Thermal (uniform ΔT, truss)",
                 magnitude=f"ΔT = {ld.delta_T:g} °C",
                 position="Uniform along member",
-                meaning="Uniform → axial thermal strain (truss)",
+                meaning="Uniform ΔT → axial thermal strain (truss)",
+                load_case=getattr(ld, "load_case", "DEFAULT"),
             ))
         else:
             rows.append(ElementLoadRow(

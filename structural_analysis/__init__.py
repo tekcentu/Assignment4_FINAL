@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 __what_is_new__ = (
-    "Gravity load direction · "
-    "canvas draws loads in true global / gravity directions · "
-    "dialog labels match selected direction"
+    "Load case tag on all user loads · "
+    "cleaner mechanical & thermal dialogs · "
+    "uniform vs gradient thermal selector"
 )
 
 from .model import (
