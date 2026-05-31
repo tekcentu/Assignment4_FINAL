@@ -34,6 +34,7 @@ from ..model import (
     NODE_COINCIDENCE_TOL,
     FrameTemperatureLoad,
     LoadCase,
+    LoadCombination,
     Material,
     Node,
     NodalLoad,
@@ -1552,6 +1553,19 @@ class DeleteLoadCaseCmd(Command):
             )
         if self.name not in model.load_cases:
             raise ValueError(f"Load case {self.name!r} does not exist.")
+        # PR #29: a case referenced by any load combination cannot be
+        # deleted — the user must edit/delete the combination first
+        # (otherwise the combination would silently lose a term).
+        combos_referencing = sorted(
+            c.name for c in model.load_combinations.values()
+            if self.name in c.terms
+        )
+        if combos_referencing:
+            raise ValueError(
+                f"Load case {self.name!r} is referenced by load "
+                f"combination(s) {', '.join(combos_referencing)}. Edit "
+                "or delete the combination(s) before deleting the case."
+            )
         referenced = any(
             ld.load_case == self.name for ld in model.nodal_loads
         ) or any(
@@ -1615,6 +1629,12 @@ class RenameLoadCaseCmd(Command):
     _saved_nodal: list = field(default_factory=list, init=False)
     _saved_member: dict[int, list] = field(default_factory=dict, init=False)
     _saved_self_weight_case: str | None = field(default=None, init=False)
+    # Snapshot of every combination whose terms referenced the old
+    # case name (keyed by combination name → original LoadCombination),
+    # so undo restores the pre-rename term dict exactly.
+    _saved_combos: dict[str, LoadCombination] = field(
+        default_factory=dict, init=False,
+    )
 
     def do(self, model: StructuralModel) -> None:
         if self.old_name == "DEFAULT":
@@ -1643,6 +1663,20 @@ class RenameLoadCaseCmd(Command):
         model.load_cases[self.new_name] = renamed
         if model.self_weight_case == self.old_name:
             model.self_weight_case = self.new_name
+        # PR #29: cascade the rename into every combination term that
+        # referenced the old case name.
+        self._saved_combos = {}
+        for comb_name, comb in list(model.load_combinations.items()):
+            if self.old_name in comb.terms:
+                self._saved_combos[comb_name] = comb
+                new_terms = {
+                    (self.new_name if k == self.old_name else k): v
+                    for k, v in comb.terms.items()
+                }
+                model.load_combinations[comb_name] = LoadCombination(
+                    name=comb.name, terms=new_terms,
+                    description=comb.description,
+                )
 
     def undo(self, model: StructuralModel) -> None:
         model.load_cases.pop(self.new_name, None)
@@ -1653,6 +1687,8 @@ class RenameLoadCaseCmd(Command):
         )
         if self._saved_self_weight_case is not None:
             model.self_weight_case = self._saved_self_weight_case
+        for comb_name, comb in self._saved_combos.items():
+            model.load_combinations[comb_name] = comb
 
 
 @dataclass
@@ -1704,6 +1740,151 @@ class SetSelfWeightCaseCmd(Command):
     def undo(self, model: StructuralModel) -> None:
         if self._saved is not None:
             model.self_weight_case = self._saved
+
+
+# ── load combinations (v0.19 — PR #29) ──────────────────────────────────
+#
+# Combinations are coefficient-weighted derived views over solved load
+# cases. The model holds the definitions in ``load_combinations``; the
+# actual combined response is computed on the result wrapper. These
+# CRUD commands edit definitions only (and invalidate any stale derived
+# result via the host's post-execute invalidation).
+
+
+def _validate_combination_terms(
+    model: StructuralModel, terms: dict[str, float],
+) -> None:
+    """Shared validation: every referenced case must exist in the
+    model. (Finite / non-zero coefficient + ≥1-term rules are enforced
+    by ``LoadCombination.__post_init__``.)"""
+    missing = sorted(name for name in terms if name not in model.load_cases)
+    if missing:
+        raise ValueError(
+            "Combination references load case(s) that do not exist: "
+            + ", ".join(missing)
+        )
+
+
+@dataclass
+class AddLoadCombinationCmd(Command):
+    """Create a coefficient combination. ``name`` is normalised by the
+    caller (uppercase, single token). Validates name uniqueness across
+    BOTH combinations and cases, plus the referenced-case existence."""
+    name: str
+    terms: dict[str, float] = field(default_factory=dict)
+    combo_description: str = ""
+    description: str = "add load combination"
+
+    def do(self, model: StructuralModel) -> None:
+        if self.name in model.load_combinations:
+            raise ValueError(
+                f"Load combination {self.name!r} already exists."
+            )
+        if self.name in model.load_cases:
+            raise ValueError(
+                f"{self.name!r} is already a load-case name; combination "
+                "names must be distinct from case names."
+            )
+        _validate_combination_terms(model, self.terms)
+        # LoadCombination.__post_init__ enforces the remaining rules
+        # (SUM_ALL reject, ≥1 term, finite / non-zero coeffs, name shape).
+        model.load_combinations[self.name] = LoadCombination(
+            name=self.name, terms=dict(self.terms),
+            description=self.combo_description,
+        )
+
+    def undo(self, model: StructuralModel) -> None:
+        model.load_combinations.pop(self.name, None)
+
+
+@dataclass
+class DeleteLoadCombinationCmd(Command):
+    """Delete a combination. Always allowed (combinations are leaf
+    derived views — nothing references them)."""
+    name: str
+    description: str = "delete load combination"
+
+    _saved: LoadCombination | None = field(default=None, init=False)
+
+    def do(self, model: StructuralModel) -> None:
+        if self.name not in model.load_combinations:
+            raise ValueError(
+                f"Load combination {self.name!r} does not exist."
+            )
+        self._saved = model.load_combinations.pop(self.name)
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._saved is not None:
+            model.load_combinations[self.name] = self._saved
+
+
+@dataclass
+class RenameLoadCombinationCmd(Command):
+    """Rename a combination (preserving its terms + description)."""
+    old_name: str
+    new_name: str
+    description: str = "rename load combination"
+
+    _saved: LoadCombination | None = field(default=None, init=False)
+
+    def do(self, model: StructuralModel) -> None:
+        if self.old_name not in model.load_combinations:
+            raise ValueError(
+                f"Load combination {self.old_name!r} does not exist."
+            )
+        if self.new_name in model.load_combinations:
+            raise ValueError(
+                f"Load combination {self.new_name!r} already exists."
+            )
+        if self.new_name in model.load_cases:
+            raise ValueError(
+                f"{self.new_name!r} is already a load-case name; "
+                "combination names must be distinct from case names."
+            )
+        self._saved = model.load_combinations[self.old_name]
+        renamed = LoadCombination(
+            name=self.new_name, terms=dict(self._saved.terms),
+            description=self._saved.description,
+        )
+        del model.load_combinations[self.old_name]
+        model.load_combinations[self.new_name] = renamed
+
+    def undo(self, model: StructuralModel) -> None:
+        model.load_combinations.pop(self.new_name, None)
+        if self._saved is not None:
+            model.load_combinations[self.old_name] = self._saved
+
+
+@dataclass
+class SetLoadCombinationTermsCmd(Command):
+    """Replace a combination's term dict (edit coefficients, add/remove
+    terms) and optionally its description in one undoable step."""
+    name: str
+    terms: dict[str, float] = field(default_factory=dict)
+    combo_description: str | None = None
+    description: str = "edit load combination"
+
+    _saved: LoadCombination | None = field(default=None, init=False)
+
+    def do(self, model: StructuralModel) -> None:
+        if self.name not in model.load_combinations:
+            raise ValueError(
+                f"Load combination {self.name!r} does not exist."
+            )
+        _validate_combination_terms(model, self.terms)
+        self._saved = model.load_combinations[self.name]
+        desc = (
+            self.combo_description if self.combo_description is not None
+            else self._saved.description
+        )
+        # __post_init__ re-validates the new term set.
+        model.load_combinations[self.name] = LoadCombination(
+            name=self.name, terms=dict(self.terms), description=desc,
+        )
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._saved is not None:
+            model.load_combinations[self.name] = self._saved
 
 
 # ── replace whole model (for File→Open) ─────────────────────────────────

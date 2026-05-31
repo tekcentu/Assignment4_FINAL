@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 __what_is_new__ = (
-    "Load case manager · "
-    "case-by-case static run with SUM_ALL view · "
-    "per-case result switching from the toolbar"
+    "Coefficient load combinations · "
+    "combination manager · "
+    "combined result display"
 )
 
 from .model import (

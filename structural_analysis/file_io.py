@@ -13,7 +13,7 @@ from .model import (
     StructuralModel, Node, Material, Section, Support, NodalLoad,
     UniformDistributedLoad, PointLoad,
     TrussTemperatureLoad, FrameTemperatureLoad,
-    LoadCase,
+    LoadCase, LoadCombination,
 )
 from .element import FrameElement2D, TrussElement2D
 
@@ -623,6 +623,72 @@ def read_input_file(filepath: str) -> StructuralModel:
                     model.load_cases[name] = LoadCase(
                         name=name, enabled=enabled,
                     )
+
+        elif keyword == "LOAD_COMBINATIONS":
+            # Format: LOAD_COMBINATIONS <count> followed by count rows of
+            #   <name>  <coeff>*<case>  [<coeff>*<case> ...]
+            # e.g.  COMB_STRENGTH  1.2*DEAD  1.6*LIVE
+            # The term token is ``coefficient*case`` (no spaces around
+            # ``*``). At least one term is required; LoadCombination's
+            # __post_init__ enforces the finite / non-zero coefficient
+            # rules. Combination names must not collide with case names
+            # (validated below) and SUM_ALL is rejected by
+            # LoadCombination itself.
+            count = int(tokens[1])
+            for _ in range(count):
+                i += 1
+                while i < len(lines) and (
+                    not lines[i].strip()
+                    or lines[i].lstrip().startswith("#")
+                ):
+                    i += 1
+                if i >= len(lines):
+                    raise ValueError(
+                        "Unexpected end of file inside LOAD_COMBINATIONS "
+                        f"block (expected {count} rows)."
+                    )
+                parts = lines[i].split("#")[0].split()
+                if len(parts) < 2:
+                    raise ValueError(
+                        f"LOAD_COMBINATIONS row {parts!r} needs a name "
+                        "and at least one coefficient*case term."
+                    )
+                comb_name = parts[0]
+                terms: dict[str, float] = {}
+                for tok in parts[1:]:
+                    if "*" not in tok:
+                        raise ValueError(
+                            f"LOAD_COMBINATIONS row {comb_name!r}: term "
+                            f"{tok!r} must be 'coefficient*case' "
+                            "(e.g. 1.2*DEAD)."
+                        )
+                    coeff_s, _, case_s = tok.partition("*")
+                    case_s = case_s.strip()
+                    try:
+                        coeff = float(coeff_s.strip())
+                    except ValueError:
+                        raise ValueError(
+                            f"LOAD_COMBINATIONS row {comb_name!r}: "
+                            f"coefficient in term {tok!r} is not a number."
+                        )
+                    if case_s in terms:
+                        raise ValueError(
+                            f"LOAD_COMBINATIONS row {comb_name!r}: case "
+                            f"{case_s!r} appears more than once."
+                        )
+                    terms[case_s] = coeff
+                if comb_name in model.load_cases:
+                    raise ValueError(
+                        f"LOAD_COMBINATIONS: name {comb_name!r} collides "
+                        "with a load-case name; combination names must be "
+                        "distinct from case names."
+                    )
+                # LoadCombination.__post_init__ enforces the remaining
+                # rules (finite / non-zero coeffs, SUM_ALL reject, ≥1
+                # term, name shape).
+                model.load_combinations[comb_name] = LoadCombination(
+                    name=comb_name, terms=terms,
+                )
 
         i += 1
 

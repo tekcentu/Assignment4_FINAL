@@ -381,6 +381,82 @@ class LoadCase:
             )
 
 
+# ── Load Combinations (v0.19) ─────────────────────────────────
+
+
+@dataclass
+class LoadCombination:
+    """A coefficient-weighted linear combination of solved load cases.
+
+    PR #29: combinations are DERIVED results — never separately solved.
+    The combined displacements / reactions / member forces are computed
+    by scaling each referenced case's :class:`AnalysisResult` by its
+    coefficient and summing (see
+    ``multi_case_result.MultiCaseAnalysisResult.combination``). This is
+    exact because the solver is linear elastic.
+
+    Attributes:
+        name: Unique key in ``StructuralModel.load_combinations``. Same
+            single-token rule as :class:`LoadCase` (no whitespace,
+            no ``#``). Must NOT collide with a load-case name or the
+            ``SUM_ALL`` sentinel — enforced by the CRUD command, not
+            here (the model layer doesn't know the case set).
+        terms: ``{case_name: coefficient}``. At least one term is
+            required. Coefficients must be finite; zero coefficients are
+            rejected at construction (a zero term is noise — drop it
+            instead). Negative coefficients ARE allowed (e.g. load
+            reversal) and are handled intentionally.
+        description: Optional free-text.
+    """
+
+    name: str
+    terms: dict[str, float] = field(default_factory=dict)
+    description: str = ""
+
+    def __post_init__(self):
+        if not self.name:
+            raise ValueError("LoadCombination.name must be non-empty.")
+        if any(ch.isspace() or ch == "#" for ch in self.name):
+            raise ValueError(
+                f"LoadCombination.name {self.name!r} contains invalid "
+                "characters (whitespace or '#'); combination names must "
+                "be a single token."
+            )
+        if self.name == "SUM_ALL":
+            raise ValueError(
+                "SUM_ALL is a built-in derived view and cannot be used "
+                "as a user-defined combination name."
+            )
+        if not self.terms:
+            raise ValueError(
+                f"LoadCombination {self.name!r} must have at least one "
+                "term (case_name: coefficient)."
+            )
+        import math
+        for case_name, coeff in self.terms.items():
+            if not case_name:
+                raise ValueError(
+                    f"LoadCombination {self.name!r} has an empty case "
+                    "name in its terms."
+                )
+            if not isinstance(coeff, (int, float)) or isinstance(coeff, bool):
+                raise ValueError(
+                    f"LoadCombination {self.name!r} term {case_name!r} "
+                    f"coefficient must be a number (got {coeff!r})."
+                )
+            if not math.isfinite(coeff):
+                raise ValueError(
+                    f"LoadCombination {self.name!r} term {case_name!r} "
+                    f"coefficient must be finite (got {coeff!r})."
+                )
+            if coeff == 0.0:
+                raise ValueError(
+                    f"LoadCombination {self.name!r} term {case_name!r} "
+                    "has a zero coefficient; drop the term instead of "
+                    "giving it a zero weight."
+                )
+
+
 # ── Structural Model ──────────────────────────────────────────
 
 
@@ -430,6 +506,18 @@ class StructuralModel:
     # cases are superposed). Must be the name of an entry in
     # ``load_cases``.
     self_weight_case: str = "DEFAULT"
+
+    # ── load combinations (v0.19 — PR #29) ──
+    # User-defined coefficient-weighted combinations of solved cases.
+    # Keyed by combination name. Combinations are DERIVED results: they
+    # are never separately solved — the combined response is computed
+    # from the per-case results by scaling + summing (see
+    # ``multi_case_result.MultiCaseAnalysisResult.combination``). The
+    # built-in SUM_ALL view is NOT stored here; it stays a derived view
+    # on the result wrapper and is never serialised.
+    load_combinations: dict[str, "LoadCombination"] = field(
+        default_factory=dict,
+    )
 
     def __post_init__(self):
         # Guarantee the DEFAULT case exists. file_io / new-from-blank

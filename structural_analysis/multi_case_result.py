@@ -115,91 +115,64 @@ class MultiCaseAnalysisResult:
             return None
         if self._sum_all_cache is not None:
             return self._sum_all_cache
-        first = next(iter(self.cases.values()))
-        # Pick any concrete case for the structural metadata
-        # (E_map, G_vectors, num_eq, K, F, elem_data) — these are
-        # case-independent, since we re-run the same solver on the same
-        # model topology.
-        D_sum = None
-        member_keys = first.member_results.keys()
-        reactions_sum: dict[int, dict[str, float]] = {}
-        # Sum buckets are lazily sized from the first concrete value
-        # per element. Hardcoding a size-6 vector here would crash on
-        # 2D truss elements whose ``f_local`` is 4-element rather than
-        # 6 (Gemini PR #28 finding). ``np.zeros_like`` matches the
-        # incoming array's shape and dtype exactly.
-        f_local_sum: dict[int, np.ndarray] = {}
-        d_local_sum: dict[int, np.ndarray] = {}
-        d_global_sum: dict[int, np.ndarray] = {}
-        for r in self.cases.values():
-            D_sum = (
-                np.asarray(r.D) if D_sum is None
-                else D_sum + np.asarray(r.D)
-            )
-            for nid, comp in r.reactions.items():
-                bucket = reactions_sum.setdefault(nid, {})
-                for k, v in comp.items():
-                    bucket[k] = bucket.get(k, 0.0) + v
-            for eid in member_keys:
-                mr = r.member_results.get(eid, {})
-                if "f_local" in mr:
-                    val = np.asarray(mr["f_local"])
-                    if eid not in f_local_sum:
-                        f_local_sum[eid] = np.zeros_like(val)
-                    f_local_sum[eid] = f_local_sum[eid] + val
-                if "d_local" in mr:
-                    val = np.asarray(mr["d_local"])
-                    if eid not in d_local_sum:
-                        d_local_sum[eid] = np.zeros_like(val)
-                    d_local_sum[eid] = d_local_sum[eid] + val
-                if "d_global" in mr:
-                    val = np.asarray(mr["d_global"])
-                    if eid not in d_global_sum:
-                        d_global_sum[eid] = np.zeros_like(val)
-                    d_global_sum[eid] = d_global_sum[eid] + val
-        summed_member_results: dict[int, dict] = {}
-        for eid in member_keys:
-            entry: dict = {}
-            if eid in f_local_sum:
-                entry["f_local"] = f_local_sum[eid]
-            if eid in d_local_sum:
-                entry["d_local"] = d_local_sum[eid]
-            if eid in d_global_sum:
-                entry["d_global"] = d_global_sum[eid]
-            summed_member_results[eid] = entry
-        # eq_residual / residual aren't superposable in a meaningful
-        # way (they're norms of independent solves); report the max
-        # so a SUM_ALL view that's still well-conditioned shows
-        # "≤ 1e-6" rather than "?".
-        max_res = max(
-            (getattr(r, "residual", 0.0) or 0.0) for r in self.cases.values()
-        )
-        max_eqres = max(
-            (getattr(r, "eq_residual", 0.0) or 0.0)
-            for r in self.cases.values()
-        )
-        self._sum_all_cache = AnalysisResult(
-            status="ok",
-            title=first.title,
-            warnings=[
+        # SUM_ALL is exactly a unit-coefficient combination of every
+        # solved case — share the combine kernel with user-defined
+        # combinations (PR #29) so the superposition math lives in
+        # one place.
+        pairs = [(r, 1.0) for r in self.cases.values()]
+        self._sum_all_cache = _combine_results(
+            pairs,
+            label=(
                 f"[SUM_ALL] derived linear superposition of "
-                f"{len(self.cases)} case(s): "
-                + ", ".join(sorted(self.cases))
-            ],
-            E_map=first.E_map,
-            num_eq=first.num_eq,
-            G_vectors=first.G_vectors,
-            K=first.K,
-            F=None,             # F is the per-case load vector; no
-                                # single F covers the superposition.
-            D=D_sum,
-            residual=max_res,
-            member_results=summed_member_results,
-            reactions=reactions_sum,
-            eq_residual=max_eqres,
-            elem_data=first.elem_data,
+                f"{len(self.cases)} case(s): " + ", ".join(sorted(self.cases))
+            ),
         )
         return self._sum_all_cache
+
+    # ── coefficient combinations (PR #29) ──────────────────────
+
+    def missing_cases_for(self, terms: dict[str, float]) -> list[str]:
+        """Return the referenced case names that have no solved result.
+
+        A combination is only computable when every case it references
+        is present in :attr:`cases` (solved OK). Disabled / failed /
+        never-requested cases all surface here."""
+        return sorted(
+            name for name in terms if name not in self.cases
+        )
+
+    def combination_available(self, terms: dict[str, float]) -> bool:
+        """True iff every case referenced by ``terms`` has a solved
+        result so the combination can be computed."""
+        if not terms:
+            return False
+        return not self.missing_cases_for(terms)
+
+    def combination(
+        self, terms: dict[str, float], *, name: str = "COMBINATION",
+    ) -> AnalysisResult | None:
+        """Compute the coefficient-weighted linear combination of solved
+        cases described by ``terms`` (``{case_name: coefficient}``).
+
+        Returns ``None`` when any referenced case is unsolved so the
+        caller can render a clear placeholder rather than a partial /
+        misleading result. Not cached on the wrapper (the wrapper does
+        not own the combination definitions) — the host caches the
+        active combination result if it wants to."""
+        if not self.combination_available(terms):
+            return None
+        pairs = [
+            (self.cases[case_name], float(coeff))
+            for case_name, coeff in terms.items()
+        ]
+        label = (
+            f"[{name}] derived combination: "
+            + " + ".join(
+                f"{coeff:g}·{case_name}"
+                for case_name, coeff in terms.items()
+            )
+        )
+        return _combine_results(pairs, label=label)
 
     # ── helpers ────────────────────────────────────────────────
 
@@ -213,6 +186,105 @@ class MultiCaseAnalysisResult:
         if include_sum_all and self.sum_all_available() and len(self.cases) >= 2:
             names.append(SUM_ALL_KEY)
         return names
+
+
+def _combine_results(
+    pairs: list[tuple[AnalysisResult, float]],
+    *,
+    label: str,
+) -> AnalysisResult | None:
+    """Scale each ``AnalysisResult`` by its coefficient and sum the
+    responses into a single derived ``AnalysisResult``.
+
+    Shared kernel for both SUM_ALL (all coefficients 1.0) and
+    user-defined coefficient combinations (PR #29). Linear elastic
+    superposition is exact, so combining solved cases this way matches
+    what re-solving with the summed load vector would produce.
+
+    Combined fields: ``D``, ``reactions``, and per-element
+    ``member_results`` (``f_local`` / ``d_local`` / ``d_global``). Sum
+    buckets are lazily sized via ``np.zeros_like`` so heterogeneous DOF
+    widths (frame 6 vs truss 4) never crash. Structural metadata
+    (E_map, num_eq, G_vectors, K, elem_data) is copied from the first
+    contributing case — these are case-independent for a fixed model
+    topology. ``F`` is None: no single load vector covers the
+    superposition.
+
+    Returns ``None`` for an empty ``pairs`` list (nothing to combine)."""
+    if not pairs:
+        return None
+    first = pairs[0][0]
+    member_keys = first.member_results.keys()
+    D_sum = None
+    reactions_sum: dict[int, dict[str, float]] = {}
+    f_local_sum: dict[int, np.ndarray] = {}
+    d_local_sum: dict[int, np.ndarray] = {}
+    d_global_sum: dict[int, np.ndarray] = {}
+    for r, coeff in pairs:
+        c = float(coeff)
+        if r.D is not None:
+            scaled_D = c * np.asarray(r.D)
+            D_sum = scaled_D if D_sum is None else D_sum + scaled_D
+        for nid, comp in r.reactions.items():
+            bucket = reactions_sum.setdefault(nid, {})
+            for k, v in comp.items():
+                bucket[k] = bucket.get(k, 0.0) + c * v
+        for eid in member_keys:
+            mr = r.member_results.get(eid, {})
+            if "f_local" in mr:
+                val = c * np.asarray(mr["f_local"])
+                f_local_sum[eid] = (
+                    val if eid not in f_local_sum
+                    else f_local_sum[eid] + val
+                )
+            if "d_local" in mr:
+                val = c * np.asarray(mr["d_local"])
+                d_local_sum[eid] = (
+                    val if eid not in d_local_sum
+                    else d_local_sum[eid] + val
+                )
+            if "d_global" in mr:
+                val = c * np.asarray(mr["d_global"])
+                d_global_sum[eid] = (
+                    val if eid not in d_global_sum
+                    else d_global_sum[eid] + val
+                )
+    combined_member_results: dict[int, dict] = {}
+    for eid in member_keys:
+        entry: dict = {}
+        if eid in f_local_sum:
+            entry["f_local"] = f_local_sum[eid]
+        if eid in d_local_sum:
+            entry["d_local"] = d_local_sum[eid]
+        if eid in d_global_sum:
+            entry["d_global"] = d_global_sum[eid]
+        combined_member_results[eid] = entry
+    # Residual norms aren't superposable; surface the max scaled value
+    # so a well-conditioned combined view reports a small number.
+    max_res = max(
+        (abs(float(coeff)) * (getattr(r, "residual", 0.0) or 0.0))
+        for r, coeff in pairs
+    )
+    max_eqres = max(
+        (abs(float(coeff)) * (getattr(r, "eq_residual", 0.0) or 0.0))
+        for r, coeff in pairs
+    )
+    return AnalysisResult(
+        status="ok",
+        title=first.title,
+        warnings=[label],
+        E_map=first.E_map,
+        num_eq=first.num_eq,
+        G_vectors=first.G_vectors,
+        K=first.K,
+        F=None,
+        D=D_sum,
+        residual=max_res,
+        member_results=combined_member_results,
+        reactions=reactions_sum,
+        eq_residual=max_eqres,
+        elem_data=first.elem_data,
+    )
 
 
 def make_active_case_safe(
@@ -244,4 +316,5 @@ __all__ = [
     "SUM_ALL_KEY",
     "MultiCaseAnalysisResult",
     "make_active_case_safe",
+    "_combine_results",
 ]

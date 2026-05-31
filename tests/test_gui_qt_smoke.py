@@ -4631,3 +4631,176 @@ def test_active_only_resolve_drops_stale_case_on_failure(qt_app):
         "stale OK result must be dropped when a re-solve fails"
     )
     assert new_multi.failed_cases["DEAD"] == "synthetic-failure"
+
+
+# ── PR #29 — load combinations: selector, manager, canvas ───────────
+
+
+def test_combination_appears_in_selector_after_solve(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(
+        name="COMB_STRENGTH", terms={"DEAD": 1.2, "LIVE": 1.6},
+    ))
+    w._do_solve()
+    qt_app.processEvents()
+    data = [
+        w._case_combo.itemData(i) for i in range(w._case_combo.count())
+    ]
+    assert "COMB_STRENGTH" in data
+    # Combination is LAST (after real cases and SUM_ALL).
+    assert data[-1] == "COMB_STRENGTH"
+
+
+def test_selecting_combination_updates_canvas_result(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(
+        name="COMB1", terms={"DEAD": 1.0, "LIVE": 1.0},
+    ))
+    w._do_solve()
+    qt_app.processEvents()
+    w._active_case = "COMB1"
+    w._push_active_case_to_canvas()
+    comb_result = w.canvas._result
+    assert comb_result is not None
+    # Combination 1.0 DEAD + 1.0 LIVE == SUM_ALL view.
+    sa = w._multi_result.sum_all()
+    import numpy as np
+    np.testing.assert_allclose(
+        np.asarray(comb_result.D), np.asarray(sa.D), atol=1e-9,
+    )
+
+
+def test_combination_window_title_shows_comb_prefix(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.0}))
+    w._do_solve()
+    qt_app.processEvents()
+    w._active_case = "COMB1"
+    w._update_window_title_with_case()
+    assert "comb: COMB1" in w.windowTitle()
+
+
+def test_unavailable_combination_resolves_to_none(qt_app):
+    """A combination referencing an unsolved (disabled) case must
+    resolve to None so the canvas/inspector show a placeholder."""
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, SetLoadCaseEnabledCmd,
+    )
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(
+        name="COMB1", terms={"DEAD": 1.0, "LIVE": 1.0},
+    ))
+    w.execute(SetLoadCaseEnabledCmd(name="LIVE", enabled=False))
+    w._do_solve()
+    qt_app.processEvents()
+    w._active_case = "COMB1"
+    assert w._resolve_active_result() is None
+
+
+def test_combination_crud_invalidates_multi_result(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._multi_result is not None
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.0}))
+    assert w._multi_result is None
+
+
+def test_combination_manager_dialog_lists_combinations(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    from structural_analysis.gui_qt.dialogs import LoadCombinationManagerDialog
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.2}))
+    d = LoadCombinationManagerDialog(w, model=w._model)
+    names = [r["name"] for r in d._rows]
+    assert "COMB1" in names
+
+
+def test_combination_manager_add_emits_command(qt_app):
+    from structural_analysis.gui_qt.dialogs import LoadCombinationManagerDialog
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    d = LoadCombinationManagerDialog(w, model=w._model)
+    d._name_edit.setText("COMB_X")
+    d._terms_edit.setText("1.2*DEAD + 1.6*LIVE")
+    d._on_add_or_update_clicked()
+    cmds = d._accept()
+    add = [c for c in cmds if isinstance(c, AddLoadCombinationCmd)]
+    assert len(add) == 1
+    assert add[0].name == "COMB_X"
+    assert add[0].terms == {"DEAD": 1.2, "LIVE": 1.6}
+
+
+def test_combination_manager_rejects_unknown_case_term(qt_app, monkeypatch):
+    # The dialog surfaces validation failures via a blocking
+    # QMessageBox.warning — stub it so the test doesn't hang and we can
+    # assert the warning fired.
+    from structural_analysis.gui_qt import dialogs as dlg_mod
+    from structural_analysis.gui_qt.dialogs import LoadCombinationManagerDialog
+    warned: list = []
+    monkeypatch.setattr(
+        dlg_mod.QMessageBox, "warning",
+        lambda *a, **k: warned.append(a),
+    )
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    d = LoadCombinationManagerDialog(w, model=w._model)
+    d._name_edit.setText("COMB_X")
+    d._terms_edit.setText("1.0*GHOST")
+    d._on_add_or_update_clicked()
+    # Unknown case → row not added, and a warning was shown.
+    names = [r["name"] for r in d._rows if not r["deleted"]]
+    assert "COMB_X" not in names
+    assert warned, "expected a validation warning for the unknown case"
+
+
+def test_terms_expression_parser_roundtrip():
+    from structural_analysis.gui_qt.dialogs import (
+        _parse_terms_expression, _format_terms_expression,
+    )
+    terms = _parse_terms_expression("1.2*DEAD + 1.6*LIVE")
+    assert terms == {"DEAD": 1.2, "LIVE": 1.6}
+    # Whitespace form also works.
+    assert _parse_terms_expression("1.0 DEAD") == {"DEAD": 1.0}
+    # Negative coefficient.
+    assert _parse_terms_expression("1.0*DEAD + -0.7*WIND_X") == {
+        "DEAD": 1.0, "WIND_X": -0.7,
+    }
+    # Round-trip through formatter.
+    again = _parse_terms_expression(_format_terms_expression(terms))
+    assert again == terms
+
+
+def test_terms_expression_parser_rejects_zero_coeff():
+    from structural_analysis.gui_qt.dialogs import _parse_terms_expression
+    import pytest
+    with pytest.raises(ValueError, match=r"zero coefficient"):
+        _parse_terms_expression("0*DEAD")
+
+
+def test_canvas_combination_highlights_all_constituent_loads(qt_app):
+    """When a combination is active, loads from ANY constituent case
+    render full alpha; non-constituent loads dim."""
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.canvas.set_active_case("COMB1")
+    w.canvas.set_active_combination_cases({"DEAD", "LIVE"})
+    w.canvas.set_active_case_loads_only(True)
+    from structural_analysis.model import NodalLoad
+    dead = NodalLoad(node_id=2, fy=-1.0, load_case="DEAD")
+    live = NodalLoad(node_id=2, fy=-1.0, load_case="LIVE")
+    other = NodalLoad(node_id=2, fy=-1.0, load_case="OTHER")
+    assert w.canvas._load_case_alpha(dead) == 1.0
+    assert w.canvas._load_case_alpha(live) == 1.0
+    assert w.canvas._load_case_alpha(other) < 1.0

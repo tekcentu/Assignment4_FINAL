@@ -90,6 +90,13 @@ class ModelCanvas(QWidget):
         self._active_case: str = "DEFAULT"
         self._active_case_loads_only: bool = True
         self._inactive_load_alpha: float = 0.35
+        # PR #29: when a load COMBINATION is active, this holds the set
+        # of constituent case names so loads from ANY of them render at
+        # full alpha (signalling "all these cases contribute") while
+        # other-case loads dim — instead of misleadingly highlighting a
+        # single case. ``None`` ⇒ a plain load case (or SUM_ALL) is
+        # active and the single-case dimming applies.
+        self._active_combination_cases: frozenset[str] | None = None
         self._modal_result = None    # ModalResult or None
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
@@ -313,13 +320,36 @@ class ModelCanvas(QWidget):
         self._active_case_loads_only = bool(on)
         self.redraw()
 
+    def set_active_combination_cases(
+        self, case_names: "frozenset[str] | set[str] | None",
+    ) -> None:
+        """Host signal (PR #29): a load COMBINATION is active. ``case_names``
+        is the set of constituent case names — loads from any of them
+        render at full alpha. Pass ``None`` when switching back to a
+        plain case / SUM_ALL selection."""
+        new_val = frozenset(case_names) if case_names is not None else None
+        if new_val == self._active_combination_cases:
+            return
+        self._active_combination_cases = new_val
+        self.redraw()
+
     def _load_case_alpha(self, ld) -> float:
-        """Return 1.0 when ``ld`` matches the active case (or when the
-        "active case only" toggle is off so every load draws full
-        intensity), and the dim multiplier otherwise."""
+        """Return the draw alpha for a load arrow.
+
+        * "active case only" toggle off ⇒ everything full intensity.
+        * a COMBINATION is active ⇒ loads belonging to any constituent
+          case are full, others dim (PR #29 — no misleading single-case
+          highlight).
+        * otherwise ⇒ loads matching the single active case are full,
+          others dim."""
         if not self._active_case_loads_only:
             return 1.0
         case = getattr(ld, "load_case", "DEFAULT")
+        if self._active_combination_cases is not None:
+            return (
+                1.0 if case in self._active_combination_cases
+                else self._inactive_load_alpha
+            )
         return 1.0 if case == self._active_case else self._inactive_load_alpha
 
     def set_modal_result(self, modal_result, mode_idx: int = 0,

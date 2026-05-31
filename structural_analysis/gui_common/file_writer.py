@@ -290,6 +290,25 @@ def write_input_file(model: StructuralModel, path: str) -> None:
                 out.append(row)
             out.append("")
 
+    # LOAD_COMBINATIONS (v0.19 — PR #29). Only emitted when the model
+    # carries user-defined combinations. SUM_ALL is a derived view and
+    # is NEVER written here even if it somehow appears in the dict.
+    combos = {
+        name: c for name, c in model.load_combinations.items()
+        if name != "SUM_ALL"
+    }
+    if combos:
+        out.append(f"LOAD_COMBINATIONS {len(combos)}")
+        for name in sorted(combos):
+            c = combos[name]
+            # Deterministic term order so round-trips are stable.
+            term_str = "  ".join(
+                f"{coeff:g}*{case_name}"
+                for case_name, coeff in sorted(c.terms.items())
+            )
+            out.append(f"{name}  {term_str}")
+        out.append("")
+
     # ANALYSIS_OPTIONS — only when at least one option differs from
     # the default. Omitting the block on default models keeps every
     # existing fixture's round-trip byte-identical.
