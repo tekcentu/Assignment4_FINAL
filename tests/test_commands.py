@@ -1246,3 +1246,126 @@ def test_set_self_weight_case_unknown_raises():
     m = _model_with_default_case()
     with pytest.raises(ValueError, match=r"does not exist"):
         SetSelfWeightCaseCmd(case_name="GHOST").do(m)
+
+
+# ── PR #29 — load combination CRUD + case cascade ────────────────────
+
+
+def _model_with_two_cases():
+    from structural_analysis.gui_common.commands import AddLoadCaseCmd
+    from structural_analysis.model import StructuralModel
+    m = StructuralModel(title="comb-cmds")
+    AddLoadCaseCmd(name="DEAD").do(m)
+    AddLoadCaseCmd(name="LIVE").do(m)
+    return m
+
+
+def test_add_combination_undo_redo():
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    m = _model_with_two_cases()
+    cmd = AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.2, "LIVE": 1.6})
+    cmd.do(m)
+    assert "COMB1" in m.load_combinations
+    cmd.undo(m)
+    assert "COMB1" not in m.load_combinations
+    cmd.do(m)
+    assert m.load_combinations["COMB1"].terms == {"DEAD": 1.2, "LIVE": 1.6}
+
+
+def test_add_combination_rejects_unknown_case():
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    m = _model_with_two_cases()
+    with pytest.raises(ValueError, match=r"do not exist"):
+        AddLoadCombinationCmd(name="C", terms={"GHOST": 1.0}).do(m)
+
+
+def test_add_combination_rejects_name_colliding_with_case():
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    m = _model_with_two_cases()
+    with pytest.raises(ValueError, match=r"already a load-case name"):
+        AddLoadCombinationCmd(name="DEAD", terms={"LIVE": 1.0}).do(m)
+
+
+def test_delete_combination_undo():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, DeleteLoadCombinationCmd,
+    )
+    m = _model_with_two_cases()
+    AddLoadCombinationCmd(name="C1", terms={"DEAD": 1.0}).do(m)
+    cmd = DeleteLoadCombinationCmd(name="C1")
+    cmd.do(m)
+    assert "C1" not in m.load_combinations
+    cmd.undo(m)
+    assert m.load_combinations["C1"].terms == {"DEAD": 1.0}
+
+
+def test_rename_combination_undo():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, RenameLoadCombinationCmd,
+    )
+    m = _model_with_two_cases()
+    AddLoadCombinationCmd(name="C1", terms={"DEAD": 1.0}).do(m)
+    cmd = RenameLoadCombinationCmd(old_name="C1", new_name="C2")
+    cmd.do(m)
+    assert "C1" not in m.load_combinations and "C2" in m.load_combinations
+    cmd.undo(m)
+    assert "C1" in m.load_combinations and "C2" not in m.load_combinations
+
+
+def test_set_combination_terms_undo():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, SetLoadCombinationTermsCmd,
+    )
+    m = _model_with_two_cases()
+    AddLoadCombinationCmd(name="C1", terms={"DEAD": 1.0}).do(m)
+    cmd = SetLoadCombinationTermsCmd(name="C1", terms={"DEAD": 1.2, "LIVE": 1.6})
+    cmd.do(m)
+    assert m.load_combinations["C1"].terms == {"DEAD": 1.2, "LIVE": 1.6}
+    cmd.undo(m)
+    assert m.load_combinations["C1"].terms == {"DEAD": 1.0}
+
+
+def test_rename_case_cascades_into_combination_terms():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, RenameLoadCaseCmd,
+    )
+    m = _model_with_two_cases()
+    AddLoadCombinationCmd(name="C1", terms={"DEAD": 1.2, "LIVE": 1.6}).do(m)
+    RenameLoadCaseCmd(old_name="DEAD", new_name="PERM").do(m)
+    # The combination term keyed by DEAD must now be keyed by PERM.
+    assert m.load_combinations["C1"].terms == {"PERM": 1.2, "LIVE": 1.6}
+
+
+def test_rename_case_cascade_into_combinations_undo():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, RenameLoadCaseCmd,
+    )
+    m = _model_with_two_cases()
+    AddLoadCombinationCmd(name="C1", terms={"DEAD": 1.2, "LIVE": 1.6}).do(m)
+    cmd = RenameLoadCaseCmd(old_name="DEAD", new_name="PERM")
+    cmd.do(m)
+    cmd.undo(m)
+    assert m.load_combinations["C1"].terms == {"DEAD": 1.2, "LIVE": 1.6}
+
+
+def test_delete_case_blocked_when_referenced_by_combination():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, DeleteLoadCaseCmd,
+    )
+    m = _model_with_two_cases()
+    AddLoadCombinationCmd(name="C1", terms={"DEAD": 1.0}).do(m)
+    with pytest.raises(ValueError, match=r"referenced by load combination"):
+        DeleteLoadCaseCmd(name="DEAD").do(m)
+    # Case is still present (delete was atomic-blocked).
+    assert "DEAD" in m.load_cases
+
+
+def test_delete_case_allowed_after_combination_removed():
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, DeleteLoadCombinationCmd, DeleteLoadCaseCmd,
+    )
+    m = _model_with_two_cases()
+    AddLoadCombinationCmd(name="C1", terms={"DEAD": 1.0}).do(m)
+    DeleteLoadCombinationCmd(name="C1").do(m)
+    DeleteLoadCaseCmd(name="DEAD").do(m)  # now allowed
+    assert "DEAD" not in m.load_cases

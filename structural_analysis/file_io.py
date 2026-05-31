@@ -13,7 +13,7 @@ from .model import (
     StructuralModel, Node, Material, Section, Support, NodalLoad,
     UniformDistributedLoad, PointLoad,
     TrussTemperatureLoad, FrameTemperatureLoad,
-    LoadCase,
+    LoadCase, LoadCombination,
 )
 from .element import FrameElement2D, TrussElement2D
 
@@ -624,6 +624,90 @@ def read_input_file(filepath: str) -> StructuralModel:
                         name=name, enabled=enabled,
                     )
 
+        elif keyword == "LOAD_COMBINATIONS":
+            # Format: LOAD_COMBINATIONS <count> followed by count rows of
+            #   <name>  <coeff>*<case>  [<coeff>*<case> ...]
+            # e.g.  COMB_STRENGTH  1.2*DEAD  1.6*LIVE
+            # The term token is ``coefficient*case`` (no spaces around
+            # ``*``). At least one term is required; LoadCombination's
+            # __post_init__ enforces the finite / non-zero coefficient
+            # rules. Combination names must not collide with case names
+            # (validated below) and SUM_ALL is rejected by
+            # LoadCombination itself.
+            count = int(tokens[1])
+            for _ in range(count):
+                i += 1
+                while i < len(lines) and (
+                    not lines[i].strip()
+                    or lines[i].lstrip().startswith("#")
+                ):
+                    i += 1
+                if i >= len(lines):
+                    raise ValueError(
+                        "Unexpected end of file inside LOAD_COMBINATIONS "
+                        f"block (expected {count} rows)."
+                    )
+                # On a combination row the text after the first ``#`` is
+                # the (optional, free-text) description — captured here
+                # before it would otherwise be stripped as a comment, so
+                # descriptions round-trip through save/reopen.
+                before_hash, sep, after_hash = lines[i].partition("#")
+                comb_desc = after_hash.strip() if sep else ""
+                parts = before_hash.split()
+                if len(parts) < 2:
+                    raise ValueError(
+                        f"LOAD_COMBINATIONS row {parts!r} needs a name "
+                        "and at least one coefficient*case term."
+                    )
+                # Normalise the combination name and term-case names to
+                # uppercase — the GUI always stores case names uppercase
+                # (``_normalize_load_case``), so a hand-written
+                # lower/mixed-case combination row would otherwise refer
+                # to a case it can never match and be permanently
+                # "unavailable". A post-parse check below validates the
+                # (uppercased) references against the case set.
+                comb_name = parts[0].upper()
+                terms: dict[str, float] = {}
+                for tok in parts[1:]:
+                    if "*" not in tok:
+                        raise ValueError(
+                            f"LOAD_COMBINATIONS row {comb_name!r}: term "
+                            f"{tok!r} must be 'coefficient*case' "
+                            "(e.g. 1.2*DEAD)."
+                        )
+                    coeff_s, _, case_s = tok.partition("*")
+                    case_s = case_s.strip().upper()
+                    try:
+                        coeff = float(coeff_s.strip())
+                    except ValueError:
+                        raise ValueError(
+                            f"LOAD_COMBINATIONS row {comb_name!r}: "
+                            f"coefficient in term {tok!r} is not a number."
+                        )
+                    if case_s in terms:
+                        raise ValueError(
+                            f"LOAD_COMBINATIONS row {comb_name!r}: case "
+                            f"{case_s!r} appears more than once."
+                        )
+                    terms[case_s] = coeff
+                if comb_name in model.load_cases:
+                    raise ValueError(
+                        f"LOAD_COMBINATIONS: name {comb_name!r} collides "
+                        "with a load-case name; combination names must be "
+                        "distinct from case names."
+                    )
+                if comb_name in model.load_combinations:
+                    raise ValueError(
+                        "LOAD_COMBINATIONS: duplicate combination name "
+                        f"{comb_name!r}."
+                    )
+                # LoadCombination.__post_init__ enforces the remaining
+                # rules (finite / non-zero coeffs, SUM_ALL reject, ≥1
+                # term, name shape).
+                model.load_combinations[comb_name] = LoadCombination(
+                    name=comb_name, terms=terms, description=comb_desc,
+                )
+
         i += 1
 
     # Final sweep: auto-create any case referenced by a load tag that
@@ -639,6 +723,31 @@ def read_input_file(filepath: str) -> StructuralModel:
     for name in referenced:
         if name not in model.load_cases:
             model.load_cases[name] = LoadCase(name=name)
+
+    # Validate combinations AFTER the auto-create sweep — the case set
+    # is only complete here (a case may exist solely via a per-load
+    # ``case=`` tag, or because LOAD_COMBINATIONS appeared before
+    # LOAD_CASES in a hand-written file):
+    #   1. A combination name must not collide with ANY case name. The
+    #      per-row check during parsing only saw cases defined so far;
+    #      a collision with a later-created case would leave the model
+    #      with a case and a combination sharing a name, which the GUI's
+    #      ``_resolve_active_result`` mis-resolves (Codex PR #29 P2).
+    #   2. Every referenced case must exist — a dangling reference is a
+    #      malformed file, not a silently-unavailable combination.
+    for comb in model.load_combinations.values():
+        if comb.name in model.load_cases:
+            raise ValueError(
+                f"LOAD_COMBINATIONS: combination {comb.name!r} collides "
+                "with a load-case name; combination names must be "
+                "distinct from case names."
+            )
+        missing = sorted(c for c in comb.terms if c not in model.load_cases)
+        if missing:
+            raise ValueError(
+                f"LOAD_COMBINATIONS: combination {comb.name!r} references "
+                f"load case(s) that do not exist: {', '.join(missing)}."
+            )
 
     return model
 

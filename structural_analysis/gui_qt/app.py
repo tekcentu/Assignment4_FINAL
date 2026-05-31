@@ -563,6 +563,17 @@ class MainWindow(QMainWindow):
             "which case absorbs the self-weight contribution."
         )
         m_view.addAction(self.act_load_cases)
+        # Load Combination Manager (View → Load com&binations…).
+        self.act_load_combinations = QAction(
+            "Load com&binations…", self,
+            triggered=self._show_load_combination_manager,
+        )
+        self.act_load_combinations.setToolTip(
+            "Add, rename, delete coefficient combinations of load cases "
+            "(e.g. 1.2 DEAD + 1.6 LIVE). Combinations are derived views "
+            "computed from solved case results."
+        )
+        m_view.addAction(self.act_load_combinations)
 
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)
@@ -2009,10 +2020,13 @@ class MainWindow(QMainWindow):
         self._multi_result = new_multi
         # Pick a sensible active case for the freshly-solved result
         # (may differ from the one the user was looking at if e.g. they
-        # had SUM_ALL and an enabled case just failed).
-        self._active_case = make_active_case_safe(
-            self._multi_result, self._active_case,
-        )
+        # had SUM_ALL and an enabled case just failed). A still-defined
+        # combination selection is preserved as-is — selecting it after
+        # a solve resolves to the combined result (or its placeholder).
+        if self._active_case not in self._model.load_combinations:
+            self._active_case = make_active_case_safe(
+                self._multi_result, self._active_case,
+            )
         self._refresh_case_selector_combo()
         self._push_active_case_to_canvas()
         self._update_window_title_with_case()
@@ -2064,6 +2078,25 @@ class MainWindow(QMainWindow):
             and self._element_inspector.isVisible()
         ):
             self._element_inspector.refresh(self._model, self._result)
+        # PR #29: when the user selects an unavailable combination,
+        # explain WHY there's no result rather than leaving a bare
+        # placeholder.
+        if (
+            new_name in self._model.load_combinations
+            and self._result is None
+        ):
+            comb = self._model.load_combinations[new_name]
+            if self._multi_result is None:
+                self.set_status(
+                    f"Combination {new_name} needs a solve first (F5)."
+                )
+            else:
+                missing = self._multi_result.missing_cases_for(comb.terms)
+                if missing:
+                    self.set_status(
+                        f"Combination {new_name} requires solved results "
+                        f"for {', '.join(missing)}."
+                    )
 
     def _refresh_case_selector_combo(self) -> None:
         """Repopulate the toolbar combo from the model's case dict.
@@ -2098,6 +2131,21 @@ class MainWindow(QMainWindow):
                 and len(self._multi_result.cases) >= 2
             ):
                 combo.addItem(SUM_ALL_KEY, SUM_ALL_KEY)
+            # User-defined combinations LAST (PR #29). A combination
+            # whose referenced cases aren't all solved is shown with a
+            # "(needs solve)" hint and still selectable — selecting it
+            # surfaces the placeholder rather than silently hiding it.
+            for comb_name in sorted(self._model.load_combinations):
+                comb = self._model.load_combinations[comb_name]
+                available = (
+                    self._multi_result is not None
+                    and self._multi_result.combination_available(comb.terms)
+                )
+                label = (
+                    f"{comb_name}  [comb]" if available
+                    else f"{comb_name}  [comb · needs solve]"
+                )
+                combo.addItem(label, comb_name)
             # Restore selection by matching the userData (the raw
             # case name, not the "(disabled)" label).
             idx = combo.findData(self._active_case)
@@ -2113,16 +2161,52 @@ class MainWindow(QMainWindow):
         finally:
             combo.blockSignals(False)
 
+    def _resolve_active_result(self):
+        """Resolve ``self._active_case`` to a concrete ``AnalysisResult``
+        (or ``None`` for a pre-solve / unavailable selection).
+
+        Handles three kinds of selection:
+        * a load-case name → the per-case result;
+        * ``SUM_ALL`` → the unit-coefficient superposition view;
+        * a combination name → the coefficient-weighted view (or
+          ``None`` when a referenced case is unsolved, so the canvas /
+          inspector show a clear placeholder)."""
+        if self._multi_result is None:
+            return None
+        name = self._active_case
+        if name in self._model.load_combinations:
+            comb = self._model.load_combinations[name]
+            return self._multi_result.combination(
+                comb.terms, name=name,
+            )
+        return self._multi_result.get(name)
+
     def _push_active_case_to_canvas(self) -> None:
         """Sync ``self._result`` (the legacy single-case view) and the
-        canvas to whatever the active case currently resolves to."""
-        if self._multi_result is None:
-            self._result = None
-        else:
-            self._result = self._multi_result.get(self._active_case)
+        canvas to whatever the active case / combination resolves to."""
+        self._result = self._resolve_active_result()
         self.canvas.set_result(self._result)
         if hasattr(self.canvas, "set_active_case"):
             self.canvas.set_active_case(self._active_case)
+        # PR #29: when a combination (or SUM_ALL) is active, tell the
+        # canvas which cases contribute so its load-dimming highlights
+        # all of them rather than a single (misleading) case.
+        if hasattr(self.canvas, "set_active_combination_cases"):
+            if self._active_case in self._model.load_combinations:
+                comb = self._model.load_combinations[self._active_case]
+                self.canvas.set_active_combination_cases(
+                    set(comb.terms.keys())
+                )
+            elif (
+                self._active_case == SUM_ALL_KEY
+                and self._multi_result is not None
+            ):
+                # SUM_ALL = 1.0 × every solved case → highlight them all.
+                self.canvas.set_active_combination_cases(
+                    set(self._multi_result.cases.keys())
+                )
+            else:
+                self.canvas.set_active_combination_cases(None)
         self._update_result_text()
 
     def _on_active_case_loads_only_toggled(self, on: bool) -> None:
@@ -2150,15 +2234,35 @@ class MainWindow(QMainWindow):
                 return
         self._refresh_case_selector_combo()
 
+    def _show_load_combination_manager(self) -> None:
+        """Open the Load Combination Manager dialog and apply its
+        result commands through the undoable ``execute()`` pipeline."""
+        from .dialogs import LoadCombinationManagerDialog
+        d = LoadCombinationManagerDialog(self, model=self._model)
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        for cmd in d.result_value or []:
+            try:
+                self.execute(cmd)
+            except ValueError as e:
+                QMessageBox.warning(self, "Load combination", str(e))
+                return
+        self._refresh_case_selector_combo()
+
     def _update_window_title_with_case(self) -> None:
-        """Reflect the active case in the window title when it differs
-        from DEFAULT (so a single-case workflow's title stays clean)."""
+        """Reflect the active case / combination in the window title
+        when it differs from DEFAULT (so a single-case workflow's title
+        stays clean)."""
         base = getattr(self, "_base_window_title", None)
         if base is None:
-            base = self.windowTitle().split(" — case: ")[0]
+            base = self.windowTitle()
+            for sep in (" — case: ", " — comb: "):
+                base = base.split(sep)[0]
             self._base_window_title = base
         if self._active_case == "DEFAULT" or self._multi_result is None:
             self.setWindowTitle(base)
+        elif self._active_case in self._model.load_combinations:
+            self.setWindowTitle(f"{base} — comb: {self._active_case}")
         else:
             self.setWindowTitle(f"{base} — case: {self._active_case}")
 

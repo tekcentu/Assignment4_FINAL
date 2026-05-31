@@ -1481,18 +1481,24 @@ class MemberLoadDialog(_ModalDialog):
         return "local"
 
     def _refresh_fields(self) -> None:
-        # Clear the field form. ``setParent(None)`` must run BEFORE
-        # ``deleteLater`` — otherwise the old QLineEdit / QLabel widgets
-        # stay parented to _field_container and remain visible (ghosting
-        # behind the freshly added fields) until the event loop
-        # processes the deferred delete. Reparenting to None removes
-        # them from the display immediately. Same idiom used by
-        # ElementPropertiesDialog.set_target / refresh_loads_only.
+        # Clear the field form. We ``hide()`` each old widget BEFORE
+        # ``deleteLater`` rather than reparenting to ``None``:
+        #   * ``deleteLater`` alone leaves the widget visible (ghosting
+        #     behind the new fields) until the event loop runs;
+        #   * ``setParent(None)`` removes the ghost but momentarily
+        #     promotes the child to a TOP-LEVEL window, which flashes as
+        #     a tiny pop-up that immediately disappears (the reported
+        #     flicker when toggling Mechanical/Thermal, direction, or
+        #     Uniform/Gradient).
+        # ``hide()`` makes the widget invisible immediately while it
+        # stays parented to ``_field_container`` (never top-level), so
+        # there is neither a ghost nor a flash; ``deleteLater`` then
+        # reclaims it on the next event-loop turn.
         while self._field_form.count():
             item = self._field_form.takeAt(0)
             w = item.widget()
             if w is not None:
-                w.setParent(None)
+                w.hide()
                 w.deleteLater()
         self._fields = {}
 
@@ -2079,6 +2085,319 @@ class LoadCaseManagerDialog(_ModalDialog):
         sw = self._sw_combo_value()
         if sw and sw != self._self_weight_case_initial:
             cmds.append(SetSelfWeightCaseCmd(case_name=sw))
+        return cmds
+
+
+def _parse_terms_expression(text: str) -> dict[str, float]:
+    """Parse a combination terms expression into ``{case: coeff}``.
+
+    Accepted forms (``+`` separates terms; ``*`` or whitespace separates
+    coefficient from case)::
+
+        1.2*DEAD + 1.6*LIVE
+        1.0 DEAD + 0.7 WIND_X
+
+    Case names are normalised (uppercased). Raises ``ValueError`` on a
+    malformed term, a duplicate case, a non-finite/zero coefficient, or
+    an empty expression."""
+    import math
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("Enter at least one term, e.g. 1.2*DEAD + 1.6*LIVE.")
+    terms: dict[str, float] = {}
+    for chunk in raw.split("+"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "*" in chunk:
+            coeff_s, _, case_s = chunk.partition("*")
+        else:
+            parts = chunk.split(None, 1)
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Cannot parse term {chunk!r}; use "
+                    "'coefficient*CASE' (e.g. 1.2*DEAD)."
+                )
+            coeff_s, case_s = parts
+        coeff_s = coeff_s.strip()
+        case_s = _normalize_load_case(case_s.strip())
+        try:
+            coeff = float(coeff_s)
+        except ValueError:
+            raise ValueError(
+                f"Coefficient {coeff_s!r} in term {chunk!r} is not a number."
+            )
+        if not math.isfinite(coeff):
+            raise ValueError(
+                f"Coefficient in term {chunk!r} must be finite."
+            )
+        if coeff == 0.0:
+            raise ValueError(
+                f"Term {chunk!r} has a zero coefficient; remove it instead."
+            )
+        if case_s in terms:
+            raise ValueError(
+                f"Case {case_s!r} appears more than once in the expression."
+            )
+        terms[case_s] = coeff
+    if not terms:
+        raise ValueError("Enter at least one term, e.g. 1.2*DEAD + 1.6*LIVE.")
+    return terms
+
+
+def _format_terms_expression(terms: dict[str, float]) -> str:
+    """Inverse of :func:`_parse_terms_expression` for display / editing."""
+    return " + ".join(
+        f"{coeff:g}*{case}" for case, coeff in terms.items()
+    )
+
+
+class LoadCombinationManagerDialog(_ModalDialog):
+    """Add / rename / delete coefficient combinations + edit their terms
+    (PR #29 — v0.19).
+
+    Like :class:`LoadCaseManagerDialog`, this dialog never mutates the
+    model directly. It collects the intent as a list of commands exposed
+    via ``result_value`` on accept; the host dispatches them through the
+    undoable ``execute()`` pipeline."""
+
+    def __init__(self, parent, *, model: StructuralModel):
+        self._model = model
+        # Working rows: {name, terms (dict), description, original_name,
+        # deleted}. original_name is None for freshly-added rows.
+        self._rows: list[dict] = [
+            {
+                "name": name,
+                "terms": dict(c.terms),
+                "description": c.description,
+                "original_name": name,
+                "deleted": False,
+            }
+            for name, c in sorted(model.load_combinations.items())
+        ]
+        super().__init__(parent, "Load combinations")
+
+    def _build_body(self, body: QWidget) -> None:
+        from PyQt6.QtWidgets import QHBoxLayout, QPushButton
+        v = QVBoxLayout(body)
+        cases = ", ".join(sorted(self._model.load_cases.keys()))
+        v.addWidget(QLabel(
+            "Coefficient combinations of solved load cases (derived "
+            "views — not separately solved).\n"
+            f"Available cases: {cases}",
+            body,
+        ))
+        self._table = QTableWidget(0, 4, body)
+        self._table.setHorizontalHeaderLabels(
+            ["Name", "Terms", "Description", ""]
+        )
+        self._table.verticalHeader().setVisible(False)
+        # The Name column is editable in place (double-click) so a
+        # combination can be RENAMED — _on_item_changed turns the edit
+        # into a RenameLoadCombinationCmd on accept. Terms / Description
+        # stay read-only (edit them via the form below).
+        self._table.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked
+            | QTableWidget.EditTrigger.SelectedClicked
+        )
+        self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        v.addWidget(self._table)
+
+        # Add / update form.
+        form_box = QWidget(body)
+        form = QFormLayout(form_box)
+        self._name_edit = QLineEdit(form_box)
+        self._name_edit.setPlaceholderText("e.g. COMB_STRENGTH")
+        form.addRow("Name:", self._name_edit)
+        self._terms_edit = QLineEdit(form_box)
+        self._terms_edit.setPlaceholderText("1.2*DEAD + 1.6*LIVE")
+        form.addRow("Terms:", self._terms_edit)
+        self._desc_edit = QLineEdit(form_box)
+        form.addRow("Description:", self._desc_edit)
+        v.addWidget(form_box)
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add / update combination", form_box)
+        add_btn.clicked.connect(self._on_add_or_update_clicked)
+        btn_row.addWidget(add_btn)
+        btn_row.addStretch()
+        v.addLayout(btn_row)
+
+        self._rebuild_table()
+
+    def _rebuild_table(self) -> None:
+        from PyQt6.QtWidgets import QPushButton
+        # Suppress itemChanged while we synthesise cells.
+        try:
+            self._table.itemChanged.disconnect(self._on_item_changed)
+        except (TypeError, RuntimeError):
+            pass
+        live = [r for r in self._rows if not r["deleted"]]
+        self._table.setRowCount(len(live))
+        for i, row in enumerate(live):
+            self._table.setItem(i, 0, QTableWidgetItem(row["name"]))
+            # Terms / Description are read-only cells (edit via the form).
+            terms_item = QTableWidgetItem(
+                _format_terms_expression(row["terms"])
+            )
+            terms_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            self._table.setItem(i, 1, terms_item)
+            desc_item = QTableWidgetItem(row["description"])
+            desc_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            self._table.setItem(i, 2, desc_item)
+            del_btn = QPushButton("Delete")
+            del_btn.clicked.connect(
+                lambda _checked=False, r=row: self._on_delete_clicked(r)
+            )
+            self._table.setCellWidget(i, 3, del_btn)
+        self._table.itemChanged.connect(self._on_item_changed)
+
+    def _set_item_text_silent(self, item, text: str) -> None:
+        self._table.blockSignals(True)
+        try:
+            item.setText(text)
+        finally:
+            self._table.blockSignals(False)
+
+    def _on_item_changed(self, item) -> None:
+        """In-place rename via the Name column (column 0)."""
+        if item.column() != 0:
+            return
+        live = [r for r in self._rows if not r["deleted"]]
+        r = live[item.row()]
+        try:
+            new_name = _normalize_load_case(item.text())
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid combination name", str(e))
+            self._set_item_text_silent(item, r["name"])
+            return
+        if new_name == r["name"]:
+            return
+        if new_name == "SUM_ALL":
+            QMessageBox.warning(
+                self, "Invalid combination name",
+                "SUM_ALL is a built-in derived view and cannot be used.",
+            )
+            self._set_item_text_silent(item, r["name"])
+            return
+        if new_name in self._model.load_cases:
+            QMessageBox.warning(
+                self, "Invalid combination name",
+                f"{new_name!r} is already a load-case name.",
+            )
+            self._set_item_text_silent(item, r["name"])
+            return
+        live_names = {row["name"] for row in live if row is not r}
+        if new_name in live_names:
+            QMessageBox.warning(
+                self, "Invalid combination name",
+                f"Combination {new_name!r} is already defined.",
+            )
+            self._set_item_text_silent(item, r["name"])
+            return
+        r["name"] = new_name
+        self._set_item_text_silent(item, new_name)
+
+    def _on_delete_clicked(self, row: dict) -> None:
+        row["deleted"] = True
+        self._rebuild_table()
+
+    def _on_add_or_update_clicked(self) -> None:
+        try:
+            name = _normalize_load_case(self._name_edit.text())
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid combination name", str(e))
+            return
+        if name == "SUM_ALL":
+            QMessageBox.warning(
+                self, "Invalid combination name",
+                "SUM_ALL is a built-in derived view and cannot be used "
+                "as a combination name.",
+            )
+            return
+        if name in self._model.load_cases:
+            QMessageBox.warning(
+                self, "Invalid combination name",
+                f"{name!r} is already a load-case name; combination "
+                "names must be distinct from case names.",
+            )
+            return
+        try:
+            terms = _parse_terms_expression(self._terms_edit.text())
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid terms", str(e))
+            return
+        # Referenced cases must exist.
+        missing = sorted(c for c in terms if c not in self._model.load_cases)
+        if missing:
+            QMessageBox.warning(
+                self, "Invalid terms",
+                "Combination references unknown load case(s): "
+                + ", ".join(missing),
+            )
+            return
+        desc = self._desc_edit.text().strip()
+        # Update an existing live row with this name, else append a new.
+        for r in self._rows:
+            if not r["deleted"] and r["name"] == name:
+                r["terms"] = terms
+                r["description"] = desc
+                break
+        else:
+            self._rows.append({
+                "name": name,
+                "terms": terms,
+                "description": desc,
+                "original_name": None,
+                "deleted": False,
+            })
+        self._name_edit.clear()
+        self._terms_edit.clear()
+        self._desc_edit.clear()
+        self._rebuild_table()
+
+    def _accept(self) -> list:
+        from ..gui_common.commands import (
+            AddLoadCombinationCmd,
+            DeleteLoadCombinationCmd,
+            RenameLoadCombinationCmd,
+            SetLoadCombinationTermsCmd,
+        )
+        cmds: list = []
+        # Deletes first.
+        for r in self._rows:
+            if r["deleted"] and r["original_name"] is not None:
+                cmds.append(DeleteLoadCombinationCmd(name=r["original_name"]))
+        # Adds + renames + term edits.
+        for r in self._rows:
+            if r["deleted"]:
+                continue
+            orig = r["original_name"]
+            if orig is None:
+                cmds.append(AddLoadCombinationCmd(
+                    name=r["name"], terms=dict(r["terms"]),
+                    combo_description=r["description"],
+                ))
+            else:
+                if orig != r["name"]:
+                    cmds.append(RenameLoadCombinationCmd(
+                        old_name=orig, new_name=r["name"],
+                    ))
+                original = self._model.load_combinations.get(orig)
+                terms_changed = (
+                    original is None or original.terms != r["terms"]
+                    or original.description != r["description"]
+                )
+                if terms_changed:
+                    cmds.append(SetLoadCombinationTermsCmd(
+                        name=r["name"], terms=dict(r["terms"]),
+                        combo_description=r["description"],
+                    ))
         return cmds
 
 

@@ -4089,42 +4089,37 @@ def test_member_load_dialog_load_case_rejects_hash(qt_app):
 
 def test_member_load_dialog_no_stale_field_widgets_after_mode_switch(qt_app):
     """Layout-ghosting regression: switching Mechanical → Thermal must
-    leave NO leftover QLineEdit children parented to the field
-    container. The fix reparents old fields to None immediately
-    (before deleteLater) so they vanish from the display without
-    waiting for the event loop. We deliberately do NOT call
-    processEvents here — the assertion must hold synchronously."""
-    from PyQt6.QtWidgets import QLineEdit
+    HIDE the old field widgets immediately (so they neither ghost
+    behind the new fields nor flash as a top-level window). We capture
+    the old widgets and assert they are hidden synchronously — without
+    processEvents — which is the guarantee ``hide()`` provides."""
     from structural_analysis.gui_qt.dialogs import MemberLoadDialog
-
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
     d._rb_cat_mechanical.setChecked(True)
     d._rb_udl.setChecked(True)
     d._refresh_fields()
-    # Mechanical/UDL/local exposes exactly wx + wy.
-    live = d._field_container.findChildren(QLineEdit)
-    assert len(live) == 2
-
-    # Switch to Thermal (uniform) → only a single ΔT field should
-    # remain; the wx/wy edits must be gone, not lingering behind it.
+    # Capture the live wx / wy editors.
+    old_fields = [d._fields["wx"], d._fields["wy"]]
+    # Switch to Thermal (uniform) → the wx/wy editors must be hidden,
+    # not lingering visible behind the new ΔT field.
     d._rb_cat_thermal.setChecked(True)
     d._rb_t_uniform.setChecked(True)
     d._refresh_fields()
-    live = d._field_container.findChildren(QLineEdit)
-    assert len(live) == 1, (
-        "stale field widgets still parented to the container after a "
-        "mode switch — layout ghosting bug regressed"
+    assert all(e.isHidden() for e in old_fields), (
+        "old field widgets are not hidden after a mode switch — "
+        "ghosting / flicker regressed"
     )
+    # And no old field stayed parented to None (which would flash as a
+    # top-level window).
+    assert all(e.parent() is not None for e in old_fields)
 
 
 def test_member_load_dialog_no_stale_widgets_after_direction_switch(qt_app):
     """Same ghosting guard across the Local → Gravity direction switch
     (local shows wx+wy, gravity shows a single magnitude field)."""
-    from PyQt6.QtWidgets import QLineEdit
     from structural_analysis.gui_qt.dialogs import MemberLoadDialog
-
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
@@ -4132,10 +4127,11 @@ def test_member_load_dialog_no_stale_widgets_after_direction_switch(qt_app):
     d._rb_udl.setChecked(True)
     d._rb_local.setChecked(True)
     d._refresh_fields()
-    assert len(d._field_container.findChildren(QLineEdit)) == 2
+    old_fields = [d._fields["wx"], d._fields["wy"]]
     d._rb_gravity.setChecked(True)
     d._refresh_fields()
-    assert len(d._field_container.findChildren(QLineEdit)) == 1
+    assert all(e.isHidden() for e in old_fields)
+    assert all(e.parent() is not None for e in old_fields)
 
 
 def test_member_load_dialog_local_help_visible_only_in_local_mode(qt_app):
@@ -4631,3 +4627,285 @@ def test_active_only_resolve_drops_stale_case_on_failure(qt_app):
         "stale OK result must be dropped when a re-solve fails"
     )
     assert new_multi.failed_cases["DEAD"] == "synthetic-failure"
+
+
+# ── PR #29 — load combinations: selector, manager, canvas ───────────
+
+
+def test_combination_appears_in_selector_after_solve(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(
+        name="COMB_STRENGTH", terms={"DEAD": 1.2, "LIVE": 1.6},
+    ))
+    w._do_solve()
+    qt_app.processEvents()
+    data = [
+        w._case_combo.itemData(i) for i in range(w._case_combo.count())
+    ]
+    assert "COMB_STRENGTH" in data
+    # Combination is LAST (after real cases and SUM_ALL).
+    assert data[-1] == "COMB_STRENGTH"
+
+
+def test_selecting_combination_updates_canvas_result(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(
+        name="COMB1", terms={"DEAD": 1.0, "LIVE": 1.0},
+    ))
+    w._do_solve()
+    qt_app.processEvents()
+    w._active_case = "COMB1"
+    w._push_active_case_to_canvas()
+    comb_result = w.canvas._result
+    assert comb_result is not None
+    # Combination 1.0 DEAD + 1.0 LIVE == SUM_ALL view.
+    sa = w._multi_result.sum_all()
+    import numpy as np
+    np.testing.assert_allclose(
+        np.asarray(comb_result.D), np.asarray(sa.D), atol=1e-9,
+    )
+
+
+def test_combination_window_title_shows_comb_prefix(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.0}))
+    w._do_solve()
+    qt_app.processEvents()
+    w._active_case = "COMB1"
+    w._update_window_title_with_case()
+    assert "comb: COMB1" in w.windowTitle()
+
+
+def test_unavailable_combination_resolves_to_none(qt_app):
+    """A combination referencing an unsolved (disabled) case must
+    resolve to None so the canvas/inspector show a placeholder."""
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, SetLoadCaseEnabledCmd,
+    )
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(
+        name="COMB1", terms={"DEAD": 1.0, "LIVE": 1.0},
+    ))
+    w.execute(SetLoadCaseEnabledCmd(name="LIVE", enabled=False))
+    w._do_solve()
+    qt_app.processEvents()
+    w._active_case = "COMB1"
+    assert w._resolve_active_result() is None
+
+
+def test_combination_crud_invalidates_multi_result(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._multi_result is not None
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.0}))
+    assert w._multi_result is None
+
+
+def test_combination_manager_dialog_lists_combinations(qt_app):
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    from structural_analysis.gui_qt.dialogs import LoadCombinationManagerDialog
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.2}))
+    d = LoadCombinationManagerDialog(w, model=w._model)
+    names = [r["name"] for r in d._rows]
+    assert "COMB1" in names
+
+
+def test_combination_manager_add_emits_command(qt_app):
+    from structural_analysis.gui_qt.dialogs import LoadCombinationManagerDialog
+    from structural_analysis.gui_common.commands import AddLoadCombinationCmd
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    d = LoadCombinationManagerDialog(w, model=w._model)
+    d._name_edit.setText("COMB_X")
+    d._terms_edit.setText("1.2*DEAD + 1.6*LIVE")
+    d._on_add_or_update_clicked()
+    cmds = d._accept()
+    add = [c for c in cmds if isinstance(c, AddLoadCombinationCmd)]
+    assert len(add) == 1
+    assert add[0].name == "COMB_X"
+    assert add[0].terms == {"DEAD": 1.2, "LIVE": 1.6}
+
+
+def test_combination_manager_rejects_unknown_case_term(qt_app, monkeypatch):
+    # The dialog surfaces validation failures via a blocking
+    # QMessageBox.warning — stub it so the test doesn't hang and we can
+    # assert the warning fired.
+    from structural_analysis.gui_qt import dialogs as dlg_mod
+    from structural_analysis.gui_qt.dialogs import LoadCombinationManagerDialog
+    warned: list = []
+    monkeypatch.setattr(
+        dlg_mod.QMessageBox, "warning",
+        lambda *a, **k: warned.append(a),
+    )
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    d = LoadCombinationManagerDialog(w, model=w._model)
+    d._name_edit.setText("COMB_X")
+    d._terms_edit.setText("1.0*GHOST")
+    d._on_add_or_update_clicked()
+    # Unknown case → row not added, and a warning was shown.
+    names = [r["name"] for r in d._rows if not r["deleted"]]
+    assert "COMB_X" not in names
+    assert warned, "expected a validation warning for the unknown case"
+
+
+def test_terms_expression_parser_roundtrip():
+    from structural_analysis.gui_qt.dialogs import (
+        _parse_terms_expression, _format_terms_expression,
+    )
+    terms = _parse_terms_expression("1.2*DEAD + 1.6*LIVE")
+    assert terms == {"DEAD": 1.2, "LIVE": 1.6}
+    # Whitespace form also works.
+    assert _parse_terms_expression("1.0 DEAD") == {"DEAD": 1.0}
+    # Negative coefficient.
+    assert _parse_terms_expression("1.0*DEAD + -0.7*WIND_X") == {
+        "DEAD": 1.0, "WIND_X": -0.7,
+    }
+    # Round-trip through formatter.
+    again = _parse_terms_expression(_format_terms_expression(terms))
+    assert again == terms
+
+
+def test_terms_expression_parser_rejects_zero_coeff():
+    from structural_analysis.gui_qt.dialogs import _parse_terms_expression
+    import pytest
+    with pytest.raises(ValueError, match=r"zero coefficient"):
+        _parse_terms_expression("0*DEAD")
+
+
+def test_canvas_combination_highlights_all_constituent_loads(qt_app):
+    """When a combination is active, loads from ANY constituent case
+    render full alpha; non-constituent loads dim."""
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.canvas.set_active_case("COMB1")
+    w.canvas.set_active_combination_cases({"DEAD", "LIVE"})
+    w.canvas.set_active_case_loads_only(True)
+    from structural_analysis.model import NodalLoad
+    dead = NodalLoad(node_id=2, fy=-1.0, load_case="DEAD")
+    live = NodalLoad(node_id=2, fy=-1.0, load_case="LIVE")
+    other = NodalLoad(node_id=2, fy=-1.0, load_case="OTHER")
+    assert w.canvas._load_case_alpha(dead) == 1.0
+    assert w.canvas._load_case_alpha(live) == 1.0
+    assert w.canvas._load_case_alpha(other) < 1.0
+
+
+# ── Gemini PR #29 review fixes (GUI) ────────────────────────────────
+
+
+def test_combination_manager_rename_emits_rename_command(qt_app):
+    """Editing the Name cell in place must produce a
+    RenameLoadCombinationCmd (the rename path was previously
+    unreachable because the table was read-only)."""
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, RenameLoadCombinationCmd,
+    )
+    from structural_analysis.gui_qt.dialogs import LoadCombinationManagerDialog
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.0}))
+    d = LoadCombinationManagerDialog(w, model=w._model)
+    # Simulate an in-place name edit on the first row.
+    item = d._table.item(0, 0)
+    item.setText("COMB_RENAMED")
+    d._on_item_changed(item)
+    cmds = d._accept()
+    renames = [c for c in cmds if isinstance(c, RenameLoadCombinationCmd)]
+    assert len(renames) == 1
+    assert renames[0].old_name == "COMB1"
+    assert renames[0].new_name == "COMB_RENAMED"
+
+
+def test_sum_all_highlights_all_solved_case_loads(qt_app):
+    """When SUM_ALL is active, loads from every solved case render at
+    full alpha (Gemini PR #29 fix — previously all dimmed)."""
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._do_solve()
+    qt_app.processEvents()
+    w._active_case = "SUM_ALL"
+    w._push_active_case_to_canvas()
+    w.canvas.set_active_case_loads_only(True)
+    from structural_analysis.model import NodalLoad
+    dead = NodalLoad(node_id=2, fy=-1.0, load_case="DEAD")
+    live = NodalLoad(node_id=2, fy=-1.0, load_case="LIVE")
+    assert w.canvas._load_case_alpha(dead) == 1.0
+    assert w.canvas._load_case_alpha(live) == 1.0
+
+
+# ── PR #29 review-fix: member-load dialog toggle flicker ────────────
+
+
+def _count_top_level_widgets():
+    from PyQt6.QtWidgets import QApplication
+    return len(QApplication.topLevelWidgets())
+
+
+def test_member_load_dialog_mech_thermal_toggle_no_extra_top_level(qt_app):
+    """Toggling Mechanical/Thermal must update in place and never spawn
+    a transient top-level window (the reported flicker came from
+    ``setParent(None)`` briefly promoting a field widget to top-level)."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    qt_app.processEvents()
+    before = _count_top_level_widgets()
+    for _ in range(4):
+        d._rb_cat_thermal.setChecked(True)
+        d._refresh_fields()
+        d._rb_cat_mechanical.setChecked(True)
+        d._refresh_fields()
+    qt_app.processEvents()
+    assert _count_top_level_widgets() <= before
+
+
+def test_member_load_dialog_direction_toggle_no_extra_top_level(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._refresh_fields()
+    qt_app.processEvents()
+    before = _count_top_level_widgets()
+    for _ in range(4):
+        d._rb_local.setChecked(True)
+        d._refresh_fields()
+        d._rb_global.setChecked(True)
+        d._refresh_fields()
+        d._rb_gravity.setChecked(True)
+        d._refresh_fields()
+    qt_app.processEvents()
+    assert _count_top_level_widgets() <= before
+
+
+def test_member_load_dialog_uniform_gradient_toggle_no_extra_top_level(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_thermal.setChecked(True)
+    d._refresh_fields()
+    qt_app.processEvents()
+    before = _count_top_level_widgets()
+    for _ in range(4):
+        d._rb_t_gradient.setChecked(True)
+        d._refresh_fields()
+        d._rb_t_uniform.setChecked(True)
+        d._refresh_fields()
+    qt_app.processEvents()
+    assert _count_top_level_widgets() <= before
