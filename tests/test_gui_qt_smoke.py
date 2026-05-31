@@ -4909,3 +4909,247 @@ def test_member_load_dialog_uniform_gradient_toggle_no_extra_top_level(qt_app):
         d._refresh_fields()
     qt_app.processEvents()
     assert _count_top_level_widgets() <= before
+
+
+# ── PR #30: multiple nodal loads per node + manager dialog ───────────
+
+
+def _single_node_window(qt_app):
+    """MainWindow with a single node (id=1) at the origin — enough for
+    the nodal-load manager tests."""
+    from structural_analysis.model import Node
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0)}
+    return w
+
+
+def test_nodal_load_manager_lists_existing_rows(qt_app):
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    assert d._table.rowCount() == 2
+    assert d._table.item(0, 0).text() == "DEAD"
+    assert d._table.item(1, 0).text() == "LIVE"
+
+
+def test_nodal_load_manager_add_appends_undoable_row(qt_app, monkeypatch):
+    from structural_analysis.gui_qt import dialogs as dlg_mod
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    w = _single_node_window(qt_app)
+    # Stub the inner add/edit form to return a fixed value without
+    # showing a modal exec(). The manager treats _open_form's return
+    # tuple as (fx, fy, mz, load_case).
+    monkeypatch.setattr(
+        NodalLoadManagerDialog, "_open_form",
+        lambda self, existing=None: (0.0, -10.0, 0.0, "DEAD"),
+    )
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    d._on_add()
+    assert len(w._model.nodal_loads) == 1
+    assert w._model.nodal_loads[0].load_case == "DEAD"
+    # Single undo removes the row.
+    w._do_undo()
+    assert w._model.nodal_loads == []
+
+
+def test_nodal_load_manager_edit_only_changes_selected_row(qt_app, monkeypatch):
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    # Select the LIVE row (visible index 1).
+    d._table.selectRow(1)
+    monkeypatch.setattr(
+        NodalLoadManagerDialog, "_open_form",
+        lambda self, existing=None: (0.0, -30.0, 0.0, "LIVE"),
+    )
+    d._on_edit()
+    # DEAD row unchanged.
+    assert w._model.nodal_loads[0].fy == -10.0
+    assert w._model.nodal_loads[0].load_case == "DEAD"
+    # LIVE row updated.
+    assert w._model.nodal_loads[1].fy == -30.0
+    # Undo restores LIVE row to -20.
+    w._do_undo()
+    assert w._model.nodal_loads[1].fy == -20.0
+
+
+def test_nodal_load_manager_delete_only_removes_selected_row(qt_app):
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    w._model.nodal_loads.append(NodalLoad(1, fx=5.0, load_case="WIND"))
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    # Select the LIVE row (visible index 1).
+    d._table.selectRow(1)
+    d._on_delete()
+    cases = [ld.load_case for ld in w._model.nodal_loads]
+    assert cases == ["DEAD", "WIND"]
+    w._do_undo()
+    cases = [ld.load_case for ld in w._model.nodal_loads]
+    assert cases == ["DEAD", "LIVE", "WIND"]
+
+
+def test_nodal_load_manager_edit_with_no_selection_warns(qt_app, monkeypatch):
+    from structural_analysis.gui_qt import dialogs as dlg_mod
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0))
+    infos: list = []
+    monkeypatch.setattr(
+        dlg_mod.QMessageBox, "information",
+        lambda *a, **k: infos.append(a),
+    )
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    d._table.clearSelection()
+    d._on_edit()
+    # Model untouched; user got a message.
+    assert len(w._model.nodal_loads) == 1
+    assert infos
+
+
+def test_nodal_load_manager_add_rejects_zero_load(qt_app, monkeypatch):
+    from structural_analysis.gui_qt import dialogs as dlg_mod
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    w = _single_node_window(qt_app)
+    infos: list = []
+    monkeypatch.setattr(
+        dlg_mod.QMessageBox, "information",
+        lambda *a, **k: infos.append(a),
+    )
+    monkeypatch.setattr(
+        NodalLoadManagerDialog, "_open_form",
+        lambda self, existing=None: (0.0, 0.0, 0.0, "DEAD"),
+    )
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    d._on_add()
+    assert w._model.nodal_loads == []
+    assert infos
+
+
+def test_nodal_load_manager_invalidates_stale_results(qt_app, monkeypatch):
+    """Each Add/Edit/Delete must invalidate cached solve results so the
+    user can't view a stale diagram after editing loads."""
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEFAULT"))
+    # Mock a "solved" state on the host.
+    w._result = object()
+    monkeypatch.setattr(
+        NodalLoadManagerDialog, "_open_form",
+        lambda self, existing=None: (0.0, -20.0, 0.0, "DEFAULT"),
+    )
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    d._table.selectRow(0)
+    d._on_edit()
+    # The host's invalidation surface clears _result.
+    assert w._result is None
+
+
+def test_node_properties_dialog_shows_multi_row_summary(qt_app):
+    from structural_analysis.gui_qt.dialogs import _nodal_load_summary
+    from structural_analysis.model import NodalLoad
+    w = _single_node_window(qt_app)
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    text = _nodal_load_summary(w._model, 1)
+    # Two bullet rows in the summary.
+    assert text.count("•") == 2
+    assert "DEAD" in text and "LIVE" in text
+
+
+def test_node_properties_dialog_empty_state(qt_app):
+    from structural_analysis.gui_qt.dialogs import _nodal_load_summary
+    w = _single_node_window(qt_app)
+    assert _nodal_load_summary(w._model, 1) == "(none)"
+
+
+def test_node_menu_action_opens_nodal_load_manager(qt_app, monkeypatch):
+    """The right-click → 'edit nodal load…' action must open the new
+    manager dialog (not the legacy single-load editor)."""
+    from structural_analysis.gui_qt import dialogs as dlg_mod
+    opened: list = []
+
+    class _StubMgr:
+        def __init__(self, parent, *, host, model, node_id):
+            opened.append(node_id)
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(dlg_mod, "NodalLoadManagerDialog", _StubMgr)
+    from structural_analysis.gui_qt import app as app_mod
+    monkeypatch.setattr(app_mod, "NodalLoadManagerDialog", _StubMgr)
+    w = _single_node_window(qt_app)
+    w._edit_nodal_load(1)
+    assert opened == [1]
+
+
+def test_nodal_load_manager_skips_unrelated_node_rows(qt_app):
+    """Loads attached to other nodes must not appear in the per-node
+    manager's table."""
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import Node, NodalLoad
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(2, fy=-99.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    assert d._table.rowCount() == 2
+    cases = [d._table.item(i, 0).text() for i in range(2)]
+    assert cases == ["DEAD", "LIVE"]
+
+
+def test_nodal_load_manager_handles_intervening_rows_correctly(qt_app, monkeypatch):
+    """When other-node loads appear between this node's rows, the
+    captured global-index must still target the right row on Edit."""
+    from structural_analysis.gui_qt.dialogs import NodalLoadManagerDialog
+    from structural_analysis.model import Node, NodalLoad
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    # Interleave: node1 DEAD, node2 DEAD, node1 LIVE.
+    w._model.nodal_loads.append(NodalLoad(1, fy=-10.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(2, fy=-99.0, load_case="DEAD"))
+    w._model.nodal_loads.append(NodalLoad(1, fy=-20.0, load_case="LIVE"))
+    d = NodalLoadManagerDialog(
+        w, host=w, model=w._model, node_id=1,
+    )
+    # Visible row 1 (LIVE) maps to global index 2 in model.nodal_loads.
+    d._table.selectRow(1)
+    monkeypatch.setattr(
+        NodalLoadManagerDialog, "_open_form",
+        lambda self, existing=None: (0.0, -30.0, 0.0, "LIVE"),
+    )
+    d._on_edit()
+    # Node-2 row (global index 1) untouched.
+    assert w._model.nodal_loads[1].node_id == 2
+    assert w._model.nodal_loads[1].fy == -99.0
+    # Node-1 LIVE row updated.
+    assert w._model.nodal_loads[2].node_id == 1
+    assert w._model.nodal_loads[2].fy == -30.0

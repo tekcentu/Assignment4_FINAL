@@ -62,7 +62,6 @@ from ..gui_common.commands import (
     DrawMemberWithSplitsCmd,
     ReplaceModelCmd,
     SetGridSystemCmd,
-    SetNodalLoadCmd,
     SetSupportCmd,
     UpdateElementCmd,
 )
@@ -92,7 +91,7 @@ from .dialogs import (
     GridSpacingDialog,
     MaterialListDialog,
     MemberLoadDialog,
-    NodalLoadDialog,
+    NodalLoadManagerDialog,
     NodePropertiesDialog,
     SupportDialog,
 )
@@ -1107,18 +1106,22 @@ class MainWindow(QMainWindow):
         self.execute(SetSupportCmd(support=support, node_id=node_id))
 
     def _edit_nodal_load(self, node_id: int) -> None:
-        existing = next((ld for ld in self._model.nodal_loads
-                         if ld.node_id == node_id), None)
-        d = NodalLoadDialog(
-            self, existing=existing, node_id=node_id, model=self._model,
-        )
-        if d.exec() != QDialog.DialogCode.Accepted:
+        """Open the per-node nodal-load manager (v0.20 — PR #30).
+
+        Replaces the pre-v0.20 single-load editor: a node can now carry
+        multiple independent rows (one per case, several per case…), and
+        each Add / Edit / Delete is an individual undoable command. The
+        dialog dispatches commands immediately through ``self.execute``
+        so the model stays in sync with the table while it's open.
+        """
+        try:
+            d = NodalLoadManagerDialog(
+                self, host=self, model=self._model, node_id=node_id,
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Node not found", str(e))
             return
-        fx, fy, mz, load_case = d.result_value
-        self._ensure_load_case_exists(load_case)
-        self.execute(SetNodalLoadCmd(
-            node_id=node_id, fx=fx, fy=fy, mz=mz, load_case=load_case,
-        ))
+        d.exec()
 
     def _ensure_load_case_exists(self, case_name: str) -> None:
         """Auto-create the named load case if the user typed a new one
