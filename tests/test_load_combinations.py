@@ -371,3 +371,70 @@ def test_reader_rejects_combination_referencing_unknown_case():
             read_input_file(path)
     finally:
         os.unlink(path)
+
+
+# ── Codex PR #29 P2 fixes ───────────────────────────────────────────
+
+
+def test_reader_rejects_combination_name_colliding_with_later_case():
+    """A combination defined BEFORE the colliding case (here auto-created
+    from a per-load case= tag) must still be rejected by the final
+    post-sweep collision check (Codex P2)."""
+    body = (
+        "TITLE\nlate-collide\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "LOAD_CASES 1\nDEAD\n\n"
+        # Combination named WIND defined here, BEFORE the WIND case is
+        # auto-created by the load tag below.
+        "LOAD_COMBINATIONS 1\nWIND  1.0*DEAD\n\n"
+        "MEMBER_UDL 1\n1  0.0  -10.0  case=WIND\n\n"
+    )
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        with pytest.raises(ValueError, match=r"collides with a load-case"):
+            read_input_file(path)
+    finally:
+        os.unlink(path)
+
+
+def test_round_trip_preserves_combination_description():
+    """The free-text description must survive save → reopen (Codex P2)."""
+    m = _two_case_cantilever()
+    m.load_combinations["COMB1"] = LoadCombination(
+        name="COMB1", terms={"DEAD": 1.2, "LIVE": 1.6},
+        description="ULS strength check 1.2D + 1.6L",
+    )
+    m2 = _round_trip(m)
+    assert m2.load_combinations["COMB1"].description == (
+        "ULS strength check 1.2D + 1.6L"
+    )
+    # Terms still intact.
+    assert m2.load_combinations["COMB1"].terms == {"DEAD": 1.2, "LIVE": 1.6}
+
+
+def test_combination_without_description_round_trips_clean():
+    """No description → no trailing '#', and an empty description on
+    reopen."""
+    m = _two_case_cantilever()
+    m.load_combinations["COMB1"] = LoadCombination(
+        name="COMB1", terms={"DEAD": 1.0},
+    )
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        write_input_file(m, path)
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        m2 = read_input_file(path)
+    finally:
+        os.unlink(path)
+    # The COMB1 row carries no '#'.
+    comb_line = [ln for ln in text.splitlines() if ln.startswith("COMB1")][0]
+    assert "#" not in comb_line
+    assert m2.load_combinations["COMB1"].description == ""

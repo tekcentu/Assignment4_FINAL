@@ -306,7 +306,15 @@ def write_input_file(model: StructuralModel, path: str) -> None:
                 f"{coeff:g}*{case_name}"
                 for case_name, coeff in sorted(c.terms.items())
             )
-            out.append(f"{name}  {term_str}")
+            row = f"{name}  {term_str}"
+            # Persist the optional free-text description as a trailing
+            # ``# …`` (the reader captures the post-# text on a
+            # combination row as the description). A literal newline
+            # would corrupt the single-line row, so flatten it.
+            desc = (c.description or "").replace("\n", " ").replace("\r", " ").strip()
+            if desc:
+                row += f"  # {desc}"
+            out.append(row)
         out.append("")
 
     # ANALYSIS_OPTIONS — only when at least one option differs from

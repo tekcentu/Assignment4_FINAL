@@ -647,7 +647,13 @@ def read_input_file(filepath: str) -> StructuralModel:
                         "Unexpected end of file inside LOAD_COMBINATIONS "
                         f"block (expected {count} rows)."
                     )
-                parts = lines[i].split("#")[0].split()
+                # On a combination row the text after the first ``#`` is
+                # the (optional, free-text) description — captured here
+                # before it would otherwise be stripped as a comment, so
+                # descriptions round-trip through save/reopen.
+                before_hash, sep, after_hash = lines[i].partition("#")
+                comb_desc = after_hash.strip() if sep else ""
+                parts = before_hash.split()
                 if len(parts) < 2:
                     raise ValueError(
                         f"LOAD_COMBINATIONS row {parts!r} needs a name "
@@ -699,7 +705,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                 # rules (finite / non-zero coeffs, SUM_ALL reject, ≥1
                 # term, name shape).
                 model.load_combinations[comb_name] = LoadCombination(
-                    name=comb_name, terms=terms,
+                    name=comb_name, terms=terms, description=comb_desc,
                 )
 
         i += 1
@@ -718,12 +724,24 @@ def read_input_file(filepath: str) -> StructuralModel:
         if name not in model.load_cases:
             model.load_cases[name] = LoadCase(name=name)
 
-    # Validate combination references AFTER the auto-create sweep (a
-    # combination may legitimately reference a case that only exists
-    # via a per-load ``case=`` tag). A reference to a non-existent case
-    # is a malformed file — fail loudly rather than producing a
-    # permanently-unavailable combination.
+    # Validate combinations AFTER the auto-create sweep — the case set
+    # is only complete here (a case may exist solely via a per-load
+    # ``case=`` tag, or because LOAD_COMBINATIONS appeared before
+    # LOAD_CASES in a hand-written file):
+    #   1. A combination name must not collide with ANY case name. The
+    #      per-row check during parsing only saw cases defined so far;
+    #      a collision with a later-created case would leave the model
+    #      with a case and a combination sharing a name, which the GUI's
+    #      ``_resolve_active_result`` mis-resolves (Codex PR #29 P2).
+    #   2. Every referenced case must exist — a dangling reference is a
+    #      malformed file, not a silently-unavailable combination.
     for comb in model.load_combinations.values():
+        if comb.name in model.load_cases:
+            raise ValueError(
+                f"LOAD_COMBINATIONS: combination {comb.name!r} collides "
+                "with a load-case name; combination names must be "
+                "distinct from case names."
+            )
         missing = sorted(c for c in comb.terms if c not in model.load_cases)
         if missing:
             raise ValueError(
