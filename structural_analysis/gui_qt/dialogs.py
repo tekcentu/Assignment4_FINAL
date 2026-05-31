@@ -2186,7 +2186,14 @@ class LoadCombinationManagerDialog(_ModalDialog):
             ["Name", "Terms", "Description", ""]
         )
         self._table.verticalHeader().setVisible(False)
-        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        # The Name column is editable in place (double-click) so a
+        # combination can be RENAMED — _on_item_changed turns the edit
+        # into a RenameLoadCombinationCmd on accept. Terms / Description
+        # stay read-only (edit them via the form below).
+        self._table.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked
+            | QTableWidget.EditTrigger.SelectedClicked
+        )
         self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -2215,21 +2222,80 @@ class LoadCombinationManagerDialog(_ModalDialog):
 
     def _rebuild_table(self) -> None:
         from PyQt6.QtWidgets import QPushButton
+        # Suppress itemChanged while we synthesise cells.
+        try:
+            self._table.itemChanged.disconnect(self._on_item_changed)
+        except (TypeError, RuntimeError):
+            pass
         live = [r for r in self._rows if not r["deleted"]]
         self._table.setRowCount(len(live))
         for i, row in enumerate(live):
             self._table.setItem(i, 0, QTableWidgetItem(row["name"]))
-            self._table.setItem(
-                i, 1, QTableWidgetItem(_format_terms_expression(row["terms"]))
+            # Terms / Description are read-only cells (edit via the form).
+            terms_item = QTableWidgetItem(
+                _format_terms_expression(row["terms"])
             )
-            self._table.setItem(
-                i, 2, QTableWidgetItem(row["description"])
+            terms_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             )
+            self._table.setItem(i, 1, terms_item)
+            desc_item = QTableWidgetItem(row["description"])
+            desc_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            self._table.setItem(i, 2, desc_item)
             del_btn = QPushButton("Delete")
             del_btn.clicked.connect(
                 lambda _checked=False, r=row: self._on_delete_clicked(r)
             )
             self._table.setCellWidget(i, 3, del_btn)
+        self._table.itemChanged.connect(self._on_item_changed)
+
+    def _set_item_text_silent(self, item, text: str) -> None:
+        self._table.blockSignals(True)
+        try:
+            item.setText(text)
+        finally:
+            self._table.blockSignals(False)
+
+    def _on_item_changed(self, item) -> None:
+        """In-place rename via the Name column (column 0)."""
+        if item.column() != 0:
+            return
+        live = [r for r in self._rows if not r["deleted"]]
+        r = live[item.row()]
+        try:
+            new_name = _normalize_load_case(item.text())
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid combination name", str(e))
+            self._set_item_text_silent(item, r["name"])
+            return
+        if new_name == r["name"]:
+            return
+        if new_name == "SUM_ALL":
+            QMessageBox.warning(
+                self, "Invalid combination name",
+                "SUM_ALL is a built-in derived view and cannot be used.",
+            )
+            self._set_item_text_silent(item, r["name"])
+            return
+        if new_name in self._model.load_cases:
+            QMessageBox.warning(
+                self, "Invalid combination name",
+                f"{new_name!r} is already a load-case name.",
+            )
+            self._set_item_text_silent(item, r["name"])
+            return
+        live_names = {row["name"] for row in live if row is not r}
+        if new_name in live_names:
+            QMessageBox.warning(
+                self, "Invalid combination name",
+                f"Combination {new_name!r} is already defined.",
+            )
+            self._set_item_text_silent(item, r["name"])
+            return
+        r["name"] = new_name
+        self._set_item_text_silent(item, new_name)
 
     def _on_delete_clicked(self, row: dict) -> None:
         row["deleted"] = True

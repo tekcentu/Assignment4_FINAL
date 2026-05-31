@@ -4804,3 +4804,46 @@ def test_canvas_combination_highlights_all_constituent_loads(qt_app):
     assert w.canvas._load_case_alpha(dead) == 1.0
     assert w.canvas._load_case_alpha(live) == 1.0
     assert w.canvas._load_case_alpha(other) < 1.0
+
+
+# ── Gemini PR #29 review fixes (GUI) ────────────────────────────────
+
+
+def test_combination_manager_rename_emits_rename_command(qt_app):
+    """Editing the Name cell in place must produce a
+    RenameLoadCombinationCmd (the rename path was previously
+    unreachable because the table was read-only)."""
+    from structural_analysis.gui_common.commands import (
+        AddLoadCombinationCmd, RenameLoadCombinationCmd,
+    )
+    from structural_analysis.gui_qt.dialogs import LoadCombinationManagerDialog
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w.execute(AddLoadCombinationCmd(name="COMB1", terms={"DEAD": 1.0}))
+    d = LoadCombinationManagerDialog(w, model=w._model)
+    # Simulate an in-place name edit on the first row.
+    item = d._table.item(0, 0)
+    item.setText("COMB_RENAMED")
+    d._on_item_changed(item)
+    cmds = d._accept()
+    renames = [c for c in cmds if isinstance(c, RenameLoadCombinationCmd)]
+    assert len(renames) == 1
+    assert renames[0].old_name == "COMB1"
+    assert renames[0].new_name == "COMB_RENAMED"
+
+
+def test_sum_all_highlights_all_solved_case_loads(qt_app):
+    """When SUM_ALL is active, loads from every solved case render at
+    full alpha (Gemini PR #29 fix — previously all dimmed)."""
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._do_solve()
+    qt_app.processEvents()
+    w._active_case = "SUM_ALL"
+    w._push_active_case_to_canvas()
+    w.canvas.set_active_case_loads_only(True)
+    from structural_analysis.model import NodalLoad
+    dead = NodalLoad(node_id=2, fy=-1.0, load_case="DEAD")
+    live = NodalLoad(node_id=2, fy=-1.0, load_case="LIVE")
+    assert w.canvas._load_case_alpha(dead) == 1.0
+    assert w.canvas._load_case_alpha(live) == 1.0

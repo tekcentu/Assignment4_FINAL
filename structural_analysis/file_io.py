@@ -653,7 +653,14 @@ def read_input_file(filepath: str) -> StructuralModel:
                         f"LOAD_COMBINATIONS row {parts!r} needs a name "
                         "and at least one coefficient*case term."
                     )
-                comb_name = parts[0]
+                # Normalise the combination name and term-case names to
+                # uppercase — the GUI always stores case names uppercase
+                # (``_normalize_load_case``), so a hand-written
+                # lower/mixed-case combination row would otherwise refer
+                # to a case it can never match and be permanently
+                # "unavailable". A post-parse check below validates the
+                # (uppercased) references against the case set.
+                comb_name = parts[0].upper()
                 terms: dict[str, float] = {}
                 for tok in parts[1:]:
                     if "*" not in tok:
@@ -663,7 +670,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                             "(e.g. 1.2*DEAD)."
                         )
                     coeff_s, _, case_s = tok.partition("*")
-                    case_s = case_s.strip()
+                    case_s = case_s.strip().upper()
                     try:
                         coeff = float(coeff_s.strip())
                     except ValueError:
@@ -682,6 +689,11 @@ def read_input_file(filepath: str) -> StructuralModel:
                         f"LOAD_COMBINATIONS: name {comb_name!r} collides "
                         "with a load-case name; combination names must be "
                         "distinct from case names."
+                    )
+                if comb_name in model.load_combinations:
+                    raise ValueError(
+                        "LOAD_COMBINATIONS: duplicate combination name "
+                        f"{comb_name!r}."
                     )
                 # LoadCombination.__post_init__ enforces the remaining
                 # rules (finite / non-zero coeffs, SUM_ALL reject, ≥1
@@ -705,6 +717,19 @@ def read_input_file(filepath: str) -> StructuralModel:
     for name in referenced:
         if name not in model.load_cases:
             model.load_cases[name] = LoadCase(name=name)
+
+    # Validate combination references AFTER the auto-create sweep (a
+    # combination may legitimately reference a case that only exists
+    # via a per-load ``case=`` tag). A reference to a non-existent case
+    # is a malformed file — fail loudly rather than producing a
+    # permanently-unavailable combination.
+    for comb in model.load_combinations.values():
+        missing = sorted(c for c in comb.terms if c not in model.load_cases)
+        if missing:
+            raise ValueError(
+                f"LOAD_COMBINATIONS: combination {comb.name!r} references "
+                f"load case(s) that do not exist: {', '.join(missing)}."
+            )
 
     return model
 

@@ -2188,14 +2188,22 @@ class MainWindow(QMainWindow):
         self.canvas.set_result(self._result)
         if hasattr(self.canvas, "set_active_case"):
             self.canvas.set_active_case(self._active_case)
-        # PR #29: when a combination is active, tell the canvas which
-        # constituent cases contribute so its load-dimming highlights
+        # PR #29: when a combination (or SUM_ALL) is active, tell the
+        # canvas which cases contribute so its load-dimming highlights
         # all of them rather than a single (misleading) case.
         if hasattr(self.canvas, "set_active_combination_cases"):
             if self._active_case in self._model.load_combinations:
                 comb = self._model.load_combinations[self._active_case]
                 self.canvas.set_active_combination_cases(
                     set(comb.terms.keys())
+                )
+            elif (
+                self._active_case == SUM_ALL_KEY
+                and self._multi_result is not None
+            ):
+                # SUM_ALL = 1.0 × every solved case → highlight them all.
+                self.canvas.set_active_combination_cases(
+                    set(self._multi_result.cases.keys())
                 )
             else:
                 self.canvas.set_active_combination_cases(None)

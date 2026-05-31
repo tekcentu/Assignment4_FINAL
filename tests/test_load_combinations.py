@@ -302,3 +302,72 @@ def test_reader_combinations_block_skips_indented_comments():
     finally:
         os.unlink(path)
     assert m.load_combinations["COMB1"].terms == {"DEAD": 1.2, "LIVE": 1.6}
+
+
+# ── Gemini PR #29 review fixes ──────────────────────────────────────
+
+
+def test_reader_uppercases_combination_and_term_names():
+    """A hand-written lowercase combination row must normalise to
+    uppercase so it matches the (uppercase) case names the GUI writes."""
+    body = (
+        "TITLE\nlower\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "LOAD_CASES 1\nDEAD\n\n"
+        "LOAD_COMBINATIONS 1\ncomb_x  1.2*dead\n\n"
+    )
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        m = read_input_file(path)
+    finally:
+        os.unlink(path)
+    assert "COMB_X" in m.load_combinations
+    assert m.load_combinations["COMB_X"].terms == {"DEAD": 1.2}
+
+
+def test_reader_rejects_duplicate_combination_name():
+    body = (
+        "TITLE\ndup\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "LOAD_CASES 1\nDEAD\n\n"
+        "LOAD_COMBINATIONS 2\nC1  1.0*DEAD\nC1  2.0*DEAD\n\n"
+    )
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        with pytest.raises(ValueError, match=r"duplicate combination name"):
+            read_input_file(path)
+    finally:
+        os.unlink(path)
+
+
+def test_reader_rejects_combination_referencing_unknown_case():
+    body = (
+        "TITLE\norphan\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "LOAD_CASES 1\nDEAD\n\n"
+        "LOAD_COMBINATIONS 1\nC1  1.0*DEAD  1.0*GHOST\n\n"
+    )
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        with pytest.raises(ValueError, match=r"do not exist.*GHOST|GHOST"):
+            read_input_file(path)
+    finally:
+        os.unlink(path)
