@@ -4089,42 +4089,37 @@ def test_member_load_dialog_load_case_rejects_hash(qt_app):
 
 def test_member_load_dialog_no_stale_field_widgets_after_mode_switch(qt_app):
     """Layout-ghosting regression: switching Mechanical → Thermal must
-    leave NO leftover QLineEdit children parented to the field
-    container. The fix reparents old fields to None immediately
-    (before deleteLater) so they vanish from the display without
-    waiting for the event loop. We deliberately do NOT call
-    processEvents here — the assertion must hold synchronously."""
-    from PyQt6.QtWidgets import QLineEdit
+    HIDE the old field widgets immediately (so they neither ghost
+    behind the new fields nor flash as a top-level window). We capture
+    the old widgets and assert they are hidden synchronously — without
+    processEvents — which is the guarantee ``hide()`` provides."""
     from structural_analysis.gui_qt.dialogs import MemberLoadDialog
-
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
     d._rb_cat_mechanical.setChecked(True)
     d._rb_udl.setChecked(True)
     d._refresh_fields()
-    # Mechanical/UDL/local exposes exactly wx + wy.
-    live = d._field_container.findChildren(QLineEdit)
-    assert len(live) == 2
-
-    # Switch to Thermal (uniform) → only a single ΔT field should
-    # remain; the wx/wy edits must be gone, not lingering behind it.
+    # Capture the live wx / wy editors.
+    old_fields = [d._fields["wx"], d._fields["wy"]]
+    # Switch to Thermal (uniform) → the wx/wy editors must be hidden,
+    # not lingering visible behind the new ΔT field.
     d._rb_cat_thermal.setChecked(True)
     d._rb_t_uniform.setChecked(True)
     d._refresh_fields()
-    live = d._field_container.findChildren(QLineEdit)
-    assert len(live) == 1, (
-        "stale field widgets still parented to the container after a "
-        "mode switch — layout ghosting bug regressed"
+    assert all(e.isHidden() for e in old_fields), (
+        "old field widgets are not hidden after a mode switch — "
+        "ghosting / flicker regressed"
     )
+    # And no old field stayed parented to None (which would flash as a
+    # top-level window).
+    assert all(e.parent() is not None for e in old_fields)
 
 
 def test_member_load_dialog_no_stale_widgets_after_direction_switch(qt_app):
     """Same ghosting guard across the Local → Gravity direction switch
     (local shows wx+wy, gravity shows a single magnitude field)."""
-    from PyQt6.QtWidgets import QLineEdit
     from structural_analysis.gui_qt.dialogs import MemberLoadDialog
-
     w = MainWindow()
     eid = _frame_model_for_dialog(w)
     d = MemberLoadDialog(w, model=w._model, elem_id=eid)
@@ -4132,10 +4127,11 @@ def test_member_load_dialog_no_stale_widgets_after_direction_switch(qt_app):
     d._rb_udl.setChecked(True)
     d._rb_local.setChecked(True)
     d._refresh_fields()
-    assert len(d._field_container.findChildren(QLineEdit)) == 2
+    old_fields = [d._fields["wx"], d._fields["wy"]]
     d._rb_gravity.setChecked(True)
     d._refresh_fields()
-    assert len(d._field_container.findChildren(QLineEdit)) == 1
+    assert all(e.isHidden() for e in old_fields)
+    assert all(e.parent() is not None for e in old_fields)
 
 
 def test_member_load_dialog_local_help_visible_only_in_local_mode(qt_app):
@@ -4847,3 +4843,69 @@ def test_sum_all_highlights_all_solved_case_loads(qt_app):
     live = NodalLoad(node_id=2, fy=-1.0, load_case="LIVE")
     assert w.canvas._load_case_alpha(dead) == 1.0
     assert w.canvas._load_case_alpha(live) == 1.0
+
+
+# ── PR #29 review-fix: member-load dialog toggle flicker ────────────
+
+
+def _count_top_level_widgets():
+    from PyQt6.QtWidgets import QApplication
+    return len(QApplication.topLevelWidgets())
+
+
+def test_member_load_dialog_mech_thermal_toggle_no_extra_top_level(qt_app):
+    """Toggling Mechanical/Thermal must update in place and never spawn
+    a transient top-level window (the reported flicker came from
+    ``setParent(None)`` briefly promoting a field widget to top-level)."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    qt_app.processEvents()
+    before = _count_top_level_widgets()
+    for _ in range(4):
+        d._rb_cat_thermal.setChecked(True)
+        d._refresh_fields()
+        d._rb_cat_mechanical.setChecked(True)
+        d._refresh_fields()
+    qt_app.processEvents()
+    assert _count_top_level_widgets() <= before
+
+
+def test_member_load_dialog_direction_toggle_no_extra_top_level(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_mechanical.setChecked(True)
+    d._rb_udl.setChecked(True)
+    d._refresh_fields()
+    qt_app.processEvents()
+    before = _count_top_level_widgets()
+    for _ in range(4):
+        d._rb_local.setChecked(True)
+        d._refresh_fields()
+        d._rb_global.setChecked(True)
+        d._refresh_fields()
+        d._rb_gravity.setChecked(True)
+        d._refresh_fields()
+    qt_app.processEvents()
+    assert _count_top_level_widgets() <= before
+
+
+def test_member_load_dialog_uniform_gradient_toggle_no_extra_top_level(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    d._rb_cat_thermal.setChecked(True)
+    d._refresh_fields()
+    qt_app.processEvents()
+    before = _count_top_level_widgets()
+    for _ in range(4):
+        d._rb_t_gradient.setChecked(True)
+        d._refresh_fields()
+        d._rb_t_uniform.setChecked(True)
+        d._refresh_fields()
+    qt_app.processEvents()
+    assert _count_top_level_widgets() <= before

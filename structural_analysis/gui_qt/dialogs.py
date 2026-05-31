@@ -1481,18 +1481,24 @@ class MemberLoadDialog(_ModalDialog):
         return "local"
 
     def _refresh_fields(self) -> None:
-        # Clear the field form. ``setParent(None)`` must run BEFORE
-        # ``deleteLater`` — otherwise the old QLineEdit / QLabel widgets
-        # stay parented to _field_container and remain visible (ghosting
-        # behind the freshly added fields) until the event loop
-        # processes the deferred delete. Reparenting to None removes
-        # them from the display immediately. Same idiom used by
-        # ElementPropertiesDialog.set_target / refresh_loads_only.
+        # Clear the field form. We ``hide()`` each old widget BEFORE
+        # ``deleteLater`` rather than reparenting to ``None``:
+        #   * ``deleteLater`` alone leaves the widget visible (ghosting
+        #     behind the new fields) until the event loop runs;
+        #   * ``setParent(None)`` removes the ghost but momentarily
+        #     promotes the child to a TOP-LEVEL window, which flashes as
+        #     a tiny pop-up that immediately disappears (the reported
+        #     flicker when toggling Mechanical/Thermal, direction, or
+        #     Uniform/Gradient).
+        # ``hide()`` makes the widget invisible immediately while it
+        # stays parented to ``_field_container`` (never top-level), so
+        # there is neither a ghost nor a flash; ``deleteLater`` then
+        # reclaims it on the next event-loop turn.
         while self._field_form.count():
             item = self._field_form.takeAt(0)
             w = item.widget()
             if w is not None:
-                w.setParent(None)
+                w.hide()
                 w.deleteLater()
         self._fields = {}
 
