@@ -81,6 +81,15 @@ class ModelCanvas(QWidget):
         self.deformed_stations: int = 21
         self.diagram_stations: int = 21
         self._result = None
+        # PR-A: which load case the host considers "active". Loads on
+        # the canvas whose ``load_case`` matches this string render at
+        # full alpha; others dim to ``_inactive_load_alpha`` when
+        # ``_active_case_loads_only`` is True (the View → "Active case
+        # loads only" toggle). The host (MainWindow) is the source of
+        # truth for the toggle — canvas just consumes the boolean.
+        self._active_case: str = "DEFAULT"
+        self._active_case_loads_only: bool = True
+        self._inactive_load_alpha: float = 0.35
         self._modal_result = None    # ModalResult or None
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
@@ -286,6 +295,32 @@ class ModelCanvas(QWidget):
     def clear_result(self) -> None:
         self._result = None
         self.redraw()
+
+    def set_active_case(self, name: str) -> None:
+        """Host signal: a new load case is active. Triggers a redraw so
+        the load-dimming and any case-tagged annotations update.
+        Idempotent on no-op."""
+        if name == self._active_case:
+            return
+        self._active_case = name
+        self.redraw()
+
+    def set_active_case_loads_only(self, on: bool) -> None:
+        """Host signal: toggle the "show only active-case loads" mode
+        (when off, all loads draw at full alpha)."""
+        if on == self._active_case_loads_only:
+            return
+        self._active_case_loads_only = bool(on)
+        self.redraw()
+
+    def _load_case_alpha(self, ld) -> float:
+        """Return 1.0 when ``ld`` matches the active case (or when the
+        "active case only" toggle is off so every load draws full
+        intensity), and the dim multiplier otherwise."""
+        if not self._active_case_loads_only:
+            return 1.0
+        case = getattr(ld, "load_case", "DEFAULT")
+        return 1.0 if case == self._active_case else self._inactive_load_alpha
 
     def set_modal_result(self, modal_result, mode_idx: int = 0,
                          scale: float = 1.0) -> None:
@@ -897,6 +932,9 @@ class ModelCanvas(QWidget):
         # ``force_scale`` is "world-units of arrow length per kN" so
         # arrow length is directly proportional to the load magnitude
         # (set by _draw_model from the largest nodal load in the model).
+        # ``case_alpha`` dims loads belonging to non-active load cases
+        # when the host has the "active case only" overlay on (PR-A).
+        case_alpha = self._load_case_alpha(ld)
         if force_scale > 0:
             if ld.fx:
                 dx = ld.fx * force_scale
@@ -904,28 +942,37 @@ class ModelCanvas(QWidget):
                     "",
                     xy=(x, y),
                     xytext=(x - dx, y),
-                    arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=2),
+                    arrowprops=dict(
+                        arrowstyle="->", color="#2ca02c", lw=2,
+                        alpha=case_alpha,
+                    ),
                     zorder=5,
                 )
                 self.ax.annotate(f"Fx={ld.fx:+.3g}", (x - dx, y),
                                  xytext=(0, 5), textcoords="offset points",
-                                 fontsize=7, color="#2ca02c", zorder=6)
+                                 fontsize=7, color="#2ca02c", zorder=6,
+                                 alpha=case_alpha)
             if ld.fy:
                 dy = ld.fy * force_scale
                 self.ax.annotate(
                     "",
                     xy=(x, y),
                     xytext=(x, y - dy),
-                    arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=2),
+                    arrowprops=dict(
+                        arrowstyle="->", color="#2ca02c", lw=2,
+                        alpha=case_alpha,
+                    ),
                     zorder=5,
                 )
                 self.ax.annotate(f"Fy={ld.fy:+.3g}", (x, y - dy),
                                  xytext=(5, 0), textcoords="offset points",
-                                 fontsize=7, color="#2ca02c", zorder=6)
+                                 fontsize=7, color="#2ca02c", zorder=6,
+                                 alpha=case_alpha)
         if ld.mz:
             self.ax.annotate(f"M={ld.mz:+.3g}", (x, y), xytext=(8, -8),
                              textcoords="offset points", fontsize=7,
-                             color="#2ca02c", zorder=6)
+                             color="#2ca02c", zorder=6,
+                             alpha=case_alpha)
 
     def _draw_member_loads(self, elem, ni, nj, load_scales: dict) -> None:
         """Draw each member load in its TRUE direction:
@@ -957,6 +1004,9 @@ class ModelCanvas(QWidget):
         point_scale = load_scales.get("point", 0.0)
 
         for ml in elem.member_loads:
+            # PR-A: dim loads belonging to non-active cases when the
+            # host has the "active case only" overlay on.
+            case_alpha = self._load_case_alpha(ml)
             if isinstance(ml, UniformDistributedLoad):
                 labels.append(_label_for_udl(ml))
                 if udl_scale > 0:
@@ -967,6 +1017,7 @@ class ModelCanvas(QWidget):
                             continue
                         self._draw_udl_arrow_strip(
                             ni, nj, dx, dy, mag, udl_scale,
+                            case_alpha=case_alpha,
                         )
             elif isinstance(ml, PointLoad):
                 labels.append(_label_for_pointload(ml))
@@ -989,6 +1040,7 @@ class ModelCanvas(QWidget):
                             xytext=(bx - dx * h, by - dy * h),
                             arrowprops=dict(
                                 arrowstyle="->", color="#9467bd", lw=2,
+                                alpha=case_alpha,
                             ),
                             zorder=5,
                         )
@@ -1005,6 +1057,8 @@ class ModelCanvas(QWidget):
     def _draw_udl_arrow_strip(
         self, ni, nj, dx: float, dy: float, magnitude: float,
         udl_scale: float, n_arrows: int = 6,
+        *,
+        case_alpha: float = 1.0,
     ) -> None:
         """Draw ``n_arrows`` evenly spaced arrows along the element in
         the direction ``(dx, dy)`` with length proportional to
@@ -1012,10 +1066,15 @@ class ModelCanvas(QWidget):
         and the tail sits OPPOSITE to the load direction so the visual
         actually points the way the force acts — matching how nodal
         loads are drawn (see ``_draw_nodal_load`` which also offsets
-        the tail by ``-`` the force components)."""
+        the tail by ``-`` the force components).
+
+        ``case_alpha`` multiplies the per-arrow alpha (PR-A) so loads
+        from non-active cases render at the host's configured dim
+        level."""
         h = magnitude * udl_scale
         if h == 0.0:
             return
+        arrow_alpha = 0.85 * case_alpha
         for i in range(n_arrows):
             t = (i + 0.5) / n_arrows
             bx = ni.x + (nj.x - ni.x) * t
@@ -1025,7 +1084,8 @@ class ModelCanvas(QWidget):
                 xy=(bx, by),
                 xytext=(bx - dx * h, by - dy * h),
                 arrowprops=dict(
-                    arrowstyle="->", color="#9467bd", lw=1.0, alpha=0.85,
+                    arrowstyle="->", color="#9467bd", lw=1.0,
+                    alpha=arrow_alpha,
                 ),
                 zorder=4,
             )

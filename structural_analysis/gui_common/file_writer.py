@@ -249,12 +249,58 @@ def write_input_file(model: StructuralModel, path: str) -> None:
             )
         out.append("")
 
+    # LOAD_CASES — only when the model carries case data that the
+    # reader's auto-create pass couldn't reconstruct: extra cases
+    # beyond DEFAULT, or any disabled-but-defined case. Skipping the
+    # block on plain single-case models keeps every pre-v0.18 fixture's
+    # round-trip byte-identical.
+    #
+    # SUM_ALL is intentionally never serialised: it's a derived view
+    # the GUI computes on demand from the solved per-case results, not
+    # a stored case. If the user (or a programmatic bug) somehow put
+    # it in the dict, drop it here so it doesn't pollute the file.
+    case_names_for_disk = {
+        n for n in model.load_cases if n != "SUM_ALL"
+    }
+    needs_load_cases_block = any(
+        name != "DEFAULT" or not model.load_cases[name].enabled
+        for name in case_names_for_disk
+    )
+    if needs_load_cases_block:
+        # Stable order so round-trips are deterministic; DEFAULT first
+        # (when carried), then the rest alphabetically.
+        ordered_names = (
+            (["DEFAULT"] if "DEFAULT" in case_names_for_disk else [])
+            + sorted(n for n in case_names_for_disk if n != "DEFAULT")
+        )
+        # Drop a trailing DEFAULT row when it's at default state
+        # (enabled, no description) — the reader auto-creates it
+        # anyway, so emitting it would be noise.
+        def _is_default_row(name: str) -> bool:
+            lc = model.load_cases[name]
+            return name == "DEFAULT" and lc.enabled
+        rows = [n for n in ordered_names if not _is_default_row(n)]
+        if rows:
+            out.append(f"LOAD_CASES {len(rows)}")
+            for name in rows:
+                lc = model.load_cases[name]
+                row = name
+                if not lc.enabled:
+                    row += "  enabled=false"
+                out.append(row)
+            out.append("")
+
     # ANALYSIS_OPTIONS — only when at least one option differs from
     # the default. Omitting the block on default models keeps every
     # existing fixture's round-trip byte-identical.
+    opt_lines: list[str] = []
     if model.include_self_weight:
-        out.append("ANALYSIS_OPTIONS 1")
-        out.append("include_self_weight=true")
+        opt_lines.append("include_self_weight=true")
+    if model.self_weight_case != "DEFAULT":
+        opt_lines.append(f"self_weight_case={model.self_weight_case}")
+    if opt_lines:
+        out.append(f"ANALYSIS_OPTIONS {len(opt_lines)}")
+        out.extend(opt_lines)
         out.append("")
 
     with open(path, "w", encoding="utf-8") as f:

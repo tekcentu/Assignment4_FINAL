@@ -386,6 +386,165 @@ def test_reader_rejects_udl_with_surplus_numeric_token():
         _read_text_or_raise(body)
 
 
+# ── PR-A — LOAD_CASES block round-trip + auto-create on read ────────
+
+
+def _read_file(text: str):
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return read_input_file(path)
+    finally:
+        os.unlink(path)
+
+
+def test_reader_auto_creates_DEFAULT_case():
+    """Every freshly-read model must carry DEFAULT, regardless of
+    whether the file emits a LOAD_CASES block."""
+    body = (
+        "TITLE\nlegacy\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+    )
+    m = _read_file(body)
+    assert "DEFAULT" in m.load_cases
+
+
+def test_reader_auto_creates_cases_referenced_by_load_tags():
+    """If a load row carries case=WIND and no LOAD_CASES block declares
+    WIND, the reader must auto-create it so the model stays
+    self-describing."""
+    body = (
+        "TITLE\nauto-create\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "MEMBER_UDL 1\n1  0.0  -10.0  case=WIND\n\n"
+    )
+    m = _read_file(body)
+    assert "WIND" in m.load_cases
+    assert m.load_cases["WIND"].enabled is True
+
+
+def test_round_trip_with_multiple_cases_preserves_definitions():
+    from structural_analysis.gui_common.file_writer import write_input_file
+    from structural_analysis.model import LoadCase
+    m = _basic_frame_model()
+    m.load_cases["DEAD"] = LoadCase(name="DEAD")
+    m.load_cases["LIVE"] = LoadCase(name="LIVE", enabled=False)
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-10.0, load_case="DEAD")
+    )
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        write_input_file(m, path)
+        m2 = read_input_file(path)
+    finally:
+        os.unlink(path)
+    assert "DEAD" in m2.load_cases
+    assert "LIVE" in m2.load_cases
+    assert m2.load_cases["LIVE"].enabled is False
+    assert m2.elements[0].member_loads[0].load_case == "DEAD"
+
+
+def test_writer_omits_load_cases_block_when_only_DEFAULT():
+    """Single-case (DEFAULT only) models must keep emitting the
+    pre-v0.18 byte-identical output — no LOAD_CASES block."""
+    from structural_analysis.gui_common.file_writer import write_input_file
+    m = _basic_frame_model()
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        write_input_file(m, path)
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    finally:
+        os.unlink(path)
+    assert "LOAD_CASES" not in text
+
+
+def test_self_weight_case_round_trip():
+    """ANALYSIS_OPTIONS ``self_weight_case=NAME`` must round-trip."""
+    from structural_analysis.gui_common.file_writer import write_input_file
+    from structural_analysis.model import LoadCase
+    m = _basic_frame_model()
+    m.load_cases["DEAD"] = LoadCase(name="DEAD")
+    m.include_self_weight = True
+    m.self_weight_case = "DEAD"
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        write_input_file(m, path)
+        m2 = read_input_file(path)
+    finally:
+        os.unlink(path)
+    assert m2.include_self_weight is True
+    assert m2.self_weight_case == "DEAD"
+
+
+def test_writer_omits_self_weight_case_when_default():
+    """Default ``self_weight_case = "DEFAULT"`` should NOT appear in the
+    written file — keeps legacy round-trips byte-identical."""
+    from structural_analysis.gui_common.file_writer import write_input_file
+    m = _basic_frame_model()
+    m.include_self_weight = True   # but self_weight_case stays DEFAULT
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        write_input_file(m, path)
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    finally:
+        os.unlink(path)
+    assert "self_weight_case" not in text
+
+
+def test_reader_unknown_load_cases_key_raises():
+    body = (
+        "TITLE\nbad\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "LOAD_CASES 1\nWIND  zone=A\n\n"
+    )
+    with pytest.raises(ValueError, match=r"LOAD_CASES.*zone|unknown key"):
+        _read_file(body)
+
+
+def test_sum_all_is_never_written_as_a_case():
+    """The SUM_ALL key is a derived view — adding it to load_cases by
+    mistake should be impossible because LoadCase rejects it (no, wait
+    — SUM_ALL is a valid token-shape). Test that the writer never
+    surfaces it as a real case row even if the user fakes one."""
+    from structural_analysis.gui_common.file_writer import write_input_file
+    from structural_analysis.model import LoadCase
+    m = _basic_frame_model()
+    # User shouldn't be able to create SUM_ALL through the dialog, but
+    # defend in depth: even if it slipped into the dict, it must NOT
+    # be written.
+    m.load_cases["SUM_ALL"] = LoadCase(name="SUM_ALL")
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        write_input_file(m, path)
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    finally:
+        os.unlink(path)
+    # The header for the LOAD_CASES block may or may not exist, but
+    # the SUM_ALL key must not appear in any row.
+    # Strip the case= tokens to avoid a false positive from per-load
+    # rows.
+    assert "SUM_ALL" not in text
+
+
 def test_reader_rejects_pointload_with_surplus_numeric_token():
     """``MEMBER_POINT_LOADS: 1  3  0  -20  99  case=LIVE`` has an
     extra numeric ``99`` beyond px/py. Must be rejected."""
@@ -482,3 +641,26 @@ def test_split_frame_thermal_preserves_load_case_on_both_children():
     ]
     assert len(thermals) == 2
     assert all(ld.load_case == "THERMAL" for ld in thermals)
+
+
+# ── Gemini PR #28 — comment-skip strips leading whitespace ──────────
+
+
+def test_reader_load_cases_block_skips_indented_comments():
+    """``  # comment`` rows with leading whitespace inside the block
+    must be skipped without raising. Pre-fix the loop only checked
+    ``startswith('#')`` after a no-strip ``not lines[i]`` test, so an
+    indented comment would fall through and the parser would try to
+    parse it as a case row (Gemini PR #28 medium finding)."""
+    body = (
+        "TITLE\nindented-comment\n\n"
+        "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
+        "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
+        "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
+        "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
+        "LOAD_CASES 1\n"
+        "    # indented comment - must be skipped\n"
+        "WIND\n\n"
+    )
+    m = _read_file(body)
+    assert "WIND" in m.load_cases
