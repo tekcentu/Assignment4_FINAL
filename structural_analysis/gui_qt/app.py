@@ -137,6 +137,41 @@ def _push_validation_to_canvas(
     )
 
 
+def _show_orphan_nodes_dialog(parent: "QWidget", node_ids: list[int]) -> str:
+    """Present the orphan-node remediation dialog before a solve attempt.
+
+    Returns:
+        ``'delete'``   — delete the listed nodes then proceed to solve.
+        ``'continue'`` — solve with the orphan nodes still present.
+        ``'cancel'``   — abort the solve and return to editing.
+    """
+    nodes_str = ", ".join(str(n) for n in sorted(node_ids))
+    plural = "nodes are" if len(node_ids) > 1 else "node is"
+    msg = QMessageBox(parent)
+    msg.setWindowTitle("Orphan nodes found")
+    msg.setIcon(QMessageBox.Icon.Warning)
+    msg.setText(
+        f"The following {plural} not connected to any element: {nodes_str}.\n\n"
+        "Orphan nodes are often leftover geometry from accidental clicks. "
+        "They do not affect analysis results but are usually unintentional."
+    )
+    delete_btn = msg.addButton(
+        "Delete orphan(s) and solve", QMessageBox.ButtonRole.AcceptRole
+    )
+    continue_btn = msg.addButton(
+        "Continue anyway", QMessageBox.ButtonRole.YesRole
+    )
+    cancel_btn = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+    msg.setDefaultButton(delete_btn)
+    msg.exec()
+    clicked = msg.clickedButton()
+    if clicked is delete_btn:
+        return "delete"
+    if clicked is continue_btn:
+        return "continue"
+    return "cancel"
+
+
 def _build_starter_model() -> StructuralModel:
     """Build an empty model pre-populated with two common Materials and
     two matching Sections so the user can immediately draw elements
@@ -1933,10 +1968,54 @@ class MainWindow(QMainWindow):
                 or "Validation failed for an unknown reason.",
             )
             return
-        if v_result.has_warnings:
+
+        # Orphan-node dedicated dialog: offer deletion, continue, or cancel.
+        # Orphan warnings are handled here so they don't appear twice in the
+        # generic warnings dialog below.
+        orphan_issues = [
+            i for i in v_result.issues
+            if i.severity == "warning"
+            and "not connected to any element" in i.message
+        ]
+        if orphan_issues:
+            orphan_nids = sorted(
+                nid for issue in orphan_issues for nid in issue.node_ids
+            )
+            _push_validation_to_canvas(self.canvas, v_result)
+            self._show_validation_in_report(v_result)
+            choice = _show_orphan_nodes_dialog(self, orphan_nids)
+            if choice == "delete":
+                for nid in orphan_nids:
+                    self.execute(DeleteNodeCmd(node_id=nid))
+                # Re-validate: execute() cleared highlights; re-check for
+                # any issues that survive after the deletion.
+                v_result = validate_model(self._model)
+                if v_result.has_errors:
+                    self._clear_stale_result_state()
+                    _push_validation_to_canvas(self.canvas, v_result)
+                    self._show_validation_in_report(v_result)
+                    QMessageBox.critical(
+                        self, "Model not ready to solve",
+                        v_result.format_report()
+                        or "Validation failed for an unknown reason.",
+                    )
+                    return
+            elif choice == "cancel":
+                self._clear_stale_result_state()
+                _push_validation_to_canvas(self.canvas, v_result)
+                self._show_validation_in_report(v_result)
+                return
+            # "continue": fall through with original v_result
+
+        # Generic warnings dialog for any remaining non-orphan warnings.
+        non_orphan_warnings = [
+            i for i in v_result.issues
+            if i.severity == "warning"
+            and "not connected to any element" not in i.message
+        ]
+        if non_orphan_warnings:
             warnings_text = "\n".join(
-                f"  - {i.message}" for i in v_result.issues
-                if i.severity == "warning"
+                f"  - {i.message}" for i in non_orphan_warnings
             )
             ans = QMessageBox.question(
                 self, "Warnings before solve",

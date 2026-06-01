@@ -1,9 +1,9 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.22.1"
+__version__ = "0.22.2"
 __what_is_new__ = (
-    "Pre-solve validation + canvas highlighting · "
-    "mechanism detection extended to double-pinned frames · "
+    "Pre-solve orphan-node dialog (delete / continue / cancel) · "
+    "release mechanism detection extended to double-pinned and corbel frames · "
     "Solve All skips empty load cases"
 )
 
