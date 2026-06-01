@@ -5563,9 +5563,158 @@ def test_single_release_at_far_end_detected_as_mechanism(qt_app, monkeypatch):
     qt_app.processEvents()
 
     assert w._result is None
-    assert 2 in w.canvas._error_node_ids
+    # Both the released-end node 1 (cause) and the free node 2 (unstable
+    # DOF) must light up — the user needs to see the root of the mechanism.
+    assert 1 in w.canvas._error_node_ids, "released-end node 1 must be highlighted"
+    assert 2 in w.canvas._error_node_ids, "free node 2 must be highlighted"
     assert 1 in w.canvas._error_element_ids
     assert w.canvas.has_validation_highlights()
+    text = w._result_text.toPlainText()
+    assert "unconstrained transverse DOF" in text
+    assert "stabilizing-side end" in text, (
+        f"message must use the new generic wording, got: {text}"
+    )
+
+
+def _corbel_indirect_mechanism_model(w) -> None:
+    """Column 1→3→2 (fixed at node 1) + corbel element 3→4 with a moment
+    release at the column-junction end (node 3).  Node 3 is NOT directly
+    supported; it is stabilised only through the column that reaches the
+    fixed base.  Node 4 is the free leaf — the corbel can rotate as a
+    rigid body about the pin at node 3."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, NodalLoad, Node, Section, Support,
+    )
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        3: Node(3, 0.0, 2.0),
+        2: Node(2, 0.0, 4.0),
+        4: Node(4, 2.0, 2.0),
+    }
+    w._model.elements = [
+        FrameElement2D(id=1, node_i=1, node_j=3, E=2.1e8, A=0.02, I=8e-5, section_id=1),
+        FrameElement2D(id=2, node_i=3, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1),
+        FrameElement2D(id=3, node_i=3, node_j=4, E=2.1e8, A=0.02, I=8e-5,
+                       section_id=1, release_i=True),  # pin at column-junction side
+    ]
+    w._model.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    w._model.nodal_loads.append(NodalLoad(node_id=4, fy=-10.0, load_case="DEFAULT"))
+
+
+def test_corbel_indirect_mechanism_flagged(qt_app, monkeypatch):
+    """Column-stabilised corbel with pin at the column junction must be caught
+    by the validator even though the junction node is not directly supported.
+    Solve must be blocked, the free tip and corbel element must be highlighted,
+    and the report must name the unconstrained DOF."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _corbel_indirect_mechanism_model(w)
+    monkeypatch.setattr(app_mod.QMessageBox, "critical", lambda *a, **k: None)
+    w._do_solve()
+    qt_app.processEvents()
+
+    assert w._result is None, "solve must be blocked for the corbel mechanism"
+    # Both the released-end node 3 (cause) and the free tip node 4
+    # (unstable DOF) must be highlighted so the user can see the root.
+    assert 3 in w.canvas._error_node_ids, "released-end node 3 must be highlighted"
+    assert 4 in w.canvas._error_node_ids, "free tip node 4 must be highlighted"
+    assert 3 in w.canvas._error_element_ids, "corbel element 3 must be highlighted"
+    assert w.canvas.has_validation_highlights()
+    text = w._result_text.toPlainText()
+    assert "unconstrained transverse DOF" in text
+    assert "stabilizing-side end" in text, (
+        f"message must use the new generic wording, got: {text}"
+    )
+
+
+def _corbel_reverse_mechanism_model(w) -> None:
+    """Same corbel mechanism as _corbel_indirect_mechanism_model but with the
+    element drawn from free tip (node 4) → column junction (node 3) and a
+    release at END (node_j=3), i.e. the user clicked the free tip first.
+    Equivalent to 'FRAME END' in the text format / 'Moment release at end (j)'
+    in the dialog."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, NodalLoad, Node, Section, Support,
+    )
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        3: Node(3, 0.0, 2.0),
+        2: Node(2, 0.0, 4.0),
+        4: Node(4, 2.0, 2.0),
+    }
+    w._model.elements = [
+        FrameElement2D(id=1, node_i=1, node_j=3, E=2.1e8, A=0.02, I=8e-5, section_id=1),
+        FrameElement2D(id=2, node_i=3, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1),
+        # Reversed orientation: node_i=4 (tip), node_j=3 (junction), END release
+        FrameElement2D(id=3, node_i=4, node_j=3, E=2.1e8, A=0.02, I=8e-5,
+                       section_id=1, release_i=False, release_j=True),
+    ]
+    w._model.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    w._model.nodal_loads.append(NodalLoad(node_id=4, fy=-10.0, load_case="DEFAULT"))
+
+
+def test_corbel_reverse_orientation_mechanism_flagged(qt_app, monkeypatch):
+    """Same corbel mechanism with reversed element orientation (4→3 END release)
+    must be caught identically.  This covers the case where the user clicked
+    the free tip first and selected 'Moment release at end (j)' in the dialog."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _corbel_reverse_mechanism_model(w)
+    monkeypatch.setattr(app_mod.QMessageBox, "critical", lambda *a, **k: None)
+    w._do_solve()
+    qt_app.processEvents()
+
+    assert w._result is None, "solve must be blocked (reversed-orientation corbel)"
+    # Same dual highlight: released end (node 3) + free tip (node 4).
+    assert 3 in w.canvas._error_node_ids, "released-end node 3 must be highlighted"
+    assert 4 in w.canvas._error_node_ids, "free tip node 4 must be highlighted"
+    assert 3 in w.canvas._error_element_ids, "corbel element 3 must be highlighted"
+    assert w.canvas.has_validation_highlights()
+    assert "unconstrained transverse DOF" in w._result_text.toPlainText()
+
+
+def test_corbel_mechanism_loaded_from_fixture_file(qt_app, monkeypatch):
+    """Load the corbel mechanism model from the corbel_mechanism.spa.json fixture
+    (same path as File→Open in the GUI) and confirm the solve is blocked.
+
+    This exercises the full chain: JSON→model_txt→file_io.read_input_file→
+    validate_model→_run_static_solve, with the release correctly read from the
+    'FRAME START' token in the text format."""
+    import os
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.gui_qt.project_io import load_project_json
+
+    fixture = os.path.join(os.path.dirname(__file__), "corbel_mechanism.spa.json")
+    assert os.path.exists(fixture), f"fixture not found: {fixture}"
+
+    project = load_project_json(fixture)
+    w = MainWindow()
+    w._model = project.model
+
+    # Verify the fixture was parsed as expected before testing the GUI path.
+    corbels = [e for e in w._model.elements
+               if getattr(e, "node_i", None) == 3 and getattr(e, "node_j", None) == 4]
+    assert corbels, "fixture must contain corbel element 3→4"
+    assert getattr(corbels[0], "release_i", False), (
+        "fixture corbel must have release_i=True (FRAME START at node 3)"
+    )
+
+    monkeypatch.setattr(app_mod.QMessageBox, "critical", lambda *a, **k: None)
+    w._do_solve()
+    qt_app.processEvents()
+
+    assert w._result is None, "solve must be blocked (fixture file corbel)"
+    assert 4 in w.canvas._error_node_ids
     assert "unconstrained transverse DOF" in w._result_text.toPlainText()
 
 
@@ -5604,6 +5753,194 @@ def _three_case_model(w) -> None:
     w._model.load_cases["LIVE"] = LoadCase(name="LIVE")
     w._model.load_cases["WIND"] = LoadCase(name="WIND")
     w._model.load_cases["DEFAULT"].enabled = False
+
+
+# ── orphan-node dialog workflow ──────────────────────────────────────
+
+
+def _orphan_model(w) -> None:
+    """Minimal solvable model that also has one orphan node (node 3)."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Material, Node, NodalLoad, Section, Support
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 4.0, 0.0),
+        3: Node(3, 8.0, 0.0),  # orphan — not connected to any element
+    }
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1,
+    )]
+    w._model.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    w._model.nodal_loads.append(NodalLoad(
+        node_id=2, fy=-10.0, load_case="DEFAULT",
+    ))
+
+
+def test_orphan_node_triggers_dedicated_dialog(qt_app, monkeypatch):
+    """When the model has an orphan node, the orphan-node dialog function
+    must be called (not just the generic warnings dialog)."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _orphan_model(w)
+    calls = []
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog",
+        lambda parent, nids: calls.append(nids) or "cancel",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert calls, "orphan dialog must have been invoked"
+    assert 3 in calls[0], "orphan node 3 must appear in the dialog node list"
+
+
+def test_orphan_delete_removes_node_and_solves(qt_app, monkeypatch):
+    """Choosing 'delete' in the orphan dialog must remove the orphan node
+    via BatchDeleteCmd (single undo step) and produce a successful DEFAULT-case
+    solve — not just any wrapper object, but a real successful case entry."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _orphan_model(w)
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "delete",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert 3 not in w._model.nodes, "orphan node 3 must be deleted"
+    assert w._multi_result is not None, "a multi-case result must be produced"
+    assert "DEFAULT" in w._multi_result.cases, (
+        "DEFAULT case must have solved successfully after orphan deletion; "
+        f"failed_cases={w._multi_result.failed_cases}"
+    )
+    assert not w._multi_result.failed_cases, (
+        f"no case should have failed: {w._multi_result.failed_cases}"
+    )
+
+
+def test_orphan_delete_uses_single_undo_step(qt_app, monkeypatch):
+    """Multiple orphan nodes must be deleted via a single BatchDeleteCmd so
+    one Ctrl+Z restores them all together (clean undo history)."""
+    from structural_analysis.model import Node
+    from structural_analysis.gui_qt import app as app_mod
+
+    w = MainWindow()
+    _orphan_model(w)  # has orphan node 3; full load case + load already set
+    # Add a second orphan node so BatchDeleteCmd has two ids to delete.
+    w._model.nodes[4] = Node(4, 9.0, 0.0)
+
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "delete",
+    )
+    undo_len_before = len(w._undo)
+    w._do_solve()
+    qt_app.processEvents()
+    # Exactly ONE new entry on the undo stack, not two — that's the
+    # whole point of using BatchDeleteCmd instead of looping
+    # DeleteNodeCmd for each orphan.
+    assert len(w._undo) == undo_len_before + 1, (
+        f"expected exactly 1 new undo entry (BatchDeleteCmd), got "
+        f"{len(w._undo) - undo_len_before}"
+    )
+    assert 3 not in w._model.nodes and 4 not in w._model.nodes, (
+        "both orphan nodes 3 and 4 must be removed"
+    )
+
+
+def test_orphan_continue_leaves_node_in_model(qt_app, monkeypatch):
+    """Choosing 'continue' in the orphan dialog leaves the orphan node in the
+    model.  The solver pipeline (assembler.validate_model) currently rejects
+    isolated nodes and reports the DEFAULT case under failed_cases — that's
+    consistent with the model state the user chose to keep.  This test pins
+    the dialog-routing behaviour (no deletion, no early-return) without
+    asserting solver success."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _orphan_model(w)
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "continue",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert 3 in w._model.nodes, "orphan node 3 must still be present"
+    # The solver IS invoked (multi_result populated) — whether the case
+    # ends up under .cases or .failed_cases depends on the core
+    # assembler, which the dialog does not bypass.
+    assert w._multi_result is not None, (
+        "Continue must invoke the solver (multi_result must be populated)"
+    )
+
+
+def test_orphan_cancel_clears_stale_result(qt_app, monkeypatch):
+    """Choosing 'cancel' in the orphan dialog must not solve and must
+    clear any stale result from a previous solve."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._multi_result is not None  # prior solve result
+
+    # Now introduce an orphan node to force the dialog.
+    from structural_analysis.model import Node
+    w._model.nodes[99] = Node(99, 20.0, 0.0)
+
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "cancel",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._result is None
+    assert w._multi_result is None
+
+
+def test_orphan_cancel_shows_validation_highlights(qt_app, monkeypatch):
+    """After a 'cancel' on the orphan dialog, the orphan node should be
+    highlighted on the canvas so the user can see it."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _orphan_model(w)
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "cancel",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert w.canvas.has_validation_highlights()
+    assert 3 in w.canvas._warning_node_ids
+
+
+def test_orphan_delete_is_undoable(qt_app, monkeypatch):
+    """The BatchDeleteCmd executed via the orphan dialog must be on the undo
+    stack so Ctrl+Z restores all orphan nodes in one step."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _orphan_model(w)
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "delete",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert 3 not in w._model.nodes
+    w._do_undo()  # undo the deletion
+    assert 3 in w._model.nodes, "undo must restore the orphan node"
+
+
+def test_no_orphan_no_orphan_dialog(qt_app, monkeypatch):
+    """When the model has no orphan nodes, the orphan dialog must NOT be
+    invoked — only the normal solve path runs."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    calls = []
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog",
+        lambda *a, **k: calls.append(True) or "cancel",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert not calls, "orphan dialog must NOT be called when no orphan nodes exist"
 
 
 def test_solve_all_skips_empty_load_case(qt_app):

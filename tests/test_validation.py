@@ -375,7 +375,7 @@ def test_single_pin_at_supported_end_is_error():
         f"(rz support at M doesn't prevent rigid-body rotation via the pin): "
         f"{[i.message for i in res.issues]}"
     )
-    assert mech[0].node_ids == [2]
+    assert mech[0].node_ids == [1, 2]  # released end (1) + free end (2)
 
 
 def test_two_collinear_double_pin_frames_at_free_midnode_is_error():
@@ -474,7 +474,10 @@ def test_single_release_at_far_supported_end_is_error():
         if i.severity == "error" and "unconstrained transverse DOF" in i.message
     ]
     assert len(mech) == 1
-    assert mech[0].node_ids == [2]
+    # Both the released-end (cause) and the free end (unstable DOF) are
+    # listed so the canvas highlights both — the released end first.
+    assert mech[0].node_ids == [1, 2]
+    assert mech[0].code == "single_release_mechanism"
     assert 1 in mech[0].element_ids
 
 
@@ -496,7 +499,7 @@ def test_single_release_at_far_end_rz_support_still_error():
         if i.severity == "error" and "unconstrained transverse DOF" in i.message
     ]
     assert len(mech) == 1
-    assert mech[0].node_ids == [2]
+    assert mech[0].node_ids == [1, 2]  # released end (1) + free end (2)
 
 
 def test_single_release_at_free_end_only_is_not_flagged_by_rigid_body_check():
@@ -625,6 +628,216 @@ def test_internal_hinge_continuous_beam_not_flagged():
         f"internal hinge between two stable supports must not be flagged: "
         f"{[i.message for i in mech]}"
     )
+
+
+# ── corbel / indirect-support release mechanism ──────────────────────
+
+
+def _corbel_column_model(
+    *,
+    release_at_column_side: bool = False,
+    release_at_free_end: bool = False,
+) -> StructuralModel:
+    """Column 1→3→2 (fixed at node 1) + corbel 3→4.
+
+    Node 1: fixed support.
+    Node 3: column junction — NOT directly supported but part of the
+            stable column connected to the fixed base.
+    Node 2: column top (free).
+    Node 4: corbel tip (free leaf — only one incident element).
+
+    ``release_at_column_side=True`` sets ``release_i=True`` on the corbel
+    element at the node-3 (column-junction) side.
+    ``release_at_free_end=True`` sets ``release_j=True`` at the tip (node 4).
+    """
+    m = StructuralModel(title="corbel-column")
+    _seed_materials_sections(m)
+    m.nodes = {
+        1: Node(1, 0.0, 0.0),
+        3: Node(3, 0.0, 2.0),
+        2: Node(2, 0.0, 4.0),
+        4: Node(4, 2.0, 2.0),
+    }
+    m.elements.append(_frame(1, 3, elem_id=1))
+    m.elements.append(_frame(3, 2, elem_id=2))
+    m.elements.append(FrameElement2D(
+        id=3, node_i=3, node_j=4,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_i=release_at_column_side,
+        release_j=release_at_free_end,
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    return m
+
+
+def test_corbel_indirect_junction_release_is_error():
+    """Column 1-3-2 (fixed at 1) + corbel 3→4 with release_i at the column
+    junction (node 3).  Node 3 is NOT directly supported — it is stabilised
+    indirectly via the column.  Node 4 is the free leaf.
+
+    The element can rotate as a rigid body about the pin at node 3, so node 4
+    has an unconstrained transverse DOF and must be flagged."""
+    m = _corbel_column_model(release_at_column_side=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if i.severity == "error" and "unconstrained transverse DOF" in i.message
+    ]
+    assert len(mech) == 1, (
+        f"expected 1 mechanism error, got {len(mech)}: "
+        f"{[i.message for i in mech]}"
+    )
+    # Highlights both the released end (node 3, the cause) and the free
+    # tip (node 4, the unstable DOF location).
+    assert mech[0].node_ids == [3, 4], (
+        f"both released-end node 3 and free node 4 must be highlighted, "
+        f"got {mech[0].node_ids}"
+    )
+    assert 3 in mech[0].element_ids, "element 3 (corbel) must be listed"
+    assert mech[0].code == "single_release_mechanism"
+
+
+def test_corbel_without_release_is_valid():
+    """Same column + corbel geometry, but no moment release on the corbel.
+    Normal fixed-base frame cantilever — must NOT be flagged."""
+    m = _corbel_column_model(release_at_column_side=False)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if "unconstrained transverse DOF" in i.message
+    ]
+    assert not mech, (
+        f"unreleased corbel must not trigger mechanism check: "
+        f"{[i.message for i in mech]}"
+    )
+
+
+def test_corbel_free_end_release_only_is_not_flagged():
+    """Corbel 3→4 with release_j=True (pin at the free tip, node 4) and
+    a rigid connection at the column-side node 3.  No rigid-body rotation is
+    possible — the base is stiff.  Must NOT be flagged by this check."""
+    m = _corbel_column_model(release_at_free_end=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if "unconstrained transverse DOF" in i.message
+    ]
+    assert not mech, (
+        f"free-end-only release must not trigger rigid-body check: "
+        f"{[i.message for i in mech]}"
+    )
+
+
+def test_corbel_reverse_orientation_end_release_is_error():
+    """Same corbel mechanism expressed with the REVERSED element orientation:
+    element drawn from free tip (node 4 = node_i) → column junction (node 3 = node_j),
+    with release_j=True (END release at node_j=3, the column side).
+
+    Equivalent to a user clicking the free tip first and the column junction
+    second, then checking 'Moment release at end (j)' in the dialog.
+    Must be detected identically to the 3→4 START case."""
+    m = StructuralModel(title="corbel-reverse")
+    _seed_materials_sections(m)
+    m.nodes = {
+        1: Node(1, 0.0, 0.0),
+        3: Node(3, 0.0, 2.0),
+        2: Node(2, 0.0, 4.0),
+        4: Node(4, 2.0, 2.0),
+    }
+    m.elements.append(_frame(1, 3, elem_id=1))
+    m.elements.append(_frame(3, 2, elem_id=2))
+    # Corbel: drawn free-tip → column-junction, release at end (node_j=3)
+    m.elements.append(FrameElement2D(
+        id=3, node_i=4, node_j=3,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_i=False, release_j=True,  # END release = pin at node_j=3
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if i.severity == "error" and "unconstrained transverse DOF" in i.message
+    ]
+    assert len(mech) == 1, (
+        f"reversed-orientation corbel (4→3 END) must still be detected: "
+        f"{[i.message for i in mech]}"
+    )
+    assert mech[0].node_ids == [3, 4], (
+        f"both released-end node 3 and free node 4 must be highlighted, "
+        f"got {mech[0].node_ids}"
+    )
+    assert 3 in mech[0].element_ids
+
+
+def test_corbel_text_format_start_release_is_error():
+    """Parse a model in the native .txt file format that matches the GUI-exported
+    model: column 1-3-2 (fixed at 1) + corbel '3 3 4 1 FRAME START'.
+
+    This is the exact text a user would get from File→Export or from the
+    model_txt field in a .spa.json.  The parsed StructuralModel must carry
+    release_i=True on the corbel, and validate_model must flag it."""
+    import tempfile, os
+    from structural_analysis.file_io import read_input_file
+
+    model_txt = """\
+TITLE
+Corbel column mechanism test
+
+NODES 4
+1  0.0  0.0
+2  0.0  4.0
+3  0.0  2.0
+4  2.0  2.0
+
+MATERIALS 1
+1  210000000.0  1.2e-05  7850.0  Steel
+
+SECTIONS 1
+1  1  0.02  8e-05  0.3  S
+
+ELEMENTS 3
+1  1  3  1  FRAME
+2  3  2  1  FRAME
+3  3  4  1  FRAME START
+
+SUPPORTS 1
+1  1  1  1
+
+LOADS 1
+4  0.0  -10.0  0.0
+"""
+    fd, tmp = tempfile.mkstemp(suffix=".txt")
+    try:
+        os.write(fd, model_txt.encode())
+        os.close(fd)
+        model = read_input_file(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    # Verify the file was parsed correctly.
+    corbel = next(e for e in model.elements if e.node_i == 3 and e.node_j == 4)
+    assert getattr(corbel, "release_i", False), (
+        "file_io must set release_i=True for 'FRAME START'"
+    )
+    assert not getattr(corbel, "release_j", False), (
+        "release_j must remain False for a START-only release"
+    )
+
+    # Now run the same validate_model that the Solve button calls.
+    res = validate_model(model)
+    mech = [
+        i for i in res.issues
+        if i.severity == "error" and "unconstrained transverse DOF" in i.message
+    ]
+    assert len(mech) == 1, (
+        f"text-format corbel with 'FRAME START' must be detected: "
+        f"{[i.message for i in mech]}"
+    )
+    assert 4 in mech[0].node_ids
+    assert corbel.id in mech[0].element_ids
 
 
 # ── basic sanity (formerly "fatal" list) ─────────────────────────────

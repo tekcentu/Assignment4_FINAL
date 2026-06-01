@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.22.1"
+__version__ = "0.22.3"
 __what_is_new__ = (
-    "Pre-solve validation + canvas highlighting · "
-    "mechanism detection extended to double-pinned frames · "
-    "Solve All skips empty load cases"
+    "Orphan-node dialog uses single-undo batch delete · "
+    "release mechanism wording generalized (stabilizing-side) · "
+    "release mechanism highlights both released end and free node"
 )
 
 from .model import (
