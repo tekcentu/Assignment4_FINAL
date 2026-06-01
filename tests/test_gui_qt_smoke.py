@@ -5521,6 +5521,54 @@ def test_double_pinned_frame_detected_as_mechanism(qt_app, monkeypatch):
     assert "unconstrained transverse DOF" in text
 
 
+def _single_release_far_end_model(w) -> None:
+    """Frame element with pin at the supported far end (release_i=True at node 1)
+    and full connection at free node 2.  Element can rotate as a rigid body
+    about the pin at node 1 — single-release mechanism."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, NodalLoad, Node, Section, Support,
+    )
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_i=True,  # pin at the supported far end
+    )]
+    w._model.supports[1] = Support(
+        node_id=1, ux=True, uy=True, rz=False,
+    )
+    w._model.nodal_loads.append(NodalLoad(
+        node_id=2, fy=-10.0, load_case="DEFAULT",
+    ))
+
+
+def test_single_release_at_far_end_detected_as_mechanism(qt_app, monkeypatch):
+    """A frame with a pin at the translation-only supported end must be caught
+    by the validator, block the solve, highlight the free node and element,
+    and display the mechanism message in the report panel."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _single_release_far_end_model(w)
+    monkeypatch.setattr(
+        app_mod.QMessageBox, "critical", lambda *a, **k: None,
+    )
+    w._do_solve()
+    qt_app.processEvents()
+
+    assert w._result is None
+    assert 2 in w.canvas._error_node_ids
+    assert 1 in w.canvas._error_element_ids
+    assert w.canvas.has_validation_highlights()
+    assert "unconstrained transverse DOF" in w._result_text.toPlainText()
+
+
 # ── active-case filtering (Solve All Cases skips empty cases) ────────
 
 

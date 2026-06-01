@@ -351,27 +351,31 @@ def test_single_pin_at_free_end_only_is_valid():
     )
 
 
-def test_single_pin_at_supported_end_only_is_valid():
-    """A frame with a release at only the supported end (release_i=True) still
-    carries shear at the free end — must NOT be flagged."""
+def test_single_pin_at_supported_end_is_error():
+    """A frame with release_i=True (pin at the supported far end) leaves the
+    free node N with a singular stiffness — the element can rotate as a rigid
+    body about the pin at M regardless of M's rz support, because the pin
+    decouples element rotation from node rotation.  Must be flagged as error."""
     m = StructuralModel(title="single-pin-support")
     _seed_materials_sections(m)
     m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
     m.elements.append(FrameElement2D(
         id=1, node_i=1, node_j=2,
         E=2.1e8, A=0.02, I=8e-5, section_id=1,
-        release_i=True,  # pin at the supported end only
+        release_i=True,  # pin at the supported end → rigid-body rotation about node 1
     ))
     m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
     res = validate_model(m)
     mech = [
         i for i in res.issues
-        if "unconstrained transverse DOF" in i.message
+        if i.severity == "error" and "unconstrained transverse DOF" in i.message
     ]
-    assert not mech, (
-        f"single-pin at supported end must not trigger mechanism: "
-        f"{[i.message for i in mech]}"
+    assert len(mech) == 1, (
+        f"single-pin at supported end must be a mechanism error "
+        f"(rz support at M doesn't prevent rigid-body rotation via the pin): "
+        f"{[i.message for i in res.issues]}"
     )
+    assert mech[0].node_ids == [2]
 
 
 def test_two_collinear_double_pin_frames_at_free_midnode_is_error():
@@ -444,6 +448,126 @@ def test_double_pin_frame_with_noncollinear_truss_is_valid():
     assert not mech, (
         f"non-collinear axial-only members must not trigger mechanism: "
         f"{[i.message for i in mech]}"
+    )
+
+
+# ── single-release rigid-body-rotation mechanism detection ───────────
+
+
+def test_single_release_at_far_supported_end_is_error():
+    """Frame E from M (translation-only support: ux+uy, no rz) to free N,
+    with release at M side (pin at M).  E can rotate as a rigid body about
+    M → mechanism at N, must be flagged."""
+    m = StructuralModel(title="single-release")
+    _seed_materials_sections(m)
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    # release_i=True → pin at node 1 (M), full connection at node 2 (N)
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_i=True,
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=False)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if i.severity == "error" and "unconstrained transverse DOF" in i.message
+    ]
+    assert len(mech) == 1
+    assert mech[0].node_ids == [2]
+    assert 1 in mech[0].element_ids
+
+
+def test_single_release_at_far_end_rz_support_still_error():
+    """Even when the far supported node has rz=True, the pin in the element
+    decouples element rotation from node rotation — mechanism persists."""
+    m = StructuralModel(title="single-release-rz")
+    _seed_materials_sections(m)
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_i=True,  # pin at node 1 — rz support at 1 doesn't help
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if i.severity == "error" and "unconstrained transverse DOF" in i.message
+    ]
+    assert len(mech) == 1
+    assert mech[0].node_ids == [2]
+
+
+def test_single_release_at_free_end_only_is_not_flagged_by_rigid_body_check():
+    """Pin at the free end (release_j=True, release_i=False) — the element is
+    rigidly connected to the supported far end, so no rigid-body rotation is
+    possible.  Must NOT be flagged by the new check."""
+    m = StructuralModel(title="pin-at-free-end")
+    _seed_materials_sections(m)
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_j=True,  # pin at free node 2 only
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=False)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if i.severity == "error" and "unconstrained transverse DOF" in i.message
+    ]
+    assert not mech, (
+        f"pin at free end only must not trigger rigid-body check: "
+        f"{[i.message for i in mech]}"
+    )
+
+
+def test_normal_cantilever_not_flagged_by_rigid_body_check():
+    """Frame with no releases at all — standard fixed cantilever.
+    The rigid-body check must not flag it."""
+    m = _basic_supported_cantilever()
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if "unconstrained transverse DOF" in i.message
+    ]
+    assert not mech
+
+
+def test_single_release_two_incident_elements_not_flagged():
+    """Free node N with TWO incident elements (one single-release, one normal)
+    — multi-element topology; rigid-body check is deferred and must not fire."""
+    m = StructuralModel(title="two-elem")
+    _seed_materials_sections(m)
+    m.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 4.0, 0.0),  # free node with 2 incident elements
+        3: Node(3, 8.0, 0.0),
+    }
+    # E1: pin at node 1 (far, supported), full connection at node 2 (free)
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_i=True,
+    ))
+    # E2: normal frame element — provides bending coupling at node 2
+    m.elements.append(FrameElement2D(
+        id=2, node_i=2, node_j=3,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=False)
+    m.supports[3] = Support(node_id=3, ux=True, uy=True, rz=True)
+    res = validate_model(m)
+    rigid_mech = [
+        i for i in res.issues
+        if "rigid body" in i.message.lower() or (
+            "unconstrained transverse DOF" in i.message and 2 in i.node_ids
+        )
+    ]
+    assert not rigid_mech, (
+        f"two-element topology must not trigger single-element rigid-body "
+        f"check: {[i.message for i in rigid_mech]}"
     )
 
 

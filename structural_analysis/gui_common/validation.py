@@ -28,6 +28,15 @@ Detections shipped here:
   at the query node and therefore stabilises it.  Two non-collinear
   axial-only members at the same free node span 2-D and are not flagged.
 
+* **Single-release rigid-body rotation** — a free node N connected by
+  exactly one frame element whose OPPOSITE (far) end carries a moment
+  release (pin) at a directly-supported node M.  The pin in the element
+  at M allows the element to rotate as a rigid body about M regardless
+  of any rotational restraint at M (the pin decouples element rotation
+  from node rotation).  Stiffness matrix for N's free DOFs is provably
+  singular.  Caught only for the obvious single-element topology; the
+  multi-element generalisation is deferred.
+
 Active-load-case filtering for "Solve All Cases":
 
 * :func:`cases_with_loads` returns the sorted list of *enabled* cases
@@ -327,6 +336,66 @@ def _find_unsupported_components(
     return issues
 
 
+def _find_single_release_mechanisms(
+    model: "StructuralModel",
+) -> list[ValidationIssue]:
+    """Single-element, single-release rigid-body-rotation mechanism.
+
+    A free node N connected by exactly one frame element E is a mechanism
+    when E has a moment release (pin) at its OTHER end M and M is a
+    directly-supported node.  The element pin at M decouples E's rotation
+    from the node's rotation — rz support at M provides NO help.  The
+    3×3 free-DOF stiffness for N (UX, UY, RZ) has a provable zero
+    eigenvalue (rigid-body rotation of E about M).
+
+    Only the single-element topology is checked (multi-element cases are
+    deferred).  The double-pin case (both ends released) is already caught
+    by :func:`_find_truss_mechanisms`.  The double-flag with the
+    unsupported-component check is avoided by requiring that M itself be
+    a directly-supported node.
+    """
+    issues: list[ValidationIssue] = []
+    for nid in model.nodes:
+        if _node_is_supported(model, nid):
+            continue
+        incident = _incident_elements(model, nid)
+        if len(incident) != 1:
+            continue  # multi-element topology: mechanism may not exist
+        elem = incident[0]
+        if _element_is_truss(elem):
+            continue  # trusses (and double-pin frames) handled elsewhere
+        if _is_axial_only_at_node(elem, nid):
+            continue  # double-pin already caught by _find_truss_mechanisms
+        # Identify the far end of this element.
+        if elem.node_i == nid:
+            far_nid = elem.node_j
+            release_at_far = getattr(elem, "release_j", False)
+        else:
+            far_nid = elem.node_i
+            release_at_far = getattr(elem, "release_i", False)
+        if not release_at_far:
+            continue  # no pin at far end → element provides full moment coupling → stable
+        # Only flag when the far node is directly supported; if it is not
+        # supported, the unsupported-component check already raises an error.
+        if not _node_is_supported(model, far_nid):
+            continue
+        issues.append(ValidationIssue(
+            severity="error",
+            message=(
+                f"Node {nid} is connected only to element {elem.id}, "
+                f"which has a moment release (pin) at its far end "
+                f"(node {far_nid}). The element can rotate as a rigid "
+                f"body about that pin, leaving node {nid} with an "
+                f"unconstrained transverse DOF. Add a support at "
+                f"node {nid}, connect another stabilising member, or "
+                f"remove the release at node {far_nid}."
+            ),
+            node_ids=[nid],
+            element_ids=[elem.id],
+        ))
+    return issues
+
+
 def _find_truss_mechanisms(model: "StructuralModel") -> list[ValidationIssue]:
     """Unsupported nodes stabilised only by axial-force-only members
     whose directions don't span 2-D.
@@ -469,6 +538,7 @@ def validate_model(model: "StructuralModel") -> ModelValidationResult:
     issues.extend(_find_orphan_nodes(model))
     issues.extend(_find_unsupported_components(model))
     issues.extend(_find_truss_mechanisms(model))
+    issues.extend(_find_single_release_mechanisms(model))
     return ModelValidationResult(issues=issues)
 
 
