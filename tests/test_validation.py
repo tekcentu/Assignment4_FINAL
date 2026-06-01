@@ -375,7 +375,7 @@ def test_single_pin_at_supported_end_is_error():
         f"(rz support at M doesn't prevent rigid-body rotation via the pin): "
         f"{[i.message for i in res.issues]}"
     )
-    assert mech[0].node_ids == [2]
+    assert mech[0].node_ids == [1, 2]  # released end (1) + free end (2)
 
 
 def test_two_collinear_double_pin_frames_at_free_midnode_is_error():
@@ -474,7 +474,10 @@ def test_single_release_at_far_supported_end_is_error():
         if i.severity == "error" and "unconstrained transverse DOF" in i.message
     ]
     assert len(mech) == 1
-    assert mech[0].node_ids == [2]
+    # Both the released-end (cause) and the free end (unstable DOF) are
+    # listed so the canvas highlights both — the released end first.
+    assert mech[0].node_ids == [1, 2]
+    assert mech[0].code == "single_release_mechanism"
     assert 1 in mech[0].element_ids
 
 
@@ -496,7 +499,7 @@ def test_single_release_at_far_end_rz_support_still_error():
         if i.severity == "error" and "unconstrained transverse DOF" in i.message
     ]
     assert len(mech) == 1
-    assert mech[0].node_ids == [2]
+    assert mech[0].node_ids == [1, 2]  # released end (1) + free end (2)
 
 
 def test_single_release_at_free_end_only_is_not_flagged_by_rigid_body_check():
@@ -684,8 +687,14 @@ def test_corbel_indirect_junction_release_is_error():
         f"expected 1 mechanism error, got {len(mech)}: "
         f"{[i.message for i in mech]}"
     )
-    assert mech[0].node_ids == [4], f"problem node must be 4, got {mech[0].node_ids}"
-    assert 3 in mech[0].element_ids, f"element 3 (corbel) must be listed"
+    # Highlights both the released end (node 3, the cause) and the free
+    # tip (node 4, the unstable DOF location).
+    assert mech[0].node_ids == [3, 4], (
+        f"both released-end node 3 and free node 4 must be highlighted, "
+        f"got {mech[0].node_ids}"
+    )
+    assert 3 in mech[0].element_ids, "element 3 (corbel) must be listed"
+    assert mech[0].code == "single_release_mechanism"
 
 
 def test_corbel_without_release_is_valid():
@@ -753,7 +762,10 @@ def test_corbel_reverse_orientation_end_release_is_error():
         f"reversed-orientation corbel (4→3 END) must still be detected: "
         f"{[i.message for i in mech]}"
     )
-    assert mech[0].node_ids == [4], f"problem node must be 4, got {mech[0].node_ids}"
+    assert mech[0].node_ids == [3, 4], (
+        f"both released-end node 3 and free node 4 must be highlighted, "
+        f"got {mech[0].node_ids}"
+    )
     assert 3 in mech[0].element_ids
 
 

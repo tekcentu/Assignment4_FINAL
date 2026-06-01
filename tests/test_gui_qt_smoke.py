@@ -5563,10 +5563,17 @@ def test_single_release_at_far_end_detected_as_mechanism(qt_app, monkeypatch):
     qt_app.processEvents()
 
     assert w._result is None
-    assert 2 in w.canvas._error_node_ids
+    # Both the released-end node 1 (cause) and the free node 2 (unstable
+    # DOF) must light up — the user needs to see the root of the mechanism.
+    assert 1 in w.canvas._error_node_ids, "released-end node 1 must be highlighted"
+    assert 2 in w.canvas._error_node_ids, "free node 2 must be highlighted"
     assert 1 in w.canvas._error_element_ids
     assert w.canvas.has_validation_highlights()
-    assert "unconstrained transverse DOF" in w._result_text.toPlainText()
+    text = w._result_text.toPlainText()
+    assert "unconstrained transverse DOF" in text
+    assert "stabilizing-side end" in text, (
+        f"message must use the new generic wording, got: {text}"
+    )
 
 
 def _corbel_indirect_mechanism_model(w) -> None:
@@ -5612,10 +5619,17 @@ def test_corbel_indirect_mechanism_flagged(qt_app, monkeypatch):
     qt_app.processEvents()
 
     assert w._result is None, "solve must be blocked for the corbel mechanism"
+    # Both the released-end node 3 (cause) and the free tip node 4
+    # (unstable DOF) must be highlighted so the user can see the root.
+    assert 3 in w.canvas._error_node_ids, "released-end node 3 must be highlighted"
     assert 4 in w.canvas._error_node_ids, "free tip node 4 must be highlighted"
     assert 3 in w.canvas._error_element_ids, "corbel element 3 must be highlighted"
     assert w.canvas.has_validation_highlights()
-    assert "unconstrained transverse DOF" in w._result_text.toPlainText()
+    text = w._result_text.toPlainText()
+    assert "unconstrained transverse DOF" in text
+    assert "stabilizing-side end" in text, (
+        f"message must use the new generic wording, got: {text}"
+    )
 
 
 def _corbel_reverse_mechanism_model(w) -> None:
@@ -5661,6 +5675,8 @@ def test_corbel_reverse_orientation_mechanism_flagged(qt_app, monkeypatch):
     qt_app.processEvents()
 
     assert w._result is None, "solve must be blocked (reversed-orientation corbel)"
+    # Same dual highlight: released end (node 3) + free tip (node 4).
+    assert 3 in w.canvas._error_node_ids, "released-end node 3 must be highlighted"
     assert 4 in w.canvas._error_node_ids, "free tip node 4 must be highlighted"
     assert 3 in w.canvas._error_element_ids, "corbel element 3 must be highlighted"
     assert w.canvas.has_validation_highlights()
@@ -5783,7 +5799,8 @@ def test_orphan_node_triggers_dedicated_dialog(qt_app, monkeypatch):
 
 def test_orphan_delete_removes_node_and_solves(qt_app, monkeypatch):
     """Choosing 'delete' in the orphan dialog must remove the orphan node
-    via DeleteNodeCmd and continue to a successful solve."""
+    via BatchDeleteCmd (single undo step) and produce a successful DEFAULT-case
+    solve — not just any wrapper object, but a real successful case entry."""
     from structural_analysis.gui_qt import app as app_mod
     w = MainWindow()
     _orphan_model(w)
@@ -5793,14 +5810,52 @@ def test_orphan_delete_removes_node_and_solves(qt_app, monkeypatch):
     w._do_solve()
     qt_app.processEvents()
     assert 3 not in w._model.nodes, "orphan node 3 must be deleted"
-    assert w._result is not None or w._multi_result is not None, (
-        "a solve result must be produced after orphan deletion"
+    assert w._multi_result is not None, "a multi-case result must be produced"
+    assert "DEFAULT" in w._multi_result.cases, (
+        "DEFAULT case must have solved successfully after orphan deletion; "
+        f"failed_cases={w._multi_result.failed_cases}"
+    )
+    assert not w._multi_result.failed_cases, (
+        f"no case should have failed: {w._multi_result.failed_cases}"
     )
 
 
-def test_orphan_continue_leaves_node_and_solves(qt_app, monkeypatch):
-    """Choosing 'continue' in the orphan dialog leaves the orphan node
-    in the model and proceeds to a successful solve."""
+def test_orphan_delete_uses_single_undo_step(qt_app, monkeypatch):
+    """Multiple orphan nodes must be deleted via a single BatchDeleteCmd so
+    one Ctrl+Z restores them all together (clean undo history)."""
+    from structural_analysis.model import Node
+    from structural_analysis.gui_qt import app as app_mod
+
+    w = MainWindow()
+    _orphan_model(w)  # has orphan node 3; full load case + load already set
+    # Add a second orphan node so BatchDeleteCmd has two ids to delete.
+    w._model.nodes[4] = Node(4, 9.0, 0.0)
+
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "delete",
+    )
+    undo_len_before = len(w._undo)
+    w._do_solve()
+    qt_app.processEvents()
+    # Exactly ONE new entry on the undo stack, not two — that's the
+    # whole point of using BatchDeleteCmd instead of looping
+    # DeleteNodeCmd for each orphan.
+    assert len(w._undo) == undo_len_before + 1, (
+        f"expected exactly 1 new undo entry (BatchDeleteCmd), got "
+        f"{len(w._undo) - undo_len_before}"
+    )
+    assert 3 not in w._model.nodes and 4 not in w._model.nodes, (
+        "both orphan nodes 3 and 4 must be removed"
+    )
+
+
+def test_orphan_continue_leaves_node_in_model(qt_app, monkeypatch):
+    """Choosing 'continue' in the orphan dialog leaves the orphan node in the
+    model.  The solver pipeline (assembler.validate_model) currently rejects
+    isolated nodes and reports the DEFAULT case under failed_cases — that's
+    consistent with the model state the user chose to keep.  This test pins
+    the dialog-routing behaviour (no deletion, no early-return) without
+    asserting solver success."""
     from structural_analysis.gui_qt import app as app_mod
     w = MainWindow()
     _orphan_model(w)
@@ -5810,7 +5865,12 @@ def test_orphan_continue_leaves_node_and_solves(qt_app, monkeypatch):
     w._do_solve()
     qt_app.processEvents()
     assert 3 in w._model.nodes, "orphan node 3 must still be present"
-    assert w._result is not None or w._multi_result is not None
+    # The solver IS invoked (multi_result populated) — whether the case
+    # ends up under .cases or .failed_cases depends on the core
+    # assembler, which the dialog does not bypass.
+    assert w._multi_result is not None, (
+        "Continue must invoke the solver (multi_result must be populated)"
+    )
 
 
 def test_orphan_cancel_clears_stale_result(qt_app, monkeypatch):
@@ -5852,8 +5912,8 @@ def test_orphan_cancel_shows_validation_highlights(qt_app, monkeypatch):
 
 
 def test_orphan_delete_is_undoable(qt_app, monkeypatch):
-    """DeleteNodeCmd executed via the orphan dialog must be on the undo
-    stack so Ctrl+Z can restore the orphan node."""
+    """The BatchDeleteCmd executed via the orphan dialog must be on the undo
+    stack so Ctrl+Z restores all orphan nodes in one step."""
     from structural_analysis.gui_qt import app as app_mod
     w = MainWindow()
     _orphan_model(w)

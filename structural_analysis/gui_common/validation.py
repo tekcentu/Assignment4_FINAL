@@ -29,15 +29,15 @@ Detections shipped here:
   axial-only members at the same free node span 2-D and are not flagged.
 
 * **Single-release rigid-body rotation** — a free node N connected by
-  exactly one frame element whose OPPOSITE (column-side / far) end
+  exactly one frame element whose OPPOSITE (stabilizing-side / far) end
   carries a moment release (pin).  The pin decouples the element's
   rotation from the far node's rotation, so the element can spin as a
   rigid body about that pin.  The stiffness matrix for N's free DOFs
   (UX, UY, RZ) has a provable zero eigenvalue regardless of whether the
-  far node is *directly* supported or merely part of a stable column /
-  frame that connects to a support indirectly.  Caught only for the
-  single-element leaf-node topology; the multi-element generalisation
-  is deferred.
+  far node is *directly* supported or merely part of a stable assembly
+  (column, frame, or any structure) that connects to a support
+  indirectly.  Caught only for the single-element leaf-node topology;
+  the multi-element generalisation is deferred.
 
 Active-load-case filtering for "Solve All Cases":
 
@@ -71,12 +71,18 @@ class ValidationIssue:
     ``node_ids`` / ``element_ids`` carry the model objects the GUI
     should paint as the problem location — the canvas highlight layer
     aggregates these from every issue.
+
+    ``code`` is a stable machine-readable tag (e.g. ``"orphan_node"``,
+    ``"single_release_mechanism"``).  Use it when the UI needs to route
+    on issue type — never substring-match the message text, since the
+    message is meant for the user and may be reworded.
     """
 
     severity: str  # "error" | "warning"
     message: str
     node_ids: list[int] = field(default_factory=list)
     element_ids: list[int] = field(default_factory=list)
+    code: str = ""
 
 
 @dataclass
@@ -298,6 +304,7 @@ def _find_orphan_nodes(model: "StructuralModel") -> list[ValidationIssue]:
             severity="warning",
             message=f"Node {nid} is not connected to any element.",
             node_ids=[nid],
+            code="orphan_node",
         )
         for nid in orphans
     ]
@@ -401,15 +408,21 @@ def _find_single_release_mechanisms(
         issues.append(ValidationIssue(
             severity="error",
             message=(
-                f"Node {nid} is connected only to element {elem.id}, "
-                f"which has a moment release (pin) at its column-side end "
-                f"(node {far_nid}). The element can rotate as a rigid body "
-                f"about that pin, leaving node {nid} with an unconstrained "
-                f"transverse DOF. Add a support at node {nid}, connect "
-                f"another stabilising member, or remove the release."
+                f"Node {nid} is unstable: element {elem.id} has a moment "
+                f"release at its stabilizing-side end (node {far_nid}), so "
+                f"it cannot act as a cantilever and cannot provide "
+                f"transverse stiffness to node {nid}. The element can "
+                f"rotate as a rigid body about that pin, leaving node "
+                f"{nid} with an unconstrained transverse DOF. Add a "
+                f"support at node {nid}, connect another stabilizing "
+                f"member, or remove the release at node {far_nid}."
             ),
-            node_ids=[nid],
+            # Highlight BOTH the released-end node (the cause) and the
+            # free node (the location of the unstable DOF) so the user
+            # can see the root of the mechanism on the canvas.
+            node_ids=[far_nid, nid],
             element_ids=[elem.id],
+            code="single_release_mechanism",
         ))
     return issues
 
