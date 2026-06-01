@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.22.3"
+__version__ = "0.22.4"
 __what_is_new__ = (
-    "Orphan-node dialog uses single-undo batch delete · "
-    "release mechanism wording generalized (stabilizing-side) · "
-    "release mechanism highlights both released end and free node"
+    "Faster canvas redraws (batched element/node/selection artists) · "
+    "dense-view auto-hides IDs with a halo for legibility · "
+    "labeled grid culls to the visible viewport"
 )
 
 from .model import (
