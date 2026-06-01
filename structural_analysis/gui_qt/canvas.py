@@ -122,6 +122,15 @@ class ModelCanvas(QWidget):
         self._drag_rect: (
             tuple[float, float, float, float, bool] | None
         ) = None
+        # PR #31 — pre-solve validation highlight layer.  Distinct from
+        # selection: amber = warning (orphan / advisory), red = error
+        # (mechanism / disconnected unsupported component).  Painted
+        # behind the selection layer so a selected problem node still
+        # shows the gold ring on top.
+        self._warning_node_ids: set[int] = set()
+        self._error_node_ids: set[int] = set()
+        self._warning_element_ids: set[int] = set()
+        self._error_element_ids: set[int] = set()
         # Per-element max / min markers on the currently-drawn moment /
         # shear / axial diagram. Populated by _draw_diagrams and fed
         # into the snap engine so the cursor snaps to those points in
@@ -422,6 +431,7 @@ class ModelCanvas(QWidget):
         self._draw_grid()
         self._draw_origin_axes()
         self._draw_model()
+        self._draw_validation_highlights()
         self._draw_selection()
         self._draw_element_preview()
         if self._result is not None and self._result.status == "ok":
@@ -778,6 +788,136 @@ class ModelCanvas(QWidget):
                 start_x, start_y, marker="o", markersize=5,
                 markerfacecolor="white", markeredgecolor=color,
                 alpha=0.85, zorder=9,
+            )
+
+    # ── PR #31 — pre-solve validation highlight layer ──────────────
+
+    def set_validation_highlights(
+        self,
+        *,
+        warning_node_ids: set[int] | None = None,
+        error_node_ids: set[int] | None = None,
+        warning_element_ids: set[int] | None = None,
+        error_element_ids: set[int] | None = None,
+    ) -> None:
+        """Push a set of problem ids onto the validation highlight
+        layer.  Any argument omitted (or ``None``) clears that band.
+
+        The canvas owns its own copies of the sets so later mutation of
+        the caller's set doesn't bleed into the painted highlights.
+        Triggers a redraw.
+        """
+        self._warning_node_ids = set(warning_node_ids or ())
+        self._error_node_ids = set(error_node_ids or ())
+        self._warning_element_ids = set(warning_element_ids or ())
+        self._error_element_ids = set(error_element_ids or ())
+        self.redraw()
+
+    def clear_validation_highlights(self) -> None:
+        """Erase the validation highlight layer.  Called after a
+        successful solve, after the user fixes the model (via the
+        invalidation surface), or when the user explicitly dismisses
+        the report."""
+        if (
+            self._warning_node_ids or self._error_node_ids
+            or self._warning_element_ids or self._error_element_ids
+        ):
+            self._warning_node_ids = set()
+            self._error_node_ids = set()
+            self._warning_element_ids = set()
+            self._error_element_ids = set()
+            self.redraw()
+
+    def has_validation_highlights(self) -> bool:
+        return bool(
+            self._warning_node_ids or self._error_node_ids
+            or self._warning_element_ids or self._error_element_ids
+        )
+
+    def _draw_validation_highlights(self) -> None:
+        """Paint warning (amber) and error (red) markers on top of
+        normal model draw but behind the selection layer.
+
+        Elements get a thick translucent band along their length;
+        nodes get a coloured ring/cross marker.  Error styling is
+        bolder than warning styling so the user can read severity at
+        a glance.
+
+        Every same-severity band/marker is plotted in a single
+        ``ax.plot`` call (segments separated by ``None``s for lines;
+        marker arrays for nodes) so a model with dozens of flagged
+        elements still adds only one ``Line2D`` artist per severity
+        instead of N — matters for redraw / pan / zoom responsiveness
+        on larger models.
+        """
+        model = self._model()
+        # ── elements: behind selection (zorder < _draw_selection's 1.5) ──
+        warn_xs: list[float | None] = []
+        warn_ys: list[float | None] = []
+        for eid in self._warning_element_ids:
+            elem = next((e for e in model.elements if e.id == eid), None)
+            if elem is None:
+                continue
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            warn_xs.extend([ni.x, nj.x, None])
+            warn_ys.extend([ni.y, nj.y, None])
+        if warn_xs:
+            self.ax.plot(
+                warn_xs, warn_ys,
+                color="#f0a030", linewidth=5.0, alpha=0.55,
+                solid_capstyle="round", zorder=1.4,
+            )
+        err_xs: list[float | None] = []
+        err_ys: list[float | None] = []
+        for eid in self._error_element_ids:
+            elem = next((e for e in model.elements if e.id == eid), None)
+            if elem is None:
+                continue
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            err_xs.extend([ni.x, nj.x, None])
+            err_ys.extend([ni.y, nj.y, None])
+        if err_xs:
+            self.ax.plot(
+                err_xs, err_ys,
+                color="#e03030", linewidth=5.5, alpha=0.65,
+                solid_capstyle="round", zorder=1.45,
+            )
+        # ── nodes: behind selection rings (selection is zorder 11) ──
+        warn_nx: list[float] = []
+        warn_ny: list[float] = []
+        for nid in self._warning_node_ids:
+            node = model.nodes.get(nid)
+            if node is None:
+                continue
+            warn_nx.append(node.x)
+            warn_ny.append(node.y)
+        if warn_nx:
+            self.ax.plot(
+                warn_nx, warn_ny, marker="D", markersize=13,
+                linestyle="None",
+                markerfacecolor="none", markeredgecolor="#f0a030",
+                markeredgewidth=2.2, zorder=9.5,
+            )
+        err_nx: list[float] = []
+        err_ny: list[float] = []
+        for nid in self._error_node_ids:
+            node = model.nodes.get(nid)
+            if node is None:
+                continue
+            err_nx.append(node.x)
+            err_ny.append(node.y)
+        if err_nx:
+            self.ax.plot(
+                err_nx, err_ny, marker="X", markersize=15,
+                linestyle="None",
+                markerfacecolor="#e03030", markeredgecolor="#7a1818",
+                markeredgewidth=1.6, zorder=10,
             )
 
     def _draw_selection(self) -> None:
