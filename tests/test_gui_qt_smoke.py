@@ -5606,6 +5606,150 @@ def _three_case_model(w) -> None:
     w._model.load_cases["DEFAULT"].enabled = False
 
 
+# ── orphan-node dialog workflow ──────────────────────────────────────
+
+
+def _orphan_model(w) -> None:
+    """Minimal solvable model that also has one orphan node (node 3)."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Material, Node, NodalLoad, Section, Support
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 4.0, 0.0),
+        3: Node(3, 8.0, 0.0),  # orphan — not connected to any element
+    }
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1,
+    )]
+    w._model.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    w._model.nodal_loads.append(NodalLoad(
+        node_id=2, fy=-10.0, load_case="DEFAULT",
+    ))
+
+
+def test_orphan_node_triggers_dedicated_dialog(qt_app, monkeypatch):
+    """When the model has an orphan node, the orphan-node dialog function
+    must be called (not just the generic warnings dialog)."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _orphan_model(w)
+    calls = []
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog",
+        lambda parent, nids: calls.append(nids) or "cancel",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert calls, "orphan dialog must have been invoked"
+    assert 3 in calls[0], "orphan node 3 must appear in the dialog node list"
+
+
+def test_orphan_delete_removes_node_and_solves(qt_app, monkeypatch):
+    """Choosing 'delete' in the orphan dialog must remove the orphan node
+    via DeleteNodeCmd and continue to a successful solve."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _orphan_model(w)
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "delete",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert 3 not in w._model.nodes, "orphan node 3 must be deleted"
+    assert w._result is not None or w._multi_result is not None, (
+        "a solve result must be produced after orphan deletion"
+    )
+
+
+def test_orphan_continue_leaves_node_and_solves(qt_app, monkeypatch):
+    """Choosing 'continue' in the orphan dialog leaves the orphan node
+    in the model and proceeds to a successful solve."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _orphan_model(w)
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "continue",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert 3 in w._model.nodes, "orphan node 3 must still be present"
+    assert w._result is not None or w._multi_result is not None
+
+
+def test_orphan_cancel_clears_stale_result(qt_app, monkeypatch):
+    """Choosing 'cancel' in the orphan dialog must not solve and must
+    clear any stale result from a previous solve."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._multi_result is not None  # prior solve result
+
+    # Now introduce an orphan node to force the dialog.
+    from structural_analysis.model import Node
+    w._model.nodes[99] = Node(99, 20.0, 0.0)
+
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "cancel",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert w._result is None
+    assert w._multi_result is None
+
+
+def test_orphan_cancel_shows_validation_highlights(qt_app, monkeypatch):
+    """After a 'cancel' on the orphan dialog, the orphan node should be
+    highlighted on the canvas so the user can see it."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _orphan_model(w)
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "cancel",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert w.canvas.has_validation_highlights()
+    assert 3 in w.canvas._warning_node_ids
+
+
+def test_orphan_delete_is_undoable(qt_app, monkeypatch):
+    """DeleteNodeCmd executed via the orphan dialog must be on the undo
+    stack so Ctrl+Z can restore the orphan node."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _orphan_model(w)
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog", lambda *a, **k: "delete",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert 3 not in w._model.nodes
+    w._do_undo()  # undo the deletion
+    assert 3 in w._model.nodes, "undo must restore the orphan node"
+
+
+def test_no_orphan_no_orphan_dialog(qt_app, monkeypatch):
+    """When the model has no orphan nodes, the orphan dialog must NOT be
+    invoked — only the normal solve path runs."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _multi_case_loaded_frame(w)
+    calls = []
+    monkeypatch.setattr(
+        app_mod, "_show_orphan_nodes_dialog",
+        lambda *a, **k: calls.append(True) or "cancel",
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert not calls, "orphan dialog must NOT be called when no orphan nodes exist"
+
+
 def test_solve_all_skips_empty_load_case(qt_app):
     """WIND has no loads — Solve All must not request it from the
     multi-case solver, so it's absent from ``_multi_result.cases``."""
