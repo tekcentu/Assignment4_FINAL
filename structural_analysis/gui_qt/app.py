@@ -161,7 +161,9 @@ def _show_orphan_nodes_dialog(parent: "QWidget", node_ids: list[int]) -> str:
     continue_btn = msg.addButton(
         "Continue anyway", QMessageBox.ButtonRole.YesRole
     )
-    cancel_btn = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+    # Cancel button binds to the Reject role; its return is the
+    # fall-through case below, so we don't need to keep a handle to it.
+    msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
     msg.setDefaultButton(delete_btn)
     msg.exec()
     clicked = msg.clickedButton()
@@ -1970,23 +1972,31 @@ class MainWindow(QMainWindow):
             return
 
         # Orphan-node dedicated dialog: offer deletion, continue, or cancel.
-        # Orphan warnings are handled here so they don't appear twice in the
-        # generic warnings dialog below.
+        # Orphan warnings are routed via the stable `code` tag (set by
+        # _find_orphan_nodes) so the UI doesn't depend on message wording.
+        # They are handled here and excluded from the generic warnings
+        # dialog below to avoid duplication.
         orphan_issues = [
             i for i in v_result.issues
             if i.severity == "warning"
-            and "not connected to any element" in i.message
+            and getattr(i, "code", "") == "orphan_node"
         ]
         if orphan_issues:
-            orphan_nids = sorted(
+            # Deduplicate defensively — duplicate orphan ids would push the
+            # delete path through redundant DeleteNodeCmd attempts.
+            orphan_nids = sorted({
                 nid for issue in orphan_issues for nid in issue.node_ids
-            )
+            })
             _push_validation_to_canvas(self.canvas, v_result)
             self._show_validation_in_report(v_result)
             choice = _show_orphan_nodes_dialog(self, orphan_nids)
             if choice == "delete":
-                for nid in orphan_nids:
-                    self.execute(DeleteNodeCmd(node_id=nid))
+                # Single undo step for the whole batch (one Ctrl+Z reverts
+                # all orphan deletions together, matching the behaviour of
+                # _delete_selected_objects).
+                self.execute(BatchDeleteCmd(
+                    node_ids=orphan_nids, element_ids=[],
+                ))
                 # Re-validate: execute() cleared highlights; re-check for
                 # any issues that survive after the deletion.
                 v_result = validate_model(self._model)
@@ -2011,7 +2021,7 @@ class MainWindow(QMainWindow):
         non_orphan_warnings = [
             i for i in v_result.issues
             if i.severity == "warning"
-            and "not connected to any element" not in i.message
+            and getattr(i, "code", "") != "orphan_node"
         ]
         if non_orphan_warnings:
             warnings_text = "\n".join(
