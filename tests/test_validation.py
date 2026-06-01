@@ -57,6 +57,15 @@ def _truss(nid_i: int, nid_j: int, elem_id: int = 1) -> TrussElement2D:
     )
 
 
+def _double_pin_frame(nid_i: int, nid_j: int, elem_id: int = 1) -> FrameElement2D:
+    """Frame element with releases at both ends — equivalent to a truss after condensation."""
+    return FrameElement2D(
+        id=elem_id, node_i=nid_i, node_j=nid_j,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_i=True, release_j=True,
+    )
+
+
 def _basic_supported_cantilever() -> StructuralModel:
     """1 ← fixed, 2 free, one frame element."""
     m = StructuralModel(title="t")
@@ -295,6 +304,147 @@ def test_mixed_truss_and_frame_at_free_node_not_flagged():
         and 2 in i.node_ids
     ]
     assert not mech
+
+
+# ── double-pinned frame (hinge/release) mechanism detection ──────────
+
+
+def test_double_pin_frame_free_end_is_error():
+    """A frame with releases at both ends (double-pin) connecting a supported
+    node to a free node is mechanically a truss — the free node has an
+    unconstrained transverse DOF and must be flagged as an error."""
+    m = StructuralModel(title="double-pin")
+    _seed_materials_sections(m)
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    m.elements.append(_double_pin_frame(1, 2, elem_id=1))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if i.severity == "error" and "unconstrained transverse DOF" in i.message
+    ]
+    assert len(mech) == 1
+    assert mech[0].node_ids == [2]
+    assert 1 in mech[0].element_ids
+
+
+def test_single_pin_at_free_end_only_is_valid():
+    """A frame with a release at only the free end (release_j=True) still
+    carries transverse shear at that node — must NOT be flagged."""
+    m = StructuralModel(title="single-pin-free")
+    _seed_materials_sections(m)
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_j=True,  # pin at the free end only
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if "unconstrained transverse DOF" in i.message
+    ]
+    assert not mech, (
+        f"single-pin at free end must not trigger mechanism: "
+        f"{[i.message for i in mech]}"
+    )
+
+
+def test_single_pin_at_supported_end_only_is_valid():
+    """A frame with a release at only the supported end (release_i=True) still
+    carries shear at the free end — must NOT be flagged."""
+    m = StructuralModel(title="single-pin-support")
+    _seed_materials_sections(m)
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_i=True,  # pin at the supported end only
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if "unconstrained transverse DOF" in i.message
+    ]
+    assert not mech, (
+        f"single-pin at supported end must not trigger mechanism: "
+        f"{[i.message for i in mech]}"
+    )
+
+
+def test_two_collinear_double_pin_frames_at_free_midnode_is_error():
+    """Two collinear double-pinned frames at a free midpoint are both
+    axial-only (truss equivalents) — transverse mechanism remains."""
+    m = StructuralModel(title="collinear-dpin")
+    _seed_materials_sections(m)
+    m.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 4.0, 0.0),  # free midpoint
+        3: Node(3, 8.0, 0.0),
+    }
+    m.elements.append(_double_pin_frame(1, 2, elem_id=1))
+    m.elements.append(_double_pin_frame(2, 3, elem_id=2))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    m.supports[3] = Support(node_id=3, ux=True, uy=True, rz=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if "unconstrained transverse DOF" in i.message
+        and 2 in i.node_ids
+    ]
+    assert len(mech) == 1
+
+
+def test_double_pin_frame_mixed_with_truss_collinear_is_error():
+    """One double-pin frame and one truss, both collinear, at a free node —
+    both are axial-only and collinear, so the transverse mechanism persists."""
+    m = StructuralModel(title="mixed-axial-collinear")
+    _seed_materials_sections(m)
+    m.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 4.0, 0.0),  # free node
+        3: Node(3, 8.0, 0.0),
+    }
+    m.elements.append(_double_pin_frame(1, 2, elem_id=1))
+    m.elements.append(_truss(2, 3, elem_id=2))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    m.supports[3] = Support(node_id=3, ux=True, uy=True, rz=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if "unconstrained transverse DOF" in i.message
+        and 2 in i.node_ids
+    ]
+    assert len(mech) == 1
+
+
+def test_double_pin_frame_with_noncollinear_truss_is_valid():
+    """A double-pin frame + a non-collinear truss at a free node: directions
+    span 2-D so translational stability exists — must NOT be flagged."""
+    m = StructuralModel(title="dpin-noncollinear")
+    _seed_materials_sections(m)
+    m.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 4.0, 0.0),  # free apex
+        3: Node(3, 4.0, 3.0),
+    }
+    # double-pin horizontal + truss vertical → non-collinear
+    m.elements.append(_double_pin_frame(1, 2, elem_id=1))
+    m.elements.append(_truss(3, 2, elem_id=2))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    m.supports[3] = Support(node_id=3, ux=True, uy=True, rz=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if "unconstrained transverse DOF" in i.message
+        and 2 in i.node_ids
+    ]
+    assert not mech, (
+        f"non-collinear axial-only members must not trigger mechanism: "
+        f"{[i.message for i in mech]}"
+    )
 
 
 # ── basic sanity (formerly "fatal" list) ─────────────────────────────

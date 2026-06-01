@@ -5466,6 +5466,60 @@ def test_validation_highlights_cleared_after_model_mutation(qt_app, monkeypatch)
     assert not w.canvas.has_validation_highlights()
 
 
+def _double_pinned_frame_free_end_model(w) -> None:
+    """Frame element with releases at both ends (double-pin) from supported
+    node 1 to free node 2.  Behaves as a truss after Schur condensation —
+    the classic hinge/release free-end mechanism PR #31 must also detect."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, NodalLoad, Node, Section, Support,
+    )
+    w._model.materials[1] = Material(
+        id=1, name="Steel", E=2.1e8, density=7850.0,
+    )
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_i=True, release_j=True,
+    )]
+    w._model.supports[1] = Support(
+        node_id=1, ux=True, uy=True, rz=True,
+    )
+    w._model.nodal_loads.append(NodalLoad(
+        node_id=2, fy=-10.0, load_case="DEFAULT",
+    ))
+
+
+def test_double_pinned_frame_detected_as_mechanism(qt_app, monkeypatch):
+    """A frame with releases at both ends connecting to a free node should be
+    caught by the validator (not silently fail at solve time), block the solve,
+    and highlight the free node and element on the canvas."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _double_pinned_frame_free_end_model(w)
+    monkeypatch.setattr(
+        app_mod.QMessageBox, "critical", lambda *a, **k: None,
+    )
+    w._do_solve()
+    qt_app.processEvents()
+
+    # Solve must be blocked — no result produced.
+    assert w._result is None
+
+    # Canvas must highlight the free node and the double-pinned element.
+    assert 2 in w.canvas._error_node_ids
+    assert 1 in w.canvas._error_element_ids
+    assert w.canvas.has_validation_highlights()
+
+    # Validation report must name the mechanism.
+    text = w._result_text.toPlainText()
+    assert "unconstrained transverse DOF" in text
+
+
 # ── active-case filtering (Solve All Cases skips empty cases) ────────
 
 

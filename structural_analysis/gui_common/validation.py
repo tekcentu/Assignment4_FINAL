@@ -14,11 +14,19 @@ Detections shipped here:
 * **Orphan node** — a node with no incident element (warning).
 * **Disconnected unsupported component** — a connected component of
   elements whose nodes carry no restraint (error: rigid-body motion).
-* **Single-truss free-end mechanism** — an unsupported node whose only
-  incident elements are truss bars *and* whose bar directions don't
-  span 2-D (error: unconstrained transverse DOF).  Two non-collinear
-  truss bars at the same free node DO span 2-D and are not flagged —
-  classic triangulated truss nodes stay valid.
+* **Axial-only free-end mechanism** — an unsupported node whose every
+  incident element provides *only axial stiffness* at that node, and
+  those elements' directions don't span 2-D (error: unconstrained
+  transverse DOF).  "Axial-only" covers two cases:
+
+  - **Truss elements** — no bending or shear stiffness by definition.
+  - **Double-pinned frame elements** (``release_i=True`` *and*
+    ``release_j=True``) — both moment releases cause Schur condensation
+    to reduce the frame to a truss equivalent: axial force only.
+
+  A frame element with a release at only *one* end still carries shear
+  at the query node and therefore stabilises it.  Two non-collinear
+  axial-only members at the same free node span 2-D and are not flagged.
 
 Active-load-case filtering for "Solve All Cases":
 
@@ -143,6 +151,30 @@ def _element_is_truss(elem) -> bool:
     """True iff the element behaves as a truss bar (no transverse / rotational stiffness)."""
     kind = getattr(elem, "kind", None)
     return kind == "truss"
+
+
+def _is_axial_only_at_node(elem, _node_id: int) -> bool:
+    """True iff *elem* contributes only axial stiffness at the query node.
+
+    Two element classes qualify:
+
+    * **Truss elements** — always axial-only (their stiffness matrix has
+      no shear terms regardless of end conditions).
+    * **Frame elements with releases at both ends** (``release_i=True``
+      *and* ``release_j=True``) — the Schur-complement condensation of
+      both rotational DOFs reduces the 6×6 frame stiffness to a 4×4
+      matrix that is mathematically identical to a truss: no off-axis
+      stiffness survives.
+
+    A frame with a release at only one end still carries transverse shear
+    at both nodes — its condensed stiffness has non-zero transverse terms
+    — so it is *not* axial-only.
+    """
+    if _element_is_truss(elem):
+        return True
+    return bool(
+        getattr(elem, "release_i", False) and getattr(elem, "release_j", False)
+    )
 
 
 def _adjacency(model: "StructuralModel") -> dict[int, set[int]]:
@@ -296,17 +328,16 @@ def _find_unsupported_components(
 
 
 def _find_truss_mechanisms(model: "StructuralModel") -> list[ValidationIssue]:
-    """Unsupported nodes whose only stiffness comes from truss bars
-    aligned along < 2 independent directions.
+    """Unsupported nodes stabilised only by axial-force-only members
+    whose directions don't span 2-D.
 
-    Truss bars provide axial stiffness only.  If every element at a
-    free node is a truss AND those bars are collinear (or there's only
-    one), the node has an unconstrained transverse DOF — the system
-    has a mechanism and won't solve.
+    Axial-force-only members are truss elements and double-pinned frame
+    elements (both ``release_i`` and ``release_j`` True).  A frame
+    element with a release at only one end still carries shear stiffness
+    at the query node — its presence prevents this error for that node.
 
-    Two non-collinear truss bars at a free node *do* span 2-D and are
-    NOT flagged.  This is the false-positive guard the spec asks for
-    (classic triangulated truss configuration).
+    Two non-collinear axial-only members at a free node span 2-D and are
+    NOT flagged (classic triangulated truss joint).
     """
     issues: list[ValidationIssue] = []
     for nid in model.nodes:
@@ -315,24 +346,32 @@ def _find_truss_mechanisms(model: "StructuralModel") -> list[ValidationIssue]:
         incident = _incident_elements(model, nid)
         if not incident:
             continue  # orphan — handled elsewhere
-        # Any frame element gives full transverse + rotational stiffness
-        # at this node, so the node is fine.
-        if any(not _element_is_truss(e) for e in incident):
+        # If any incident element provides shear/bending stiffness at
+        # this node, the node's transverse DOF is stabilised — skip it.
+        if any(not _is_axial_only_at_node(e, nid) for e in incident):
             continue
-        # All incident elements are trusses.  Need ≥ 2 non-collinear
+        # All incident elements are axial-only.  Need ≥ 2 non-collinear
         # directions for translational stability.
         dirs = [
             _bar_direction_from_node(e, nid, model.nodes) for e in incident
         ]
         if _directions_span_2d(dirs):
             continue
-        # Mechanism: flag the node and every incident truss element.
+        # Produce a message that names the specific member type(s).
+        has_double_pin = any(not _element_is_truss(e) for e in incident)
+        if has_double_pin:
+            member_desc = (
+                "elements with no transverse stiffness at this node "
+                "(truss or double-pinned frame)"
+            )
+        else:
+            member_desc = "truss elements"
         issues.append(ValidationIssue(
             severity="error",
             message=(
-                f"Node {nid} is connected only by truss elements and has "
+                f"Node {nid} is connected only by {member_desc} and has "
                 f"an unconstrained transverse DOF. Add a support, connect "
-                f"another member, or use a frame element."
+                f"another stabilising member, or remove the double-pin releases."
             ),
             node_ids=[nid],
             element_ids=sorted(e.id for e in incident),
