@@ -571,6 +571,62 @@ def test_single_release_two_incident_elements_not_flagged():
     )
 
 
+def test_released_beam_between_two_supports_is_valid():
+    """A frame element with releases at BOTH ends, between two supported
+    nodes (no free node) — a simply-supported beam modelled with end pins.
+    Neither endpoint is free, so no mechanism check should fire."""
+    m = StructuralModel(title="released-beam-between-supports")
+    _seed_materials_sections(m)
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    m.elements.append(_double_pin_frame(1, 2, elem_id=1))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=False)
+    m.supports[2] = Support(node_id=2, ux=True, uy=True, rz=False)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if "unconstrained transverse DOF" in i.message
+    ]
+    assert not mech, (
+        f"double-pin beam between two supports must not be flagged: "
+        f"{[i.message for i in mech]}"
+    )
+
+
+def test_internal_hinge_continuous_beam_not_flagged():
+    """Gerber-style continuous beam: nodes 1 and 3 supported, node 2 is
+    an internal hinge between two collinear frame elements (release_j at
+    elem 1, release_i at elem 2).  Node 2 has TWO incident elements
+    contributing translational stiffness — must NOT be flagged."""
+    m = StructuralModel(title="internal-hinge")
+    _seed_materials_sections(m)
+    m.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 4.0, 0.0),  # internal hinge (free node)
+        3: Node(3, 8.0, 0.0),
+    }
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_j=True,
+    ))
+    m.elements.append(FrameElement2D(
+        id=2, node_i=2, node_j=3,
+        E=2.1e8, A=0.02, I=8e-5, section_id=1,
+        release_i=True,
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    m.supports[3] = Support(node_id=3, ux=True, uy=True, rz=True)
+    res = validate_model(m)
+    mech = [
+        i for i in res.issues
+        if "unconstrained transverse DOF" in i.message
+    ]
+    assert not mech, (
+        f"internal hinge between two stable supports must not be flagged: "
+        f"{[i.message for i in mech]}"
+    )
+
+
 # ── basic sanity (formerly "fatal" list) ─────────────────────────────
 
 
