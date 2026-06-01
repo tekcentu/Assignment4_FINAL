@@ -11,11 +11,12 @@ import os
 
 import pytest
 
-PyQt6 = pytest.importorskip("PyQt6")
-
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
+try:
+    from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
+except Exception as exc:  # noqa: BLE001
+    pytest.skip(f"PyQt6 QtWidgets unavailable: {exc}", allow_module_level=True)
 
 from structural_analysis.gui_qt.app import MainWindow  # noqa: E402
 from structural_analysis.gui_qt.canvas import HitResult  # noqa: E402

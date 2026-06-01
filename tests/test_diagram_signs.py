@@ -1,8 +1,9 @@
-"""Regression test for the canvas internal-force diagram functions.
+"""Regression test for the internal-force diagram functions.
 
 The q2a/q2b validation cases used elsewhere in the suite exercise distributed
 loads and end moments but not mid-span point loads. Gemini's PR review pointed
-out that, for the diagram functions in :mod:`structural_analysis.gui_qt.canvas`,
+out that, for the diagram functions used by the GUI (implemented in
+:mod:`structural_analysis.gui_qt.element_graphics`),
 differentiating the moment expression with respect to x gives a point-load
 contribution with the **opposite sign** of the point-load term in the shear
 expression — i.e. ``dM/dx ≠ V`` once any in-span point load is present.
@@ -29,7 +30,7 @@ from structural_analysis.model import (
 )
 from structural_analysis.element import FrameElement2D
 from structural_analysis.main import run_analysis
-from structural_analysis.gui_qt.canvas import _diagram_ordinates
+from structural_analysis.gui_qt.element_graphics import sample_internal_force as _diagram_ordinates
 
 
 def _simply_supported_beam_central_point_load(P: float = 10.0, L: float = 10.0):
