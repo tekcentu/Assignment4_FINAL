@@ -5569,6 +5569,55 @@ def test_single_release_at_far_end_detected_as_mechanism(qt_app, monkeypatch):
     assert "unconstrained transverse DOF" in w._result_text.toPlainText()
 
 
+def _corbel_indirect_mechanism_model(w) -> None:
+    """Column 1→3→2 (fixed at node 1) + corbel element 3→4 with a moment
+    release at the column-junction end (node 3).  Node 3 is NOT directly
+    supported; it is stabilised only through the column that reaches the
+    fixed base.  Node 4 is the free leaf — the corbel can rotate as a
+    rigid body about the pin at node 3."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, NodalLoad, Node, Section, Support,
+    )
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.02, I=8e-5, depth=0.3,
+    )
+    w._model.nodes = {
+        1: Node(1, 0.0, 0.0),
+        3: Node(3, 0.0, 2.0),
+        2: Node(2, 0.0, 4.0),
+        4: Node(4, 2.0, 2.0),
+    }
+    w._model.elements = [
+        FrameElement2D(id=1, node_i=1, node_j=3, E=2.1e8, A=0.02, I=8e-5, section_id=1),
+        FrameElement2D(id=2, node_i=3, node_j=2, E=2.1e8, A=0.02, I=8e-5, section_id=1),
+        FrameElement2D(id=3, node_i=3, node_j=4, E=2.1e8, A=0.02, I=8e-5,
+                       section_id=1, release_i=True),  # pin at column-junction side
+    ]
+    w._model.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    w._model.nodal_loads.append(NodalLoad(node_id=4, fy=-10.0, load_case="DEFAULT"))
+
+
+def test_corbel_indirect_mechanism_flagged(qt_app, monkeypatch):
+    """Column-stabilised corbel with pin at the column junction must be caught
+    by the validator even though the junction node is not directly supported.
+    Solve must be blocked, the free tip and corbel element must be highlighted,
+    and the report must name the unconstrained DOF."""
+    from structural_analysis.gui_qt import app as app_mod
+    w = MainWindow()
+    _corbel_indirect_mechanism_model(w)
+    monkeypatch.setattr(app_mod.QMessageBox, "critical", lambda *a, **k: None)
+    w._do_solve()
+    qt_app.processEvents()
+
+    assert w._result is None, "solve must be blocked for the corbel mechanism"
+    assert 4 in w.canvas._error_node_ids, "free tip node 4 must be highlighted"
+    assert 3 in w.canvas._error_element_ids, "corbel element 3 must be highlighted"
+    assert w.canvas.has_validation_highlights()
+    assert "unconstrained transverse DOF" in w._result_text.toPlainText()
+
+
 # ── active-case filtering (Solve All Cases skips empty cases) ────────
 
 

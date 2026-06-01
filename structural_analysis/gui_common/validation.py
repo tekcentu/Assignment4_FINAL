@@ -29,13 +29,15 @@ Detections shipped here:
   axial-only members at the same free node span 2-D and are not flagged.
 
 * **Single-release rigid-body rotation** — a free node N connected by
-  exactly one frame element whose OPPOSITE (far) end carries a moment
-  release (pin) at a directly-supported node M.  The pin in the element
-  at M allows the element to rotate as a rigid body about M regardless
-  of any rotational restraint at M (the pin decouples element rotation
-  from node rotation).  Stiffness matrix for N's free DOFs is provably
-  singular.  Caught only for the obvious single-element topology; the
-  multi-element generalisation is deferred.
+  exactly one frame element whose OPPOSITE (column-side / far) end
+  carries a moment release (pin).  The pin decouples the element's
+  rotation from the far node's rotation, so the element can spin as a
+  rigid body about that pin.  The stiffness matrix for N's free DOFs
+  (UX, UY, RZ) has a provable zero eigenvalue regardless of whether the
+  far node is *directly* supported or merely part of a stable column /
+  frame that connects to a support indirectly.  Caught only for the
+  single-element leaf-node topology; the multi-element generalisation
+  is deferred.
 
 Active-load-case filtering for "Solve All Cases":
 
@@ -341,19 +343,36 @@ def _find_single_release_mechanisms(
 ) -> list[ValidationIssue]:
     """Single-element, single-release rigid-body-rotation mechanism.
 
-    A free node N connected by exactly one frame element E is a mechanism
-    when E has a moment release (pin) at its OTHER end M and M is a
-    directly-supported node.  The element pin at M decouples E's rotation
-    from the node's rotation — rz support at M provides NO help.  The
-    3×3 free-DOF stiffness for N (UX, UY, RZ) has a provable zero
-    eigenvalue (rigid-body rotation of E about M).
+    A free leaf node N connected by exactly one frame element E is a
+    mechanism when E has a moment release (pin) at its OPPOSITE
+    (column-side / far) end B.  The pin at B decouples E's rotation from
+    B's node rotation, so E can spin as a rigid body about B regardless
+    of any rz restraint at B.  The 2×2 stiffness sub-block for N's
+    transverse and rotational free DOFs (v_N, θ_N) is provably singular
+    (det = 0) after static condensation of the released DOF at B.
 
-    Only the single-element topology is checked (multi-element cases are
-    deferred).  The double-pin case (both ends released) is already caught
-    by :func:`_find_truss_mechanisms`.  The double-flag with the
-    unsupported-component check is avoided by requiring that M itself be
-    a directly-supported node.
+    The check works whether B is *directly* supported or only indirectly
+    connected to a support through a stable frame/column — the singularity
+    arises from the element geometry alone, not from B's support status.
+
+    Guard against double-reporting: if B belongs to an entirely
+    unsupported component, :func:`_find_unsupported_components` already
+    raises an error for that component; we skip those cases here.
+
+    Only the single-element leaf topology is checked.  Multi-element
+    generalisations are deferred.  The double-pin case (both ends
+    released, axial-only) is caught by :func:`_find_truss_mechanisms`.
     """
+    # Pre-compute supported-component membership once.  A node is in a
+    # supported component iff it can reach at least one supported node
+    # through connected elements.  Nodes in entirely unsupported
+    # components are excluded to avoid double-reporting with
+    # _find_unsupported_components.
+    supported_comp: set[int] = set()
+    for comp in _connected_components(model):
+        if any(_node_is_supported(model, n) for n in comp):
+            supported_comp.update(comp)
+
     issues: list[ValidationIssue] = []
     for nid in model.nodes:
         if _node_is_supported(model, nid):
@@ -366,7 +385,7 @@ def _find_single_release_mechanisms(
             continue  # trusses (and double-pin frames) handled elsewhere
         if _is_axial_only_at_node(elem, nid):
             continue  # double-pin already caught by _find_truss_mechanisms
-        # Identify the far end of this element.
+        # Identify the far (column-side) end of this element.
         if elem.node_i == nid:
             far_nid = elem.node_j
             release_at_far = getattr(elem, "release_j", False)
@@ -374,21 +393,20 @@ def _find_single_release_mechanisms(
             far_nid = elem.node_i
             release_at_far = getattr(elem, "release_i", False)
         if not release_at_far:
-            continue  # no pin at far end → element provides full moment coupling → stable
-        # Only flag when the far node is directly supported; if it is not
-        # supported, the unsupported-component check already raises an error.
-        if not _node_is_supported(model, far_nid):
+            continue  # no pin at far end → full moment coupling → stable
+        # Skip if the far-end component has no support at all — the
+        # unsupported-component check already handles that case.
+        if far_nid not in supported_comp:
             continue
         issues.append(ValidationIssue(
             severity="error",
             message=(
                 f"Node {nid} is connected only to element {elem.id}, "
-                f"which has a moment release (pin) at its far end "
-                f"(node {far_nid}). The element can rotate as a rigid "
-                f"body about that pin, leaving node {nid} with an "
-                f"unconstrained transverse DOF. Add a support at "
-                f"node {nid}, connect another stabilising member, or "
-                f"remove the release at node {far_nid}."
+                f"which has a moment release (pin) at its column-side end "
+                f"(node {far_nid}). The element can rotate as a rigid body "
+                f"about that pin, leaving node {nid} with an unconstrained "
+                f"transverse DOF. Add a support at node {nid}, connect "
+                f"another stabilising member, or remove the release."
             ),
             node_ids=[nid],
             element_ids=[elem.id],
