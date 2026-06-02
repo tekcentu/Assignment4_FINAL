@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.22.3"
+__version__ = "0.23.0"
 __what_is_new__ = (
-    "Orphan-node dialog uses single-undo batch delete · "
-    "release mechanism wording generalized (stabilizing-side) · "
-    "release mechanism highlights both released end and free node"
+    "Tabbed Element Detail Dialog — Properties, Results, Load Assignments · "
+    "Results tab has its own case/combo selector (raw-id userData) · "
+    "Loads tab supports per-row Add/Edit/Delete (all undoable)"
 )
 
 from .model import (

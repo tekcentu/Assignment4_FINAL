@@ -499,6 +499,7 @@ def draw_element_detail(
     result: Optional[AnalysisResult] = None,
     *, n_samples: int = 11,
     section_fig: Optional[Figure] = None,
+    panels: str = "all",
 ) -> ElementDetailAxes:
     """Render the landscape-stacked element detail into ``fig``.
 
@@ -518,48 +519,121 @@ def draw_element_detail(
     N + V + M.  This trims the dialog's vertical footprint without
     sacrificing the section drawing.
 
-    Returns an :class:`ElementDetailAxes` dict with exactly four keys
-    ``{"sketch", "fbd", "diagrams", "section"}`` for backward compat;
+    ``panels`` controls which sub-panels are rendered (PR #35 — the
+    tabbed Element Detail Dialog uses two separate figures, one per
+    tab, and asks for either the upper or the lower half):
+
+    * ``"all"`` *(default)* — sketch + fbd + N + V + M (original
+      behaviour, unchanged).
+    * ``"properties"`` — sketch + fbd only (2 thin rows). N/V/M panels
+      omitted; the returned axes carry ``None`` for ``diagrams``,
+      ``ax_n``, ``ax_v``, ``ax_m``.
+    * ``"diagrams"`` — N + V + M only (3 rows). Sketch + FBD panels
+      omitted; the returned axes carry ``None`` for ``sketch`` and
+      ``fbd``.
+
+    Returns an :class:`ElementDetailAxes` dict with the four standard
+    keys ``{"sketch", "fbd", "diagrams", "section"}`` for backward
+    compat; values are ``None`` for panels omitted by ``panels``.
     ``.ax_n / .ax_v / .ax_m`` give the dialog access to all three
     diagram sub-panels.  When ``section_fig`` is given,
     ``axes["section"]`` points at the axis inside that figure.
     """
+    if panels not in ("all", "properties", "diagrams"):
+        raise ValueError(
+            f"panels must be 'all' | 'properties' | 'diagrams', got {panels!r}"
+        )
+    want_sketch_fbd = panels in ("all", "properties")
+    want_diagrams = panels in ("all", "diagrams")
+
     fig.clear()
+    ax_section = None
+    ax_sketch = ax_fbd = None
+    ax_n = ax_v = ax_m = None
 
     if section_fig is not None:
-        # Compact layout: section lives in its own figure, main figure
-        # is a single full-width column with five thin rows.
+        # Compact layout: section lives in its own figure (always
+        # cleared; rendered only when sketch/fbd are in scope), main
+        # figure is a single column showing only the requested panels.
         section_fig.clear()
-        ax_section = section_fig.add_subplot(111)
-        gs = GridSpec(
-            5, 1, figure=fig,
-            hspace=0.70,
-            top=0.96, bottom=0.06, left=0.14, right=0.97,
-            height_ratios=[1.3, 1.3, 1.0, 1.0, 1.4],
-        )
-        ax_sketch = fig.add_subplot(gs[0, 0])
-        ax_fbd    = fig.add_subplot(gs[1, 0])
-        ax_n      = fig.add_subplot(gs[2, 0])
-        ax_v      = fig.add_subplot(gs[3, 0], sharex=ax_n)
-        ax_m      = fig.add_subplot(gs[4, 0], sharex=ax_n)
+        if want_sketch_fbd:
+            ax_section = section_fig.add_subplot(111)
+        if want_sketch_fbd and want_diagrams:
+            gs = GridSpec(
+                5, 1, figure=fig,
+                hspace=0.70,
+                top=0.96, bottom=0.06, left=0.14, right=0.97,
+                height_ratios=[1.3, 1.3, 1.0, 1.0, 1.4],
+            )
+            ax_sketch = fig.add_subplot(gs[0, 0])
+            ax_fbd    = fig.add_subplot(gs[1, 0])
+            ax_n      = fig.add_subplot(gs[2, 0])
+            ax_v      = fig.add_subplot(gs[3, 0], sharex=ax_n)
+            ax_m      = fig.add_subplot(gs[4, 0], sharex=ax_n)
+        elif want_sketch_fbd:
+            gs = GridSpec(
+                2, 1, figure=fig,
+                hspace=0.55,
+                top=0.94, bottom=0.10, left=0.14, right=0.97,
+                height_ratios=[1.3, 1.3],
+            )
+            ax_sketch = fig.add_subplot(gs[0, 0])
+            ax_fbd    = fig.add_subplot(gs[1, 0])
+        else:  # diagrams only
+            gs = GridSpec(
+                3, 1, figure=fig,
+                hspace=0.70,
+                top=0.95, bottom=0.08, left=0.14, right=0.97,
+                height_ratios=[1.0, 1.0, 1.4],
+            )
+            ax_n = fig.add_subplot(gs[0, 0])
+            ax_v = fig.add_subplot(gs[1, 0], sharex=ax_n)
+            ax_m = fig.add_subplot(gs[2, 0], sharex=ax_n)
     else:
-        gs = GridSpec(
-            5, 6, figure=fig,
-            hspace=0.60, wspace=0.40,
-            top=0.96, bottom=0.05, left=0.08, right=0.97,
-            height_ratios=[2, 2, 1.2, 1.2, 1.6],
-        )
-        ax_section = fig.add_subplot(gs[0:2, 0:2])
-        ax_sketch  = fig.add_subplot(gs[0, 2:6])
-        ax_fbd     = fig.add_subplot(gs[1, 2:6])
-        ax_n       = fig.add_subplot(gs[2, 0:6])
-        ax_v       = fig.add_subplot(gs[3, 0:6], sharex=ax_n)
-        ax_m       = fig.add_subplot(gs[4, 0:6], sharex=ax_n)
+        # section_fig is None: original 5-row × 6-col layout.  Only
+        # used in panels="all" mode by external callers; the tabbed
+        # inspector always passes a section_fig.  Sub-panel selection
+        # is still honoured for completeness.
+        if want_sketch_fbd and want_diagrams:
+            gs = GridSpec(
+                5, 6, figure=fig,
+                hspace=0.60, wspace=0.40,
+                top=0.96, bottom=0.05, left=0.08, right=0.97,
+                height_ratios=[2, 2, 1.2, 1.2, 1.6],
+            )
+            ax_section = fig.add_subplot(gs[0:2, 0:2])
+            ax_sketch  = fig.add_subplot(gs[0, 2:6])
+            ax_fbd     = fig.add_subplot(gs[1, 2:6])
+            ax_n       = fig.add_subplot(gs[2, 0:6])
+            ax_v       = fig.add_subplot(gs[3, 0:6], sharex=ax_n)
+            ax_m       = fig.add_subplot(gs[4, 0:6], sharex=ax_n)
+        elif want_sketch_fbd:
+            gs = GridSpec(
+                2, 6, figure=fig,
+                hspace=0.55, wspace=0.40,
+                top=0.94, bottom=0.10, left=0.08, right=0.97,
+                height_ratios=[2, 2],
+            )
+            ax_section = fig.add_subplot(gs[0:2, 0:2])
+            ax_sketch  = fig.add_subplot(gs[0, 2:6])
+            ax_fbd     = fig.add_subplot(gs[1, 2:6])
+        else:  # diagrams only
+            gs = GridSpec(
+                3, 1, figure=fig,
+                hspace=0.70,
+                top=0.95, bottom=0.08, left=0.10, right=0.97,
+                height_ratios=[1.0, 1.0, 1.4],
+            )
+            ax_n = fig.add_subplot(gs[0, 0])
+            ax_v = fig.add_subplot(gs[1, 0], sharex=ax_n)
+            ax_m = fig.add_subplot(gs[2, 0], sharex=ax_n)
 
     ni = model.nodes.get(getattr(elem, "node_i", None))
     nj = model.nodes.get(getattr(elem, "node_j", None))
     if ni is None or nj is None:
         for a in (ax_sketch, ax_fbd, ax_n, ax_v, ax_m, ax_section):
+            if a is None:
+                continue
             a.text(0.5, 0.5, "missing node", transform=a.transAxes,
                    ha="center", va="center", color="#b00", fontsize=9)
         axes = ElementDetailAxes(
@@ -582,48 +656,50 @@ def draw_element_detail(
             f_local = mr["f_local"]
 
     # ── Upper panels (local frame) ────────────────────────────────
-    _draw_member_sketch(ax_sketch, elem, ni, nj, section)
-    _draw_fbd(ax_fbd, elem, ni, nj, f_local, section)
-    _draw_section_thumbnail(ax_section, section)
-
-    L = _member_length(ni, nj)
-    if L > 1e-12:
-        ax_n.set_xlim(0.0, L)
+    if want_sketch_fbd:
+        _draw_member_sketch(ax_sketch, elem, ni, nj, section)
+        _draw_fbd(ax_fbd, elem, ni, nj, f_local, section)
+        if ax_section is not None:
+            _draw_section_thumbnail(ax_section, section)
 
     # ── N / V / M diagrams ────────────────────────────────────────
-    if f_local is None:
-        # Pre-solve placeholder — zero lines, placeholder text on ax_n.
-        # The "Run analysis" text MUST land on ax_n because the smoke
-        # test asserts axes["diagrams"].texts (which is ax_n) contains
-        # "Run analysis".
-        ax_n.text(0.5, 0.5, "Run analysis to see N/V/M diagrams",
-                  transform=ax_n.transAxes, ha="center", va="center",
-                  color="#555", fontsize=9)
-        ax_n.set_xticks([])
-        ax_n.set_yticks([])
-        _spine_clean(ax_n)
-        for ax, lbl in ((ax_v, "V — shear"), (ax_m, "M — moment")):
-            ax.set_xticks([])
-            ax.set_yticks([])
-            _spine_clean(ax)
-            ax.text(0.5, 0.5, lbl, transform=ax.transAxes,
-                    ha="center", va="center", color="#bbb", fontsize=8,
-                    style="italic")
-    else:
-        xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local,
-                                            "axial",  n_samples)
-        xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local,
-                                            "shear",  n_samples)
-        xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local,
-                                            "moment", n_samples)
+    if want_diagrams:
+        L = _member_length(ni, nj)
+        if L > 1e-12:
+            ax_n.set_xlim(0.0, L)
+        if f_local is None:
+            # Pre-solve placeholder — zero lines, placeholder text on ax_n.
+            # The "Run analysis" text MUST land on ax_n because the smoke
+            # test asserts axes["diagrams"].texts (which is ax_n) contains
+            # "Run analysis".
+            ax_n.text(0.5, 0.5, "Run analysis to see N/V/M diagrams",
+                      transform=ax_n.transAxes, ha="center", va="center",
+                      color="#555", fontsize=9)
+            ax_n.set_xticks([])
+            ax_n.set_yticks([])
+            _spine_clean(ax_n)
+            for ax, lbl in ((ax_v, "V — shear"), (ax_m, "M — moment")):
+                ax.set_xticks([])
+                ax.set_yticks([])
+                _spine_clean(ax)
+                ax.text(0.5, 0.5, lbl, transform=ax.transAxes,
+                        ha="center", va="center", color="#bbb", fontsize=8,
+                        style="italic")
+        else:
+            xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local,
+                                                "axial",  n_samples)
+            xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local,
+                                                "shear",  n_samples)
+            xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local,
+                                                "moment", n_samples)
 
-        _draw_single_nvm_diagram(ax_n, xs_n, ys_n, "N", "kN",
-                                 color=_DIAGRAM_COLOR["axial"])
-        _draw_single_nvm_diagram(ax_v, xs_v, ys_v, "V", "kN",
-                                 color=_DIAGRAM_COLOR["shear"])
-        _draw_single_nvm_diagram(ax_m, xs_m, ys_m, "M", "kN·m",
-                                 color=_DIAGRAM_COLOR["moment"],
-                                 invert=True)
+            _draw_single_nvm_diagram(ax_n, xs_n, ys_n, "N", "kN",
+                                     color=_DIAGRAM_COLOR["axial"])
+            _draw_single_nvm_diagram(ax_v, xs_v, ys_v, "V", "kN",
+                                     color=_DIAGRAM_COLOR["shear"])
+            _draw_single_nvm_diagram(ax_m, xs_m, ys_m, "M", "kN·m",
+                                     color=_DIAGRAM_COLOR["moment"],
+                                     invert=True)
 
     axes = ElementDetailAxes(
         sketch=ax_sketch, fbd=ax_fbd, diagrams=ax_n, section=ax_section,

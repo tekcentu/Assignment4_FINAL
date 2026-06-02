@@ -3107,7 +3107,13 @@ def _node_reaction(result, node_id: int) -> str | None:
 
 
 class ElementPropertiesDialog(QDialog):
-    """Read-only inspector for an element.
+    """Read-only / loads-edit inspector for an element (SAP2000-style tabs).
+
+    PR #35: three tabs on a ``QTabWidget`` — **Properties** (geometry +
+    section thumbnail + material/E/A/I + releases), **Results** (N/V/M
+    diagrams with a dialog-local case/combo selector, end-force table,
+    crosshair readout), and **Load Assignments** (member-loads table with
+    per-row Edit / Delete buttons and an Add button at the bottom).
 
     Non-modal so the main window stays usable for view-only operations
     (pan / zoom / solve / overlay toggles). The host
@@ -3119,23 +3125,46 @@ class ElementPropertiesDialog(QDialog):
     re-opening from another element calls :meth:`set_target` to swap
     the contents in place. After a solve the host calls
     :meth:`refresh` so the diagrams pick up the new result.
+
+    Public API preserved across the PR #35 rewrite:
+    ``set_target``, ``refresh``, ``refresh_loads_only``, ``_elem_id``,
+    ``_detail_axes`` (still a 4-key dict with sketch/fbd/diagrams/section
+    keys — sketch+fbd+section come from the Properties tab figure,
+    diagrams come from the Results tab figure).
+
+    Host callbacks (set by MainWindow after construction):
+      _host_delete_member_load(elem_id, load_index)
+      _host_add_member_load(elem_id)
+      _host_edit_member_load(elem_id, load_index)
+    All three remain ``None`` in unit-test construction so the row
+    buttons render disabled and the model is never mutated implicitly.
     """
 
-    def __init__(self, parent, model: StructuralModel, elem_id: int,
-                 result=None) -> None:
+    _TAB_PROPERTIES = 0
+    _TAB_RESULTS = 1
+    _TAB_LOADS = 2
+    _TAB_NAME_TO_INDEX = {
+        "properties": _TAB_PROPERTIES,
+        "results": _TAB_RESULTS,
+        "loads": _TAB_LOADS,
+    }
+
+    def __init__(
+        self, parent, model: StructuralModel, elem_id: int,
+        result=None, *, multi_result=None,
+    ) -> None:
         super().__init__(parent)
         self.setModal(False)
-        # Persist across close so MainWindow's singleton stays valid;
-        # tests + the host both rely on _element_inspector being
-        # reusable across right-clicks.
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
         self._outer = QVBoxLayout(self)
-        # Body widget — wholly replaced by set_target on each refresh.
+        # Body widget — a QTabWidget wholly replaced by set_target on
+        # each refresh.  Keep the variable name ``_body_widget`` so the
+        # set_target / refresh_loads_only logic doesn't change shape.
         self._body_widget: QWidget = QWidget(self)
         self._outer.addWidget(self._body_widget)
 
-        # Buttons live at the bottom permanently — only the body swaps.
+        # Buttons live at the bottom permanently.
         self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Close, parent=self,
         )
@@ -3147,27 +3176,45 @@ class ElementPropertiesDialog(QDialog):
         self._outer.addWidget(self._buttons)
 
         self._elem_id: int = elem_id
-        # Host callback for per-row Delete buttons in the loads table.
-        # The host (MainWindow) sets this to its delete_member_load
-        # method after constructing the singleton inspector. Until then
-        # (or in unit tests that construct the dialog directly), the
-        # buttons render as disabled so the model is never mutated
-        # implicitly.
+        # Host callbacks (set by MainWindow after construction).
         self._host_delete_member_load = None
+        self._host_add_member_load = None
+        self._host_edit_member_load = None
+
+        # Per-rebuild widget handles — every tab body is wholly rebuilt
+        # by set_target so these get reassigned on each refresh.
+        # ``_loads_widget`` keeps the legacy semantics (points at the
+        # QTableWidget itself); ``_loads_tab_widget`` holds the whole
+        # tab body inserted into the QTabWidget.
+        self._tabs: QTabWidget | None = None
+        self._props_widget: QWidget | None = None
+        self._results_widget: QWidget | None = None
+        self._loads_tab_widget: QWidget | None = None
         self._loads_widget: QWidget | None = None
-        self.set_target(model, elem_id, result)
+
+        # Dialog-local result selection (raw case / SUM_ALL / combination
+        # name).  Initialised to the host's active case at open time so
+        # the dialog mirrors what the user is currently viewing on the
+        # canvas, then drifts independently as the user picks a different
+        # case in the Results tab.
+        active_case = getattr(parent, "_active_case", "DEFAULT")
+        self._results_selection: str = active_case
+
+        self.set_target(model, elem_id, result, multi_result=multi_result)
 
     def set_target(
         self, model: StructuralModel, elem_id: int, result=None,
+        *, multi_result=None,
     ) -> None:
         """Swap the inspector to show ``elem_id``. Raises ``ValueError``
-        if the element does not exist. The figure / form widgets are
-        rebuilt from scratch — simpler than wiring every field for
-        individual updates, and the dialog is hardly hot-path."""
+        if the element does not exist. All three tabs are rebuilt; the
+        Properties / Loads tab bodies are inexpensive, and Results is
+        the only one that depends on the result so it's the natural
+        rebuild boundary even when only the result changed."""
         elem = next((e for e in model.elements if e.id == elem_id), None)
         if elem is None:
             raise ValueError(f"Element {elem_id} does not exist.")
-        new_body = self._build_body(model, elem, result)
+        new_body = self._build_tabs(model, elem, result, multi_result)
         self._outer.replaceWidget(self._body_widget, new_body)
         self._body_widget.setParent(None)
         self._body_widget.deleteLater()
@@ -3175,57 +3222,109 @@ class ElementPropertiesDialog(QDialog):
         self._elem_id = elem_id
         self.setWindowTitle(f"Element {elem_id} properties")
 
-    def refresh(self, model: StructuralModel, result=None) -> None:
-        """Re-render the current element against ``model`` / ``result``.
-        Called by the host after :meth:`MainWindow._do_solve` so the
-        N/V/M traces and the end-force block pick up the new result.
-        Silently no-ops if the current element id no longer exists."""
+    def refresh(
+        self, model: StructuralModel, result=None, *, multi_result=None,
+    ) -> None:
+        """Re-render the current element. Called by the host after solve /
+        case change / model mutation. Silently no-ops if the current
+        element id no longer exists.
+
+        Preserves :attr:`_results_selection` so the user's pinned dialog
+        case stays put across solves; the new result is re-resolved
+        against the same selection in the rebuilt Results tab."""
         if not any(e.id == self._elem_id for e in model.elements):
             self.close()
             return
-        self.set_target(model, self._elem_id, result)
+        self.set_target(
+            model, self._elem_id, result, multi_result=multi_result,
+        )
 
-    def _build_body(
-        self, model: StructuralModel, elem, result,
+    def set_initial_tab(self, name: str) -> None:
+        """Switch the focused tab to ``name`` (``"properties"``,
+        ``"results"``, or ``"loads"``). Used by the host when right-click
+        routes directly to "Edit member loads…" or "Element Details"."""
+        idx = self._TAB_NAME_TO_INDEX.get(name)
+        if idx is not None and self._tabs is not None:
+            self._tabs.setCurrentIndex(idx)
+
+    # ── tab assembly ──────────────────────────────────────────────────
+
+    def _build_tabs(
+        self, model: StructuralModel, elem, result, multi_result,
     ) -> QWidget:
-        from PyQt6.QtGui import QFont
-
         from .element_graphics import (
-            draw_element_detail,
             internal_force_at,
             sample_internal_force,
         )
 
-        body = QWidget(self)
-        layout = QVBoxLayout(body)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        elem_id = elem.id
-        section = model.sections.get(getattr(elem, "section_id", None) or -1)
-        # Default (section-driven) material — always shown so the user
-        # can see what the section would assign if the override were
-        # cleared.
-        default_material = (model.materials.get(section.material_id)
-                             if section is not None else None)
-        # Effective material — the one currently driving E/α/ρ on the
-        # element. Falls back to the default when there's no override.
-        override_id = getattr(elem, "material_id_override", None)
-        if override_id is not None:
-            effective_mat = model.materials.get(override_id)
-        else:
-            effective_mat = default_material
-
+        # Element-wide cached data the interactive crosshair layer needs.
         ni = model.nodes.get(elem.node_i)
         nj = model.nodes.get(elem.node_j)
         if ni is None or nj is None:
             length = 0.0
         else:
             length = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+        self._elem_ref = elem
+        self._ni_ref = ni
+        self._nj_ref = nj
+        self._L = length
+        self._internal_force_at = internal_force_at
+        self._sample_internal_force = sample_internal_force
 
-        # Top row: property form on the left, compact section
-        # thumbnail mini-figure on the right.  Pulling the section
-        # outline out of the main matplotlib figure trims the dialog's
-        # vertical footprint significantly.
+        # Tab widget is the entire body.  We never let the QTabWidget
+        # itself be the outer body widget because set_target() replaces
+        # _body_widget wholesale — keep the same pattern (wrap in a
+        # QWidget) so the replace logic doesn't need to special-case.
+        container = QWidget(self)
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        tabs = QTabWidget(container)
+        self._tabs = tabs
+
+        self._props_widget = self._build_properties_tab(model, elem)
+        tabs.addTab(self._props_widget, "Properties")
+
+        self._results_widget = self._build_results_tab(
+            model, elem, result, multi_result,
+        )
+        tabs.addTab(self._results_widget, "Results")
+
+        self._loads_tab_widget = self._build_loads_tab(model, elem)
+        tabs.addTab(self._loads_tab_widget, "Load Assignments")
+
+        container_layout.addWidget(tabs)
+        return container
+
+    # ── Properties tab ────────────────────────────────────────────────
+
+    def _build_properties_tab(
+        self, model: StructuralModel, elem,
+    ) -> QWidget:
+        """Build the Properties tab: geometry + section + material form,
+        member-sketch / FBD figure, side-by-side section thumbnail."""
+        from .element_graphics import draw_element_detail
+
+        body = QWidget(self)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        elem_id = elem.id
+        section = model.sections.get(getattr(elem, "section_id", None) or -1)
+        default_material = (
+            model.materials.get(section.material_id)
+            if section is not None else None
+        )
+        override_id = getattr(elem, "material_id_override", None)
+        if override_id is not None:
+            effective_mat = model.materials.get(override_id)
+        else:
+            effective_mat = default_material
+
+        ni = self._ni_ref
+        nj = self._nj_ref
+        length = self._L
+
+        # Top row: form on the left, section thumbnail on the right.
         top_row = QHBoxLayout()
         form_widget = QWidget(body)
         form = QFormLayout(form_widget)
@@ -3238,7 +3337,6 @@ class ElementPropertiesDialog(QDialog):
         self._section_canvas.setMinimumSize(180, 180)
         self._section_canvas.setMaximumSize(260, 260)
         top_row.addWidget(self._section_canvas, stretch=1)
-
         layout.addLayout(top_row)
 
         form.addRow("Element ID:", QLabel(str(elem_id)))
@@ -3255,16 +3353,19 @@ class ElementPropertiesDialog(QDialog):
             eff_name = effective_mat.name or f"material {effective_mat.id}"
             if override_id is None:
                 tag = "— section default"
-                mat_line = (f"{eff_name}  (id {effective_mat.id})  {tag}")
+                mat_line = f"{eff_name}  (id {effective_mat.id})  {tag}"
             else:
-                default_name = (default_material.name
-                                if default_material is not None
-                                and default_material.name
-                                else f"material "
-                                     f"{section.material_id if section else '?'}")
-                default_id = (default_material.id
-                              if default_material is not None
-                              else (section.material_id if section else None))
+                default_name = (
+                    default_material.name
+                    if default_material is not None and default_material.name
+                    else f"material "
+                         f"{section.material_id if section else '?'}"
+                )
+                default_id = (
+                    default_material.id
+                    if default_material is not None
+                    else (section.material_id if section else None)
+                )
                 mat_line = (
                     f"{eff_name}  (id {effective_mat.id})  — override "
                     f"(default: {default_name}, id {default_id})"
@@ -3275,75 +3376,172 @@ class ElementPropertiesDialog(QDialog):
         form.addRow("A:", QLabel(f"{elem.A:g} m²"))
         if isinstance(elem, FrameElement2D):
             form.addRow("I:", QLabel(f"{elem.I:g} m⁴"))
-            form.addRow("Releases:",
-                         QLabel(f"i={elem.release_i},  j={elem.release_j}"))
+            form.addRow(
+                "Releases:",
+                QLabel(f"i={elem.release_i},  j={elem.release_j}"),
+            )
 
-        # Loads section — structured table with per-row Delete buttons.
-        # The form layout above ends here; the loads block sits below it
-        # at full width so the four columns (#, Type, Magnitude,
-        # Position/Notes) all read cleanly.
-        loads_header = QLabel("── Member loads ──")
-        loads_header.setStyleSheet("font-weight: bold;")
-        layout.addWidget(loads_header)
-        loads_widget = self._build_loads_table(model, elem)
-        self._loads_widget = loads_widget
-        layout.addWidget(loads_widget)
+        # Sketch + FBD figure (no diagrams here — those live in the
+        # Results tab).  Section thumbnail is drawn into the side
+        # mini-figure via section_fig=.
+        self._props_fig = Figure(figsize=(6.5, 3.0), dpi=92)
+        self._props_fig.patch.set_facecolor("white")
+        self._props_canvas = FigureCanvasQTAgg(self._props_fig)
+        self._props_canvas.setMinimumSize(520, 220)
+        layout.addWidget(self._props_canvas)
+        props_axes = draw_element_detail(
+            self._props_fig, elem, model, result=None,
+            section_fig=self._section_fig, panels="properties",
+        )
+        self._props_canvas.draw_idle()
+        self._section_canvas.draw_idle()
+        self._props_axes = props_axes
 
-        # Main figure — only sketch + FBD + N + V + M (section is in
-        # the side mini-figure above).  Shorter overall so the dialog
-        # fits comfortably on typical laptop screens.
-        self._detail_fig = Figure(figsize=(7.0, 6.8), dpi=92)
-        self._detail_fig.patch.set_facecolor("white")
-        self._detail_canvas = FigureCanvasQTAgg(self._detail_fig)
-        self._detail_canvas.setMinimumSize(560, 480)
-        layout.addWidget(self._detail_canvas)
+        return body
+
+    # ── Results tab ───────────────────────────────────────────────────
+
+    def _build_results_tab(
+        self, model: StructuralModel, elem, result, multi_result,
+    ) -> QWidget:
+        """Build the Results tab: local case/combo selector + N/V/M
+        diagrams + crosshair readout + end-force table.
+
+        Pre-solve / failed / unsolved selections paint a placeholder and
+        leave **zero** data lines on the diagrams figure — never stale.
+        """
+        from PyQt6.QtGui import QFont
+        from ..gui_common.results_view import (
+            case_combo_entries, resolve_view,
+        )
+        from .element_graphics import draw_element_detail
+
+        body = QWidget(self)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # ── Local case/combo selector ──
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(QLabel("Case / Combination:"))
+        self._results_combo = QComboBox(body)
+        # Always store the RAW identifier in userData so we never
+        # substring-match the display label (avoiding the legacy bug
+        # where "COMB1  [comb]" leaked into the internal key).
+        entries = case_combo_entries(model, multi_result)
+        for label, raw_name in entries:
+            self._results_combo.addItem(label, raw_name)
+        if entries:
+            idx = self._results_combo.findData(self._results_selection)
+            if idx < 0:
+                # The saved selection isn't available anymore — fall
+                # back to DEFAULT or the first entry.
+                idx = self._results_combo.findData("DEFAULT")
+                if idx < 0:
+                    idx = 0
+                self._results_selection = self._results_combo.itemData(idx)
+            self._results_combo.setCurrentIndex(idx)
+            self._results_combo.currentIndexChanged.connect(
+                self._on_results_selection_changed
+            )
+        sel_row.addWidget(self._results_combo, stretch=1)
+        layout.addLayout(sel_row)
+
+        # ── Status placeholder ──
+        # Resolve the selection to a result (None if pre-solve / failed /
+        # combination needs solve).  status_msg drives the placeholder
+        # QLabel shown above the diagrams figure.
+        if multi_result is not None:
+            resolved, status_msg = resolve_view(
+                model, multi_result, self._results_selection,
+            )
+        else:
+            # Backward-compat path for callers that construct the dialog
+            # with just (model, elem_id, result) — no multi_result in
+            # hand. Treat the passed-in ``result`` as the active view so
+            # legacy tests and any non-MainWindow callers keep working.
+            resolved = result
+            status_msg = (
+                ""
+                if result is not None
+                   and getattr(result, "status", None) == "ok"
+                else "No analysis results yet. "
+                     "Run analysis to show N/V/M diagrams."
+            )
         ok_result = (
-            result if (result is not None
-                       and getattr(result, "status", None) == "ok")
+            resolved
+            if resolved is not None
+               and getattr(resolved, "status", None) == "ok"
             else None
         )
-        self._detail_axes = draw_element_detail(
-            self._detail_fig, elem, model, ok_result,
-            section_fig=self._section_fig,
+        if ok_result is None and not status_msg:
+            status_msg = (
+                "No analysis results yet. "
+                "Run analysis to show N/V/M diagrams."
+            )
+        self._results_status = QLabel(status_msg, body)
+        self._results_status.setStyleSheet("color: #555; font-style: italic;")
+        self._results_status.setVisible(bool(status_msg))
+        layout.addWidget(self._results_status)
+
+        # ── Diagrams figure ──
+        self._detail_fig = Figure(figsize=(7.0, 4.5), dpi=92)
+        self._detail_fig.patch.set_facecolor("white")
+        self._detail_canvas = FigureCanvasQTAgg(self._detail_fig)
+        self._detail_canvas.setMinimumSize(560, 320)
+        layout.addWidget(self._detail_canvas)
+        results_axes = draw_element_detail(
+            self._detail_fig, elem, model, ok_result, panels="diagrams",
         )
         self._detail_canvas.draw_idle()
-        self._section_canvas.draw_idle()
 
-        # Cache the three N/V/M sub-panel axes for the interactive layer.
-        self._ax_n = self._detail_axes.ax_n
-        self._ax_v = self._detail_axes.ax_v
-        self._ax_m = self._detail_axes.ax_m
+        # Cache the three N/V/M sub-panel axes for the crosshair layer.
+        self._ax_n = results_axes.ax_n
+        self._ax_v = results_axes.ax_v
+        self._ax_m = results_axes.ax_m
         self._diagram_axes_set = {self._ax_n, self._ax_v, self._ax_m}
 
-        # Cache element data for crosshair math (uses element_graphics helpers).
-        f_local_raw = (_element_local_forces(ok_result, elem_id)
-                       if ok_result is not None else None)
-        self._elem_ref       = elem
-        self._ni_ref         = ni
-        self._nj_ref         = nj
-        self._f_local_ref    = (list(f_local_raw) if f_local_raw is not None
-                                else None)
-        self._L              = length
-        self._cursors: list  = []
-        self._maxima_annotations: list = []
-        self._internal_force_at    = internal_force_at
-        self._sample_internal_force = sample_internal_force
+        # Assemble the public _detail_axes dict that smoke tests read.
+        # ``diagrams`` is the N (axial) axis (the test's anchor for the
+        # pre-solve "Run analysis" text + post-solve line count) and the
+        # sketch / fbd / section keys come from the Properties tab.
+        from .element_graphics import ElementDetailAxes
+        self._detail_axes = ElementDetailAxes(
+            sketch=getattr(self, "_props_axes", None) and self._props_axes.get("sketch"),
+            fbd=getattr(self, "_props_axes", None) and self._props_axes.get("fbd"),
+            diagrams=self._ax_n,
+            section=getattr(self, "_props_axes", None) and self._props_axes.get("section"),
+        )
+        self._detail_axes.ax_n = self._ax_n
+        self._detail_axes.ax_v = self._ax_v
+        self._detail_axes.ax_m = self._ax_m
 
-        # Crosshair — hidden axvlines on each diagram axis (post-solve only).
+        # ── Crosshair + readout strip ──
+        f_local_raw = (
+            _element_local_forces(ok_result, elem.id)
+            if ok_result is not None else None
+        )
+        self._f_local_ref = (
+            list(f_local_raw) if f_local_raw is not None else None
+        )
+        self._cursors = []
+        self._maxima_annotations = []
         if self._f_local_ref is not None:
-            _kw = dict(color="red", linestyle="--", linewidth=0.9,
-                       alpha=0.0, zorder=5)
+            _kw = dict(
+                color="red", linestyle="--", linewidth=0.9,
+                alpha=0.0, zorder=5,
+            )
             self._cursors = [
                 self._ax_n.axvline(x=0, **_kw),
                 self._ax_v.axvline(x=0, **_kw),
                 self._ax_m.axvline(x=0, **_kw),
             ]
             self._detail_canvas.mpl_connect(
-                "motion_notify_event", self._on_diagram_motion)
+                "motion_notify_event", self._on_diagram_motion,
+            )
             self._detail_canvas.mpl_connect(
-                "button_press_event", self._on_diagram_motion)
+                "button_press_event", self._on_diagram_motion,
+            )
 
-        # Real-time readout strip — fixed-width labels under the figure.
         _mono = QFont("Courier")
         _mono.setPointSize(8)
         val_row = QHBoxLayout()
@@ -3359,7 +3557,6 @@ class ElementPropertiesDialog(QDialog):
         val_row.addStretch()
         layout.addLayout(val_row)
 
-        # Show Maxima checkbox.
         maxima_row = QHBoxLayout()
         self._show_maxima_cb = QCheckBox("Show Maxima")
         self._show_maxima_cb.setEnabled(self._f_local_ref is not None)
@@ -3368,9 +3565,9 @@ class ElementPropertiesDialog(QDialog):
         maxima_row.addStretch()
         layout.addLayout(maxima_row)
 
-        # End-force table (retained from original for precision read-out).
-        if result is not None and getattr(result, "status", None) == "ok":
-            f_local = _element_local_forces(result, elem_id)
+        # ── End-force table (only when a solved result is shown) ──
+        if ok_result is not None:
+            f_local = _element_local_forces(ok_result, elem.id)
             if f_local is not None:
                 sep = QLabel("── End forces (local) ──")
                 sep.setStyleSheet("font-weight: bold;")
@@ -3397,7 +3594,89 @@ class ElementPropertiesDialog(QDialog):
                         ),
                     )
 
+        # Keep handles for re-resolution when the user changes the local
+        # selector (cheap rebuild via _on_results_selection_changed).
+        self._results_model_ref = model
+        self._results_multi_ref = multi_result
         return body
+
+    def _on_results_selection_changed(self, _idx: int) -> None:
+        """Local case/combo combo changed — re-render the Results tab
+        in place (the rest of the dialog is untouched, and the host's
+        canvas active-case is NOT modified).  Uses currentData() so the
+        raw identifier flows through; never the display label."""
+        if self._results_combo is None:
+            return
+        new_sel = self._results_combo.currentData()
+        if not new_sel or new_sel == self._results_selection:
+            return
+        self._results_selection = new_sel
+        elem = next(
+            (e for e in self._results_model_ref.elements
+             if e.id == self._elem_id),
+            None,
+        )
+        if elem is None:
+            return
+        new_widget = self._build_results_tab(
+            self._results_model_ref, elem,
+            None,  # result arg is ignored by the rebuild path —
+                   # resolve_view() picks the right result for the
+                   # dialog's selection from multi_result.
+            self._results_multi_ref,
+        )
+        if self._tabs is not None and self._results_widget is not None:
+            self._tabs.removeTab(self._TAB_RESULTS)
+            self._results_widget.setParent(None)
+            self._results_widget.deleteLater()
+            self._tabs.insertTab(
+                self._TAB_RESULTS, new_widget, "Results",
+            )
+            self._tabs.setCurrentIndex(self._TAB_RESULTS)
+            self._results_widget = new_widget
+
+    # ── Load Assignments tab ──────────────────────────────────────────
+
+    def _build_loads_tab(
+        self, model: StructuralModel, elem,
+    ) -> QWidget:
+        """Build the Load Assignments tab: loads table + Add button."""
+        body = QWidget(self)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        loads_header = QLabel("Member loads on this element")
+        loads_header.setStyleSheet("font-weight: bold;")
+        layout.addWidget(loads_header)
+
+        # _loads_widget stays pointing at the QTableWidget itself (the
+        # existing inspector tests treat it as the table); the entire
+        # tab body is held by the QTabWidget via self._loads_tab_widget.
+        self._loads_widget = self._build_loads_table(model, elem)
+        layout.addWidget(self._loads_widget)
+
+        # Bottom row: Add button (Edit / Delete are per-row in the table).
+        add_row = QHBoxLayout()
+        add_row.addStretch()
+        self._add_load_btn = QPushButton("Add member load…")
+        self._add_load_btn.setEnabled(
+            self._host_add_member_load is not None
+        )
+        self._add_load_btn.clicked.connect(self._on_add_load_clicked)
+        add_row.addWidget(self._add_load_btn)
+        layout.addLayout(add_row)
+
+        return body
+
+    def _on_add_load_clicked(self) -> None:
+        if self._host_add_member_load is None:
+            return
+        self._host_add_member_load(self._elem_id)
+
+    def _on_edit_load_clicked(self, load_index: int) -> None:
+        if self._host_edit_member_load is None:
+            return
+        self._host_edit_member_load(self._elem_id, load_index)
 
     # ── Loads table ──────────────────────────────────────────────────
 
@@ -3406,25 +3685,24 @@ class ElementPropertiesDialog(QDialog):
     ) -> QWidget:
         """Build the per-element member-loads table widget.
 
-        Read-only columns + one Delete button per row. Delete is routed
-        through ``self._host_delete_member_load`` (set by the host on
-        the singleton inspector). When the callback is missing — e.g.
-        in unit tests that construct the dialog directly — the buttons
-        are disabled so the model is never mutated implicitly.
+        Columns: # | Type | Direction | Magnitude | Position / Notes |
+        Case | Edit | Delete.  Edit and Delete are routed through the
+        host callbacks (``_host_edit_member_load`` /
+        ``_host_delete_member_load``); when those callbacks are missing
+        — e.g. in unit tests that construct the dialog directly — the
+        buttons render disabled so the model is never mutated implicitly.
         """
         from .load_summary import format_element_loads
 
         rows = format_element_loads(model, elem)
-        table = QTableWidget(0, 6)
-        table.setHorizontalHeaderLabels(
-            ["#", "Type", "Magnitude", "Position / Notes", "Case", ""]
-        )
+        table = QTableWidget(0, 8)
+        table.setHorizontalHeaderLabels([
+            "#", "Type", "Direction", "Magnitude",
+            "Position / Notes", "Case", "", "",
+        ])
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        # Show a scrollbar when the load count exceeds the visible
-        # window, and scroll per-pixel so the mouse wheel scrolls the
-        # table smoothly rather than jumping a whole row at a time.
         table.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded,
         )
@@ -3432,28 +3710,17 @@ class ElementPropertiesDialog(QDialog):
             QTableWidget.ScrollMode.ScrollPerPixel,
         )
         header = table.horizontalHeader()
-        header.setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents,
-        )
-        header.setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents,
-        )
-        header.setSectionResizeMode(
-            2, QHeaderView.ResizeMode.ResizeToContents,
-        )
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(
-            4, QHeaderView.ResizeMode.ResizeToContents,
-        )
-        header.setSectionResizeMode(
-            5, QHeaderView.ResizeMode.ResizeToContents,
-        )
+        for c in (0, 1, 2, 3, 5, 6, 7):
+            header.setSectionResizeMode(
+                c, QHeaderView.ResizeMode.ResizeToContents,
+            )
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         if not rows:
             table.setRowCount(1)
             none_item = QTableWidgetItem("(no member loads)")
             none_item.setFlags(Qt.ItemFlag.NoItemFlags)
             table.setItem(0, 0, QTableWidgetItem(""))
-            table.setSpan(0, 0, 1, 6)
+            table.setSpan(0, 0, 1, 8)
             table.setItem(0, 0, none_item)
         else:
             table.setRowCount(len(rows))
@@ -3462,8 +3729,11 @@ class ElementPropertiesDialog(QDialog):
                 t_item = QTableWidgetItem(row.type_label)
                 t_item.setToolTip(row.meaning)
                 table.setItem(i, 1, t_item)
-                table.setItem(i, 2, QTableWidgetItem(row.magnitude))
-                table.setItem(i, 3, QTableWidgetItem(row.position))
+                table.setItem(
+                    i, 2, QTableWidgetItem(_direction_label_for_row(row)),
+                )
+                table.setItem(i, 3, QTableWidgetItem(row.magnitude))
+                table.setItem(i, 4, QTableWidgetItem(row.position))
                 # Case column: dim "—" placeholder for the default case
                 # so legacy data doesn't visually shout a case tag it
                 # never had.
@@ -3473,20 +3743,28 @@ class ElementPropertiesDialog(QDialog):
                 case_item = QTableWidgetItem(case_text)
                 if row.load_case == "DEFAULT":
                     case_item.setForeground(QColor("#888"))
-                table.setItem(i, 4, case_item)
-                btn = QPushButton("Delete")
-                btn.setEnabled(
+                table.setItem(i, 5, case_item)
+                # Capture row.index at lambda definition time so later
+                # additions / removals don't change the button targets.
+                load_idx = row.index
+                edit_btn = QPushButton("Edit")
+                edit_btn.setEnabled(
+                    self._host_edit_member_load is not None
+                )
+                edit_btn.clicked.connect(
+                    lambda _checked=False, idx=load_idx:
+                    self._on_edit_load_clicked(idx)
+                )
+                table.setCellWidget(i, 6, edit_btn)
+                del_btn = QPushButton("Delete")
+                del_btn.setEnabled(
                     self._host_delete_member_load is not None
                 )
-                # Capture row.index at lambda definition time so a later
-                # row addition / removal doesn't change which load the
-                # button targets.
-                load_idx = row.index
-                btn.clicked.connect(
+                del_btn.clicked.connect(
                     lambda _checked=False, idx=load_idx:
                     self._on_delete_load_clicked(idx)
                 )
-                table.setCellWidget(i, 5, btn)
+                table.setCellWidget(i, 7, del_btn)
         # Height: always reserve at least 3 rows so a single-load
         # element still reads as a table (not one cramped row), and cap
         # at 6 visible rows — beyond that the vertical scrollbar (set
@@ -3512,10 +3790,11 @@ class ElementPropertiesDialog(QDialog):
     def refresh_loads_only(
         self, model: StructuralModel, result=None,
     ) -> None:
-        """Re-render just the loads table without rebuilding the whole
-        inspector (which would flash the figure). The host calls this
-        after a successful :class:`DeleteMemberLoadCmd` so the row
-        disappears immediately while the diagrams stay put."""
+        """Re-render just the loads table inside the Load Assignments
+        tab without rebuilding the Properties / Results tabs (which
+        would flash the diagrams figure). The host calls this after a
+        successful :class:`DeleteMemberLoadCmd` so the row disappears
+        immediately while the diagrams stay put."""
         elem = next(
             (e for e in model.elements if e.id == self._elem_id), None,
         )
@@ -3524,21 +3803,19 @@ class ElementPropertiesDialog(QDialog):
             # close the inspector so the user isn't staring at stale data.
             self.close()
             return
-        new_widget = self._build_loads_table(model, elem)
-        # Find the index of the current loads widget inside the outer
-        # layout and swap it in place.
-        body_layout = self._body_widget.layout()
-        if body_layout is None:
+        # Rebuild the Loads tab body in place; full set_target on
+        # fallback paths.
+        if self._tabs is None or self._loads_tab_widget is None:
             self.set_target(model, self._elem_id, result)
             return
-        body_layout.replaceWidget(self._loads_widget, new_widget)
-        # Newly created widgets are hidden by default after
-        # replaceWidget — without an explicit show() the table goes
-        # invisible the moment a row is deleted.
-        new_widget.show()
-        self._loads_widget.setParent(None)
-        self._loads_widget.deleteLater()
-        self._loads_widget = new_widget
+        new_widget = self._build_loads_tab(model, elem)
+        self._tabs.removeTab(self._TAB_LOADS)
+        self._loads_tab_widget.setParent(None)
+        self._loads_tab_widget.deleteLater()
+        self._tabs.insertTab(
+            self._TAB_LOADS, new_widget, "Load Assignments",
+        )
+        self._loads_tab_widget = new_widget
 
     # ── Interactive handlers ──────────────────────────────────────────
 
@@ -3614,6 +3891,17 @@ class ElementPropertiesDialog(QDialog):
                 )
                 self._maxima_annotations.append(ann)
         self._detail_canvas.draw_idle()
+
+
+def _direction_label_for_row(row) -> str:
+    """Direction column text for the Load Assignments table.
+
+    Mechanical loads carry a direction string; thermal loads have none
+    (their effect is a strain field, not a force vector) — show an em
+    dash so the column reads cleanly."""
+    if row.direction:
+        return row.direction
+    return "—"
 
 
 def _element_local_forces(result, elem_id: int):
