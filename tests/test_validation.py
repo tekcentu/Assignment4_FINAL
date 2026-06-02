@@ -19,6 +19,8 @@ from structural_analysis.gui_common.validation import (
     ModelValidationResult,
     ValidationIssue,
     cases_with_loads,
+    sync_load_case_registry,
+    used_case_names,
     validate_model,
 )
 from structural_analysis.model import (
@@ -1041,3 +1043,116 @@ def test_cases_with_loads_combines_all_sources():
     m.self_weight_case = "DEAD"
     active = cases_with_loads(m)
     assert set(active) == {"DEAD", "LIVE", "WIND"}
+
+
+# ── sync_load_case_registry (load-case registry safety net) ──────────
+
+
+def _single_frame_model() -> StructuralModel:
+    m = StructuralModel(title="sync")
+    _seed_materials_sections(m)
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    m.elements.append(_frame(1, 2))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    return m
+
+
+def test_sync_registry_adds_member_load_tag():
+    """A member load tagged LIVE on a model with only DEFAULT must
+    register LIVE."""
+    m = _single_frame_model()
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-5.0, load_case="LIVE"),
+    )
+    assert "LIVE" not in m.load_cases
+    added = sync_load_case_registry(m)
+    assert added == ["LIVE"]
+    assert "LIVE" in m.load_cases
+    assert m.load_cases["LIVE"].enabled
+
+
+def test_sync_registry_adds_nodal_load_tag():
+    m = _single_frame_model()
+    m.nodal_loads.append(NodalLoad(node_id=2, fy=-3.0, load_case="WIND"))
+    added = sync_load_case_registry(m)
+    assert added == ["WIND"]
+    assert "WIND" in m.load_cases
+
+
+def test_sync_registry_deduplicates():
+    """Two loads with the same new tag → one registry entry, listed once."""
+    m = _single_frame_model()
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-5.0, load_case="LIVE"),
+    )
+    m.nodal_loads.append(NodalLoad(node_id=2, fy=-3.0, load_case="LIVE"))
+    added = sync_load_case_registry(m)
+    assert added == ["LIVE"]
+    assert list(m.load_cases.keys()).count("LIVE") == 1
+
+
+def test_sync_registry_noop_when_complete():
+    m = _single_frame_model()
+    m.load_cases["LIVE"] = LoadCase(name="LIVE")
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-5.0, load_case="LIVE"),
+    )
+    added = sync_load_case_registry(m)
+    assert added == []
+
+
+def test_sync_registry_preserves_existing_enabled_flag():
+    """An existing disabled case referenced by a load must NOT be flipped
+    back to enabled by the sync."""
+    m = _single_frame_model()
+    m.load_cases["LIVE"] = LoadCase(name="LIVE", enabled=False)
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-5.0, load_case="LIVE"),
+    )
+    sync_load_case_registry(m)
+    assert m.load_cases["LIVE"].enabled is False
+
+
+def test_sync_registry_includes_self_weight_case():
+    m = _single_frame_model()
+    m.include_self_weight = True
+    m.self_weight_case = "SW"
+    added = sync_load_case_registry(m)
+    assert "SW" in added
+    assert "SW" in m.load_cases
+
+
+def test_sync_registry_idempotent():
+    m = _single_frame_model()
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-5.0, load_case="LIVE"),
+    )
+    sync_load_case_registry(m)
+    assert sync_load_case_registry(m) == []
+
+
+# ── used_case_names (unused-case labelling) ──────────────────────────
+
+
+def test_used_case_names_member_and_nodal():
+    m = _single_frame_model()
+    m.load_cases["LIVE"] = LoadCase(name="LIVE")
+    m.load_cases["WIND"] = LoadCase(name="WIND")
+    m.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-5.0, load_case="LIVE"),
+    )
+    used = used_case_names(m)
+    assert "LIVE" in used
+    assert "WIND" not in used  # enabled but no load source
+
+
+def test_used_case_names_settlement_marks_all_enabled():
+    m = _single_frame_model()
+    m.load_cases["LIVE"] = LoadCase(name="LIVE")
+    m.supports[1] = Support(
+        node_id=1, ux=True, uy=True, rz=True, settle_uy=-0.01,
+    )
+    used = used_case_names(m)
+    # Settlement is case-independent → every enabled case is used.
+    assert "LIVE" in used
+    assert "DEFAULT" in used
