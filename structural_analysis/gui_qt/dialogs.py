@@ -63,6 +63,8 @@ from ..profiles import (
 
 from PyQt6.QtWidgets import QStackedWidget
 
+from .table_copy import install_table_copy
+
 
 def parse_float(text: str, name: str, *, allow_blank: bool = False) -> Optional[float]:
     s = (text or "").strip()
@@ -1314,6 +1316,7 @@ class NodalLoadManagerDialog(QDialog):
         self._table.setHorizontalHeaderLabels(
             ["Case", "Fx (kN)", "Fy (kN)", "Mz (kN·m)"]
         )
+        install_table_copy(self._table, include_headers=True)
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(
@@ -2067,6 +2070,7 @@ class LoadCaseManagerDialog(_ModalDialog):
         self._table.setHorizontalHeaderLabels(
             ["Name", "Enabled", "Self-weight", "Notes"]
         )
+        install_table_copy(self._table, include_headers=True)
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -2407,6 +2411,7 @@ class LoadCombinationManagerDialog(_ModalDialog):
         self._table.setHorizontalHeaderLabels(
             ["Name", "Terms", "Description", ""]
         )
+        install_table_copy(self._table, include_headers=True)
         self._table.verticalHeader().setVisible(False)
         # The Name column is editable in place (double-click) so a
         # combination can be RENAMED — _on_item_changed turns the edit
@@ -2649,6 +2654,7 @@ class MaterialListDialog(_ModalDialog):
         mat_page = QWidget(self._tabs)
         ml = QVBoxLayout(mat_page)
         self._mat_tree = QTreeWidget(mat_page)
+        install_table_copy(self._mat_tree, include_headers=True)
         self._mat_tree.setHeaderLabels(
             ["id", "name", "E (kN/m²)", "α (1/°C)", "ρ (kg/m³)",
              "ν", "G (derived)"]
@@ -2670,6 +2676,7 @@ class MaterialListDialog(_ModalDialog):
         sec_page = QWidget(self._tabs)
         sl = QVBoxLayout(sec_page)
         self._sec_tree = QTreeWidget(sec_page)
+        install_table_copy(self._sec_tree, include_headers=True)
         self._sec_tree.setHeaderLabels(
             ["id", "name", "material", "A (m²)", "I (m⁴)", "depth (m)",
              "width (m)", "shape"]
@@ -3178,8 +3185,14 @@ class ElementPropertiesDialog(QDialog):
         # The form layout above ends here; the loads block sits below it
         # at full width so the four columns (#, Type, Magnitude,
         # Position/Notes) all read cleanly.
-        loads_header = QLabel("── Member loads ──")
-        loads_header.setStyleSheet("font-weight: bold;")
+        # Compact heading — a single tight bold label instead of the old
+        # dashed banner, so the loads table sits closer to the form and
+        # wastes less vertical space.
+        loads_header = QLabel("Member loads")
+        loads_header.setStyleSheet(
+            "font-weight: bold; margin: 2px 0 0 0;"
+        )
+        loads_header.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(loads_header)
         loads_widget = self._build_loads_table(model, elem)
         self._loads_widget = loads_widget
@@ -3322,6 +3335,10 @@ class ElementPropertiesDialog(QDialog):
         table.setHorizontalHeaderLabels(
             ["#", "Type", "Magnitude", "Position / Notes", "Case", ""]
         )
+        # Spreadsheet copy: read-only / NoSelection table, so Ctrl+C and
+        # right-click Copy fall back to the whole table (Case/Type/...
+        # columns; the trailing Delete-button column copies as empty).
+        install_table_copy(table, include_headers=True)
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)

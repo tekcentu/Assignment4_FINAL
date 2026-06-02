@@ -89,6 +89,8 @@ class MassSummaryWindow(QMainWindow):
 
         self._table = QTableWidget(0, len(_COLUMNS), central)
         self._table.setHorizontalHeaderLabels(_COLUMNS)
+        from .table_copy import install_table_copy
+        install_table_copy(self._table, include_headers=True)
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(
