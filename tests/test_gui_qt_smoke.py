@@ -6581,6 +6581,101 @@ def test_loads_tab_edit_button_swaps_load_undoable(qt_app, monkeypatch):
     )
 
 
+def _stub_member_load_dialog(monkeypatch, load):
+    """Patch MemberLoadDialog (both the dialogs module and the app-module
+    binding the host hook uses) with an auto-accepting stub returning
+    ``load``."""
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.gui_qt import dialogs as dialogs_mod
+
+    class _StubDialog:
+        def __init__(self, *a, **k):
+            self.result_value = load
+        def exec(self):
+            return dialogs_mod.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(dialogs_mod, "MemberLoadDialog", _StubDialog)
+    monkeypatch.setattr(app_mod, "MemberLoadDialog", _StubDialog)
+
+
+def test_loads_tab_add_registers_new_load_case(qt_app, monkeypatch):
+    """P2 (Codex): adding a load with a brand-new case name via the Loads
+    tab must register that case in model.load_cases AND make it
+    discoverable by cases_with_loads(), matching the legacy
+    _add_member_load path. Without the _ensure_load_case_exists call the
+    load would be saved against a case Solve All never sees."""
+    from structural_analysis.gui_common.validation import cases_with_loads
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    assert "WIND2" not in w._model.load_cases
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    _stub_member_load_dialog(
+        monkeypatch,
+        UniformDistributedLoad(wy=-7.0, coord_system="local", load_case="WIND2"),
+    )
+    w._element_inspector._add_load_btn.click()
+    qt_app.processEvents()
+
+    assert "WIND2" in w._model.load_cases, (
+        "new case typed in the Add dialog must be registered"
+    )
+    assert "WIND2" in cases_with_loads(w._model), (
+        "the new case must be discoverable by cases_with_loads()"
+    )
+
+
+def test_loads_tab_add_new_case_appears_in_toolbar_combo(qt_app, monkeypatch):
+    """After an inspector Add with a new case, the toolbar case selector
+    lists it (parity with the _add_member_load path)."""
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    _stub_member_load_dialog(
+        monkeypatch,
+        UniformDistributedLoad(wy=-3.0, coord_system="local", load_case="SNOW"),
+    )
+    w._element_inspector._add_load_btn.click()
+    qt_app.processEvents()
+
+    combo_data = [
+        w._case_combo.itemData(i) for i in range(w._case_combo.count())
+    ]
+    assert "SNOW" in combo_data, (
+        "newly-registered case must appear in the toolbar selector"
+    )
+
+
+def test_loads_tab_edit_registers_new_load_case(qt_app, monkeypatch):
+    """P2 (Codex): editing a row to a brand-new case name must register
+    that case too (the edit hook had the same gap as Add)."""
+    from structural_analysis.gui_common.validation import cases_with_loads
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    assert "GUST" not in w._model.load_cases
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    _stub_member_load_dialog(
+        monkeypatch,
+        UniformDistributedLoad(wy=-9.0, coord_system="local", load_case="GUST"),
+    )
+    edit_btn = w._element_inspector._loads_widget.cellWidget(0, 6)
+    edit_btn.click()
+    qt_app.processEvents()
+
+    assert "GUST" in w._model.load_cases, (
+        "new case typed in the Edit dialog must be registered"
+    )
+    assert "GUST" in cases_with_loads(w._model)
+
+
 def test_loads_tab_add_button_disabled_without_host_callback(qt_app):
     """When the dialog is constructed without host wiring (unit-test path),
     the Add button must render disabled so the model is never mutated
@@ -6696,3 +6791,58 @@ def test_loads_tab_stays_focused_after_edit(qt_app, monkeypatch):
     assert w._element_inspector._tabs.currentIndex() == insp._TAB_LOADS, (
         "user must stay on the Load Assignments tab after an edit"
     )
+
+
+# ── PR #34: canvas perf + dense-view readability ─────────────────────
+
+
+def test_canvas_dense_models_auto_hide_id_labels(qt_app):
+    """Dense plans should stay readable and avoid hundreds of text artists."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        i: Node(i, float(i), 0.0)
+        for i in range(1, w.canvas.MAX_AUTO_NODE_LABELS + 2)
+    }
+    w._model.elements = [
+        FrameElement2D(
+            id=i, node_i=i, node_j=i + 1,
+            E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+        )
+        for i in range(1, w.canvas.MAX_AUTO_ELEMENT_LABELS + 2)
+    ]
+
+    w.canvas.redraw()
+    labels = [text.get_text() for text in w.canvas.ax.texts]
+
+    assert not any(label.startswith("n") and label[1:].isdigit() for label in labels)
+    assert not any(label.startswith("e") and label[1:].isdigit() for label in labels)
+    assert any("Dense view" in label for label in labels)
+
+
+def test_labeled_grid_draws_only_visible_viewport_lines(qt_app):
+    """Large named grids should not create artists for off-screen lines."""
+    from structural_analysis.gui_qt.grid import GridSystem
+
+    w = MainWindow()
+    w._grid = GridSystem.from_spacing(
+        x_count=80, x_spacing=1.0,
+        y_count=80, y_spacing=1.0,
+    )
+    w.canvas.redraw()
+    w.canvas.ax.set_xlim(10.0, 14.0)
+    w.canvas.ax.set_ylim(20.0, 24.0)
+    w.canvas.redraw()
+
+    grid_line_count = sum(
+        1 for line in w.canvas.ax.lines
+        if line.get_color() == "#aac8ff"
+    )
+    labels = [text.get_text().strip() for text in w.canvas.ax.texts]
+
+    assert grid_line_count <= 12
+    assert "K" in labels  # x=10, visible in the viewport
+    assert "21" in labels  # y=20, visible in the viewport
+    assert "A" not in labels  # x=0, outside the viewport

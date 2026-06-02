@@ -1625,6 +1625,11 @@ class MainWindow(QMainWindow):
         load = d.result_value
         if load is None:
             return
+        # Register a newly-typed load case before the load references it,
+        # mirroring the _add_member_load path. Without this the load is
+        # stored against a case that model.load_cases never learns about,
+        # so cases_with_loads() / Solve All / the case selector ignore it.
+        self._ensure_load_case_exists(getattr(load, "load_case", "DEFAULT"))
         try:
             self.execute(AddMemberLoadCmd(elem_id=elem_id, load=load))
         except ValueError as e:
@@ -1676,6 +1681,9 @@ class MainWindow(QMainWindow):
         new_load = d.result_value
         if new_load is None:
             return
+        # Register a newly-typed load case before the swap references it
+        # (same gap the Add hook has — see add_member_load_from_inspector).
+        self._ensure_load_case_exists(getattr(new_load, "load_case", "DEFAULT"))
         try:
             self.execute(UpdateMemberLoadCmd(
                 elem_id=elem_id, load_index=load_index,
