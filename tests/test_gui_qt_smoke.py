@@ -4912,6 +4912,177 @@ def test_member_load_dialog_uniform_gradient_toggle_no_extra_top_level(qt_app):
     assert _count_top_level_widgets() <= before
 
 
+# ── PR #35: MemberLoadDialog edit-mode prefill ───────────────────────
+
+
+def test_member_load_dialog_prefills_existing_udl_local(qt_app):
+    """Edit mode for a local UDL must select the mechanical / udl / local
+    radios and prefill the wx and wy fields."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    existing = UniformDistributedLoad(wx=2.5, wy=-7.5, coord_system="local")
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=existing, existing_index=0,
+    )
+    assert d._rb_cat_mechanical.isChecked()
+    assert d._rb_udl.isChecked()
+    assert d._rb_local.isChecked()
+    assert d._fields["wx"].text() == "2.5"
+    assert d._fields["wy"].text() == "-7.5"
+    assert "Edit member load" in d.windowTitle()
+
+
+def test_member_load_dialog_prefills_existing_udl_global(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=UniformDistributedLoad(
+            wx=0.0, wy=-3.0, coord_system="global",
+        ),
+    )
+    assert d._rb_global.isChecked()
+    assert d._fields["wy"].text() == "-3"
+
+
+def test_member_load_dialog_prefills_existing_udl_gravity(qt_app):
+    """Gravity hides wx; only the magnitude (wy field) should be filled."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=UniformDistributedLoad(
+            wy=10.0, coord_system="gravity",
+        ),
+    )
+    assert d._rb_gravity.isChecked()
+    assert "wx" not in d._fields  # gravity hides wx
+    assert d._fields["wy"].text() == "10"
+
+
+def test_member_load_dialog_prefills_existing_pointload_includes_a(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import PointLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=PointLoad(
+            px=1.0, py=-4.0, a=2.5, coord_system="local",
+        ),
+    )
+    assert d._rb_point.isChecked()
+    assert d._rb_local.isChecked()
+    assert d._fields["px"].text() == "1"
+    assert d._fields["py"].text() == "-4"
+    assert d._fields["a"].text() == "2.5"
+
+
+def test_member_load_dialog_prefills_existing_frame_thermal_uniform(qt_app):
+    """Frame uniform ΔT is stored as t_top == t_bottom; the dialog should
+    detect it as uniform mode and prefill the single delta_T field."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import FrameTemperatureLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=FrameTemperatureLoad(t_top=15.0, t_bottom=15.0),
+    )
+    assert d._rb_cat_thermal.isChecked()
+    assert d._rb_t_uniform.isChecked()
+    assert "delta_T" in d._fields
+    assert d._fields["delta_T"].text() == "15"
+
+
+def test_member_load_dialog_prefills_existing_frame_thermal_gradient(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import FrameTemperatureLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=FrameTemperatureLoad(t_top=20.0, t_bottom=5.0),
+    )
+    assert d._rb_t_gradient.isChecked()
+    assert d._fields["t_top"].text() == "20"
+    assert d._fields["t_bottom"].text() == "5"
+
+
+def test_member_load_dialog_prefills_truss_thermal_uniform(qt_app):
+    from structural_analysis.element import TrussElement2D
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import (
+        Material, Node, Section, TrussTemperatureLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    w._model.elements = [TrussElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, section_id=1,
+    )]
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=1,
+        existing_load=TrussTemperatureLoad(delta_T=-12.5),
+    )
+    assert d._rb_cat_thermal.isChecked()
+    assert d._rb_t_uniform.isChecked()
+    assert d._fields["delta_T"].text() == "-12.5"
+
+
+def test_member_load_dialog_prefill_load_case(qt_app):
+    """Edit mode must select the existing load's load_case in the combo."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import (
+        LoadCase, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    w._model.load_cases["WIND"] = LoadCase(name="WIND", enabled=True)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=UniformDistributedLoad(
+            wy=-1.0, coord_system="local", load_case="WIND",
+        ),
+    )
+    assert d._case_combo.currentText() == "WIND"
+
+
+def test_member_load_dialog_no_existing_load_keeps_add_defaults(qt_app):
+    """Regression: when existing_load is None (the Add path), the dialog
+    must still default to mechanical / UDL / local with empty fields, so
+    every existing add-member-load test stays green."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    assert d._rb_cat_mechanical.isChecked()
+    assert d._rb_udl.isChecked()
+    assert d._rb_local.isChecked()
+    assert d._fields["wx"].text() == "0.0"
+    assert d._fields["wy"].text() == "0.0"
+    assert "Edit member load" not in d.windowTitle()
+
+
 # ── PR #30: multiple nodal loads per node + manager dialog ───────────
 
 

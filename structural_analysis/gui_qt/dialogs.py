@@ -1485,14 +1485,39 @@ class NodalLoadManagerDialog(QDialog):
 
 
 class MemberLoadDialog(_ModalDialog):
-    def __init__(self, parent, *, model: StructuralModel, elem_id: int):
+    """Add (default) or edit (when ``existing_load`` is provided) one
+    member-load row.
+
+    Edit mode is a strict UI prefill — radio state and field text are
+    seeded from ``existing_load`` so the user can amend any field and
+    accept; the dialog still returns a freshly-built load instance, and
+    the caller decides whether to land that as an
+    :class:`AddMemberLoadCmd` (Add) or
+    :class:`UpdateMemberLoadCmd` (Edit).  ``existing_index`` is stored
+    for the caller's convenience and does not affect dialog logic.
+    """
+
+    def __init__(
+        self, parent, *,
+        model: StructuralModel,
+        elem_id: int,
+        existing_load: object | None = None,
+        existing_index: int | None = None,
+    ):
         self._model = model
         self._elem_id = elem_id
         elem = next((e for e in model.elements if e.id == elem_id), None)
         if elem is None:
             raise ValueError(f"Element {elem_id} does not exist.")
         self._elem = elem
-        super().__init__(parent, f"Member load on element {elem_id}")
+        self._existing_load = existing_load
+        self._existing_index = existing_index
+        title = (
+            f"Edit member load on element {elem_id}"
+            if existing_load is not None
+            else f"Member load on element {elem_id}"
+        )
+        super().__init__(parent, title)
 
     def _build_body(self, body: QWidget) -> None:
         v = QVBoxLayout(body)
@@ -1679,6 +1704,90 @@ class MemberLoadDialog(_ModalDialog):
         else:
             self._rb_cat_mechanical.setChecked(True)
         self._refresh_fields()
+
+        # Edit mode: seed every radio + field + the case combo from the
+        # caller-supplied existing load. The radio toggles already trigger
+        # _refresh_fields via signal hookups, so by the time we fill the
+        # QLineEdits the right keys exist in self._fields.
+        if self._existing_load is not None:
+            self._apply_existing_load(self._existing_load)
+
+    def _apply_existing_load(self, load: object) -> None:
+        """Seed radios + field text + case combo from an existing load.
+
+        Called once from :meth:`_build_body` when the dialog is opened in
+        edit mode. After this returns, the user can amend any field and
+        click OK — :meth:`_accept` constructs a brand-new load instance
+        the same way it does for Add.
+        """
+        # Match the case combo first — independent of category/type.
+        case_name = getattr(load, "load_case", "DEFAULT") or "DEFAULT"
+        idx = self._case_combo.findText(case_name)
+        if idx >= 0:
+            self._case_combo.setCurrentIndex(idx)
+
+        if isinstance(load, (FrameTemperatureLoad, TrussTemperatureLoad)):
+            self._rb_cat_thermal.setChecked(True)
+            if isinstance(load, TrussTemperatureLoad):
+                self._rb_t_uniform.setChecked(True)
+                self._refresh_fields()
+                if "delta_T" in self._fields:
+                    self._fields["delta_T"].setText(self._fmt(load.delta_T))
+                return
+            # FrameTemperatureLoad: uniform iff t_top == t_bottom
+            if load.t_top == load.t_bottom:
+                self._rb_t_uniform.setChecked(True)
+                self._refresh_fields()
+                if "delta_T" in self._fields:
+                    self._fields["delta_T"].setText(self._fmt(load.t_top))
+            else:
+                self._rb_t_gradient.setChecked(True)
+                self._refresh_fields()
+                if "t_top" in self._fields:
+                    self._fields["t_top"].setText(self._fmt(load.t_top))
+                if "t_bottom" in self._fields:
+                    self._fields["t_bottom"].setText(self._fmt(load.t_bottom))
+            return
+
+        # Mechanical (UDL or PointLoad).
+        self._rb_cat_mechanical.setChecked(True)
+        cs = getattr(load, "coord_system", "local")
+        if cs == "gravity":
+            self._rb_gravity.setChecked(True)
+        elif cs == "global":
+            self._rb_global.setChecked(True)
+        else:
+            self._rb_local.setChecked(True)
+
+        if isinstance(load, UniformDistributedLoad):
+            self._rb_udl.setChecked(True)
+            self._refresh_fields()
+            # Gravity hides wx — the load's wx is 0 by construction; skip.
+            if cs != "gravity" and "wx" in self._fields:
+                self._fields["wx"].setText(self._fmt(load.wx))
+            if "wy" in self._fields:
+                self._fields["wy"].setText(self._fmt(load.wy))
+            return
+
+        if isinstance(load, PointLoad):
+            self._rb_point.setChecked(True)
+            self._refresh_fields()
+            if cs != "gravity" and "px" in self._fields:
+                self._fields["px"].setText(self._fmt(load.px))
+            if "py" in self._fields:
+                self._fields["py"].setText(self._fmt(load.py))
+            if "a" in self._fields:
+                self._fields["a"].setText(self._fmt(load.a))
+
+    @staticmethod
+    def _fmt(v: float) -> str:
+        """Compact textual rendering for prefilled numeric fields. Uses
+        ``%g`` so 0.0 → "0" and 3.14 → "3.14" without the noisy default
+        ``str(float)`` exponent. Negative zero is normalised to zero so a
+        round-trip ``-0.0`` doesn't surprise the user."""
+        if v == 0:
+            v = 0.0
+        return f"{v:g}"
 
     def _current_category(self) -> str:
         return "thermal" if self._rb_cat_thermal.isChecked() else "mechanical"
