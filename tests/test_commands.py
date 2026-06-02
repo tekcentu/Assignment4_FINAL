@@ -29,6 +29,7 @@ from structural_analysis.gui_common.commands import (
     BatchUpdateElementsCmd,
     CLEAR_MATERIAL_OVERRIDE,
     DeleteMemberLoadCmd,
+    UpdateMemberLoadCmd,
     DrawMemberWithSplitsCmd,
     SplitElementCmd,
 )
@@ -1047,6 +1048,103 @@ def test_delete_member_load_unknown_element_raises():
     m, _ = _frame_with_three_loads()
     with pytest.raises(ValueError):
         DeleteMemberLoadCmd(elem_id=9999, load_index=0).do(m)
+
+
+# ── UpdateMemberLoadCmd (PR #35) ────────────────────────────────────
+
+
+def test_update_member_load_swaps_in_place():
+    """Replace the middle load with a new UDL; the other two rows and the
+    list length stay put."""
+    m, eid = _frame_with_three_loads()
+    new = UniformDistributedLoad(wy=-99.0)
+    UpdateMemberLoadCmd(
+        elem_id=eid, load_index=1, new_load=new,
+    ).do(m)
+    loads = m.elements[0].member_loads
+    assert len(loads) == 3
+    assert isinstance(loads[0], UniformDistributedLoad)
+    assert loads[1] is new
+    assert isinstance(loads[2], FrameTemperatureLoad)
+
+
+def test_update_member_load_undo_restores_exact_instance():
+    """Undo restores by identity (the EXACT old instance), not just by
+    value — matters when the user edits a load that other code already
+    holds a reference to."""
+    m, eid = _frame_with_three_loads()
+    original = m.elements[0].member_loads[1]
+    cmd = UpdateMemberLoadCmd(
+        elem_id=eid, load_index=1,
+        new_load=PointLoad(py=-5.0, a=1.0),
+    )
+    cmd.do(m)
+    cmd.undo(m)
+    assert m.elements[0].member_loads[1] is original
+
+
+def test_update_member_load_redo_replays():
+    m, eid = _frame_with_three_loads()
+    new = UniformDistributedLoad(wy=-1.0, wx=2.0)
+    cmd = UpdateMemberLoadCmd(elem_id=eid, load_index=0, new_load=new)
+    cmd.do(m)
+    cmd.undo(m)
+    cmd.do(m)
+    assert m.elements[0].member_loads[0] is new
+
+
+def test_update_member_load_invalid_index_atomic_no_mutation():
+    m, eid = _frame_with_three_loads()
+    snapshot = list(m.elements[0].member_loads)
+    with pytest.raises(ValueError):
+        UpdateMemberLoadCmd(
+            elem_id=eid, load_index=99,
+            new_load=UniformDistributedLoad(wy=-1.0),
+        ).do(m)
+    assert m.elements[0].member_loads == snapshot
+
+
+def test_update_member_load_negative_index_raises():
+    m, eid = _frame_with_three_loads()
+    with pytest.raises(ValueError):
+        UpdateMemberLoadCmd(
+            elem_id=eid, load_index=-1,
+            new_load=UniformDistributedLoad(wy=-1.0),
+        ).do(m)
+
+
+def test_update_member_load_unknown_element_raises():
+    m, _ = _frame_with_three_loads()
+    with pytest.raises(ValueError):
+        UpdateMemberLoadCmd(
+            elem_id=9999, load_index=0,
+            new_load=UniformDistributedLoad(wy=-1.0),
+        ).do(m)
+
+
+def test_update_member_load_truss_rejects_frame_thermal():
+    """Mirror of AddMemberLoadCmd's element-type guard — atomic refusal."""
+    m, eid = _truss_model_one_member()
+    m.elements[0].member_loads.append(TrussTemperatureLoad(delta_T=20.0))
+    snapshot = list(m.elements[0].member_loads)
+    with pytest.raises(ValueError, match="FrameTemperatureLoad"):
+        UpdateMemberLoadCmd(
+            elem_id=eid, load_index=0,
+            new_load=FrameTemperatureLoad(t_top=10.0, t_bottom=30.0),
+        ).do(m)
+    assert m.elements[0].member_loads == snapshot
+
+
+def test_update_member_load_frame_rejects_truss_thermal():
+    m, eid = _frame_model_one_member()
+    m.elements[0].member_loads.append(FrameTemperatureLoad(t_top=10.0, t_bottom=30.0))
+    snapshot = list(m.elements[0].member_loads)
+    with pytest.raises(ValueError, match="TrussTemperatureLoad"):
+        UpdateMemberLoadCmd(
+            elem_id=eid, load_index=0,
+            new_load=TrussTemperatureLoad(delta_T=20.0),
+        ).do(m)
+    assert m.elements[0].member_loads == snapshot
 
 
 def test_delete_member_load_does_not_affect_other_elements():
