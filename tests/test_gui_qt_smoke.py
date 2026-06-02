@@ -6652,3 +6652,47 @@ def test_loads_tab_change_invalidates_result_and_shows_placeholder(
     assert not insp._ax_n.lines, (
         "stale N/V/M diagrams must not survive a model-changing edit"
     )
+
+
+def test_loads_tab_stays_focused_after_edit(qt_app, monkeypatch):
+    """Editing a load from the Load Assignments tab triggers a full
+    refresh() (to clear stale Results diagrams). The user must remain on
+    the Load Assignments tab, not get bounced to Properties — regression
+    for the QTabWidget removeTab/set_target focus-jump (PR #37 review)."""
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.gui_qt import dialogs as dialogs_mod
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_with_multi_cases(w)
+    # Give the element a load so the Loads tab has an editable row.
+    w._model.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-3.0, coord_system="local")
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    insp = w._element_inspector
+    assert insp._tabs.currentIndex() == insp._TAB_LOADS
+
+    replacement = UniformDistributedLoad(wy=-77.0, coord_system="local")
+
+    class _StubDialog:
+        def __init__(self, *a, **k):
+            self.result_value = replacement
+        def exec(self):
+            return dialogs_mod.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(dialogs_mod, "MemberLoadDialog", _StubDialog)
+    monkeypatch.setattr(app_mod, "MemberLoadDialog", _StubDialog)
+
+    edit_btn = insp._loads_widget.cellWidget(0, 6)
+    edit_btn.click()
+    qt_app.processEvents()
+
+    # Full refresh() ran (Results now invalidated), but the focused tab
+    # must still be Load Assignments.
+    assert w._element_inspector._tabs.currentIndex() == insp._TAB_LOADS, (
+        "user must stay on the Load Assignments tab after an edit"
+    )

@@ -3214,6 +3214,15 @@ class ElementPropertiesDialog(QDialog):
         elem = next((e for e in model.elements if e.id == elem_id), None)
         if elem is None:
             raise ValueError(f"Element {elem_id} does not exist.")
+        # Preserve the focused tab across the full rebuild so a
+        # refresh() triggered from the Load Assignments tab (after an
+        # Add / Edit / Delete) doesn't bounce the user back to
+        # Properties.  The host calls set_initial_tab() AFTER set_target
+        # when it wants a specific tab (open / right-click routing), so
+        # that explicit intent still wins.
+        prev_index = (
+            self._tabs.currentIndex() if self._tabs is not None else None
+        )
         new_body = self._build_tabs(model, elem, result, multi_result)
         self._outer.replaceWidget(self._body_widget, new_body)
         self._body_widget.setParent(None)
@@ -3221,6 +3230,12 @@ class ElementPropertiesDialog(QDialog):
         self._body_widget = new_body
         self._elem_id = elem_id
         self.setWindowTitle(f"Element {elem_id} properties")
+        if (
+            prev_index is not None
+            and self._tabs is not None
+            and 0 <= prev_index < self._tabs.count()
+        ):
+            self._tabs.setCurrentIndex(prev_index)
 
     def refresh(
         self, model: StructuralModel, result=None, *, multi_result=None,
@@ -3808,6 +3823,11 @@ class ElementPropertiesDialog(QDialog):
         if self._tabs is None or self._loads_tab_widget is None:
             self.set_target(model, self._elem_id, result)
             return
+        # removeTab on the active tab makes QTabWidget auto-switch focus
+        # elsewhere; save and restore the current index so editing /
+        # deleting a row from the Load Assignments tab keeps the user
+        # on that tab.
+        current_idx = self._tabs.currentIndex()
         new_widget = self._build_loads_tab(model, elem)
         self._tabs.removeTab(self._TAB_LOADS)
         self._loads_tab_widget.setParent(None)
@@ -3816,6 +3836,8 @@ class ElementPropertiesDialog(QDialog):
             self._TAB_LOADS, new_widget, "Load Assignments",
         )
         self._loads_tab_widget = new_widget
+        if 0 <= current_idx < self._tabs.count():
+            self._tabs.setCurrentIndex(current_idx)
 
     # ── Interactive handlers ──────────────────────────────────────────
 
