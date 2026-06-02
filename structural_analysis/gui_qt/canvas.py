@@ -14,6 +14,7 @@ import matplotlib
 matplotlib.use("QtAgg")  # noqa: E402  must precede pyplot import
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as _MplPolygon
+from matplotlib import patheffects as _path_effects
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT,
 )
@@ -55,6 +56,9 @@ class ModelCanvas(QWidget):
 
     NODE_PICK_RADIUS_PX = 12
     ELEM_PICK_RADIUS_PX = 8
+    MAX_AUTO_NODE_LABELS = 300
+    MAX_AUTO_ELEMENT_LABELS = 250
+    MAX_LABELED_GRID_LINES = 240
 
     def __init__(self, parent: QWidget | None,
                  model_provider: Callable[[], StructuralModel],
@@ -682,26 +686,43 @@ class ModelCanvas(QWidget):
                          color="#cccccc")
             return
         # Draw the labeled grid manually. Don't enable matplotlib's auto-grid.
+        # Only draw lines that can be seen in the current viewport; this keeps
+        # pan/zoom responsive on large building grids and avoids edge labels
+        # piling up far outside the user's view.
         self.ax.grid(False)
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
-        # Adjust limits to encompass the grid extent if needed.
-        if grid.x_lines:
-            x0 = min(x0, min(ln.coord for ln in grid.x_lines))
-            x1 = max(x1, max(ln.coord for ln in grid.x_lines))
-        if grid.y_lines:
-            y0 = min(y0, min(ln.coord for ln in grid.y_lines))
-            y1 = max(y1, max(ln.coord for ln in grid.y_lines))
-        for ln in grid.x_lines:
+        x_pad = max(abs(x1 - x0) * 0.02, 1e-9)
+        y_pad = max(abs(y1 - y0) * 0.02, 1e-9)
+        x_lines = [
+            ln for ln in grid.x_lines
+            if min(x0, x1) - x_pad <= ln.coord <= max(x0, x1) + x_pad
+        ]
+        y_lines = [
+            ln for ln in grid.y_lines
+            if min(y0, y1) - y_pad <= ln.coord <= max(y0, y1) + y_pad
+        ]
+        total_visible = len(x_lines) + len(y_lines)
+        label_stride = max(
+            1,
+            (total_visible + self.MAX_LABELED_GRID_LINES - 1)
+            // self.MAX_LABELED_GRID_LINES,
+        )
+
+        for idx, ln in enumerate(x_lines):
             self.ax.axvline(ln.coord, color="#aac8ff", linewidth=0.7,
                             linestyle="-", alpha=0.6, zorder=0)
-            self.ax.text(ln.coord, y1, f"  {ln.label}", color="#3060c0",
-                         fontsize=8, va="bottom", ha="center", zorder=1)
-        for ln in grid.y_lines:
+            if idx % label_stride == 0:
+                self.ax.text(ln.coord, max(y0, y1), f"  {ln.label}",
+                             color="#3060c0", fontsize=8, va="bottom",
+                             ha="center", zorder=1)
+        for idx, ln in enumerate(y_lines):
             self.ax.axhline(ln.coord, color="#aac8ff", linewidth=0.7,
                             linestyle="-", alpha=0.6, zorder=0)
-            self.ax.text(x1, ln.coord, f"  {ln.label}", color="#3060c0",
-                         fontsize=8, va="center", ha="left", zorder=1)
+            if idx % label_stride == 0:
+                self.ax.text(max(x0, x1), ln.coord, f"  {ln.label}",
+                             color="#3060c0", fontsize=8, va="center",
+                             ha="left", zorder=1)
 
     def _draw_origin_axes(self) -> None:
         x0, x1 = self.ax.get_xlim()
@@ -851,11 +872,12 @@ class ModelCanvas(QWidget):
         on larger models.
         """
         model = self._model()
+        element_by_id = {elem.id: elem for elem in model.elements}
         # ── elements: behind selection (zorder < _draw_selection's 1.5) ──
         warn_xs: list[float | None] = []
         warn_ys: list[float | None] = []
         for eid in self._warning_element_ids:
-            elem = next((e for e in model.elements if e.id == eid), None)
+            elem = element_by_id.get(eid)
             if elem is None:
                 continue
             ni = model.nodes.get(elem.node_i)
@@ -873,7 +895,7 @@ class ModelCanvas(QWidget):
         err_xs: list[float | None] = []
         err_ys: list[float | None] = []
         for eid in self._error_element_ids:
-            elem = next((e for e in model.elements if e.id == eid), None)
+            elem = element_by_id.get(eid)
             if elem is None:
                 continue
             ni = model.nodes.get(elem.node_i)
@@ -922,28 +944,41 @@ class ModelCanvas(QWidget):
 
     def _draw_selection(self) -> None:
         model = self._model()
+        element_by_id = {elem.id: elem for elem in model.elements}
         # Paint element-band highlights behind the element line so the
-        # crisp element stroke still reads through.
+        # crisp element stroke still reads through. Use one segmented plot
+        # instead of one artist per selected element for smoother redraws
+        # after window selections.
+        sel_xs: list[float | None] = []
+        sel_ys: list[float | None] = []
         for eid in self._selected_element_ids:
-            elem = next((e for e in model.elements if e.id == eid), None)
+            elem = element_by_id.get(eid)
             if elem is None:
                 continue
             ni = model.nodes.get(elem.node_i)
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
+            sel_xs.extend([ni.x, nj.x, None])
+            sel_ys.extend([ni.y, nj.y, None])
+        if sel_xs:
             self.ax.plot(
-                [ni.x, nj.x], [ni.y, nj.y],
-                color="#ffbf00", linewidth=6.0, alpha=0.45,
+                sel_xs, sel_ys, color="#ffbf00", linewidth=6.0, alpha=0.45,
                 solid_capstyle="round", zorder=1.5,
             )
-        # Paint node highlights on top (orange ring).
+        # Paint node highlights on top (orange ring), again batched into
+        # a single marker artist.
+        sel_nx: list[float] = []
+        sel_ny: list[float] = []
         for nid in self._selected_node_ids:
             node = model.nodes.get(nid)
             if node is None:
                 continue
+            sel_nx.append(node.x)
+            sel_ny.append(node.y)
+        if sel_nx:
             self.ax.plot(
-                node.x, node.y, marker="o", markersize=13,
+                sel_nx, sel_ny, marker="o", markersize=13, linestyle="None",
                 markerfacecolor="none", markeredgecolor="#ffbf00",
                 markeredgewidth=2.4, zorder=11,
             )
@@ -1017,18 +1052,38 @@ class ModelCanvas(QWidget):
             "point": target / max_point if max_point > 0 else 0.0,
         }
 
+        draw_element_ids = len(model.elements) <= self.MAX_AUTO_ELEMENT_LABELS
+        draw_node_ids = len(model.nodes) <= self.MAX_AUTO_NODE_LABELS
+        frame_xs: list[float | None] = []
+        frame_ys: list[float | None] = []
+        truss_xs: list[float | None] = []
+        truss_ys: list[float | None] = []
+        release_xs: list[float] = []
+        release_ys: list[float] = []
+        release_edges: list[str] = []
+
         for elem in model.elements:
             ni = model.nodes.get(elem.node_i)
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
-            color = "#1f77b4" if isinstance(elem, FrameElement2D) else "#d62728"
-            ls = "-" if isinstance(elem, FrameElement2D) else "--"
-            self.ax.plot([ni.x, nj.x], [ni.y, nj.y], color=color, linestyle=ls,
-                         linewidth=2.0, zorder=2)
+            is_frame = isinstance(elem, FrameElement2D)
+            if is_frame:
+                frame_xs.extend([ni.x, nj.x, None])
+                frame_ys.extend([ni.y, nj.y, None])
+            else:
+                truss_xs.extend([ni.x, nj.x, None])
+                truss_ys.extend([ni.y, nj.y, None])
+            color = "#1f77b4" if is_frame else "#d62728"
             mx, my = (ni.x + nj.x) / 2, (ni.y + nj.y) / 2
-            self.ax.annotate(f"e{elem.id}", (mx, my), color=color,
-                             fontsize=8, ha="center", va="bottom", zorder=4)
+            if draw_element_ids:
+                text = self.ax.annotate(
+                    f"e{elem.id}", (mx, my), color=color, fontsize=8,
+                    ha="center", va="bottom", zorder=4,
+                )
+                text.set_path_effects([
+                    _path_effects.withStroke(linewidth=2.0, foreground="white"),
+                ])
             if self.show_section_labels:
                 section = model.sections.get(getattr(elem, "section_id", None))
                 if section is not None:
@@ -1045,26 +1100,59 @@ class ModelCanvas(QWidget):
                                   fc="white", ec="#dddddd", alpha=0.82),
                         zorder=6,
                     )
-            if isinstance(elem, FrameElement2D):
+            if is_frame:
                 if elem.release_i:
-                    self.ax.plot(ni.x + 0.15 * (nj.x - ni.x),
-                                 ni.y + 0.15 * (nj.y - ni.y),
-                                 marker="o", color="white", markersize=7,
-                                 markeredgecolor=color, zorder=5)
+                    release_xs.append(ni.x + 0.15 * (nj.x - ni.x))
+                    release_ys.append(ni.y + 0.15 * (nj.y - ni.y))
+                    release_edges.append(color)
                 if elem.release_j:
-                    self.ax.plot(nj.x - 0.15 * (nj.x - ni.x),
-                                 nj.y - 0.15 * (nj.y - ni.y),
-                                 marker="o", color="white", markersize=7,
-                                 markeredgecolor=color, zorder=5)
+                    release_xs.append(nj.x - 0.15 * (nj.x - ni.x))
+                    release_ys.append(nj.y - 0.15 * (nj.y - ni.y))
+                    release_edges.append(color)
             self._draw_member_loads(elem, ni, nj, load_scales)
 
+        if frame_xs:
+            self.ax.plot(frame_xs, frame_ys, color="#1f77b4", linestyle="-",
+                         linewidth=2.0, zorder=2)
+        if truss_xs:
+            self.ax.plot(truss_xs, truss_ys, color="#d62728", linestyle="--",
+                         linewidth=2.0, zorder=2)
+        for rx, ry, edge in zip(release_xs, release_ys, release_edges):
+            self.ax.plot(rx, ry, marker="o", color="white", markersize=7,
+                         markeredgecolor=edge, zorder=5)
+
+        node_xs = [n.x for n in model.nodes.values()]
+        node_ys = [n.y for n in model.nodes.values()]
+        if node_xs:
+            self.ax.plot(node_xs, node_ys, "o", color="black", markersize=6,
+                         linestyle="None", zorder=5)
         for nid, n in model.nodes.items():
-            self.ax.plot(n.x, n.y, "o", color="black", markersize=6, zorder=5)
-            self.ax.annotate(f"n{nid}", (n.x, n.y), xytext=(5, 5),
-                             textcoords="offset points", fontsize=8, zorder=6)
+            if draw_node_ids:
+                text = self.ax.annotate(
+                    f"n{nid}", (n.x, n.y), xytext=(5, 5),
+                    textcoords="offset points", fontsize=8, zorder=6,
+                )
+                text.set_path_effects([
+                    _path_effects.withStroke(linewidth=2.0, foreground="white"),
+                ])
             sup = model.supports.get(nid)
             if sup is not None:
                 self._draw_support(sup, n.x, n.y)
+
+        if not draw_element_ids or not draw_node_ids:
+            hidden: list[str] = []
+            if not draw_element_ids:
+                hidden.append("element IDs")
+            if not draw_node_ids:
+                hidden.append("node IDs")
+            self.ax.annotate(
+                "Dense view: " + " and ".join(hidden) + " hidden",
+                (0.02, 0.02), xycoords="axes fraction", fontsize=8,
+                color="#666666", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white",
+                          ec="#dddddd", alpha=0.85),
+                zorder=20,
+            )
 
         for ld in model.nodal_loads:
             n = model.nodes.get(ld.node_id)

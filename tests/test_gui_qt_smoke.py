@@ -6164,3 +6164,55 @@ def test_cancelling_warnings_clears_stale_result_and_shows_report(
     assert "not connected" in text or "orphan" in text.lower() or "Node 99" in text
     # Canvas has the warning highlight.
     assert 99 in w.canvas._warning_node_ids
+
+
+def test_canvas_dense_models_auto_hide_id_labels(qt_app):
+    """Dense plans should stay readable and avoid hundreds of text artists."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Node
+
+    w = MainWindow()
+    w._model.nodes = {
+        i: Node(i, float(i), 0.0)
+        for i in range(1, w.canvas.MAX_AUTO_NODE_LABELS + 2)
+    }
+    w._model.elements = [
+        FrameElement2D(
+            id=i, node_i=i, node_j=i + 1,
+            E=2.0e8, A=0.01, I=1.0e-4, section_id=1,
+        )
+        for i in range(1, w.canvas.MAX_AUTO_ELEMENT_LABELS + 2)
+    ]
+
+    w.canvas.redraw()
+    labels = [text.get_text() for text in w.canvas.ax.texts]
+
+    assert not any(label.startswith("n") and label[1:].isdigit() for label in labels)
+    assert not any(label.startswith("e") and label[1:].isdigit() for label in labels)
+    assert any("Dense view" in label for label in labels)
+
+
+def test_labeled_grid_draws_only_visible_viewport_lines(qt_app):
+    """Large named grids should not create artists for off-screen lines."""
+    from structural_analysis.gui_qt.grid import GridSystem
+
+    w = MainWindow()
+    w._grid = GridSystem.from_spacing(
+        x_count=80, x_spacing=1.0,
+        y_count=80, y_spacing=1.0,
+    )
+    w.canvas.redraw()
+    w.canvas.ax.set_xlim(10.0, 14.0)
+    w.canvas.ax.set_ylim(20.0, 24.0)
+    w.canvas.redraw()
+
+    grid_line_count = sum(
+        1 for line in w.canvas.ax.lines
+        if line.get_color() == "#aac8ff"
+    )
+    labels = [text.get_text().strip() for text in w.canvas.ax.texts]
+
+    assert grid_line_count <= 12
+    assert "K" in labels  # x=10, visible in the viewport
+    assert "21" in labels  # y=20, visible in the viewport
+    assert "A" not in labels  # x=0, outside the viewport
