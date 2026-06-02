@@ -70,6 +70,8 @@ from ..gui_common.results_view import format_result
 from ..gui_common.validation import (
     ModelValidationResult,
     cases_with_loads,
+    sync_load_case_registry,
+    used_case_names,
     validate_model,
 )
 
@@ -1954,6 +1956,19 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Load-case registry safety net: a load tagged with a case the
+        # registry never learned about (e.g. a dialog path that forgot to
+        # register, or a programmatic edit) would otherwise be silently
+        # dropped by cases_with_loads / Solve All. Auto-register any such
+        # orphan tags so every assigned case is treated as a real case.
+        auto_registered = sync_load_case_registry(self._model)
+        if auto_registered:
+            self._refresh_case_selector_combo()
+            self.set_status(
+                "Auto-registered load case(s): "
+                + ", ".join(auto_registered)
+            )
+
         # PR #31 — pre-solve validation.  Errors block the solve, surface
         # the report in the result panel, and paint problem nodes/elements
         # on the canvas.  Warnings prompt the user to proceed.  Failed
@@ -2159,7 +2174,7 @@ class MainWindow(QMainWindow):
         n_solved = len(new_multi.cases)
         n_failed = len(new_multi.failed_cases)
         skipped_suffix = (
-            f" · skipped empty: {', '.join(skipped_cases)}"
+            f" · skipped unused load cases: {', '.join(skipped_cases)}"
             if skipped_cases else ""
         )
         if n_failed:
@@ -2226,10 +2241,24 @@ class MainWindow(QMainWindow):
             else:
                 missing = self._multi_result.missing_cases_for(comb.terms)
                 if missing:
-                    self.set_status(
-                        f"Combination {raw_name} requires solved results "
-                        f"for {', '.join(missing)}."
-                    )
+                    # Distinguish "unsolved" from "unused" — a referenced
+                    # case with no assigned loads can never solve, so say
+                    # so plainly instead of an open-ended "needs solve".
+                    used = used_case_names(self._model)
+                    no_loads = [c for c in missing if c not in used]
+                    if no_loads:
+                        self.set_status(
+                            f"Combination {raw_name} requires solved "
+                            f"results for {', '.join(missing)}. "
+                            f"{', '.join(no_loads)} "
+                            f"{'have' if len(no_loads) > 1 else 'has'} "
+                            f"no assigned loads."
+                        )
+                    else:
+                        self.set_status(
+                            f"Combination {raw_name} requires solved "
+                            f"results for {', '.join(missing)}."
+                        )
 
     def _refresh_case_selector_combo(self) -> None:
         """Repopulate the toolbar combo from the model's case dict.
@@ -2253,9 +2282,19 @@ class MainWindow(QMainWindow):
                     if n != "DEFAULT"
                 )
             )
+            # Enabled cases with no load source are labelled
+            # "(no loads assigned)" so they don't masquerade as ordinary
+            # unsolved result cases — Solve All skips them, and the user
+            # sees why rather than a bare "needs solve".
+            used = used_case_names(self._model)
             for name in ordered:
                 lc = self._model.load_cases[name]
-                label = name if lc.enabled else f"{name}  (disabled)"
+                if not lc.enabled:
+                    label = f"{name}  (disabled)"
+                elif name not in used:
+                    label = f"{name}  (no loads assigned)"
+                else:
+                    label = name
                 combo.addItem(label, name)
             # SUM_ALL — only when every requested case has solved.
             if (

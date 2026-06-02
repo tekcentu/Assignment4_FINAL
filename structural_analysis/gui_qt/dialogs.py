@@ -3046,6 +3046,11 @@ class ElementPropertiesDialog(QDialog):
         # implicitly.
         self._host_delete_member_load = None
         self._loads_widget: QWidget | None = None
+        # "Show Maxima" is ON by default and its state is remembered
+        # across rebuilds (set_target / refresh) for the lifetime of the
+        # dialog. Switching the active case via the main canvas selector
+        # rebuilds the body but must NOT reset this user choice.
+        self._show_maxima_on: bool = True
         self.set_target(model, elem_id, result)
 
     def set_target(
@@ -3250,7 +3255,12 @@ class ElementPropertiesDialog(QDialog):
         val_row.addStretch()
         layout.addLayout(val_row)
 
-        # Show Maxima checkbox.
+        # Show Maxima checkbox — defaults ON and restores the persisted
+        # per-dialog state so a case switch (which rebuilds this body)
+        # doesn't reset the user's choice. Connecting before setChecked
+        # means the restore fires _toggle_maxima, drawing the annotations
+        # for the freshly-rendered (current-case) diagrams — so there are
+        # never stale maxima values from the previous case.
         maxima_row = QHBoxLayout()
         self._show_maxima_cb = QCheckBox("Show Maxima")
         self._show_maxima_cb.setEnabled(self._f_local_ref is not None)
@@ -3258,6 +3268,8 @@ class ElementPropertiesDialog(QDialog):
         maxima_row.addWidget(self._show_maxima_cb)
         maxima_row.addStretch()
         layout.addLayout(maxima_row)
+        if self._f_local_ref is not None and self._show_maxima_on:
+            self._show_maxima_cb.setChecked(True)
 
         # End-force table (retained from original for precision read-out).
         if result is not None and getattr(result, "status", None) == "ok":
@@ -3476,7 +3488,11 @@ class ElementPropertiesDialog(QDialog):
         self._detail_canvas.draw_idle()
 
     def _toggle_maxima(self, state: int) -> None:
-        """Add / remove absolute-peak annotations on each diagram axis."""
+        """Add / remove absolute-peak annotations on each diagram axis.
+
+        Records the user's choice in ``self._show_maxima_on`` so it
+        survives a body rebuild (case switch / refresh)."""
+        self._show_maxima_on = bool(state)
         for ann in self._maxima_annotations:
             try:
                 ann.remove()
