@@ -563,7 +563,11 @@ class MainWindow(QMainWindow):
             "intensity regardless of which case is active."
         )
         m_view.addAction(self.act_active_case_loads_only)
-        # Load Case Manager dialog (View → Load &cases…).
+
+        # Load cases & combinations are model/analysis DEFINITIONS, not
+        # view options — they live under a dedicated Model menu rather
+        # than View (where they were easy to miss / mistake for display
+        # toggles).
         self.act_load_cases = QAction(
             "Load &cases…", self,
             triggered=self._show_load_case_manager,
@@ -572,8 +576,6 @@ class MainWindow(QMainWindow):
             "Add, rename, delete, enable/disable load cases. Also sets "
             "which case absorbs the self-weight contribution."
         )
-        m_view.addAction(self.act_load_cases)
-        # Load Combination Manager (View → Load com&binations…).
         self.act_load_combinations = QAction(
             "Load com&binations…", self,
             triggered=self._show_load_combination_manager,
@@ -583,7 +585,9 @@ class MainWindow(QMainWindow):
             "(e.g. 1.2 DEAD + 1.6 LIVE). Combinations are derived views "
             "computed from solved case results."
         )
-        m_view.addAction(self.act_load_combinations)
+        m_model = self.menuBar().addMenu("&Model")
+        m_model.addAction(self.act_load_cases)
+        m_model.addAction(self.act_load_combinations)
 
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)

@@ -6216,3 +6216,207 @@ def test_labeled_grid_draws_only_visible_viewport_lines(qt_app):
     assert "K" in labels  # x=10, visible in the viewport
     assert "21" in labels  # y=20, visible in the viewport
     assert "A" not in labels  # x=0, outside the viewport
+
+
+# ── hotfix v0.22.5: load-case registry sync, menu, maxima, copy ──────
+
+
+def _solvable_frame(w, *, case="DEFAULT"):
+    """Fixed-base frame with one nodal load on the given case. Returns eid."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        Material, NodalLoad, Node, Section, Support,
+    )
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )]
+    w._model.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    w._model.nodal_loads.append(
+        NodalLoad(node_id=2, fy=-10.0, load_case=case)
+    )
+    return 1
+
+
+def test_solve_all_auto_registers_orphan_member_load_case(qt_app):
+    """A member load tagged LIVE with LIVE never registered must be picked
+    up by Solve All (sync_load_case_registry runs first)."""
+    from structural_analysis.model import UniformDistributedLoad
+    w = MainWindow()
+    _solvable_frame(w, case="DEFAULT")
+    # Bypass _ensure_load_case_exists: append a LIVE-tagged load directly.
+    w._model.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-4.0, coord_system="local", load_case="LIVE")
+    )
+    assert "LIVE" not in w._model.load_cases
+    w._do_solve()
+    qt_app.processEvents()
+    assert "LIVE" in w._model.load_cases, "LIVE must be auto-registered"
+    assert w._multi_result is not None
+    assert "LIVE" in w._multi_result.cases, "Solve All must include LIVE"
+
+
+def test_solve_all_auto_registers_orphan_nodal_load_case(qt_app):
+    from structural_analysis.model import NodalLoad
+    w = MainWindow()
+    _solvable_frame(w, case="DEFAULT")
+    w._model.nodal_loads.append(
+        NodalLoad(node_id=2, fx=5.0, load_case="WIND")
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    assert "WIND" in w._model.load_cases
+    assert "WIND" in w._multi_result.cases
+
+
+def test_two_loads_same_orphan_case_no_duplicate(qt_app):
+    from structural_analysis.model import UniformDistributedLoad
+    w = MainWindow()
+    _solvable_frame(w, case="DEFAULT")
+    for _ in range(2):
+        w._model.elements[0].member_loads.append(
+            UniformDistributedLoad(wy=-2.0, coord_system="local", load_case="LIVE")
+        )
+    w._do_solve()
+    qt_app.processEvents()
+    assert list(w._model.load_cases).count("LIVE") == 1
+
+
+def test_case_selector_includes_auto_registered_case_after_solve(qt_app):
+    from structural_analysis.model import UniformDistributedLoad
+    w = MainWindow()
+    _solvable_frame(w, case="DEFAULT")
+    w._model.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-4.0, coord_system="local", load_case="LIVE")
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    data = [w._case_combo.itemData(i) for i in range(w._case_combo.count())]
+    assert "LIVE" in data
+
+
+def test_unused_enabled_case_labelled_no_loads_assigned(qt_app):
+    """An enabled case with no load source shows '(no loads assigned)'
+    in the selector, not a plain unsolved entry."""
+    from structural_analysis.gui_common.commands import AddLoadCaseCmd
+    w = MainWindow()
+    _solvable_frame(w, case="DEFAULT")
+    w.execute(AddLoadCaseCmd(name="LIVE"))  # enabled, no loads
+    texts = [w._case_combo.itemText(i) for i in range(w._case_combo.count())]
+    data = [w._case_combo.itemData(i) for i in range(w._case_combo.count())]
+    live_label = texts[data.index("LIVE")]
+    assert "no loads assigned" in live_label
+    # Raw identifier is still bare LIVE (userData), not the decorated label.
+    assert "LIVE" in data
+
+
+def test_remove_last_load_relabels_case_as_unused(qt_app):
+    """After deleting the only LIVE load, LIVE flips to '(no loads
+    assigned)' in the selector instead of staying a plain case."""
+    from structural_analysis.gui_common.commands import (
+        AddMemberLoadCmd, DeleteMemberLoadCmd,
+    )
+    from structural_analysis.model import UniformDistributedLoad
+    w = MainWindow()
+    _solvable_frame(w, case="DEFAULT")
+    w.execute(AddMemberLoadCmd(
+        elem_id=1,
+        load=UniformDistributedLoad(wy=-3.0, coord_system="local", load_case="LIVE"),
+    ))
+    w._ensure_load_case_exists("LIVE")
+    qt_app.processEvents()
+    # Now delete that load.
+    w.execute(DeleteMemberLoadCmd(elem_id=1, load_index=0))
+    qt_app.processEvents()
+    texts = [w._case_combo.itemText(i) for i in range(w._case_combo.count())]
+    data = [w._case_combo.itemData(i) for i in range(w._case_combo.count())]
+    if "LIVE" in data:  # case kept (not auto-deleted)
+        assert "no loads assigned" in texts[data.index("LIVE")]
+
+
+def test_load_cases_moved_to_model_menu(qt_app):
+    """Load cases / combinations live under a Model menu, not View."""
+    w = MainWindow()
+    menus = {
+        a.text(): a.menu()
+        for a in w.menuBar().actions() if a.menu() is not None
+    }
+    assert "&Model" in menus, f"expected a Model menu, got {list(menus)}"
+    model_actions = menus["&Model"].actions()
+    assert w.act_load_cases in model_actions
+    assert w.act_load_combinations in model_actions
+    # And they are no longer under View.
+    view_actions = menus.get("&View").actions()
+    assert w.act_load_cases not in view_actions
+    assert w.act_load_combinations not in view_actions
+
+
+def test_element_detail_show_maxima_on_by_default(qt_app):
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+    elem = w._model.elements[0]
+    w._open_element_inspector(elem.id)
+    qt_app.processEvents()
+    d = w._element_inspector
+    assert d._show_maxima_cb.isChecked(), "Show Maxima must default ON"
+    assert d._maxima_annotations, "default-ON must render maxima annotations"
+
+
+def test_element_detail_show_maxima_persists_across_refresh(qt_app):
+    """Refreshing the inspector (as a canvas case switch does) must not
+    reset Show Maxima."""
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+    elem = w._model.elements[0]
+    w._open_element_inspector(elem.id)
+    qt_app.processEvents()
+    d = w._element_inspector
+    assert d._show_maxima_cb.isChecked()
+    # Simulate a canvas-driven refresh.
+    d.refresh(w._model, w._result)
+    qt_app.processEvents()
+    assert w._element_inspector._show_maxima_cb.isChecked(), (
+        "Show Maxima must stay ON across a refresh"
+    )
+
+
+def test_element_detail_show_maxima_manual_off_persists(qt_app):
+    w = MainWindow(initial_path="inputs/q2a_settlement.txt")
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+    elem = w._model.elements[0]
+    w._open_element_inspector(elem.id)
+    qt_app.processEvents()
+    d = w._element_inspector
+    d._show_maxima_cb.setChecked(False)  # manual off
+    assert d._show_maxima_on is False
+    d.refresh(w._model, w._result)
+    qt_app.processEvents()
+    assert not w._element_inspector._show_maxima_cb.isChecked(), (
+        "manual Show-Maxima-off must persist across refresh"
+    )
+
+
+def test_load_case_manager_table_has_copy_installed(qt_app):
+    from structural_analysis.gui_qt.dialogs import LoadCaseManagerDialog
+    w = MainWindow()
+    d = LoadCaseManagerDialog(w, model=w._model)
+    assert getattr(d._table, "_table_copy_installed", False) is True
+
+
+def test_element_loads_table_has_copy_installed(qt_app):
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid)
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    assert getattr(table, "_table_copy_installed", False) is True

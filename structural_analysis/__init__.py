@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.22.4"
+__version__ = "0.22.5"
 __what_is_new__ = (
-    "Faster canvas redraws (batched element/node/selection artists) · "
-    "dense-view auto-hides IDs with a halo for legibility · "
-    "labeled grid culls to the visible viewport"
+    "Load cases auto-register from assignments; unused cases labelled · "
+    "Load Cases / Combinations moved to a Model menu · "
+    "spreadsheet-style Ctrl+C / right-click Copy on all tables"
 )
 
 from .model import (
