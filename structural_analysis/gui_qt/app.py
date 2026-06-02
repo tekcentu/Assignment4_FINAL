@@ -66,7 +66,11 @@ from ..gui_common.commands import (
     UpdateElementCmd,
 )
 from ..gui_common.file_writer import write_input_file
-from ..gui_common.results_view import format_result
+from ..gui_common.results_view import (
+    case_combo_entries,
+    format_result,
+    resolve_view,
+)
 from ..gui_common.validation import (
     ModelValidationResult,
     cases_with_loads,
@@ -2244,41 +2248,13 @@ class MainWindow(QMainWindow):
         combo.blockSignals(True)
         try:
             combo.clear()
-            # Real cases — sorted alphabetically with DEFAULT pinned
-            # to the front so it's always visible at index 0.
-            ordered = (
-                (["DEFAULT"] if "DEFAULT" in self._model.load_cases else [])
-                + sorted(
-                    n for n in self._model.load_cases
-                    if n != "DEFAULT"
-                )
-            )
-            for name in ordered:
-                lc = self._model.load_cases[name]
-                label = name if lc.enabled else f"{name}  (disabled)"
-                combo.addItem(label, name)
-            # SUM_ALL — only when every requested case has solved.
-            if (
-                self._multi_result is not None
-                and self._multi_result.sum_all_available()
-                and len(self._multi_result.cases) >= 2
+            # Shared entry list (label, raw_name) — same routing the
+            # per-element inspector's local result selector uses, so
+            # labels and the SUM_ALL / combination rules never drift.
+            for label, raw_name in case_combo_entries(
+                self._model, self._multi_result,
             ):
-                combo.addItem(SUM_ALL_KEY, SUM_ALL_KEY)
-            # User-defined combinations LAST (PR #29). A combination
-            # whose referenced cases aren't all solved is shown with a
-            # "(needs solve)" hint and still selectable — selecting it
-            # surfaces the placeholder rather than silently hiding it.
-            for comb_name in sorted(self._model.load_combinations):
-                comb = self._model.load_combinations[comb_name]
-                available = (
-                    self._multi_result is not None
-                    and self._multi_result.combination_available(comb.terms)
-                )
-                label = (
-                    f"{comb_name}  [comb]" if available
-                    else f"{comb_name}  [comb · needs solve]"
-                )
-                combo.addItem(label, comb_name)
+                combo.addItem(label, raw_name)
             # Restore selection by matching the userData (the raw
             # case name, not the "(disabled)" label).
             idx = combo.findData(self._active_case)
@@ -2298,21 +2274,13 @@ class MainWindow(QMainWindow):
         """Resolve ``self._active_case`` to a concrete ``AnalysisResult``
         (or ``None`` for a pre-solve / unavailable selection).
 
-        Handles three kinds of selection:
-        * a load-case name → the per-case result;
-        * ``SUM_ALL`` → the unit-coefficient superposition view;
-        * a combination name → the coefficient-weighted view (or
-          ``None`` when a referenced case is unsolved, so the canvas /
-          inspector show a clear placeholder)."""
-        if self._multi_result is None:
-            return None
-        name = self._active_case
-        if name in self._model.load_combinations:
-            comb = self._model.load_combinations[name]
-            return self._multi_result.combination(
-                comb.terms, name=name,
-            )
-        return self._multi_result.get(name)
+        Delegates to :func:`resolve_view` so case / SUM_ALL / combination
+        routing lives in one Qt-free place shared with the per-element
+        inspector's local result selector."""
+        result, _status = resolve_view(
+            self._model, self._multi_result, self._active_case,
+        )
+        return result
 
     def _push_active_case_to_canvas(self) -> None:
         """Sync ``self._result`` (the legacy single-case view) and the
