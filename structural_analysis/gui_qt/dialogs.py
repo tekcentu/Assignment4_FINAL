@@ -3593,7 +3593,7 @@ class ElementPropertiesDialog(QDialog):
         maxima_row = QHBoxLayout()
         self._show_maxima_cb = QCheckBox("Show Maxima")
         self._show_maxima_cb.setEnabled(self._f_local_ref is not None)
-        self._show_maxima_cb.stateChanged.connect(self._toggle_maxima)
+        self._show_maxima_cb.toggled.connect(self._toggle_maxima)
         maxima_row.addWidget(self._show_maxima_cb)
         maxima_row.addStretch()
         layout.addLayout(maxima_row)
@@ -3907,19 +3907,19 @@ class ElementPropertiesDialog(QDialog):
                             if m_val is not None else "M: —")
         self._detail_canvas.draw_idle()
 
-    def _toggle_maxima(self, state: int) -> None:
+    def _toggle_maxima(self, checked: bool) -> None:
         """Add / remove absolute-peak annotations on each diagram axis.
 
         Records the user's choice in ``self._show_maxima_on`` so it
         survives a body rebuild (case switch / refresh)."""
-        self._show_maxima_on = bool(state)
+        self._show_maxima_on = bool(checked)
         for ann in self._maxima_annotations:
             try:
                 ann.remove()
             except ValueError:
                 pass
         self._maxima_annotations.clear()
-        if state and self._f_local_ref is not None:
+        if checked and self._f_local_ref is not None:
             for kind, ax in (
                 ("axial",  self._ax_n),
                 ("shear",  self._ax_v),

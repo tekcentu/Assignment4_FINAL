@@ -91,6 +91,18 @@ def test_include_headers_prepends_header_row(qt_app):
     assert tsv_for_view(t, include_headers=True) == "Case\tType\na\tb"
 
 
+def test_include_headers_aligns_with_selected_column_subset(qt_app):
+    """Selecting only some columns must slice the header row to match,
+    so the TSV stays a proper rectangle when pasted into Excel."""
+    from PyQt6.QtWidgets import QTableWidgetSelectionRange
+    t = _table([["a", "b", "c"], ["d", "e", "f"]])
+    t.setHorizontalHeaderLabels(["C0", "C1", "C2"])
+    # Select only columns 1..2 across both rows.
+    t.setRangeSelected(QTableWidgetSelectionRange(0, 1, 1, 2), True)
+    tsv = tsv_for_view(t, include_headers=True)
+    assert tsv == "C1\tC2\nb\tc\ne\tf"
+
+
 def test_install_is_idempotent(qt_app):
     t = _table([["a"]])
     install_table_copy(t)

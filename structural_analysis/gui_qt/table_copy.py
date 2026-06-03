@@ -78,16 +78,12 @@ def copy_view_to_clipboard(
 
 
 def _index_text(view: QAbstractItemView, index) -> str:
-    """Display text for one model index. Table cells holding an embedded
+    """Display text for one model index. Cells holding an embedded
     widget (buttons) copy as an empty string so 'Edit' / 'Delete' never
-    leak into the spreadsheet."""
-    cell_widget = getattr(view, "cellWidget", None)
-    if cell_widget is not None:
-        try:
-            if cell_widget(index.row(), index.column()) is not None:
-                return ""
-        except (TypeError, RuntimeError):
-            pass
+    leak into the spreadsheet. ``indexWidget`` is the generic
+    ``QAbstractItemView`` API and works for tables, trees, and lists."""
+    if view.indexWidget(index) is not None:
+        return ""
     data = index.data(Qt.ItemDataRole.DisplayRole)
     return "" if data is None else str(data)
 
@@ -116,6 +112,7 @@ def tsv_for_view(
     selected = sel_model.selectedIndexes() if sel_model is not None else []
 
     lines: list[str] = []
+    col_range: tuple[int, int] | None = None
     if selected:
         # Group by row, remember the spanned column range so a
         # rectangular selection keeps its shape; gaps inside the range
@@ -127,6 +124,7 @@ def tsv_for_view(
             )
         all_cols = [c for cols in by_row.values() for c in cols]
         c_min, c_max = min(all_cols), max(all_cols)
+        col_range = (c_min, c_max)
         for r in sorted(by_row):
             cols = by_row[r]
             lines.append(
@@ -146,6 +144,12 @@ def tsv_for_view(
     if include_headers:
         headers = _header_text(view)
         if headers is not None:
+            # When the user copied only a column subset, slice the
+            # header row to the same range so the TSV stays a true
+            # rectangle (Excel paste keeps header ↔ data alignment).
+            if col_range is not None:
+                c_min, c_max = col_range
+                headers = headers[c_min:c_max + 1]
             lines.insert(0, "\t".join(headers))
     return "\n".join(lines)
 
