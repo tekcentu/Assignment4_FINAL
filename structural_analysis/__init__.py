@@ -1,6 +1,6 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.22.5"
+__version__ = "0.23.1"
 __what_is_new__ = (
     "Load cases auto-register from assignments; unused cases labelled · "
     "Load Cases / Combinations moved to a Model menu · "

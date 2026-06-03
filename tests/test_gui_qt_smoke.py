@@ -546,16 +546,34 @@ def test_show_element_menu_disables_edits_while_inspector_open(qt_app):
         del QMenu.exec   # restore the real method
 
     by_label = {label: enabled for label, enabled in captured["actions"]}
-    details_label = next(l for l in by_label if "show details" in l.lower())
+    # PR #35: "show details / FBD…" was renamed to "Element Details…".
+    details_label = next(l for l in by_label if "element details" in l.lower())
     assert by_label[details_label], (
-        '"show details" must stay enabled while inspector is open'
+        '"Element Details" must stay enabled while inspector is open'
     )
-    for needle in ("edit section", "add member load",
-                    "clear member loads", "delete"):
+    # PR #35: "Edit member loads…" also stays enabled — it just re-focuses
+    # the Load Assignments tab on the already-open inspector.
+    loads_label = next(l for l in by_label if "edit member loads" in l.lower())
+    assert by_label[loads_label], (
+        '"Edit member loads…" must stay enabled while inspector is open'
+    )
+    # "add member load…" was retired in PR #35 — Add / Edit / Delete now
+    # live inside the Load Assignments tab of the inspector itself.
+    for needle in ("edit section", "clear member loads"):
         label = next(l for l in by_label if needle in l.lower())
         assert not by_label[label], (
             f'menu item {label!r} must be disabled while inspector is open'
         )
+    # The standalone "delete" item — match the exact prefix so the
+    # "Element Details…" item (which contains "details") doesn't trip
+    # the lookup.
+    delete_label = next(
+        l for l in by_label
+        if l.lower().endswith(": delete")
+    )
+    assert not by_label[delete_label], (
+        f'menu item {delete_label!r} must be disabled while inspector is open'
+    )
 
 
 def test_inspector_open_locks_editing_keeps_view(qt_app):
@@ -3253,7 +3271,7 @@ def test_inspector_delete_button_removes_one_row_only(qt_app):
     w._open_element_inspector(eid)
     qt_app.processEvents()
     table = w._element_inspector._loads_widget
-    btn = table.cellWidget(1, 5)  # Delete button on row index 1 (PointLoad)
+    btn = table.cellWidget(1, 7)  # Delete button on row index 1 (PR #35: col 7)
     assert isinstance(btn, QPushButton)
     btn.click()
     qt_app.processEvents()
@@ -3282,7 +3300,7 @@ def test_inspector_delete_then_undo_restores_row(qt_app):
     w._open_element_inspector(eid)
     qt_app.processEvents()
     table = w._element_inspector._loads_widget
-    btn = table.cellWidget(1, 5)
+    btn = table.cellWidget(1, 7)
     btn.click()
     qt_app.processEvents()
     assert len(w._model.elements[0].member_loads) == 2
@@ -3308,7 +3326,7 @@ def test_inspector_delete_buttons_disabled_when_no_host_callback(qt_app):
     d = ElementPropertiesDialog(w, w._model, eid, None)
     table = d._loads_widget
     for i in range(table.rowCount()):
-        btn = table.cellWidget(i, 5)
+        btn = table.cellWidget(i, 7)  # Delete column (PR #35: col 7)
         assert isinstance(btn, QPushButton)
         assert not btn.isEnabled(), (
             f"row {i} Delete button must be disabled without host callback"
@@ -4273,15 +4291,18 @@ def test_inspector_loads_table_shows_case_column(qt_app):
     w._open_element_inspector(1)
     qt_app.processEvents()
     table = w._element_inspector._loads_widget
-    assert table.columnCount() == 6
+    # PR #35: Direction column added at col 2 and Edit/Delete split into
+    # cols 6 and 7, so total goes from 6 → 8 and Case shifts from col 4
+    # to col 5.
+    assert table.columnCount() == 8
     headers = [
         table.horizontalHeaderItem(i).text()
         for i in range(table.columnCount())
     ]
-    assert headers[4] == "Case"
+    assert headers[5] == "Case"
     # Default row shows the dim placeholder; named row shows the case.
-    assert table.item(0, 4).text() == "—"
-    assert table.item(1, 4).text() == "DEAD"
+    assert table.item(0, 5).text() == "—"
+    assert table.item(1, 5).text() == "DEAD"
 
 
 def test_nodal_load_summary_includes_case_when_non_default(qt_app):
@@ -4910,6 +4931,177 @@ def test_member_load_dialog_uniform_gradient_toggle_no_extra_top_level(qt_app):
         d._refresh_fields()
     qt_app.processEvents()
     assert _count_top_level_widgets() <= before
+
+
+# ── PR #35: MemberLoadDialog edit-mode prefill ───────────────────────
+
+
+def test_member_load_dialog_prefills_existing_udl_local(qt_app):
+    """Edit mode for a local UDL must select the mechanical / udl / local
+    radios and prefill the wx and wy fields."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    existing = UniformDistributedLoad(wx=2.5, wy=-7.5, coord_system="local")
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=existing, existing_index=0,
+    )
+    assert d._rb_cat_mechanical.isChecked()
+    assert d._rb_udl.isChecked()
+    assert d._rb_local.isChecked()
+    assert d._fields["wx"].text() == "2.5"
+    assert d._fields["wy"].text() == "-7.5"
+    assert "Edit member load" in d.windowTitle()
+
+
+def test_member_load_dialog_prefills_existing_udl_global(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=UniformDistributedLoad(
+            wx=0.0, wy=-3.0, coord_system="global",
+        ),
+    )
+    assert d._rb_global.isChecked()
+    assert d._fields["wy"].text() == "-3"
+
+
+def test_member_load_dialog_prefills_existing_udl_gravity(qt_app):
+    """Gravity hides wx; only the magnitude (wy field) should be filled."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=UniformDistributedLoad(
+            wy=10.0, coord_system="gravity",
+        ),
+    )
+    assert d._rb_gravity.isChecked()
+    assert "wx" not in d._fields  # gravity hides wx
+    assert d._fields["wy"].text() == "10"
+
+
+def test_member_load_dialog_prefills_existing_pointload_includes_a(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import PointLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=PointLoad(
+            px=1.0, py=-4.0, a=2.5, coord_system="local",
+        ),
+    )
+    assert d._rb_point.isChecked()
+    assert d._rb_local.isChecked()
+    assert d._fields["px"].text() == "1"
+    assert d._fields["py"].text() == "-4"
+    assert d._fields["a"].text() == "2.5"
+
+
+def test_member_load_dialog_prefills_existing_frame_thermal_uniform(qt_app):
+    """Frame uniform ΔT is stored as t_top == t_bottom; the dialog should
+    detect it as uniform mode and prefill the single delta_T field."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import FrameTemperatureLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=FrameTemperatureLoad(t_top=15.0, t_bottom=15.0),
+    )
+    assert d._rb_cat_thermal.isChecked()
+    assert d._rb_t_uniform.isChecked()
+    assert "delta_T" in d._fields
+    assert d._fields["delta_T"].text() == "15"
+
+
+def test_member_load_dialog_prefills_existing_frame_thermal_gradient(qt_app):
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import FrameTemperatureLoad
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=FrameTemperatureLoad(t_top=20.0, t_bottom=5.0),
+    )
+    assert d._rb_t_gradient.isChecked()
+    assert d._fields["t_top"].text() == "20"
+    assert d._fields["t_bottom"].text() == "5"
+
+
+def test_member_load_dialog_prefills_truss_thermal_uniform(qt_app):
+    from structural_analysis.element import TrussElement2D
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import (
+        Material, Node, Section, TrussTemperatureLoad,
+    )
+
+    w = MainWindow()
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    w._model.elements = [TrussElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, section_id=1,
+    )]
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=1,
+        existing_load=TrussTemperatureLoad(delta_T=-12.5),
+    )
+    assert d._rb_cat_thermal.isChecked()
+    assert d._rb_t_uniform.isChecked()
+    assert d._fields["delta_T"].text() == "-12.5"
+
+
+def test_member_load_dialog_prefill_load_case(qt_app):
+    """Edit mode must select the existing load's load_case in the combo."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+    from structural_analysis.model import (
+        LoadCase, UniformDistributedLoad,
+    )
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    w._model.load_cases["WIND"] = LoadCase(name="WIND", enabled=True)
+    d = MemberLoadDialog(
+        w, model=w._model, elem_id=eid,
+        existing_load=UniformDistributedLoad(
+            wy=-1.0, coord_system="local", load_case="WIND",
+        ),
+    )
+    assert d._case_combo.currentText() == "WIND"
+
+
+def test_member_load_dialog_no_existing_load_keeps_add_defaults(qt_app):
+    """Regression: when existing_load is None (the Add path), the dialog
+    must still default to mechanical / UDL / local with empty fields, so
+    every existing add-member-load test stays green."""
+    from structural_analysis.gui_qt.dialogs import MemberLoadDialog
+
+    w = MainWindow()
+    eid = _frame_model_for_dialog(w)
+    d = MemberLoadDialog(w, model=w._model, elem_id=eid)
+    assert d._rb_cat_mechanical.isChecked()
+    assert d._rb_udl.isChecked()
+    assert d._rb_local.isChecked()
+    assert d._fields["wx"].text() == "0.0"
+    assert d._fields["wy"].text() == "0.0"
+    assert "Edit member load" not in d.windowTitle()
 
 
 # ── PR #30: multiple nodal loads per node + manager dialog ───────────
@@ -6164,6 +6356,444 @@ def test_cancelling_warnings_clears_stale_result_and_shows_report(
     assert "not connected" in text or "orphan" in text.lower() or "Node 99" in text
     # Canvas has the warning highlight.
     assert 99 in w.canvas._warning_node_ids
+
+
+# ── PR #35: tabbed Element Detail Dialog ─────────────────────────────
+
+
+def _frame_with_multi_cases(w):
+    """Two-case fixture for the Results-tab tests: DEFAULT + WIND, single
+    frame element with one nodal load per case so both cases produce a
+    real solve. Returns the element id."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import (
+        LoadCase, Material, NodalLoad, Node, Section, Support,
+    )
+    w._model.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    w._model.sections[1] = Section(
+        id=1, name="S", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    w._model.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1,
+    )]
+    w._model.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    w._model.load_cases["WIND"] = LoadCase(name="WIND", enabled=True)
+    w._model.nodal_loads.append(NodalLoad(
+        node_id=2, fy=-10.0, load_case="DEFAULT",
+    ))
+    w._model.nodal_loads.append(NodalLoad(
+        node_id=2, fx=5.0, load_case="WIND",
+    ))
+    return 1
+
+
+def test_inspector_uses_tabbed_layout(qt_app):
+    """Inspector body is now a QTabWidget with three labelled tabs."""
+    from PyQt6.QtWidgets import QTabWidget
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid)
+    qt_app.processEvents()
+
+    insp = w._element_inspector
+    assert isinstance(insp._tabs, QTabWidget)
+    assert insp._tabs.count() == 3
+    labels = [insp._tabs.tabText(i) for i in range(3)]
+    assert labels == ["Properties", "Results", "Load Assignments"]
+
+
+def test_inspector_opens_on_properties_tab_by_default(qt_app):
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid)
+    qt_app.processEvents()
+    assert w._element_inspector._tabs.currentIndex() == 0  # Properties
+
+
+def test_right_click_edit_member_loads_opens_loads_tab(qt_app):
+    """show_element_menu(action='loads') routes directly to the inspector
+    and lands the focus on the Load Assignments tab."""
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w.show_element_menu(eid, action="loads")
+    qt_app.processEvents()
+    insp = w._element_inspector
+    assert insp is not None and insp.isVisible()
+    assert insp._tabs.currentIndex() == 2  # Load Assignments
+
+
+def test_right_click_details_action_opens_properties_tab(qt_app):
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w.show_element_menu(eid, action="details")
+    qt_app.processEvents()
+    insp = w._element_inspector
+    assert insp is not None and insp.isVisible()
+    assert insp._tabs.currentIndex() == 0
+
+
+def test_results_tab_shows_no_analysis_yet_pre_solve(qt_app):
+    """Pre-solve, the Results tab paints a status label that includes
+    'No analysis results yet' and the N axis carries the placeholder
+    text and zero data lines."""
+    w = MainWindow()
+    eid = _frame_with_multi_cases(w)
+    w._open_element_inspector(eid)
+    qt_app.processEvents()
+    insp = w._element_inspector
+    assert "No analysis results yet" in insp._results_status.text()
+    assert not insp._ax_n.lines, "pre-solve N-axis must hold zero data lines"
+
+
+def test_results_tab_shows_diagrams_post_solve(qt_app):
+    w = MainWindow()
+    eid = _frame_with_multi_cases(w)
+    w._open_element_inspector(eid)
+    qt_app.processEvents()
+    w._do_solve()
+    qt_app.processEvents()
+    # _do_solve() invokes the host's refresh hook; the inspector now
+    # holds a populated Results tab.
+    insp = w._element_inspector
+    assert insp._ax_n.lines, "post-solve N-axis must carry the axial trace"
+
+
+def test_results_tab_local_selector_does_not_change_canvas_case(qt_app):
+    """Changing the dialog's local case selector must not flip the host's
+    active case (the canvas keeps showing whatever it was showing)."""
+    w = MainWindow()
+    eid = _frame_with_multi_cases(w)
+    w._do_solve()
+    qt_app.processEvents()
+    canvas_case_before = w._active_case
+    w._open_element_inspector(eid)
+    qt_app.processEvents()
+    insp = w._element_inspector
+    # Find the index of the other (non-active) case in the local combo.
+    other = "WIND" if canvas_case_before != "WIND" else "DEFAULT"
+    idx = insp._results_combo.findData(other)
+    assert idx >= 0, f"local combo must include {other}"
+    insp._results_combo.setCurrentIndex(idx)
+    qt_app.processEvents()
+    assert insp._results_selection == other
+    assert w._active_case == canvas_case_before, (
+        "host active case must not change when the dialog combo changes"
+    )
+
+
+def test_results_tab_combo_stores_raw_identifier_not_label(qt_app):
+    """The local combo's userData carries the raw case / combination name
+    so the legacy "[comb]"-leaks-into-key bug stays fixed."""
+    from structural_analysis.model import LoadCase, LoadCombination
+    w = MainWindow()
+    eid = _frame_with_multi_cases(w)
+    w._model.load_combinations["COMB1"] = LoadCombination(
+        name="COMB1", terms={"DEFAULT": 1.0, "WIND": 1.0},
+    )
+    w._open_element_inspector(eid)
+    qt_app.processEvents()
+    insp = w._element_inspector
+    found = False
+    for i in range(insp._results_combo.count()):
+        label = insp._results_combo.itemText(i)
+        data = insp._results_combo.itemData(i)
+        if data == "COMB1":
+            found = True
+            # The label gets "[comb]" or "[comb · needs solve]"; the data
+            # stays bare so resolve_view never sees the decoration.
+            assert "COMB1" in label
+            assert label != "COMB1"
+    assert found, "COMB1 must appear in the local combo with raw identifier"
+
+
+def test_loads_tab_add_button_appends_load_undoable(qt_app, monkeypatch):
+    """Clicking Add in the Loads tab opens MemberLoadDialog; on Accept,
+    AddMemberLoadCmd lands the row and Ctrl+Z removes it."""
+    from structural_analysis.gui_qt import dialogs as dialogs_mod
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    n_before = len(w._model.elements[0].member_loads)
+
+    new_load = UniformDistributedLoad(wy=-50.0, coord_system="local")
+
+    class _StubDialog:
+        def __init__(self, *a, **k):
+            self.result_value = new_load
+        def exec(self):
+            return dialogs_mod.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(dialogs_mod, "MemberLoadDialog", _StubDialog)
+    # The host hook constructs MemberLoadDialog from the app module's
+    # binding; patch that too so the stub is what gets instantiated.
+    from structural_analysis.gui_qt import app as app_mod
+    monkeypatch.setattr(app_mod, "MemberLoadDialog", _StubDialog)
+
+    insp = w._element_inspector
+    insp._add_load_btn.click()
+    qt_app.processEvents()
+
+    assert len(w._model.elements[0].member_loads) == n_before + 1
+    assert w._model.elements[0].member_loads[-1] is new_load
+    w._do_undo()
+    qt_app.processEvents()
+    assert len(w._model.elements[0].member_loads) == n_before
+
+
+def test_loads_tab_edit_button_swaps_load_undoable(qt_app, monkeypatch):
+    """Clicking Edit on a row opens MemberLoadDialog pre-filled; on
+    Accept, UpdateMemberLoadCmd swaps the row and Ctrl+Z restores the
+    exact old instance."""
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.gui_qt import dialogs as dialogs_mod
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    original = w._model.elements[0].member_loads[0]
+    replacement = UniformDistributedLoad(wy=-999.0, coord_system="local")
+
+    class _StubDialog:
+        def __init__(self, *a, **k):
+            self.result_value = replacement
+        def exec(self):
+            return dialogs_mod.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(dialogs_mod, "MemberLoadDialog", _StubDialog)
+    monkeypatch.setattr(app_mod, "MemberLoadDialog", _StubDialog)
+
+    insp = w._element_inspector
+    edit_btn = insp._loads_widget.cellWidget(0, 6)  # Edit column
+    edit_btn.click()
+    qt_app.processEvents()
+
+    assert w._model.elements[0].member_loads[0] is replacement
+    w._do_undo()
+    qt_app.processEvents()
+    assert w._model.elements[0].member_loads[0] is original, (
+        "undo must restore the EXACT original load instance"
+    )
+
+
+def _stub_member_load_dialog(monkeypatch, load):
+    """Patch MemberLoadDialog (both the dialogs module and the app-module
+    binding the host hook uses) with an auto-accepting stub returning
+    ``load``."""
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.gui_qt import dialogs as dialogs_mod
+
+    class _StubDialog:
+        def __init__(self, *a, **k):
+            self.result_value = load
+        def exec(self):
+            return dialogs_mod.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(dialogs_mod, "MemberLoadDialog", _StubDialog)
+    monkeypatch.setattr(app_mod, "MemberLoadDialog", _StubDialog)
+
+
+def test_loads_tab_add_registers_new_load_case(qt_app, monkeypatch):
+    """P2 (Codex): adding a load with a brand-new case name via the Loads
+    tab must register that case in model.load_cases AND make it
+    discoverable by cases_with_loads(), matching the legacy
+    _add_member_load path. Without the _ensure_load_case_exists call the
+    load would be saved against a case Solve All never sees."""
+    from structural_analysis.gui_common.validation import cases_with_loads
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    assert "WIND2" not in w._model.load_cases
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    _stub_member_load_dialog(
+        monkeypatch,
+        UniformDistributedLoad(wy=-7.0, coord_system="local", load_case="WIND2"),
+    )
+    w._element_inspector._add_load_btn.click()
+    qt_app.processEvents()
+
+    assert "WIND2" in w._model.load_cases, (
+        "new case typed in the Add dialog must be registered"
+    )
+    assert "WIND2" in cases_with_loads(w._model), (
+        "the new case must be discoverable by cases_with_loads()"
+    )
+
+
+def test_loads_tab_add_new_case_appears_in_toolbar_combo(qt_app, monkeypatch):
+    """After an inspector Add with a new case, the toolbar case selector
+    lists it (parity with the _add_member_load path)."""
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    _stub_member_load_dialog(
+        monkeypatch,
+        UniformDistributedLoad(wy=-3.0, coord_system="local", load_case="SNOW"),
+    )
+    w._element_inspector._add_load_btn.click()
+    qt_app.processEvents()
+
+    combo_data = [
+        w._case_combo.itemData(i) for i in range(w._case_combo.count())
+    ]
+    assert "SNOW" in combo_data, (
+        "newly-registered case must appear in the toolbar selector"
+    )
+
+
+def test_loads_tab_edit_registers_new_load_case(qt_app, monkeypatch):
+    """P2 (Codex): editing a row to a brand-new case name must register
+    that case too (the edit hook had the same gap as Add)."""
+    from structural_analysis.gui_common.validation import cases_with_loads
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    assert "GUST" not in w._model.load_cases
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    _stub_member_load_dialog(
+        monkeypatch,
+        UniformDistributedLoad(wy=-9.0, coord_system="local", load_case="GUST"),
+    )
+    edit_btn = w._element_inspector._loads_widget.cellWidget(0, 6)
+    edit_btn.click()
+    qt_app.processEvents()
+
+    assert "GUST" in w._model.load_cases, (
+        "new case typed in the Edit dialog must be registered"
+    )
+    assert "GUST" in cases_with_loads(w._model)
+
+
+def test_loads_tab_add_button_disabled_without_host_callback(qt_app):
+    """When the dialog is constructed without host wiring (unit-test path),
+    the Add button must render disabled so the model is never mutated
+    implicitly."""
+    from structural_analysis.gui_qt.dialogs import ElementPropertiesDialog
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    d = ElementPropertiesDialog(w, w._model, eid, None)
+    assert not d._add_load_btn.isEnabled()
+
+
+def test_loads_tab_includes_direction_column(qt_app):
+    """The Load Assignments table exposes a Direction column at col 2;
+    mechanical rows carry the coord-system label, thermal rows show '—'."""
+    w = MainWindow()
+    eid = _make_loaded_frame(w)
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    table = w._element_inspector._loads_widget
+    headers = [
+        table.horizontalHeaderItem(i).text()
+        for i in range(table.columnCount())
+    ]
+    assert headers[2] == "Direction"
+    # row 0 (UDL local) — direction label is non-empty / non-dash
+    assert table.item(0, 2).text() == "local axes"
+    # row 2 (FrameTemperatureLoad) — direction column is '—'
+    assert table.item(2, 2).text() == "—"
+
+
+def test_loads_tab_change_invalidates_result_and_shows_placeholder(
+    qt_app, monkeypatch,
+):
+    """After Add via the Loads tab, the analysis result is invalidated
+    and the Results tab shows the 'No analysis results yet' placeholder
+    — never stale N/V/M diagrams from before the change."""
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.gui_qt import dialogs as dialogs_mod
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_with_multi_cases(w)
+    w._do_solve()
+    qt_app.processEvents()
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    insp = w._element_inspector
+    # Sanity: diagrams populated before the load change.
+    assert insp._ax_n.lines
+
+    class _StubDialog:
+        def __init__(self, *a, **k):
+            self.result_value = UniformDistributedLoad(
+                wy=-1.0, coord_system="local",
+            )
+        def exec(self):
+            return dialogs_mod.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(dialogs_mod, "MemberLoadDialog", _StubDialog)
+    monkeypatch.setattr(app_mod, "MemberLoadDialog", _StubDialog)
+
+    insp._add_load_btn.click()
+    qt_app.processEvents()
+
+    # After the load change, _result is invalidated and Results tab
+    # has the placeholder + zero data lines.
+    assert w._result is None
+    assert "No analysis results yet" in insp._results_status.text()
+    assert not insp._ax_n.lines, (
+        "stale N/V/M diagrams must not survive a model-changing edit"
+    )
+
+
+def test_loads_tab_stays_focused_after_edit(qt_app, monkeypatch):
+    """Editing a load from the Load Assignments tab triggers a full
+    refresh() (to clear stale Results diagrams). The user must remain on
+    the Load Assignments tab, not get bounced to Properties — regression
+    for the QTabWidget removeTab/set_target focus-jump (PR #37 review)."""
+    from structural_analysis.gui_qt import app as app_mod
+    from structural_analysis.gui_qt import dialogs as dialogs_mod
+    from structural_analysis.model import UniformDistributedLoad
+
+    w = MainWindow()
+    eid = _frame_with_multi_cases(w)
+    # Give the element a load so the Loads tab has an editable row.
+    w._model.elements[0].member_loads.append(
+        UniformDistributedLoad(wy=-3.0, coord_system="local")
+    )
+    w._do_solve()
+    qt_app.processEvents()
+    w._open_element_inspector(eid, tab="loads")
+    qt_app.processEvents()
+    insp = w._element_inspector
+    assert insp._tabs.currentIndex() == insp._TAB_LOADS
+
+    replacement = UniformDistributedLoad(wy=-77.0, coord_system="local")
+
+    class _StubDialog:
+        def __init__(self, *a, **k):
+            self.result_value = replacement
+        def exec(self):
+            return dialogs_mod.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(dialogs_mod, "MemberLoadDialog", _StubDialog)
+    monkeypatch.setattr(app_mod, "MemberLoadDialog", _StubDialog)
+
+    edit_btn = insp._loads_widget.cellWidget(0, 6)
+    edit_btn.click()
+    qt_app.processEvents()
+
+    # Full refresh() ran (Results now invalidated), but the focused tab
+    # must still be Load Assignments.
+    assert w._element_inspector._tabs.currentIndex() == insp._TAB_LOADS, (
+        "user must stay on the Load Assignments tab after an edit"
+    )
+
+
+# ── PR #34: canvas perf + dense-view readability ─────────────────────
 
 
 def test_canvas_dense_models_auto_hide_id_labels(qt_app):

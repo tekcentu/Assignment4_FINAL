@@ -64,9 +64,14 @@ from ..gui_common.commands import (
     SetGridSystemCmd,
     SetSupportCmd,
     UpdateElementCmd,
+    UpdateMemberLoadCmd,
 )
 from ..gui_common.file_writer import write_input_file
-from ..gui_common.results_view import format_result
+from ..gui_common.results_view import (
+    case_combo_entries,
+    format_result,
+    resolve_view,
+)
 from ..gui_common.validation import (
     ModelValidationResult,
     cases_with_loads,
@@ -1050,41 +1055,50 @@ class MainWindow(QMainWindow):
             self.execute(DeleteNodeCmd(node_id=node_id))
 
     def show_element_menu(self, elem_id: int, action: str | None = None) -> None:
+        # Direct-action shortcuts used by other call sites (the load
+        # placement tool routes "member_load" here so the modal Add
+        # dialog still pops on a left-click; PR #35 adds "details" and
+        # "loads" so future callers can land on a specific tab without
+        # walking through the menu).
         if action == "member_load":
             self._add_member_load(elem_id)
+            return
+        if action == "details":
+            self._open_element_inspector(elem_id, tab="properties")
+            return
+        if action == "loads":
+            self._open_element_inspector(elem_id, tab="loads")
             return
         # While the element-detail inspector is open the host has the
         # rest of the editing surface locked (see _set_editing_locked).
         # The right-click context menu's edit items are built fresh
         # each time so they're not part of _lockable_actions — disable
         # them here based on the inspector's visibility instead. The
-        # "show details" item stays enabled so the user can re-target
-        # the open inspector to a different element from any
-        # right-click.
+        # "Element Details" and "Edit member loads…" items stay enabled
+        # so the user can re-target / re-focus the open inspector from
+        # any right-click.
         edits_locked = (
             self._element_inspector is not None
             and self._element_inspector.isVisible()
         )
         menu = QMenu(self)
-        a_details = menu.addAction(
-            f"Element {elem_id}: show details / FBD…"
-        )
+        a_details = menu.addAction(f"Element {elem_id}: Element Details…")
+        a_loads = menu.addAction(f"Element {elem_id}: Edit member loads…")
         menu.addSeparator()
         a_edit = menu.addAction(f"Element {elem_id}: edit section/material…")
-        a_add_load = menu.addAction(f"Element {elem_id}: add member load…")
         a_clear_loads = menu.addAction(
             f"Element {elem_id}: clear member loads"
         )
         a_delete = menu.addAction(f"Element {elem_id}: delete")
-        for action in (a_edit, a_add_load, a_clear_loads, a_delete):
-            action.setEnabled(not edits_locked)
+        for act in (a_edit, a_clear_loads, a_delete):
+            act.setEnabled(not edits_locked)
         chosen = menu.exec(self.cursor().pos())
         if chosen is a_details:
-            self._open_element_inspector(elem_id)
+            self._open_element_inspector(elem_id, tab="properties")
+        elif chosen is a_loads:
+            self._open_element_inspector(elem_id, tab="loads")
         elif chosen is a_edit:
             self._edit_element(elem_id)
-        elif chosen is a_add_load:
-            self._add_member_load(elem_id)
         elif chosen is a_clear_loads:
             self.execute(ClearMemberLoadsCmd(elem_id=elem_id))
         elif chosen is a_delete:
@@ -1520,8 +1534,11 @@ class MainWindow(QMainWindow):
         self._joint_masses_window.raise_()
         self._joint_masses_window.activateWindow()
 
-    def _open_element_inspector(self, elem_id: int) -> None:
-        """Open (or re-target) the non-modal element-detail inspector.
+    def _open_element_inspector(
+        self, elem_id: int, *, tab: str = "properties",
+    ) -> None:
+        """Open (or re-target) the non-modal tabbed element-detail
+        inspector and focus the requested tab.
 
         The inspector is a singleton on ``self._element_inspector`` —
         right-clicking a different element while it's open re-targets
@@ -1530,21 +1547,32 @@ class MainWindow(QMainWindow):
         :meth:`_set_editing_locked`); the inspector itself stays
         non-modal so pan / zoom / solve / overlay buttons continue to
         work on the main canvas.
+
+        ``tab`` selects the focused tab after opening: ``"properties"``
+        (default), ``"results"``, or ``"loads"``.  Used by the right-
+        click menu to land directly on "Edit member loads…" when the
+        user picked that item.
         """
         try:
             if self._element_inspector is None:
                 self._element_inspector = ElementPropertiesDialog(
                     self, self._model, elem_id, self._result,
+                    multi_result=self._multi_result,
                 )
                 self._element_inspector.finished.connect(
                     self._on_element_inspector_closed
                 )
-                # Per-row Delete in the loads table delegates here.
-                # Wire BEFORE re-rendering the loads table so the
+                # Wire BEFORE re-rendering so the Add / Edit / Delete
                 # buttons render as enabled rather than greyed out (the
                 # initial __init__ build ran before this assignment).
                 self._element_inspector._host_delete_member_load = (
                     self.delete_member_load
+                )
+                self._element_inspector._host_add_member_load = (
+                    self.add_member_load_from_inspector
+                )
+                self._element_inspector._host_edit_member_load = (
+                    self.edit_member_load_from_inspector
                 )
                 self._element_inspector.refresh_loads_only(
                     self._model, self._result,
@@ -1552,10 +1580,12 @@ class MainWindow(QMainWindow):
             else:
                 self._element_inspector.set_target(
                     self._model, elem_id, self._result,
+                    multi_result=self._multi_result,
                 )
         except ValueError as e:
             QMessageBox.warning(self, "Element not found", str(e))
             return
+        self._element_inspector.set_initial_tab(tab)
         self._set_editing_locked(True)
         self._element_inspector.show()
         self._element_inspector.raise_()
@@ -1578,7 +1608,102 @@ class MainWindow(QMainWindow):
         self.execute(cmd)
         if (self._element_inspector is not None
                 and self._element_inspector.isVisible()):
-            self._element_inspector.refresh(self._model, self._result)
+            self._element_inspector.refresh(
+                self._model, self._result,
+                multi_result=self._multi_result,
+            )
+
+    def add_member_load_from_inspector(self, elem_id: int) -> None:
+        """Host-side hook for the inspector's "Add member load…" button.
+
+        Opens the existing :class:`MemberLoadDialog` (Add mode) and,
+        on Accept, lands the new load via :class:`AddMemberLoadCmd` so
+        the change is undoable. Refreshes the inspector against the now-
+        invalidated result so the Results tab shows the "No analysis
+        results yet" placeholder rather than stale N/V/M diagrams."""
+        try:
+            d = MemberLoadDialog(self, model=self._model, elem_id=elem_id)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot add member load", str(e))
+            return
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        load = d.result_value
+        if load is None:
+            return
+        # Register a newly-typed load case before the load references it,
+        # mirroring the _add_member_load path. Without this the load is
+        # stored against a case that model.load_cases never learns about,
+        # so cases_with_loads() / Solve All / the case selector ignore it.
+        self._ensure_load_case_exists(getattr(load, "load_case", "DEFAULT"))
+        try:
+            self.execute(AddMemberLoadCmd(elem_id=elem_id, load=load))
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot add member load", str(e))
+            return
+        if (self._element_inspector is not None
+                and self._element_inspector.isVisible()):
+            self._element_inspector.refresh(
+                self._model, self._result,
+                multi_result=self._multi_result,
+            )
+
+    def edit_member_load_from_inspector(
+        self, elem_id: int, load_index: int,
+    ) -> None:
+        """Host-side hook for the inspector's per-row Edit buttons.
+
+        Opens the :class:`MemberLoadDialog` pre-filled with the existing
+        row and, on Accept, swaps the row via :class:`UpdateMemberLoadCmd`
+        (single undo step, exact-instance restore on undo). Refreshes
+        the inspector — same stale-results-clearing path as Add / Delete."""
+        elem = next(
+            (e for e in self._model.elements if e.id == elem_id), None,
+        )
+        if elem is None:
+            QMessageBox.warning(
+                self, "Cannot edit member load",
+                f"Element {elem_id} does not exist.",
+            )
+            return
+        if not (0 <= load_index < len(elem.member_loads)):
+            QMessageBox.warning(
+                self, "Cannot edit member load",
+                f"Load index {load_index} out of range for element "
+                f"{elem_id}.",
+            )
+            return
+        existing = elem.member_loads[load_index]
+        try:
+            d = MemberLoadDialog(
+                self, model=self._model, elem_id=elem_id,
+                existing_load=existing, existing_index=load_index,
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot edit member load", str(e))
+            return
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_load = d.result_value
+        if new_load is None:
+            return
+        # Register a newly-typed load case before the swap references it
+        # (same gap the Add hook has — see add_member_load_from_inspector).
+        self._ensure_load_case_exists(getattr(new_load, "load_case", "DEFAULT"))
+        try:
+            self.execute(UpdateMemberLoadCmd(
+                elem_id=elem_id, load_index=load_index,
+                new_load=new_load,
+            ))
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot edit member load", str(e))
+            return
+        if (self._element_inspector is not None
+                and self._element_inspector.isVisible()):
+            self._element_inspector.refresh(
+                self._model, self._result,
+                multi_result=self._multi_result,
+            )
 
     def _on_element_inspector_closed(self, _result_code=None) -> None:
         """Re-enable the editing surface once the user closes the
@@ -2174,7 +2299,7 @@ class MainWindow(QMainWindow):
         # the user doesn't have to close-and-reopen after a solve.
         if (self._element_inspector is not None
                 and self._element_inspector.isVisible()):
-            self._element_inspector.refresh(self._model, self._result)
+            self._element_inspector.refresh(self._model, self._result, multi_result=self._multi_result)
         n_solved = len(new_multi.cases)
         n_failed = len(new_multi.failed_cases)
         skipped_suffix = (
@@ -2229,7 +2354,7 @@ class MainWindow(QMainWindow):
             self._element_inspector is not None
             and self._element_inspector.isVisible()
         ):
-            self._element_inspector.refresh(self._model, self._result)
+            self._element_inspector.refresh(self._model, self._result, multi_result=self._multi_result)
         # PR #29: when the user selects an unavailable combination,
         # explain WHY there's no result rather than leaving a bare
         # placeholder.
@@ -2277,51 +2402,15 @@ class MainWindow(QMainWindow):
         combo.blockSignals(True)
         try:
             combo.clear()
-            # Real cases — sorted alphabetically with DEFAULT pinned
-            # to the front so it's always visible at index 0.
-            ordered = (
-                (["DEFAULT"] if "DEFAULT" in self._model.load_cases else [])
-                + sorted(
-                    n for n in self._model.load_cases
-                    if n != "DEFAULT"
-                )
-            )
-            # Enabled cases with no load source are labelled
-            # "(no loads assigned)" so they don't masquerade as ordinary
-            # unsolved result cases — Solve All skips them, and the user
-            # sees why rather than a bare "needs solve".
-            used = used_case_names(self._model)
-            for name in ordered:
-                lc = self._model.load_cases[name]
-                if not lc.enabled:
-                    label = f"{name}  (disabled)"
-                elif name not in used:
-                    label = f"{name}  (no loads assigned)"
-                else:
-                    label = name
-                combo.addItem(label, name)
-            # SUM_ALL — only when every requested case has solved.
-            if (
-                self._multi_result is not None
-                and self._multi_result.sum_all_available()
-                and len(self._multi_result.cases) >= 2
+            # Shared entry list (label, raw_name) — same routing the
+            # per-element inspector's local result selector uses, so
+            # labels (incl. the "(no loads assigned)" tag for unused
+            # enabled cases) and the SUM_ALL / combination rules never
+            # drift between the toolbar combo and the dialog selector.
+            for label, raw_name in case_combo_entries(
+                self._model, self._multi_result,
             ):
-                combo.addItem(SUM_ALL_KEY, SUM_ALL_KEY)
-            # User-defined combinations LAST (PR #29). A combination
-            # whose referenced cases aren't all solved is shown with a
-            # "(needs solve)" hint and still selectable — selecting it
-            # surfaces the placeholder rather than silently hiding it.
-            for comb_name in sorted(self._model.load_combinations):
-                comb = self._model.load_combinations[comb_name]
-                available = (
-                    self._multi_result is not None
-                    and self._multi_result.combination_available(comb.terms)
-                )
-                label = (
-                    f"{comb_name}  [comb]" if available
-                    else f"{comb_name}  [comb · needs solve]"
-                )
-                combo.addItem(label, comb_name)
+                combo.addItem(label, raw_name)
             # Restore selection by matching the userData (the raw
             # case name, not the "(disabled)" label).
             idx = combo.findData(self._active_case)
@@ -2341,21 +2430,13 @@ class MainWindow(QMainWindow):
         """Resolve ``self._active_case`` to a concrete ``AnalysisResult``
         (or ``None`` for a pre-solve / unavailable selection).
 
-        Handles three kinds of selection:
-        * a load-case name → the per-case result;
-        * ``SUM_ALL`` → the unit-coefficient superposition view;
-        * a combination name → the coefficient-weighted view (or
-          ``None`` when a referenced case is unsolved, so the canvas /
-          inspector show a clear placeholder)."""
-        if self._multi_result is None:
-            return None
-        name = self._active_case
-        if name in self._model.load_combinations:
-            comb = self._model.load_combinations[name]
-            return self._multi_result.combination(
-                comb.terms, name=name,
-            )
-        return self._multi_result.get(name)
+        Delegates to :func:`resolve_view` so case / SUM_ALL / combination
+        routing lives in one Qt-free place shared with the per-element
+        inspector's local result selector."""
+        result, _status = resolve_view(
+            self._model, self._multi_result, self._active_case,
+        )
+        return result
 
     def _push_active_case_to_canvas(self) -> None:
         """Sync ``self._result`` (the legacy single-case view) and the
@@ -2526,7 +2607,7 @@ class MainWindow(QMainWindow):
             self._element_inspector is not None
             and self._element_inspector.isVisible()
         ):
-            self._element_inspector.refresh(self._model, None)
+            self._element_inspector.refresh(self._model, None, multi_result=None)
         if self._modal_result is not None:
             self._modal_result = None
             self.canvas.clear_modal_result()
