@@ -48,6 +48,10 @@ class ElementLoadRow:
     position: str      # display in the Position / Notes column
     meaning: str       # short physical interpretation
     load_case: str = "DEFAULT"  # user tag (v0.17) for future load cases
+    direction: str = ""  # human label for the coord system (PR #35 — for
+                         # the Load Assignments tab's Direction column);
+                         # empty for thermal loads which have no
+                         # direction concept.
 
 
 def _element_length(model: StructuralModel, elem) -> float:
@@ -181,6 +185,7 @@ def format_element_loads(
                 position=f"Full length, {_coord_system_label(cs)}",
                 meaning=meaning,
                 load_case=getattr(ld, "load_case", "DEFAULT"),
+                direction=_coord_system_label(cs),
             ))
         elif isinstance(ld, PointLoad):
             cs = getattr(ld, "coord_system", "local")
@@ -215,6 +220,7 @@ def format_element_loads(
                 ),
                 meaning=meaning,
                 load_case=getattr(ld, "load_case", "DEFAULT"),
+                direction=_coord_system_label(cs),
             ))
         elif isinstance(ld, FrameTemperatureLoad):
             mean = 0.5 * (ld.t_top + ld.t_bottom)

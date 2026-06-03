@@ -1590,6 +1590,65 @@ class DeleteMemberLoadCmd(Command):
                 return
 
 
+@dataclass
+class UpdateMemberLoadCmd(Command):
+    """Replace one member-load row on an element atomically.
+
+    Identified by ``elem_id`` + ``load_index`` (position in
+    ``elem.member_loads``).  Stores both the saved (old) instance and the
+    new instance so undo restores the *exact* original by identity, not
+    just by value.  Same index identity guarantees as
+    :class:`DeleteMemberLoadCmd` — safe because undo is LIFO.
+
+    Atomic: if the index is out of range or the new load is incompatible
+    with the element type (frame thermal on a truss, truss thermal on a
+    frame), a ``ValueError`` is raised before any mutation.
+    """
+
+    elem_id: int
+    load_index: int
+    new_load: object  # MemberLoad
+    _saved_load: object = field(default=None, init=False)
+    description: str = "edit member load"
+
+    def do(self, model: StructuralModel) -> None:
+        from ..model import (
+            FrameTemperatureLoad,
+            TrussTemperatureLoad,
+        )
+        for elem in model.elements:
+            if elem.id == self.elem_id:
+                if not (0 <= self.load_index < len(elem.member_loads)):
+                    raise ValueError(
+                        f"Load index {self.load_index} out of range "
+                        f"for element {self.elem_id} "
+                        f"(has {len(elem.member_loads)} load"
+                        f"{'s' if len(elem.member_loads) != 1 else ''})."
+                    )
+                if isinstance(elem, TrussElement2D) and isinstance(
+                    self.new_load, FrameTemperatureLoad
+                ):
+                    raise ValueError(
+                        "FrameTemperatureLoad is only valid on frame elements."
+                    )
+                if isinstance(elem, FrameElement2D) and isinstance(
+                    self.new_load, TrussTemperatureLoad
+                ):
+                    raise ValueError(
+                        "TrussTemperatureLoad is only valid on truss elements."
+                    )
+                self._saved_load = elem.member_loads[self.load_index]
+                elem.member_loads[self.load_index] = self.new_load
+                return
+        raise ValueError(f"Element {self.elem_id} does not exist.")
+
+    def undo(self, model: StructuralModel) -> None:
+        for elem in model.elements:
+            if elem.id == self.elem_id:
+                elem.member_loads[self.load_index] = self._saved_load
+                return
+
+
 # ── load cases (v0.18 — PR-A) ───────────────────────────────────────────
 #
 # All five commands invalidate any cached multi-case result the host

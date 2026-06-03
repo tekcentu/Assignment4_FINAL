@@ -1,9 +1,109 @@
-"""Render an AnalysisResult as a human-readable text report (no stdout capture)."""
+"""Render an AnalysisResult as a human-readable text report (no stdout capture).
+
+Also exposes Qt-free helpers used by both the main-window toolbar combo and
+the per-element inspector's local result selector to keep their populate /
+resolve logic in one place (so labels and SUM_ALL / combination rules can
+never drift between them).
+"""
 
 from __future__ import annotations
 
 from ..element import FrameElement2D
 from ..model import AnalysisResult, StructuralModel
+from ..multi_case_result import MultiCaseAnalysisResult, SUM_ALL_KEY
+
+
+def case_combo_entries(
+    model: StructuralModel,
+    multi_result: MultiCaseAnalysisResult | None,
+) -> list[tuple[str, str]]:
+    """Build the ``(display_label, raw_name)`` pairs for a case/combo combo.
+
+    Order matches the existing toolbar populate logic:
+
+    1. ``DEFAULT`` first (when present), then other real cases sorted by name,
+       each shown as ``"<name>"`` or ``"<name>  (disabled)"``.
+    2. ``SUM_ALL`` — appended only when every requested case solved and at
+       least two cases are present in ``multi_result.cases``.
+    3. User-defined combinations sorted by name, labelled ``"<name>  [comb]"``
+       or ``"<name>  [comb · needs solve]"`` when any referenced case is
+       unsolved.
+
+    The ``raw_name`` is always the bare identifier (case name, ``SUM_ALL``,
+    or combination name) and is what the caller stores in ``QComboBox``
+    userData and feeds to :func:`resolve_view`.  This keeps the display
+    label and the internal key strictly separated.
+    """
+    entries: list[tuple[str, str]] = []
+    ordered = (
+        (["DEFAULT"] if "DEFAULT" in model.load_cases else [])
+        + sorted(n for n in model.load_cases if n != "DEFAULT")
+    )
+    for name in ordered:
+        lc = model.load_cases[name]
+        label = name if lc.enabled else f"{name}  (disabled)"
+        entries.append((label, name))
+    if (
+        multi_result is not None
+        and multi_result.sum_all_available()
+        and len(multi_result.cases) >= 2
+    ):
+        entries.append((SUM_ALL_KEY, SUM_ALL_KEY))
+    for comb_name in sorted(model.load_combinations):
+        comb = model.load_combinations[comb_name]
+        available = (
+            multi_result is not None
+            and multi_result.combination_available(comb.terms)
+        )
+        label = (
+            f"{comb_name}  [comb]" if available
+            else f"{comb_name}  [comb · needs solve]"
+        )
+        entries.append((label, comb_name))
+    return entries
+
+
+def resolve_view(
+    model: StructuralModel,
+    multi_result: MultiCaseAnalysisResult | None,
+    name: str,
+) -> tuple[AnalysisResult | None, str]:
+    """Resolve a raw case / SUM_ALL / combination identifier to a result.
+
+    Returns a ``(result, status_msg)`` tuple where ``status_msg`` is empty
+    on success and a short human-readable reason otherwise — ready to drop
+    onto a placeholder axis when the diagrams panel has nothing to draw.
+
+    Mirrors :meth:`MainWindow._resolve_active_result` but takes the model
+    + multi_result + name as explicit arguments so callers (dialogs, the
+    main window, future side-panels) all share the same routing.
+    """
+    if multi_result is None:
+        return None, "No analysis results yet. Run analysis to show N/V/M diagrams."
+    if name in model.load_combinations:
+        comb = model.load_combinations[name]
+        result = multi_result.combination(comb.terms, name=name)
+        if result is None:
+            missing = multi_result.missing_cases_for(comb.terms)
+            return None, (
+                f"Combination '{name}' needs solve: "
+                f"missing {', '.join(missing)}"
+                if missing else
+                f"Combination '{name}' needs solve."
+            )
+        return result, ""
+    if name == SUM_ALL_KEY:
+        result = multi_result.sum_all()
+        if result is None:
+            return None, "SUM_ALL needs every requested case solved."
+        return result, ""
+    if name in multi_result.failed_cases:
+        reason = multi_result.failed_cases[name]
+        return None, f"Case '{name}' failed: {reason}"
+    result = multi_result.get(name)
+    if result is None:
+        return None, f"Case '{name}' has not been solved yet."
+    return result, ""
 
 
 def format_result(model: StructuralModel, result: AnalysisResult | None) -> str:

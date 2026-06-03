@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.22.4"
+__version__ = "0.23.0"
 __what_is_new__ = (
-    "Faster canvas redraws (batched element/node/selection artists) · "
-    "dense-view auto-hides IDs with a halo for legibility · "
-    "labeled grid culls to the visible viewport"
+    "Tabbed Element Detail Dialog — Properties, Results, Load Assignments · "
+    "Results tab has its own case/combo selector (raw-id userData) · "
+    "Loads tab supports per-row Add/Edit/Delete (all undoable)"
 )
 
 from .model import (
