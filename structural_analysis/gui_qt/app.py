@@ -1127,6 +1127,21 @@ class MainWindow(QMainWindow):
             return False
         if any(nl.node_id == node_id for nl in self._model.nodal_loads):
             return False
+        # Mirror the command's joint-mass precondition so the menu
+        # entry stays disabled when the command would refuse. Today
+        # ``model.joint_masses`` isn't an attribute (joint masses are
+        # computed dynamically), so this is a no-op; the check stays
+        # for symmetry with MergeAdjacentElementsCmd.do().
+        joint_masses = getattr(self._model, "joint_masses", None)
+        if joint_masses is not None:
+            jm = (
+                joint_masses.get(node_id)
+                if hasattr(joint_masses, "get") else None
+            )
+            if jm is not None and any(
+                getattr(jm, k, 0.0) != 0.0 for k in ("mx", "my", "mrz")
+            ):
+                return False
         return True
 
     def show_node_menu(self, node_id: int, action: str | None = None) -> None:

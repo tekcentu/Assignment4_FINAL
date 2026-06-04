@@ -2274,8 +2274,13 @@ class MergeAdjacentElementsCmd(Command):
 
         a_id = _outer_node(e1)
         b_id = _outer_node(e2)
-        na = model.nodes[a_id]
-        nb = model.nodes[b_id]
+        na = model.nodes.get(a_id)
+        nb = model.nodes.get(b_id)
+        if na is None or nb is None:
+            raise ValueError(
+                "Outer endpoint nodes of the incident elements are not "
+                f"in the model (a={a_id}, b={b_id})."
+            )
         dxa, dya = na.x - node_m.x, na.y - node_m.y
         dxb, dyb = nb.x - node_m.x, nb.y - node_m.y
         # Outer nodes must lie on opposite sides of the middle node
