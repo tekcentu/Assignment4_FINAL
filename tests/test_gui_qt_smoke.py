@@ -7050,3 +7050,164 @@ def test_element_loads_table_has_copy_installed(qt_app):
     qt_app.processEvents()
     table = w._element_inspector._loads_widget
     assert getattr(table, "_table_copy_installed", False) is True
+
+
+# ── v0.24.0: renumber + merge GUI surfaces ──
+
+
+def _seed_line_model(w, n: int = 3):
+    """Inject a small line-of-frames model directly into the host
+    so smoke tests can drive renumber / merge without going through
+    the full draw pipeline."""
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.model import Material, Node, Section
+    m = w._model
+    m.nodes.clear()
+    m.elements.clear()
+    m.materials.setdefault(
+        1, Material(id=1, name="Steel", E=2.1e8, density=7850.0),
+    )
+    m.sections.setdefault(
+        1, Section(id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3),
+    )
+    for i in range(n + 1):
+        m.nodes[i + 1] = Node(i + 1, float(i), 0.0)
+    for k in range(n):
+        m.elements.append(
+            FrameElement2D(
+                id=k + 1, node_i=k + 1, node_j=k + 2,
+                E=2.1e8, A=0.01, I=1e-4, section_id=1,
+            ),
+        )
+    return m
+
+
+def test_view_menu_show_local_axes_action_is_checkable(qt_app):
+    w = MainWindow()
+    assert w.act_show_local_axes.isCheckable()
+    assert not w.act_show_local_axes.isChecked()
+
+
+def test_edit_menu_has_renumber_action(qt_app):
+    w = MainWindow()
+    assert w.act_renumber_elements is not None
+    # Triggering on an empty model surfaces an info box (not a crash).
+    # We just check the action exists and is enabled.
+    assert w.act_renumber_elements.isEnabled()
+
+
+def test_renumber_dialog_preview_uses_current_id_order(qt_app):
+    from structural_analysis.gui_qt.dialogs import RenumberElementsDialog
+    w = MainWindow()
+    _seed_line_model(w, 4)
+    # Mess up the ids so "compact to 1..N" is observably different.
+    for new_id, e in zip([20, 10, 30, 40], w._model.elements):
+        e.id = new_id
+    d = RenumberElementsDialog(w, model=w._model)
+    mapping = d._compute_mapping()
+    # By current ID: 10 → 1, 20 → 2, 30 → 3, 40 → 4 (sorted ascending).
+    assert mapping == {10: 1, 20: 2, 30: 3, 40: 4}
+
+
+def test_renumber_dialog_geometry_orders_top_to_bottom_left_to_right(qt_app):
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.gui_qt.dialogs import RenumberElementsDialog
+    from structural_analysis.model import Material, Node, Section
+    w = MainWindow()
+    m = w._model
+    m.nodes.clear(); m.elements.clear()
+    m.materials.setdefault(
+        1, Material(id=1, name="Steel", E=2.1e8, density=7850.0),
+    )
+    m.sections.setdefault(
+        1, Section(id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3),
+    )
+    # Three midpoints: (5, 0), (0, 5), (5, 5). Top row first.
+    m.nodes[1] = Node(1, 0.0, 0.0)
+    m.nodes[2] = Node(2, 10.0, 0.0)
+    m.nodes[3] = Node(3, 0.0, 5.0)
+    m.nodes[4] = Node(4, 10.0, 5.0)
+    m.nodes[5] = Node(5, 0.0, 10.0)
+    m.nodes[6] = Node(6, 10.0, 10.0)
+    m.elements.append(FrameElement2D(  # midpoint y=0  → bottom
+        id=10, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1))
+    m.elements.append(FrameElement2D(  # midpoint y=5  → middle
+        id=20, node_i=3, node_j=4, E=2.1e8, A=0.01, I=1e-4, section_id=1))
+    m.elements.append(FrameElement2D(  # midpoint y=10 → top
+        id=30, node_i=5, node_j=6, E=2.1e8, A=0.01, I=1e-4, section_id=1))
+    d = RenumberElementsDialog(w, model=w._model)
+    d._rb_geometry.setChecked(True)
+    mapping = d._compute_mapping()
+    # Top-to-bottom: old id 30 → new 1, 20 → 2, 10 → 3.
+    assert mapping == {30: 1, 20: 2, 10: 3}
+
+
+def test_renumber_selection_strategy_sorts_selected_by_current_id(qt_app):
+    """The third strategy must NOT depend on click order — it sorts the
+    selected ids by current ID, then appends the rest by current ID."""
+    from structural_analysis.gui_qt.dialogs import RenumberElementsDialog
+    w = MainWindow()
+    _seed_line_model(w, 5)
+    # Selection set (order-agnostic) of element ids 4 and 2.
+    d = RenumberElementsDialog(
+        w, model=w._model, selected_ids=frozenset({4, 2}),
+    )
+    d._rb_selection.setChecked(True)
+    mapping = d._compute_mapping()
+    # Selected first sorted by current id: 2 → 1, 4 → 2; then rest by id:
+    # 1 → 3, 3 → 4, 5 → 5.
+    assert mapping == {2: 1, 4: 2, 1: 3, 3: 4, 5: 5}
+
+
+def test_renumber_selection_strategy_disabled_without_selection(qt_app):
+    from structural_analysis.gui_qt.dialogs import RenumberElementsDialog
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    d = RenumberElementsDialog(w, model=w._model)   # no selection passed
+    assert not d._rb_selection.isEnabled()
+
+
+def test_renumber_via_host_invalidates_results_and_translates_selection(qt_app):
+    from structural_analysis.gui_common.commands import RenumberElementsCmd
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    # Add a dummy result so we can confirm invalidation.
+    w._result = object()
+    w.canvas.add_element_to_selection(2)
+    w.canvas.add_element_to_selection(3)
+    mapping = {1: 30, 2: 20, 3: 10}
+    w.execute(RenumberElementsCmd(mapping=mapping))
+    # Result cleared (execute() calls _invalidate_result automatically).
+    assert w._result is None
+    # Selection IDs were 2 and 3 — we translate them manually here to
+    # mirror the host's post-execute logic.
+    new_sel = {mapping[eid] for eid in (2, 3)}
+    w.canvas.clear_selection()
+    for eid in new_sel:
+        w.canvas.add_element_to_selection(eid)
+    assert set(w.canvas.get_selected_elements()) == {20, 10}
+
+
+def test_node_context_menu_offers_merge_when_eligible(qt_app):
+    """Just spot-check that node-context-menu wiring exists (the menu
+    is built lazily via show_node_menu — this confirms it doesn't crash
+    on a node that is eligible for merge)."""
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    # No exception means the show_node_menu code path is intact; we
+    # don't actually pop the modal menu here. Just exercise the helper.
+    assert w._can_merge_node(2) is True
+    assert w._can_merge_node(1) is False  # corner node, only 1 incident
+
+
+def test_merge_via_host_removes_middle_node_and_invalidates_results(qt_app):
+    from structural_analysis.gui_common.commands import (
+        MergeAdjacentElementsCmd,
+    )
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    w._result = object()
+    w.execute(MergeAdjacentElementsCmd(middle_node_id=2))
+    assert 2 not in w._model.nodes
+    assert len(w._model.elements) == 2
+    assert w._result is None

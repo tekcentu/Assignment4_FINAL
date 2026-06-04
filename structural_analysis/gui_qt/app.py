@@ -60,6 +60,8 @@ from ..gui_common.commands import (
     DeleteNodeCmd,
     DeleteSectionCmd,
     DrawMemberWithSplitsCmd,
+    MergeAdjacentElementsCmd,
+    RenumberElementsCmd,
     ReplaceModelCmd,
     SetGridSystemCmd,
     SetSupportCmd,
@@ -105,6 +107,7 @@ from .dialogs import (
     MemberLoadDialog,
     NodalLoadManagerDialog,
     NodePropertiesDialog,
+    RenumberElementsDialog,
     SupportDialog,
 )
 from .grid import GridSystem
@@ -374,6 +377,19 @@ class MainWindow(QMainWindow):
             "Forget element defaults", self,
             triggered=self._forget_element_defaults,
         )
+        # v0.24.0 — manual element-ID cleanup. Opens a preview dialog
+        # so the user sees the old → new mapping before committing.
+        # Disabled when the model has zero elements.
+        self.act_renumber_elements = QAction(
+            "&Renumber elements…", self,
+            triggered=self._do_renumber_elements,
+        )
+        self.act_renumber_elements.setToolTip(
+            "Reassign element IDs to a clean 1..N sequence. Choose "
+            "from current ID order, geometric order, or selection-first. "
+            "Undoable; member loads stay attached to their physical "
+            "element; analysis results are invalidated."
+        )
         self.act_snap = QAction("Snap to grid", self, checkable=True, checked=True,
                                   triggered=self._toggle_snap)
         # Snap-kind toggles
@@ -517,6 +533,8 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_batch_assign)
         m_edit.addAction(self.act_materials)
         m_edit.addAction(self.act_forget_elem_defaults)
+        m_edit.addSeparator()
+        m_edit.addAction(self.act_renumber_elements)
 
         # Top-right corner of the menu bar: version + what's-new summary
         # so the user always sees which features ship in this build.
@@ -1808,6 +1826,63 @@ class MainWindow(QMainWindow):
             return
         x, y = d.result_value
         self.execute(AddNodeCmd(x=x, y=y))
+
+    def _do_renumber_elements(self) -> None:
+        """Open the RenumberElementsDialog, then execute the command and
+        translate the canvas selection + open inspector to the new ids."""
+        if not self._model.elements:
+            QMessageBox.information(
+                self, "Renumber elements",
+                "No elements to renumber.",
+            )
+            return
+        selected = frozenset(self.canvas.get_selected_elements())
+        try:
+            d = RenumberElementsDialog(
+                self, model=self._model, selected_ids=selected,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Renumber elements", str(exc))
+            return
+        if d.exec() != RenumberElementsDialog.DialogCode.Accepted:
+            return
+        mapping = d.result_value or {}
+        if not mapping or all(old == new for old, new in mapping.items()):
+            self.set_status("Renumber: ids already match the chosen order.")
+            return
+        # Remember the inspector target id (if any) so we can re-point
+        # at the same physical element under its new id post-execute.
+        inspector_old_id: int | None = None
+        if (
+            self._element_inspector is not None
+            and self._element_inspector.isVisible()
+        ):
+            inspector_old_id = getattr(
+                self._element_inspector, "_elem_id", None,
+            )
+        self.execute(RenumberElementsCmd(mapping=mapping))
+        # Translate selection.
+        new_sel = {mapping.get(eid, eid) for eid in selected}
+        self.canvas.clear_selection()
+        for eid in new_sel:
+            self.canvas.add_element_to_selection(eid)
+        self.canvas.redraw()
+        # Translate the inspector target.
+        if inspector_old_id is not None and inspector_old_id in mapping:
+            new_id = mapping[inspector_old_id]
+            try:
+                self._element_inspector.set_target(
+                    self._model, new_id, self._result,
+                    multi_result=self._multi_result,
+                )
+            except Exception:
+                # Defensive: if the inspector API drifts, fall back to
+                # closing it rather than crashing the renumber.
+                self._element_inspector.close()
+        self.set_status(
+            f"Renumbered {len(mapping)} element"
+            f"{'s' if len(mapping) != 1 else ''}."
+        )
 
     def _do_batch_assign_selected(self) -> None:
         """Open the BatchAssignDialog for the current element selection."""

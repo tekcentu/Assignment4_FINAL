@@ -1085,6 +1085,139 @@ class BatchAssignDialog(_ModalDialog):
         }
 
 
+# ── renumber elements ──
+
+
+class RenumberElementsDialog(_ModalDialog):
+    """Pick an ordering, preview the old → new id mapping, confirm.
+
+    Three orderings:
+      - "By current id" — compact to 1..N, preserving relative order.
+      - "By geometry" — sort by midpoint (y descending, then x ascending),
+        i.e. top-to-bottom, left-to-right. Helps SAP-style models.
+      - "Selected first, then rest by current id" — selected elements
+        get 1..k sorted by their current id; the rest follow by current
+        id starting from k+1. Only meaningful when a selection exists.
+
+    Returns a ``{old_id: new_id}`` dict suitable for
+    :class:`RenumberElementsCmd`.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        model: StructuralModel,
+        selected_ids: frozenset[int] | set[int] = frozenset(),
+    ) -> None:
+        self._model = model
+        self._selected_ids = frozenset(selected_ids)
+        if not model.elements:
+            raise ValueError("No elements to renumber.")
+        super().__init__(parent, "Renumber elements")
+        self.resize(420, 360)
+
+    def _build_body(self, body: QWidget) -> None:
+        layout = QVBoxLayout(body)
+        heading = QLabel(
+            f"Renumber {len(self._model.elements)} element"
+            f"{'s' if len(self._model.elements) != 1 else ''}.",
+            body,
+        )
+        font = heading.font()
+        font.setBold(True)
+        heading.setFont(font)
+        layout.addWidget(heading)
+
+        from PyQt6.QtWidgets import QButtonGroup, QRadioButton, QTableWidget
+        from PyQt6.QtWidgets import QTableWidgetItem
+
+        self._rb_current = QRadioButton(
+            "By current ID (compact to 1..N)", body,
+        )
+        self._rb_geometry = QRadioButton(
+            "By geometry (top-to-bottom, left-to-right)", body,
+        )
+        self._rb_selection = QRadioButton(
+            "Selected first, then remaining by current ID", body,
+        )
+        self._rb_selection.setEnabled(bool(self._selected_ids))
+        if not self._selected_ids:
+            self._rb_selection.setToolTip(
+                "No active element selection. Close, select some "
+                "elements on the canvas, then reopen this dialog."
+            )
+        self._rb_current.setChecked(True)
+        group = QButtonGroup(body)
+        for rb in (self._rb_current, self._rb_geometry, self._rb_selection):
+            group.addButton(rb)
+            layout.addWidget(rb)
+            rb.toggled.connect(self._refresh_preview)
+
+        self._table = QTableWidget(len(self._model.elements), 3, body)
+        self._table.setHorizontalHeaderLabels(["Old ID", "New ID", "Note"])
+        self._table.verticalHeader().setVisible(False)
+        layout.addWidget(self._table)
+        self._QTableWidgetItem = QTableWidgetItem
+        self._refresh_preview()
+
+    def _strategy(self) -> str:
+        if self._rb_geometry.isChecked():
+            return "geometry"
+        if self._rb_selection.isChecked():
+            return "selection"
+        return "current"
+
+    def _compute_mapping(self) -> dict[int, int]:
+        """Compute old→new mapping for the active strategy."""
+        elements = self._model.elements
+        nodes = self._model.nodes
+        strategy = self._strategy()
+        if strategy == "geometry":
+            def _mid(e):
+                ni = nodes.get(e.node_i)
+                nj = nodes.get(e.node_j)
+                if ni is None or nj is None:
+                    return (0.0, 0.0)
+                return ((ni.x + nj.x) / 2.0, (ni.y + nj.y) / 2.0)
+            ordered = sorted(
+                elements,
+                key=lambda e: (-(_mid(e)[1]), _mid(e)[0], e.id),
+            )
+        elif strategy == "selection":
+            in_sel = sorted(
+                (e for e in elements if e.id in self._selected_ids),
+                key=lambda e: e.id,
+            )
+            out_sel = sorted(
+                (e for e in elements if e.id not in self._selected_ids),
+                key=lambda e: e.id,
+            )
+            ordered = in_sel + out_sel
+        else:  # "current"
+            ordered = sorted(elements, key=lambda e: e.id)
+        return {e.id: new_id for new_id, e in enumerate(ordered, start=1)}
+
+    def _refresh_preview(self) -> None:
+        from PyQt6.QtCore import Qt
+        mapping = self._compute_mapping()
+        rows = sorted(mapping.items(), key=lambda kv: kv[1])
+        for r, (old, new) in enumerate(rows):
+            note = ""
+            if old == new:
+                note = "(unchanged)"
+            elif old in self._selected_ids and self._strategy() == "selection":
+                note = "(selected)"
+            for c, txt in enumerate((str(old), str(new), note)):
+                item = self._QTableWidgetItem(txt)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self._table.setItem(r, c, item)
+        self._table.resizeColumnsToContents()
+
+    def _accept(self) -> dict[int, int]:
+        return self._compute_mapping()
+
+
 # ── support ──
 
 
