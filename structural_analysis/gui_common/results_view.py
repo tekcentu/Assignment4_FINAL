@@ -11,6 +11,7 @@ from __future__ import annotations
 from ..element import FrameElement2D
 from ..model import AnalysisResult, StructuralModel
 from ..multi_case_result import MultiCaseAnalysisResult, SUM_ALL_KEY
+from .validation import used_case_names
 
 
 def case_combo_entries(
@@ -39,9 +40,18 @@ def case_combo_entries(
         (["DEFAULT"] if "DEFAULT" in model.load_cases else [])
         + sorted(n for n in model.load_cases if n != "DEFAULT")
     )
+    # Enabled cases that carry no load source are tagged
+    # "(no loads assigned)" so they don't masquerade as ordinary unsolved
+    # result cases — Solve All skips them, and the user sees why.
+    used = used_case_names(model)
     for name in ordered:
         lc = model.load_cases[name]
-        label = name if lc.enabled else f"{name}  (disabled)"
+        if not lc.enabled:
+            label = f"{name}  (disabled)"
+        elif name not in used:
+            label = f"{name}  (no loads assigned)"
+        else:
+            label = name
         entries.append((label, name))
     if (
         multi_result is not None

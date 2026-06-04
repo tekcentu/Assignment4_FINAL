@@ -63,6 +63,8 @@ from ..profiles import (
 
 from PyQt6.QtWidgets import QStackedWidget
 
+from .table_copy import install_table_copy
+
 
 def parse_float(text: str, name: str, *, allow_blank: bool = False) -> Optional[float]:
     s = (text or "").strip()
@@ -1314,6 +1316,7 @@ class NodalLoadManagerDialog(QDialog):
         self._table.setHorizontalHeaderLabels(
             ["Case", "Fx (kN)", "Fy (kN)", "Mz (kN·m)"]
         )
+        install_table_copy(self._table, include_headers=True)
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(
@@ -2176,6 +2179,7 @@ class LoadCaseManagerDialog(_ModalDialog):
         self._table.setHorizontalHeaderLabels(
             ["Name", "Enabled", "Self-weight", "Notes"]
         )
+        install_table_copy(self._table, include_headers=True)
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -2516,6 +2520,7 @@ class LoadCombinationManagerDialog(_ModalDialog):
         self._table.setHorizontalHeaderLabels(
             ["Name", "Terms", "Description", ""]
         )
+        install_table_copy(self._table, include_headers=True)
         self._table.verticalHeader().setVisible(False)
         # The Name column is editable in place (double-click) so a
         # combination can be RENAMED — _on_item_changed turns the edit
@@ -2758,6 +2763,7 @@ class MaterialListDialog(_ModalDialog):
         mat_page = QWidget(self._tabs)
         ml = QVBoxLayout(mat_page)
         self._mat_tree = QTreeWidget(mat_page)
+        install_table_copy(self._mat_tree, include_headers=True)
         self._mat_tree.setHeaderLabels(
             ["id", "name", "E (kN/m²)", "α (1/°C)", "ρ (kg/m³)",
              "ν", "G (derived)"]
@@ -2779,6 +2785,7 @@ class MaterialListDialog(_ModalDialog):
         sec_page = QWidget(self._tabs)
         sl = QVBoxLayout(sec_page)
         self._sec_tree = QTreeWidget(sec_page)
+        install_table_copy(self._sec_tree, include_headers=True)
         self._sec_tree.setHeaderLabels(
             ["id", "name", "material", "A (m²)", "I (m⁴)", "depth (m)",
              "width (m)", "shape"]
@@ -3191,6 +3198,11 @@ class ElementPropertiesDialog(QDialog):
         self._results_widget: QWidget | None = None
         self._loads_tab_widget: QWidget | None = None
         self._loads_widget: QWidget | None = None
+        # "Show Maxima" is ON by default and its state is remembered
+        # across rebuilds (set_target / refresh / Results-tab case switch)
+        # for the lifetime of the dialog — switching the case must NOT
+        # reset this user choice.
+        self._show_maxima_on: bool = True
 
         # Dialog-local result selection (raw case / SUM_ALL / combination
         # name).  Initialised to the host's active case at open time so
@@ -3572,13 +3584,21 @@ class ElementPropertiesDialog(QDialog):
         val_row.addStretch()
         layout.addLayout(val_row)
 
+        # Show Maxima checkbox — defaults ON and restores the persisted
+        # per-dialog state so a case switch (which rebuilds this body)
+        # doesn't reset the user's choice. Connecting before setChecked
+        # means the restore fires _toggle_maxima, drawing the annotations
+        # for the freshly-rendered (current-case) diagrams — so there are
+        # never stale maxima values from the previous case.
         maxima_row = QHBoxLayout()
         self._show_maxima_cb = QCheckBox("Show Maxima")
         self._show_maxima_cb.setEnabled(self._f_local_ref is not None)
-        self._show_maxima_cb.stateChanged.connect(self._toggle_maxima)
+        self._show_maxima_cb.toggled.connect(self._toggle_maxima)
         maxima_row.addWidget(self._show_maxima_cb)
         maxima_row.addStretch()
         layout.addLayout(maxima_row)
+        if self._f_local_ref is not None and self._show_maxima_on:
+            self._show_maxima_cb.setChecked(True)
 
         # ── End-force table (only when a solved result is shown) ──
         if ok_result is not None:
@@ -3715,6 +3735,10 @@ class ElementPropertiesDialog(QDialog):
             "#", "Type", "Direction", "Magnitude",
             "Position / Notes", "Case", "", "",
         ])
+        # Spreadsheet copy: read-only / NoSelection table, so Ctrl+C and
+        # right-click Copy fall back to the whole table (Case/Type/...
+        # columns; the trailing Edit/Delete-button columns copy as empty).
+        install_table_copy(table, include_headers=True)
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -3883,15 +3907,19 @@ class ElementPropertiesDialog(QDialog):
                             if m_val is not None else "M: —")
         self._detail_canvas.draw_idle()
 
-    def _toggle_maxima(self, state: int) -> None:
-        """Add / remove absolute-peak annotations on each diagram axis."""
+    def _toggle_maxima(self, checked: bool) -> None:
+        """Add / remove absolute-peak annotations on each diagram axis.
+
+        Records the user's choice in ``self._show_maxima_on`` so it
+        survives a body rebuild (case switch / refresh)."""
+        self._show_maxima_on = bool(checked)
         for ann in self._maxima_annotations:
             try:
                 ann.remove()
             except ValueError:
                 pass
         self._maxima_annotations.clear()
-        if state and self._f_local_ref is not None:
+        if checked and self._f_local_ref is not None:
             for kind, ax in (
                 ("axial",  self._ax_n),
                 ("shear",  self._ax_v),

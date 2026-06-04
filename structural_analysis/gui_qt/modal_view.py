@@ -78,6 +78,8 @@ class ModalResultsDialog(QDialog):
             v.addWidget(note)
 
         self._tree = QTreeWidget(self)
+        from .table_copy import install_table_copy
+        install_table_copy(self._tree, include_headers=True)
         self._tree.setHeaderLabels(
             ["mode", "f (Hz)", "T (s)", "ω (rad/s)"]
         )

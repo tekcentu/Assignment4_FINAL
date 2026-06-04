@@ -592,6 +592,81 @@ def _has_support_settlement(model: "StructuralModel") -> bool:
     return False
 
 
+def _load_source_cases(model: "StructuralModel") -> set[str]:
+    """Case names directly referenced by a load row or by self-weight.
+
+    Walks nodal loads, every element's member loads (UDL / point /
+    thermal — thermal loads live in ``member_loads`` too), and the
+    self-weight case when self-weight is enabled.  Does **not**
+    settlement-expand (settlement is case-independent and handled by the
+    callers that need it).  This is the raw "which cases are referenced
+    by a load source" set used by :func:`sync_load_case_registry` (to
+    repair the registry) and :func:`used_case_names` (to decide which
+    cases are not just empty placeholders).
+    """
+    names: set[str] = set()
+    for ld in model.nodal_loads:
+        names.add(getattr(ld, "load_case", "DEFAULT") or "DEFAULT")
+    for elem in model.elements:
+        for ml in getattr(elem, "member_loads", []) or []:
+            names.add(getattr(ml, "load_case", "DEFAULT") or "DEFAULT")
+    if getattr(model, "include_self_weight", False):
+        names.add(getattr(model, "self_weight_case", "DEFAULT") or "DEFAULT")
+    return names
+
+
+def sync_load_case_registry(model: "StructuralModel") -> list[str]:
+    """Ensure every load-case tag referenced by a load row is registered.
+
+    Defensive safety net (mirrors the final sweep in
+    ``file_io.read_input_file``): if any nodal / member / thermal load is
+    tagged with a case name that ``model.load_cases`` doesn't define, the
+    case is auto-registered as an enabled :class:`LoadCase` so
+    :func:`cases_with_loads`, "Solve All Cases", and the result selectors
+    treat it as a real case.  Without this, a load tagged ``LIVE`` whose
+    case was never registered is silently ignored by the solver — the
+    exact orphan-tag bug this hotfix targets.
+
+    Idempotent: re-running on a complete registry is a no-op.  Does not
+    touch existing cases (their ``enabled`` flag / self-weight role are
+    preserved).  DEFAULT is always present so it is never re-created.
+
+    Returns:
+        The sorted list of names that were auto-registered (empty when
+        the registry was already complete), so the host can surface a
+        one-line status message.
+    """
+    from ..model import LoadCase
+    added: list[str] = []
+    for name in sorted(_load_source_cases(model)):
+        if name not in model.load_cases:
+            model.load_cases[name] = LoadCase(name=name)
+            added.append(name)
+    return added
+
+
+def used_case_names(model: "StructuralModel") -> set[str]:
+    """Set of case names that are *used* (carry at least one action).
+
+    A case is used when any of these references it:
+
+    * a nodal load, member load, or thermal load tagged with the case;
+    * self-weight, when enabled and assigned to the case;
+    * a support settlement / prescribed displacement — settlement is
+      case-independent, so it marks every *enabled* case as used.
+
+    Used by the GUI to label otherwise-empty enabled cases as
+    "(no loads assigned)" in the result selectors instead of letting
+    them masquerade as ordinary unsolved cases.
+    """
+    used = _load_source_cases(model)
+    if _has_support_settlement(model):
+        used |= {
+            name for name, lc in model.load_cases.items() if lc.enabled
+        }
+    return used
+
+
 def cases_with_loads(model: "StructuralModel") -> list[str]:
     """Enabled cases that actually carry at least one load source.
 
@@ -618,18 +693,7 @@ def cases_with_loads(model: "StructuralModel") -> list[str]:
     Returns:
         Alphabetically-sorted list of case names.
     """
-    has_loads: set[str] = set()
-    for ld in model.nodal_loads:
-        has_loads.add(getattr(ld, "load_case", "DEFAULT"))
-    for elem in model.elements:
-        for ml in getattr(elem, "member_loads", []):
-            has_loads.add(getattr(ml, "load_case", "DEFAULT"))
-    if getattr(model, "include_self_weight", False):
-        has_loads.add(getattr(model, "self_weight_case", "DEFAULT"))
     enabled = {
         name for name, lc in model.load_cases.items() if lc.enabled
     }
-    if _has_support_settlement(model):
-        # Settlement is case-independent — every enabled case gets it.
-        has_loads.update(enabled)
-    return sorted(enabled & has_loads)
+    return sorted(enabled & used_case_names(model))

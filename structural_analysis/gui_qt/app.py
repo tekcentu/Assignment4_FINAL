@@ -75,6 +75,8 @@ from ..gui_common.results_view import (
 from ..gui_common.validation import (
     ModelValidationResult,
     cases_with_loads,
+    sync_load_case_registry,
+    used_case_names,
     validate_model,
 )
 
@@ -566,7 +568,11 @@ class MainWindow(QMainWindow):
             "intensity regardless of which case is active."
         )
         m_view.addAction(self.act_active_case_loads_only)
-        # Load Case Manager dialog (View → Load &cases…).
+
+        # Load cases & combinations are model/analysis DEFINITIONS, not
+        # view options — they live under a dedicated Model menu rather
+        # than View (where they were easy to miss / mistake for display
+        # toggles).
         self.act_load_cases = QAction(
             "Load &cases…", self,
             triggered=self._show_load_case_manager,
@@ -575,8 +581,6 @@ class MainWindow(QMainWindow):
             "Add, rename, delete, enable/disable load cases. Also sets "
             "which case absorbs the self-weight contribution."
         )
-        m_view.addAction(self.act_load_cases)
-        # Load Combination Manager (View → Load com&binations…).
         self.act_load_combinations = QAction(
             "Load com&binations…", self,
             triggered=self._show_load_combination_manager,
@@ -586,7 +590,9 @@ class MainWindow(QMainWindow):
             "(e.g. 1.2 DEAD + 1.6 LIVE). Combinations are derived views "
             "computed from solved case results."
         )
-        m_view.addAction(self.act_load_combinations)
+        m_model = self.menuBar().addMenu("&Model")
+        m_model.addAction(self.act_load_cases)
+        m_model.addAction(self.act_load_combinations)
 
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)
@@ -2079,6 +2085,19 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Load-case registry safety net: a load tagged with a case the
+        # registry never learned about (e.g. a dialog path that forgot to
+        # register, or a programmatic edit) would otherwise be silently
+        # dropped by cases_with_loads / Solve All. Auto-register any such
+        # orphan tags so every assigned case is treated as a real case.
+        auto_registered = sync_load_case_registry(self._model)
+        if auto_registered:
+            self._refresh_case_selector_combo()
+            self.set_status(
+                "Auto-registered load case(s): "
+                + ", ".join(auto_registered)
+            )
+
         # PR #31 — pre-solve validation.  Errors block the solve, surface
         # the report in the result panel, and paint problem nodes/elements
         # on the canvas.  Warnings prompt the user to proceed.  Failed
@@ -2284,7 +2303,7 @@ class MainWindow(QMainWindow):
         n_solved = len(new_multi.cases)
         n_failed = len(new_multi.failed_cases)
         skipped_suffix = (
-            f" · skipped empty: {', '.join(skipped_cases)}"
+            f" · skipped unused load cases: {', '.join(skipped_cases)}"
             if skipped_cases else ""
         )
         if n_failed:
@@ -2351,10 +2370,24 @@ class MainWindow(QMainWindow):
             else:
                 missing = self._multi_result.missing_cases_for(comb.terms)
                 if missing:
-                    self.set_status(
-                        f"Combination {raw_name} requires solved results "
-                        f"for {', '.join(missing)}."
-                    )
+                    # Distinguish "unsolved" from "unused" — a referenced
+                    # case with no assigned loads can never solve, so say
+                    # so plainly instead of an open-ended "needs solve".
+                    used = used_case_names(self._model)
+                    no_loads = [c for c in missing if c not in used]
+                    if no_loads:
+                        self.set_status(
+                            f"Combination {raw_name} requires solved "
+                            f"results for {', '.join(missing)}. "
+                            f"{', '.join(no_loads)} "
+                            f"{'have' if len(no_loads) > 1 else 'has'} "
+                            f"no assigned loads."
+                        )
+                    else:
+                        self.set_status(
+                            f"Combination {raw_name} requires solved "
+                            f"results for {', '.join(missing)}."
+                        )
 
     def _refresh_case_selector_combo(self) -> None:
         """Repopulate the toolbar combo from the model's case dict.
@@ -2371,7 +2404,9 @@ class MainWindow(QMainWindow):
             combo.clear()
             # Shared entry list (label, raw_name) — same routing the
             # per-element inspector's local result selector uses, so
-            # labels and the SUM_ALL / combination rules never drift.
+            # labels (incl. the "(no loads assigned)" tag for unused
+            # enabled cases) and the SUM_ALL / combination rules never
+            # drift between the toolbar combo and the dialog selector.
             for label, raw_name in case_combo_entries(
                 self._model, self._multi_result,
             ):
