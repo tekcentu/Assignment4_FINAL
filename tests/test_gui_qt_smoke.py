@@ -7211,3 +7211,72 @@ def test_merge_via_host_removes_middle_node_and_invalidates_results(qt_app):
     assert 2 not in w._model.nodes
     assert len(w._model.elements) == 2
     assert w._result is None
+
+
+# ── v0.24.1: merge-reason UX ──────────────────────────────────
+
+
+def test_merge_action_label_enabled_for_eligible_node(qt_app):
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    label, enabled, tooltip = w._merge_action_label_and_tooltip(2)
+    assert enabled is True
+    assert tooltip is None
+    assert "—" not in label
+
+
+def test_merge_action_label_includes_reason_when_disabled(qt_app):
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    # Node 1: corner — only one incident element.
+    label, enabled, tooltip = w._merge_action_label_and_tooltip(1)
+    assert enabled is False
+    assert tooltip is not None
+    assert "—" in label
+    assert tooltip in label  # reason appears verbatim in action text
+
+
+def test_merge_action_reason_specifies_support(qt_app):
+    from structural_analysis.gui_common.commands import SetSupportCmd
+    from structural_analysis.model import Support
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    w.execute(SetSupportCmd(support=Support(node_id=2, ux=True, uy=True, rz=False)))
+    label, enabled, tooltip = w._merge_action_label_and_tooltip(2)
+    assert not enabled
+    assert tooltip is not None
+    assert "support" in tooltip.lower()
+    assert "support" in label.lower()
+
+
+def test_merge_action_reason_specifies_nodal_load(qt_app):
+    from structural_analysis.model import NodalLoad
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    w._model.nodal_loads.append(NodalLoad(node_id=2, fy=-10.0))
+    label, enabled, tooltip = w._merge_action_label_and_tooltip(2)
+    assert not enabled
+    assert tooltip is not None
+    assert "nodal load" in tooltip.lower()
+
+
+def test_merge_action_reason_specifies_member_loads(qt_app):
+    from structural_analysis.gui_common.commands import AddMemberLoadCmd
+    from structural_analysis.model import UniformDistributedLoad
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    w.execute(AddMemberLoadCmd(elem_id=1, load=UniformDistributedLoad(wy=-5.0)))
+    label, enabled, tooltip = w._merge_action_label_and_tooltip(2)
+    assert not enabled
+    assert tooltip is not None
+    assert "member load" in tooltip.lower() or "remapping" in tooltip.lower()
+
+
+def test_can_merge_node_consistent_with_check_merge(qt_app):
+    """_can_merge_node verdict must equal check_merge_preconditions verdict."""
+    from structural_analysis.gui_common.commands import check_merge_preconditions
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    for nid in list(w._model.nodes):
+        ok, _ = check_merge_preconditions(w._model, nid)
+        assert w._can_merge_node(nid) == ok

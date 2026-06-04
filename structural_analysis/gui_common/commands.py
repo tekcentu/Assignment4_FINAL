@@ -2204,6 +2204,99 @@ class RenumberElementsCmd(Command):
         model.elements[:] = [by_id[oid] for oid in self._saved_order]
 
 
+def check_merge_preconditions(
+    model: "StructuralModel", middle_node_id: int
+) -> "tuple[bool, str | None]":
+    """Pre-flight check for :class:`MergeAdjacentElementsCmd`.
+
+    Returns ``(True, None)`` when the merge is allowed, or
+    ``(False, reason)`` with a short, user-facing explanation when it
+    is not.  The verdict is consistent with what the command's ``do()``
+    would decide — if this returns ``True``, the command will succeed;
+    if it returns ``False``, the command will raise.  The phrasing may
+    differ because the command's ``ValueError`` text is richer (shown
+    in a ``QMessageBox``), while the reason here is designed for a
+    menu action label or tooltip.
+    """
+    from ..element import FrameElement2D
+
+    node_m = model.nodes.get(middle_node_id)
+    if node_m is None:
+        return False, f"node {middle_node_id} not found"
+
+    incident = [
+        e for e in model.elements
+        if e.node_i == middle_node_id or e.node_j == middle_node_id
+    ]
+    n = len(incident)
+    if n != 2:
+        return False, f"not exactly 2 incident elements (found {n})"
+    e1, e2 = incident
+
+    if type(e1) is not type(e2):
+        return False, "cannot merge frame and truss elements"
+
+    def _outer(e: object) -> int:
+        return e.node_j if e.node_i == middle_node_id else e.node_i  # type: ignore[union-attr]
+
+    na = model.nodes.get(_outer(e1))
+    nb = model.nodes.get(_outer(e2))
+    if na is None or nb is None:
+        return False, "outer endpoint node missing from model"
+
+    dxa, dya = na.x - node_m.x, na.y - node_m.y
+    dxb, dyb = nb.x - node_m.x, nb.y - node_m.y
+    cross = dxa * dyb - dya * dxb
+    dot = dxa * dxb + dya * dyb
+    L_a = (dxa * dxa + dya * dya) ** 0.5
+    L_b = (dxb * dxb + dyb * dyb) ** 0.5
+    tol = 1e-9 * max(L_a, L_b, 1.0)
+    if abs(cross) > tol * max(L_a, L_b, 1.0):
+        return False, "elements are not collinear"
+    if dot >= -tol:
+        return False, "elements are not on opposite sides of the middle node"
+
+    if e1.section_id != e2.section_id:
+        return False, "elements have different sections"
+    if e1.material_id_override != e2.material_id_override:
+        return False, "elements have different material overrides"
+
+    if isinstance(e1, FrameElement2D):
+        def _inner(e: object) -> bool:
+            return e.release_j if e.node_i != middle_node_id else e.release_i  # type: ignore[union-attr]
+
+        if _inner(e1) or _inner(e2):
+            return False, "release/hinge at the middle node"
+
+    if middle_node_id in model.supports:
+        sup = model.supports[middle_node_id]
+        if any(
+            getattr(sup, f"settle_{dof}", None) is not None
+            for dof in ("ux", "uy", "rz")
+        ):
+            return False, "middle node has a support settlement"
+        return False, "middle node has a support"
+
+    if any(nl.node_id == middle_node_id for nl in model.nodal_loads):
+        return False, "middle node has a nodal load"
+
+    if e1.member_loads or e2.member_loads:
+        return False, "member loads present — remapping not implemented"
+
+    joint_masses = getattr(model, "joint_masses", None)
+    if joint_masses is not None:
+        jm = (
+            joint_masses.get(middle_node_id)
+            if hasattr(joint_masses, "get") else None
+        )
+        if jm is not None and any(
+            getattr(jm, k, 0.0) != 0.0 for k in ("mx", "my", "mrz")
+        ):
+            return False, "middle node has a joint mass"
+
+    return True, None
+
+
 @dataclass
 class MergeAdjacentElementsCmd(Command):
     """Merge two collinear, compatible, unloaded elements that share

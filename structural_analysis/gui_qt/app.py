@@ -52,6 +52,7 @@ from ..gui_common.commands import (
     AddOrUpdateSectionCmd,
     BatchDeleteCmd,
     BatchUpdateElementsCmd,
+    check_merge_preconditions,
     ClearMemberLoadsCmd,
     Command,
     DeleteElementCmd,
@@ -1069,80 +1070,29 @@ class MainWindow(QMainWindow):
         self._sticky_element = None
         self.set_status("Cleared remembered element settings.")
 
-    def _can_merge_node(self, node_id: int) -> bool:
-        """Cheap pre-check used by show_node_menu to enable / disable
-        the "Merge adjacent elements" entry.
+    def _merge_action_label_and_tooltip(
+        self, node_id: int
+    ) -> "tuple[str, bool, str | None]":
+        """Return *(label, enabled, tooltip)* for the merge context-menu action.
 
-        Mirrors the structural pre-conditions in MergeAdjacentElementsCmd
-        (same subtype + collinear + same section + no support / load /
-        release at the middle node + no member loads), without raising.
-        The command itself still re-checks and raises ValueError so a
-        race between the menu being shown and clicked surfaces a clear
-        message via execute().
+        When merge is eligible the label is plain and tooltip is None.
+        When ineligible the label gets the reason appended after an em-dash
+        and the tooltip also carries the reason, so the user sees why
+        without having to open a dialog.
         """
-        from ..element import FrameElement2D
-        if node_id not in self._model.nodes:
-            return False
-        incident = [
-            e for e in self._model.elements
-            if e.node_i == node_id or e.node_j == node_id
-        ]
-        if len(incident) != 2:
-            return False
-        e1, e2 = incident
-        if type(e1) is not type(e2):
-            return False
-        if e1.section_id != e2.section_id:
-            return False
-        if e1.material_id_override != e2.material_id_override:
-            return False
-        if e1.member_loads or e2.member_loads:
-            return False
-        # Collinear (opposite-side) check.
-        node_m = self._model.nodes[node_id]
-        def _outer(e):
-            return e.node_j if e.node_i == node_id else e.node_i
-        na = self._model.nodes.get(_outer(e1))
-        nb = self._model.nodes.get(_outer(e2))
-        if na is None or nb is None:
-            return False
-        dxa, dya = na.x - node_m.x, na.y - node_m.y
-        dxb, dyb = nb.x - node_m.x, nb.y - node_m.y
-        cross = dxa * dyb - dya * dxb
-        dot = dxa * dxb + dya * dyb
-        L_max = max((dxa * dxa + dya * dya) ** 0.5,
-                    (dxb * dxb + dyb * dyb) ** 0.5, 1.0)
-        if abs(cross) > 1e-9 * L_max * L_max:
-            return False
-        if dot >= 0:
-            return False
-        # Frame: inner releases at middle node both False.
-        if isinstance(e1, FrameElement2D):
-            def _inner(e):
-                return e.release_j if e.node_i != node_id else e.release_i
-            if _inner(e1) or _inner(e2):
-                return False
-        # No support / nodal load at the middle node.
-        if node_id in self._model.supports:
-            return False
-        if any(nl.node_id == node_id for nl in self._model.nodal_loads):
-            return False
-        # Mirror the command's joint-mass precondition so the menu
-        # entry stays disabled when the command would refuse. Today
-        # ``model.joint_masses`` isn't an attribute (joint masses are
-        # computed dynamically), so this is a no-op; the check stays
-        # for symmetry with MergeAdjacentElementsCmd.do().
-        joint_masses = getattr(self._model, "joint_masses", None)
-        if joint_masses is not None:
-            jm = (
-                joint_masses.get(node_id)
-                if hasattr(joint_masses, "get") else None
-            )
-            if jm is not None and any(
-                getattr(jm, k, 0.0) != 0.0 for k in ("mx", "my", "mrz")
-            ):
-                return False
-        return True
+        can, reason = check_merge_preconditions(self._model, node_id)
+        base = f"Node {node_id}: merge adjacent elements"
+        if can:
+            return base, True, None
+        return f"{base} — {reason}", False, reason
+
+    def _can_merge_node(self, node_id: int) -> bool:
+        """Return True iff the node is eligible for an adjacent-element merge.
+
+        Thin wrapper around :func:`check_merge_preconditions`; kept for
+        backwards-compatibility with tests that call it directly.
+        """
+        return self._merge_action_label_and_tooltip(node_id)[1]
 
     def show_node_menu(self, node_id: int, action: str | None = None) -> None:
         if action == "support":
@@ -1158,17 +1108,13 @@ class MainWindow(QMainWindow):
         a1 = menu.addAction(f"Node {node_id}: edit support…")
         a2 = menu.addAction(f"Node {node_id}: edit nodal load…")
         menu.addSeparator()
-        a_merge = menu.addAction(
-            f"Node {node_id}: merge adjacent elements",
+        merge_label, merge_enabled, merge_tooltip = (
+            self._merge_action_label_and_tooltip(node_id)
         )
-        a_merge.setEnabled(self._can_merge_node(node_id))
-        if not a_merge.isEnabled():
-            a_merge.setToolTip(
-                "Available only when exactly two collinear elements of "
-                "the same type, section, and material meet at this node, "
-                "with no support / nodal load / member loads / inner "
-                "releases attached."
-            )
+        a_merge = menu.addAction(merge_label)
+        a_merge.setEnabled(merge_enabled)
+        if merge_tooltip:
+            a_merge.setToolTip(merge_tooltip)
         menu.addSeparator()
         a3 = menu.addAction(f"Node {node_id}: delete")
         chosen = menu.exec(self.cursor().pos())

@@ -28,6 +28,7 @@ from structural_analysis.gui_common.commands import (
     AddNodeCmd,
     BatchDeleteCmd,
     BatchUpdateElementsCmd,
+    check_merge_preconditions,
     CLEAR_MATERIAL_OVERRIDE,
     DeleteMemberLoadCmd,
     MergeAdjacentElementsCmd,
@@ -2031,3 +2032,103 @@ def test_merge_undo_restores_elements_and_middle_node():
     assert dict(m.nodes) == nodes_before
     assert m.elements == elems_before
     assert [e.id for e in m.elements] == ids_before
+
+
+# ── check_merge_preconditions (v0.24.1) ───────────────────────
+
+
+def test_check_merge_allows_eligible_pair():
+    m = _seed_line_of_frames(2)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is True
+    assert reason is None
+
+
+def test_check_merge_not_exactly_two_elements():
+    m = _seed_line_of_frames(2)
+    # Node 1 has only one incident element.
+    ok, reason = check_merge_preconditions(m, 1)
+    assert ok is False
+    assert reason is not None
+    assert "2" in reason and "found" in reason
+
+
+def test_check_merge_not_collinear():
+    m = StructuralModel(title="bend")
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3)
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=1.0, y_j=0.0, kind="frame", section_id=1).do(m)
+    AddMemberCmd(x_i=1.0, y_i=0.0, x_j=1.0, y_j=1.0, kind="frame", section_id=1).do(m)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "collinear" in reason
+
+
+def test_check_merge_different_sections():
+    m = _seed_line_of_frames(2)
+    m.sections[2] = Section(id=2, name="S2", material_id=1, A=0.02, I=2e-4, depth=0.4)
+    m.elements[1].section_id = 2
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "section" in reason
+
+
+def test_check_merge_support_at_middle_node():
+    m = _seed_line_of_frames(2)
+    SetSupportCmd(support=Support(node_id=2, ux=True, uy=True, rz=False)).do(m)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "support" in reason
+
+
+def test_check_merge_support_settlement_at_middle_node():
+    m = _seed_line_of_frames(2)
+    from structural_analysis.model import Support as _Support
+    m.supports[2] = _Support(
+        node_id=2, ux=True, uy=True, rz=False,
+        settle_ux=0.005, settle_uy=None, settle_rz=None,
+    )
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "settlement" in reason
+
+
+def test_check_merge_nodal_load_at_middle_node():
+    m = _seed_line_of_frames(2)
+    m.nodal_loads.append(NodalLoad(node_id=2, fy=-10.0))
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "nodal load" in reason
+
+
+def test_check_merge_member_loads_gives_reason():
+    m = _seed_line_of_frames(2)
+    AddMemberLoadCmd(elem_id=1, load=UniformDistributedLoad(wy=-3.0)).do(m)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "member load" in reason.lower() or "remapping" in reason.lower()
+
+
+def test_check_merge_and_command_agree_on_eligible_pair():
+    """check_merge_preconditions True → command succeeds."""
+    m = _seed_line_of_frames(2)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is True
+    MergeAdjacentElementsCmd(middle_node_id=2).do(m)  # must not raise
+
+
+def test_check_merge_and_command_agree_on_blocked_cases():
+    """When precheck returns False, the command must also raise."""
+    m = _seed_line_of_frames(2)
+    SetSupportCmd(support=Support(node_id=2, ux=True, uy=True, rz=False)).do(m)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert "support" in reason
+    with pytest.raises(ValueError, match="support"):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)
