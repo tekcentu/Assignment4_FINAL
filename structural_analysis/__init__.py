@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.23.1"
+__version__ = "0.24.0"
 __what_is_new__ = (
-    "Load cases auto-register from assignments; unused cases labelled · "
-    "Load Cases / Combinations moved to a Model menu · "
-    "spreadsheet-style Ctrl+C / right-click Copy on all tables"
+    "Show local axes overlay (View menu) · "
+    "Renumber elements… preview + undo (Edit menu) · "
+    "Merge adjacent unloaded collinear elements (node right-click)"
 )
 
 from .model import (
