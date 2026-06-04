@@ -74,6 +74,10 @@ class ModelCanvas(QWidget):
         self.show_reactions: bool = True
         self.show_diagrams: bool = False
         self.show_section_labels: bool = False
+        # v0.24.0: optional overlay drawing local x/y axis arrows and
+        # i/j end labels on each element so users can see element
+        # orientation at a glance. Off by default — advanced view.
+        self.show_local_axes: bool = False
         self.diagram_kind: str = "moment"
         self.deformed_scale: float = 1.0
         self.diagram_scale: float = 1.0
@@ -1121,6 +1125,9 @@ class ModelCanvas(QWidget):
             self.ax.plot(rx, ry, marker="o", color="white", markersize=7,
                          markeredgecolor=edge, zorder=5)
 
+        if self.show_local_axes:
+            self._draw_local_axes(model)
+
         node_xs = [n.x for n in model.nodes.values()]
         node_ys = [n.y for n in model.nodes.values()]
         if node_xs:
@@ -1159,6 +1166,85 @@ class ModelCanvas(QWidget):
             if n is None:
                 continue
             self._draw_nodal_load(ld, n.x, n.y, load_scales["force"])
+
+    def _draw_local_axes(self, model: StructuralModel) -> None:
+        # Local-axis overlay (View → Show local axes). Convention is
+        # pinned to ``FrameElement2D.transformation_matrix`` /
+        # ``_length_cos_sin`` in ``element.py``:
+        #     local x = (nj - ni) / L
+        #     local y = (-dy, dx) / L           (i.e. 90° CCW from x)
+        # We honour the same dense-view cap as element labels so a
+        # 10 000-element model doesn't drown in arrows.
+        if len(model.elements) > self.MAX_AUTO_ELEMENT_LABELS:
+            return
+        # Cap arrow length against the visible diagonal so it stays
+        # legible at any zoom; on short elements we additionally cap to
+        # 18% of L so the arrow never overshoots the member.
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        view_diag = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+        diag_cap = 0.025 * view_diag if view_diag > 0 else 0.0
+        gray = "#3a3a3a"
+        for elem in model.elements:
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            dx = nj.x - ni.x
+            dy = nj.y - ni.y
+            L = (dx * dx + dy * dy) ** 0.5
+            if L < 1e-12:
+                continue
+            ex_x, ex_y = dx / L, dy / L
+            ey_x, ey_y = -dy / L, dx / L
+            arrow_len = min(0.18 * L, diag_cap) if diag_cap > 0 else 0.18 * L
+            mx = (ni.x + nj.x) / 2
+            my = (ni.y + nj.y) / 2
+            # Local x arrow (mid → mid + len * ex).
+            self.ax.annotate(
+                "", xy=(mx + arrow_len * ex_x, my + arrow_len * ex_y),
+                xytext=(mx, my),
+                arrowprops=dict(
+                    arrowstyle="->", color=gray, lw=1.0,
+                    shrinkA=0, shrinkB=0,
+                ),
+                annotation_clip=False, zorder=3.5,
+            )
+            # Local y arrow (mid → mid + len * ey).
+            self.ax.annotate(
+                "", xy=(mx + arrow_len * ey_x, my + arrow_len * ey_y),
+                xytext=(mx, my),
+                arrowprops=dict(
+                    arrowstyle="->", color=gray, lw=1.0,
+                    shrinkA=0, shrinkB=0,
+                ),
+                annotation_clip=False, zorder=3.5,
+            )
+            # Tip labels — placed slightly past the arrowhead.
+            tx = mx + arrow_len * 1.12 * ex_x
+            ty = my + arrow_len * 1.12 * ex_y
+            self.ax.text(
+                tx, ty, "x", color=gray, fontsize=7,
+                ha="center", va="center", zorder=3.6,
+            )
+            tx = mx + arrow_len * 1.12 * ey_x
+            ty = my + arrow_len * 1.12 * ey_y
+            self.ax.text(
+                tx, ty, "y", color=gray, fontsize=7,
+                ha="center", va="center", zorder=3.6,
+            )
+            # i / j end labels — 6% in from each end so they don't
+            # clash with the node marker or the release marker (15%).
+            ix, iy = ni.x + 0.06 * dx, ni.y + 0.06 * dy
+            jx, jy = nj.x - 0.06 * dx, nj.y - 0.06 * dy
+            for tx, ty, lbl in ((ix, iy, "i"), (jx, jy, "j")):
+                t = self.ax.text(
+                    tx, ty, lbl, color=gray, fontsize=7,
+                    ha="center", va="center", zorder=3.6,
+                )
+                t.set_path_effects([
+                    _path_effects.withStroke(linewidth=1.6, foreground="white"),
+                ])
 
     def _draw_support(self, sup: Support, x: float, y: float) -> None:
         if sup.ux and sup.uy and sup.rz:

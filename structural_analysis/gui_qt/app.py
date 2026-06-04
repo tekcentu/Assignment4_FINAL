@@ -568,6 +568,22 @@ class MainWindow(QMainWindow):
             "intensity regardless of which case is active."
         )
         m_view.addAction(self.act_active_case_loads_only)
+        # Show local axes (v0.24.0) — draws each element's local x/y
+        # arrows plus i/j end labels so users can see element
+        # orientation at a glance. Matches the solver's local-axis
+        # convention (local x = i → j, local y = 90° CCW). Off by
+        # default so existing views stay uncluttered.
+        self.act_show_local_axes = QAction(
+            "Show local &axes", self, checkable=True,
+            checked=self.canvas.show_local_axes,
+            triggered=self._on_show_local_axes_toggled,
+        )
+        self.act_show_local_axes.setToolTip(
+            "Draw each element's local x/y arrows and i/j end labels. "
+            "Useful for spotting orientation-dependent loads and "
+            "release ends. Hidden automatically in dense models."
+        )
+        m_view.addAction(self.act_show_local_axes)
 
         # Load cases & combinations are model/analysis DEFINITIONS, not
         # view options — they live under a dedicated Model menu rather
@@ -2471,6 +2487,11 @@ class MainWindow(QMainWindow):
         self._active_case_loads_only = bool(on)
         if hasattr(self.canvas, "set_active_case_loads_only"):
             self.canvas.set_active_case_loads_only(self._active_case_loads_only)
+
+    def _on_show_local_axes_toggled(self, on: bool) -> None:
+        """View → Show local axes slot."""
+        self.canvas.show_local_axes = bool(on)
+        self.canvas.redraw()
 
     def _show_load_case_manager(self) -> None:
         """Open the Load Case Manager dialog and apply its result.
