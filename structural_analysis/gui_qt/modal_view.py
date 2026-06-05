@@ -56,12 +56,17 @@ class ModalResultsDialog(QDialog):
             if result.mass_formulation == "consistent"
             else "lumped translational"
         )
-        v.addWidget(QLabel(
+        _src_summary = getattr(result, "mass_source_summary", "self-mass only")
+        header_lbl = QLabel(
             f"<b>{result.title or 'Model'}</b> · {result.n_modes} modes · "
             f"mass: {_mass_label} · "
-            f"normalisation: {result.normalisation}",
+            f"normalisation: {result.normalisation}<br>"
+            f"<span style='color:#555;font-size:9pt;'>"
+            f"mass source: {_src_summary}</span>",
             self,
-        ))
+        )
+        header_lbl.setTextFormat(Qt.TextFormat.RichText)
+        v.addWidget(header_lbl)
         if result.mass_formulation == "lumped":
             note = QLabel(
                 "Lumped translational mass is a comparison aid. "

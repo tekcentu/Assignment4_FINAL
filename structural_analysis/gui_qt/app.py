@@ -206,6 +206,12 @@ def _build_starter_model() -> StructuralModel:
         2: Section(id=2, name="Concrete_30x50", material_id=2,
                    A=0.150,   I=3.125e-3, depth=0.500),
     }
+    # v0.25: seed a DEAD load case so new models are ready for dead-load
+    # self-weight tracking out of the box.  Old files keep whatever
+    # self_weight_case they stored (typically "DEFAULT").
+    from ..model import LoadCase as _LC
+    m.load_cases["DEAD"] = _LC(name="DEAD")
+    m.self_weight_case = "DEAD"
     return m
 
 
@@ -475,6 +481,10 @@ class MainWindow(QMainWindow):
             "&Assembled joint masses…", self,
             triggered=self._show_joint_masses,
         )
+        self.act_modal_mass_source = QAction(
+            "Modal mass &source…", self,
+            triggered=self._do_modal_mass_source,
+        )
         self.act_clear_result = QAction("&Clear results", self,
                                           triggered=self._clear_result)
 
@@ -633,6 +643,7 @@ class MainWindow(QMainWindow):
         m_run.addAction(self.act_solve)
         m_run.addAction(self.act_solve_active)
         m_run.addAction(self.act_modal)
+        m_run.addAction(self.act_modal_mass_source)
         m_run.addSeparator()
         m_run.addAction(self.act_analysis_settings)
         m_run.addAction(self.act_mass_summary)
@@ -2680,6 +2691,7 @@ class MainWindow(QMainWindow):
                 mass_formulation=d.result_value.get(
                     "mass_formulation", "consistent",
                 ),
+                mass_source=getattr(self._model, "modal_mass_source", None),
             )
         except ValueError as e:
             QMessageBox.warning(self, "Modal analysis", str(e))
@@ -2712,6 +2724,14 @@ class MainWindow(QMainWindow):
             f"Modal analysis: {modal_result.n_modes} modes · "
             f"f₁ = {float(modal_result.frequencies[0]):.4g} Hz"
         )
+
+    def _do_modal_mass_source(self) -> None:
+        from .dialogs import ModalMassSourceDialog
+        from ..gui_common.commands import UpdateModalMassSourceCmd
+        d = ModalMassSourceDialog(self, model=self._model)
+        if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
+            return
+        self.execute(UpdateModalMassSourceCmd(new_source=d.result_value))
 
     def _clear_result(self) -> None:
         self._result = None

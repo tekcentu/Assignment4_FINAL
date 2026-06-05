@@ -4305,3 +4305,157 @@ class AnalysisSettingsDialog(_ModalDialog):
 
     def _accept(self) -> dict:
         return {"include_self_weight": bool(self._sw_check.isChecked())}
+
+
+# ── modal mass source (v0.25 — PR #40) ──────────────────────────────────
+
+
+class ModalMassSourceDialog(_ModalDialog):
+    """Configure which contributions are assembled into the modal mass matrix.
+
+    Three checkboxes (self-mass, joint masses, load-case mass) plus a
+    table for per-case multipliers.  A live label warns about potential
+    double-counting while the OK button remains enabled (per the brief:
+    warn, not block).
+
+    ``result_value`` on accept is the new :class:`ModalMassSource`.
+    """
+
+    def __init__(self, parent, *, model: StructuralModel) -> None:
+        from ..model import ModalMassSource
+        self._model = model
+        self._src = getattr(model, "modal_mass_source", ModalMassSource())
+        super().__init__(parent, "Modal mass source settings")
+        self.resize(480, 420)
+
+    def _build_body(self, body: QWidget) -> None:
+        from PyQt6.QtWidgets import (
+            QFormLayout, QGroupBox, QTableWidget, QTableWidgetItem,
+            QHeaderView, QScrollArea, QSizePolicy,
+        )
+        from PyQt6.QtCore import Qt
+
+        v = QVBoxLayout(body)
+        v.setContentsMargins(4, 4, 4, 4)
+
+        # ── Three checkboxes ──────────────────────────────────────────
+        n_jm = len(self._model.joint_masses) if hasattr(self._model, "joint_masses") else 0
+        self._cb_self = QCheckBox(
+            "Include element self-mass from material density", body,
+        )
+        self._cb_self.setChecked(self._src.include_self_mass)
+
+        self._cb_jm = QCheckBox(
+            f"Include nodal / joint masses  (current model: {n_jm} "
+            f"{'entry' if n_jm == 1 else 'entries'})",
+            body,
+        )
+        self._cb_jm.setChecked(self._src.include_joint_masses)
+
+        self._cb_lc = QCheckBox(
+            "Include selected load cases as mass  (|Fy|/g added to "
+            "both translational DOFs)",
+            body,
+        )
+        self._cb_lc.setChecked(self._src.include_load_cases)
+
+        v.addWidget(self._cb_self)
+        v.addWidget(self._cb_jm)
+        v.addWidget(self._cb_lc)
+
+        # ── Case-factor table ─────────────────────────────────────────
+        cases = [
+            name for name in sorted(self._model.load_cases)
+            if name != "SUM_ALL"
+        ]
+        self._table = QTableWidget(len(cases), 2, body)
+        self._table.setHorizontalHeaderLabels(["Case", "Multiplier"])
+        self._table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch,
+        )
+        self._table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self._table.verticalHeader().setVisible(False)
+        for row, name in enumerate(cases):
+            item_name = QTableWidgetItem(name)
+            item_name.setFlags(item_name.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            factor = self._src.load_case_factors.get(name, 0.0)
+            item_mult = QTableWidgetItem(f"{factor:g}")
+            self._table.setItem(row, 0, item_name)
+            self._table.setItem(row, 1, item_mult)
+        self._table.setEnabled(self._cb_lc.isChecked())
+        self._case_names = cases
+        v.addWidget(self._table)
+
+        # ── Warning label ─────────────────────────────────────────────
+        self._warn_label = QLabel("", body)
+        self._warn_label.setWordWrap(True)
+        self._warn_label.setStyleSheet(
+            "color: #a06000; font-size: 9pt; padding: 2px 0;"
+        )
+        v.addWidget(self._warn_label)
+
+        # ── Wire signals ──────────────────────────────────────────────
+        self._cb_self.toggled.connect(self._refresh_warnings)
+        self._cb_jm.toggled.connect(self._refresh_warnings)
+        self._cb_lc.toggled.connect(self._on_lc_toggled)
+        self._table.itemChanged.connect(self._refresh_warnings)
+
+        self._refresh_warnings()
+
+    def _on_lc_toggled(self, checked: bool) -> None:
+        self._table.setEnabled(checked)
+        self._refresh_warnings()
+
+    def _read_factors(self) -> dict[str, float]:
+        factors: dict[str, float] = {}
+        for row, name in enumerate(self._case_names):
+            item = self._table.item(row, 1)
+            if item is None:
+                continue
+            try:
+                val = float(item.text())
+            except ValueError:
+                val = 0.0
+            factors[name] = val
+        return factors
+
+    def _refresh_warnings(self) -> None:
+        msg = self._double_count_message()
+        self._warn_label.setText(msg)
+
+    def _double_count_message(self) -> str:
+        if not self._cb_self.isChecked():
+            return ""
+        if not self._cb_lc.isChecked():
+            return ""
+        sw_enabled = getattr(self._model, "include_self_weight", False)
+        if not sw_enabled:
+            return ""
+        sw_case = getattr(self._model, "self_weight_case", "DEFAULT")
+        mult = self._read_factors().get(sw_case, 0.0)
+        if mult > 0.0:
+            return (
+                f"Note: Generated self-weight in {sw_case!r} is automatically "
+                "excluded from mass conversion because element density already "
+                "provides self-mass. Only manually assigned loads in that case "
+                "contribute additional mass."
+            )
+        return ""
+
+    def _accept(self):
+        from ..model import ModalMassSource
+        factors = self._read_factors() if self._cb_lc.isChecked() else {}
+        try:
+            src = ModalMassSource(
+                include_self_mass=self._cb_self.isChecked(),
+                include_joint_masses=self._cb_jm.isChecked(),
+                include_load_cases=self._cb_lc.isChecked(),
+                load_case_factors=factors,
+            )
+        except ValueError as exc:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Invalid mass source", str(exc))
+            return None
+        return src

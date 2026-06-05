@@ -2533,3 +2533,31 @@ class MergeAdjacentElementsCmd(Command):
         # with the original lo element, then insert hi at hi_idx.
         model.elements[lo_idx] = lo_elem
         model.elements.insert(hi_idx, hi_elem)
+
+
+# ── modal mass source (v0.25 — PR #40) ──────────────────────────────────
+
+
+@dataclass
+class UpdateModalMassSourceCmd(Command):
+    """Replace ``model.modal_mass_source`` with a new :class:`ModalMassSource`.
+
+    Captured on both do and undo so the mass-source dialog's OK path can
+    be wired through ``host.execute(...)`` and receive the same undo/redo
+    treatment as all other model mutations.  The command never calls GUI
+    methods directly — result invalidation happens in ``MainWindow.execute``
+    via ``_invalidate_result``.
+    """
+
+    from ..model import ModalMassSource as _ModalMassSource  # type: ignore[misc]
+    new_source: object   # ModalMassSource
+    _previous: object | None = None
+    description: str = "update modal mass source"
+
+    def do(self, model: StructuralModel) -> None:
+        self._previous = getattr(model, "modal_mass_source", None)
+        model.modal_mass_source = self.new_source
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._previous is not None:
+            model.modal_mass_source = self._previous
