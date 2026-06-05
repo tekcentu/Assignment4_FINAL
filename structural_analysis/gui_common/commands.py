@@ -2153,3 +2153,383 @@ class SetGridSystemCmd(Command):
 
     def undo(self, model: StructuralModel) -> None:
         self.setter(self._previous)
+
+
+# v0.24.0 — Element-orientation & manual-cleanup commands.
+
+
+@dataclass
+class RenumberElementsCmd(Command):
+    """Reassign element ids across the model via a bijective mapping.
+
+    The mapping must cover *exactly* the current set of element ids;
+    values must be a permutation of positive ints. After do(), the
+    element list is sorted ascending by new id so manager tables and
+    the inspector iterate in their new order. Member loads are stored
+    on the element object (not keyed by id) so they automatically
+    travel with the renumbered element.
+
+    Undo restores both ids and the original list order.
+    """
+
+    mapping: dict[int, int]
+    _saved_order: list[int] = field(default_factory=list, init=False)
+    description: str = "renumber elements"
+
+    def do(self, model: StructuralModel) -> None:
+        current_ids = [e.id for e in model.elements]
+        if set(self.mapping) != set(current_ids):
+            raise ValueError(
+                "Renumber mapping must cover exactly the current element "
+                "ids (got "
+                f"{sorted(self.mapping)}, model has {sorted(current_ids)})."
+            )
+        new_ids = list(self.mapping.values())
+        if len(set(new_ids)) != len(new_ids):
+            raise ValueError("Renumber mapping must be bijective (no duplicates).")
+        if any(v < 1 for v in new_ids):
+            raise ValueError("Renumber mapping must assign positive ids.")
+        # Save before mutating so undo can restore the original order.
+        self._saved_order = current_ids[:]
+        for e in model.elements:
+            e.id = self.mapping[e.id]
+        model.elements.sort(key=lambda e: e.id)
+
+    def undo(self, model: StructuralModel) -> None:
+        inv = {new: old for old, new in self.mapping.items()}
+        for e in model.elements:
+            e.id = inv[e.id]
+        # Restore the pre-renumber list order.
+        by_id = {e.id: e for e in model.elements}
+        model.elements[:] = [by_id[oid] for oid in self._saved_order]
+
+
+def check_merge_preconditions(
+    model: "StructuralModel", middle_node_id: int
+) -> "tuple[bool, str | None]":
+    """Pre-flight check for :class:`MergeAdjacentElementsCmd`.
+
+    Returns ``(True, None)`` when the merge is allowed, or
+    ``(False, reason)`` with a short, user-facing explanation when it
+    is not.  The verdict is consistent with what the command's ``do()``
+    would decide — if this returns ``True``, the command will succeed;
+    if it returns ``False``, the command will raise.  The phrasing may
+    differ because the command's ``ValueError`` text is richer (shown
+    in a ``QMessageBox``), while the reason here is designed for a
+    menu action label or tooltip.
+    """
+    from ..element import FrameElement2D
+
+    node_m = model.nodes.get(middle_node_id)
+    if node_m is None:
+        return False, f"node {middle_node_id} not found"
+
+    incident = [
+        e for e in model.elements
+        if e.node_i == middle_node_id or e.node_j == middle_node_id
+    ]
+    n = len(incident)
+    if n != 2:
+        return False, f"not exactly 2 incident elements (found {n})"
+    e1, e2 = incident
+
+    if type(e1) is not type(e2):
+        return False, "cannot merge frame and truss elements"
+
+    def _outer(e: object) -> int:
+        return e.node_j if e.node_i == middle_node_id else e.node_i  # type: ignore[union-attr]
+
+    na = model.nodes.get(_outer(e1))
+    nb = model.nodes.get(_outer(e2))
+    if na is None or nb is None:
+        return False, "outer endpoint node missing from model"
+
+    dxa, dya = na.x - node_m.x, na.y - node_m.y
+    dxb, dyb = nb.x - node_m.x, nb.y - node_m.y
+    cross = dxa * dyb - dya * dxb
+    dot = dxa * dxb + dya * dyb
+    L_a = (dxa * dxa + dya * dya) ** 0.5
+    L_b = (dxb * dxb + dyb * dyb) ** 0.5
+    tol = 1e-9 * max(L_a, L_b, 1.0)
+    if abs(cross) > tol * max(L_a, L_b, 1.0):
+        return False, "elements are not collinear"
+    if dot >= -tol:
+        return False, "elements are not on opposite sides of the middle node"
+
+    if e1.section_id != e2.section_id:
+        return False, "elements have different sections"
+    if e1.material_id_override != e2.material_id_override:
+        return False, "elements have different material overrides"
+
+    if isinstance(e1, FrameElement2D):
+        def _inner(e: object) -> bool:
+            return e.release_j if e.node_i != middle_node_id else e.release_i  # type: ignore[union-attr]
+
+        if _inner(e1) or _inner(e2):
+            return False, "release/hinge at the middle node"
+
+    if middle_node_id in model.supports:
+        sup = model.supports[middle_node_id]
+        if any(
+            getattr(sup, f"settle_{dof}", None) is not None
+            for dof in ("ux", "uy", "rz")
+        ):
+            return False, "middle node has a support settlement"
+        return False, "middle node has a support"
+
+    if any(nl.node_id == middle_node_id for nl in model.nodal_loads):
+        return False, "middle node has a nodal load"
+
+    if e1.member_loads or e2.member_loads:
+        return False, "member loads present — remapping not implemented"
+
+    joint_masses = getattr(model, "joint_masses", None)
+    if joint_masses is not None:
+        jm = (
+            joint_masses.get(middle_node_id)
+            if hasattr(joint_masses, "get") else None
+        )
+        if jm is not None and any(
+            getattr(jm, k, 0.0) != 0.0 for k in ("mx", "my", "mrz")
+        ):
+            return False, "middle node has a joint mass"
+
+    return True, None
+
+
+@dataclass
+class MergeAdjacentElementsCmd(Command):
+    """Merge two collinear, compatible, unloaded elements that share
+    the given middle node into a single element. V1 is conservative:
+
+    Pre-conditions (each raises ValueError on failure — surfaced by
+    the host as a QMessageBox.warning so the user sees exactly why):
+
+      1. middle node exists,
+      2. exactly two incident elements,
+      3. same element subtype (frame-frame or truss-truss),
+      4. collinear within tol,
+      5. same section_id AND same material_id_override,
+      6. (frame) inner releases at the middle node are both False,
+      7. no support at the middle node,
+      8. no nodal load at the middle node in any load case,
+      9. neither incident element carries any member load,
+     10. no joint mass on the middle node (when the model supports masses).
+
+    Orientation rule:
+      - The merged element keeps the *lower* of the two ids (the
+        "surviving" element).
+      - It also preserves the surviving element's i→j direction:
+        if surviving was outer_S → middle, the merge is outer_S → outer_O;
+        if surviving was middle → outer_S, the merge is outer_O → outer_S.
+      This avoids surprise flips of the local-x axis on the kept id.
+
+    Undo restores both incident elements at their original list
+    positions and resurrects the middle node.
+    """
+
+    middle_node_id: int
+    _saved_node: object | None = None
+    _saved_elements: list[tuple[int, object]] = field(
+        default_factory=list, init=False,
+    )
+    description: str = "merge adjacent elements"
+
+    def do(self, model: StructuralModel) -> None:
+        from ..element import FrameElement2D, TrussElement2D
+
+        m = self.middle_node_id
+        # 1. node exists
+        node_m = model.nodes.get(m)
+        if node_m is None:
+            raise ValueError(f"Node {m} not found.")
+
+        # 2. exactly two incident elements
+        incident = [
+            (idx, e)
+            for idx, e in enumerate(model.elements)
+            if e.node_i == m or e.node_j == m
+        ]
+        if len(incident) != 2:
+            raise ValueError(
+                "Merge requires exactly 2 elements at the middle node "
+                f"(found {len(incident)})."
+            )
+        (i1, e1), (i2, e2) = incident
+
+        # 3. same subtype
+        if type(e1) is not type(e2):
+            raise ValueError("Cannot merge a frame and a truss element.")
+
+        # 4. collinear — direction-cosine cross product within tol of L.
+        def _outer_node(e):
+            return e.node_j if e.node_i == m else e.node_i
+
+        a_id = _outer_node(e1)
+        b_id = _outer_node(e2)
+        na = model.nodes.get(a_id)
+        nb = model.nodes.get(b_id)
+        if na is None or nb is None:
+            raise ValueError(
+                "Outer endpoint nodes of the incident elements are not "
+                f"in the model (a={a_id}, b={b_id})."
+            )
+        dxa, dya = na.x - node_m.x, na.y - node_m.y
+        dxb, dyb = nb.x - node_m.x, nb.y - node_m.y
+        # Outer nodes must lie on opposite sides of the middle node
+        # along a single straight line, so the vectors (a − m) and
+        # (b − m) point in opposite directions. Cross = 0 ⇒ collinear;
+        # dot < 0 ⇒ opposite sides.
+        cross = dxa * dyb - dya * dxb
+        dot = dxa * dxb + dya * dyb
+        L_a = (dxa * dxa + dya * dya) ** 0.5
+        L_b = (dxb * dxb + dyb * dyb) ** 0.5
+        tol = 1e-9 * max(L_a, L_b, 1.0)
+        if abs(cross) > tol * max(L_a, L_b, 1.0):
+            raise ValueError(
+                f"Elements are not collinear (cross = {cross:.3e})."
+            )
+        if dot >= -tol:
+            raise ValueError(
+                "Elements do not extend on opposite sides of the middle node."
+            )
+
+        # 5. same section / material override
+        if e1.section_id != e2.section_id:
+            raise ValueError(
+                "Elements have different sections "
+                f"(section_id {e1.section_id} vs {e2.section_id})."
+            )
+        if e1.material_id_override != e2.material_id_override:
+            raise ValueError(
+                "Elements have different material overrides."
+            )
+
+        # 6. inner releases at middle node must be False (frame only)
+        if isinstance(e1, FrameElement2D):
+            def _inner_release(e):
+                return e.release_j if e.node_i != m else e.release_i
+
+            if _inner_release(e1) or _inner_release(e2):
+                raise ValueError(
+                    "Merging at a released end would change structural "
+                    "behaviour (inner release detected at the middle node)."
+                )
+
+        # 7. no support at middle node (covers settlement / imposed disp
+        #    since those live on Support too).
+        if m in model.supports:
+            sup = model.supports[m]
+            if any(getattr(sup, f"settle_{dof}", None) is not None
+                   for dof in ("ux", "uy", "rz")):
+                raise ValueError(
+                    "Middle node has a prescribed support settlement; "
+                    "cannot drop it during merge."
+                )
+            raise ValueError(
+                "Middle node has a support; remove it before merging."
+            )
+
+        # 8. no nodal load at middle node in any load case
+        if any(nl.node_id == m for nl in model.nodal_loads):
+            raise ValueError(
+                "Middle node carries a nodal load; remove it before merging."
+            )
+
+        # 9. neither incident element carries member loads (V1 strict)
+        if e1.member_loads or e2.member_loads:
+            raise ValueError(
+                "Merging loaded elements requires load remapping and is "
+                "not implemented yet."
+            )
+
+        # 10. joint mass at middle node
+        joint_masses = getattr(model, "joint_masses", None)
+        if joint_masses is not None:
+            jm = joint_masses.get(m) if hasattr(joint_masses, "get") else None
+            if jm is not None and any(getattr(jm, k, 0.0) != 0.0
+                                       for k in ("mx", "my", "mrz")):
+                raise ValueError(
+                    "Middle node carries a joint mass; cannot drop it "
+                    "during merge."
+                )
+
+        # ── Build merged element ─────────────────────────────────────
+        # Surviving element = lower id; merged keeps surviving's id and
+        # the surviving element's i→j orientation.
+        if e1.id <= e2.id:
+            surviving, other = e1, e2
+            surv_idx, other_idx = i1, i2
+        else:
+            surviving, other = e2, e1
+            surv_idx, other_idx = i2, i1
+        surv_outer = _outer_node(surviving)
+        other_outer = _outer_node(other)
+        if surviving.node_i == surv_outer:
+            # Surviving was outer_S → middle; merged = outer_S → outer_O.
+            new_i, new_j = surv_outer, other_outer
+            release_i_src, release_j_src = "surv_outer_i", "other_outer_j"
+        else:
+            # Surviving was middle → outer_S; merged = outer_O → outer_S.
+            new_i, new_j = other_outer, surv_outer
+            release_i_src, release_j_src = "other_outer_i", "surv_outer_j"
+
+        # Outer release mapping (frame only).
+        if isinstance(surviving, FrameElement2D):
+            def _outer_release(e, outer):
+                return e.release_i if e.node_i == outer else e.release_j
+
+            if release_i_src == "surv_outer_i":
+                rel_i = _outer_release(surviving, surv_outer)
+                rel_j = _outer_release(other, other_outer)
+            else:
+                rel_i = _outer_release(other, other_outer)
+                rel_j = _outer_release(surviving, surv_outer)
+
+            merged = FrameElement2D(
+                id=surviving.id,
+                node_i=new_i, node_j=new_j,
+                E=surviving.E, A=surviving.A,
+                alpha=surviving.alpha, depth=surviving.depth,
+                rho=surviving.rho,
+                section_id=surviving.section_id,
+                material_id_override=surviving.material_id_override,
+                I=surviving.I,
+                release_i=rel_i, release_j=rel_j,
+            )
+        else:
+            merged = TrussElement2D(
+                id=surviving.id,
+                node_i=new_i, node_j=new_j,
+                E=surviving.E, A=surviving.A,
+                alpha=surviving.alpha, depth=surviving.depth,
+                rho=surviving.rho,
+                section_id=surviving.section_id,
+                material_id_override=surviving.material_id_override,
+            )
+
+        # ── Apply mutation atomically ────────────────────────────────
+        self._saved_node = node_m
+        self._saved_elements = sorted(
+            [(i1, e1), (i2, e2)], key=lambda t: t[0],
+        )
+        lo_idx, hi_idx = self._saved_elements[0][0], self._saved_elements[1][0]
+        # Drop the higher-index element first so the lower index stays
+        # valid, then replace the lower with the merged element.
+        del model.elements[hi_idx]
+        model.elements[lo_idx] = merged
+        # Finally drop the middle node.
+        del model.nodes[m]
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._saved_node is None or not self._saved_elements:
+            return
+        m = self.middle_node_id
+        model.nodes[m] = self._saved_node
+        # Restore by index in ascending order so insertions are stable.
+        lo_idx, lo_elem = self._saved_elements[0]
+        hi_idx, hi_elem = self._saved_elements[1]
+        # The merged element currently occupies lo_idx — replace it
+        # with the original lo element, then insert hi at hi_idx.
+        model.elements[lo_idx] = lo_elem
+        model.elements.insert(hi_idx, hi_elem)

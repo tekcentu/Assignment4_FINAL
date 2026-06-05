@@ -24,11 +24,17 @@ import pytest
 from structural_analysis.element import FrameElement2D, TrussElement2D
 from structural_analysis.gui_common.commands import (
     AddMemberCmd,
+    AddMemberLoadCmd,
     AddNodeCmd,
     BatchDeleteCmd,
     BatchUpdateElementsCmd,
+    check_merge_preconditions,
     CLEAR_MATERIAL_OVERRIDE,
     DeleteMemberLoadCmd,
+    MergeAdjacentElementsCmd,
+    RenumberElementsCmd,
+    SetNodalLoadCmd,
+    SetSupportCmd,
     UpdateMemberLoadCmd,
     DrawMemberWithSplitsCmd,
     SplitElementCmd,
@@ -36,6 +42,7 @@ from structural_analysis.gui_common.commands import (
 from structural_analysis.model import (
     FrameTemperatureLoad,
     Material,
+    NodalLoad,
     PointLoad,
     Section,
     StructuralModel,
@@ -1719,3 +1726,409 @@ def test_edit_nodal_load_row_undo_is_identity_based_under_non_lifo_mutation():
     assert len(m.nodal_loads) == 1
     assert m.nodal_loads[0].fy == -20.0
     assert m.nodal_loads[0].load_case == "LIVE"
+
+
+# ── renumber / merge (v0.24.0) ────────────────────────────────
+
+
+def _seed_line_of_frames(n: int) -> StructuralModel:
+    """Build a straight horizontal frame chain with N elements (N+1 nodes).
+    Section/material identical so merge preconditions can pass."""
+    m = StructuralModel(title="renumber")
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(
+        id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    for i in range(n + 1):
+        AddNodeCmd(x=float(i), y=0.0).do(m)
+    for k in range(n):
+        AddMemberCmd(
+            x_i=float(k), y_i=0.0, x_j=float(k + 1), y_j=0.0,
+            kind="frame", section_id=1,
+        ).do(m)
+    return m
+
+
+# ── RenumberElementsCmd ────────────────────────────────────────
+
+
+def test_renumber_produces_unique_sequential_ids():
+    m = _seed_line_of_frames(4)
+    ids = [e.id for e in m.elements]
+    mapping = {old: new for new, old in enumerate(ids, start=10)}
+    RenumberElementsCmd(mapping=mapping).do(m)
+    new_ids = [e.id for e in m.elements]
+    assert sorted(new_ids) == new_ids        # sorted ascending after do()
+    assert len(set(new_ids)) == len(new_ids) # unique
+    assert set(new_ids) == set(mapping.values())
+
+
+def test_renumber_undo_restores_original_ids_and_order():
+    m = _seed_line_of_frames(4)
+    before_ids = [e.id for e in m.elements]
+    before_iter = list(m.elements)  # identity order
+    mapping = {old: new for new, old in enumerate(before_ids, start=100)}
+    cmd = RenumberElementsCmd(mapping=mapping)
+    cmd.do(m)
+    cmd.undo(m)
+    assert [e.id for e in m.elements] == before_ids
+    assert m.elements == before_iter
+
+
+def test_renumber_redo_replays_assignment():
+    m = _seed_line_of_frames(3)
+    ids = [e.id for e in m.elements]
+    mapping = dict(zip(ids, [9, 8, 7]))
+    cmd = RenumberElementsCmd(mapping=mapping)
+    cmd.do(m)
+    cmd.undo(m)
+    cmd.do(m)
+    assert sorted(e.id for e in m.elements) == [7, 8, 9]
+
+
+def test_renumber_member_loads_stay_attached_to_same_physical_element():
+    """Loads live on the element object, so renumbering must not detach
+    a UDL from the beam that carries it."""
+    m = _seed_line_of_frames(3)
+    # Drop a UDL on element id 2 (the middle one).
+    target = next(e for e in m.elements if e.id == 2)
+    target.member_loads.append(UniformDistributedLoad(wy=-5.0))
+    ids = [e.id for e in m.elements]
+    mapping = dict(zip(ids, [30, 20, 10]))   # 2 → 20
+    RenumberElementsCmd(mapping=mapping).do(m)
+    # The element that USED to be id 2 should now be id 20 — and its UDL
+    # should still be exactly there.
+    moved = next(e for e in m.elements if e.id == 20)
+    assert moved is target                    # same object
+    assert moved.member_loads[0].wy == -5.0
+
+
+def test_renumber_rejects_non_bijective_mapping():
+    m = _seed_line_of_frames(3)
+    ids = [e.id for e in m.elements]
+    bad = dict(zip(ids, [1, 1, 2]))           # duplicate
+    with pytest.raises(ValueError, match="bijective"):
+        RenumberElementsCmd(mapping=bad).do(m)
+
+
+def test_renumber_rejects_mapping_missing_an_element():
+    m = _seed_line_of_frames(3)
+    ids = [e.id for e in m.elements]
+    bad = {ids[0]: 99, ids[1]: 100}           # missing one element
+    with pytest.raises(ValueError, match="cover exactly"):
+        RenumberElementsCmd(mapping=bad).do(m)
+
+
+def test_renumber_rejects_non_positive_ids():
+    m = _seed_line_of_frames(2)
+    ids = [e.id for e in m.elements]
+    bad = dict(zip(ids, [0, 1]))
+    with pytest.raises(ValueError, match="positive"):
+        RenumberElementsCmd(mapping=bad).do(m)
+
+
+def test_renumber_sorts_elements_by_new_id():
+    m = _seed_line_of_frames(4)
+    ids = [e.id for e in m.elements]
+    mapping = dict(zip(ids, [40, 30, 20, 10]))   # reverse
+    RenumberElementsCmd(mapping=mapping).do(m)
+    assert [e.id for e in m.elements] == [10, 20, 30, 40]
+
+
+# ── MergeAdjacentElementsCmd ───────────────────────────────────
+
+
+def test_merge_unloaded_collinear_frames_succeeds():
+    m = _seed_line_of_frames(3)   # 4 nodes (1..4), 3 elements (1..3)
+    # Merge at middle node 2 — connects elements 1 (1→2) and 2 (2→3).
+    MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+    # Node 2 gone, one fewer element.
+    assert 2 not in m.nodes
+    assert len(m.elements) == 2
+    merged = next(e for e in m.elements if e.id == 1)  # lower-id survives
+    assert (merged.node_i, merged.node_j) == (1, 3)
+
+
+def test_merge_preserves_surviving_element_orientation():
+    """If the surviving element was outer_S → middle, the merged
+    element must be outer_S → other_outer (NOT lower-node-id rule)."""
+    m = StructuralModel(title="orient")
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(
+        id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    # Three collinear nodes: 1 at x=0, 2 at x=1 (middle), 3 at x=2.
+    # Element 1: 3 → 2 (i=3, j=middle).  Lower-id survivor.
+    # Element 2: 1 → 2 (i=1, j=middle).
+    for nid, x in ((1, 0.0), (2, 1.0), (3, 2.0)):
+        AddNodeCmd(node_id=nid, x=x, y=0.0).do(m)
+    AddMemberCmd(x_i=2.0, y_i=0.0, x_j=1.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)  # elem id 1: 3→2
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=1.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)  # elem id 2: 1→2
+    MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+    merged = next(e for e in m.elements if e.id == 1)
+    # Surviving was outer_S(=3) → middle(=2); merged should be 3 → 1.
+    assert (merged.node_i, merged.node_j) == (3, 1)
+
+
+def test_merge_preserves_outer_releases_through_orientation_swap():
+    """The release on the outer end of each incident element must
+    survive at the SAME physical end on the merged element."""
+    m = StructuralModel(title="rel")
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(
+        id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    for nid, x in ((1, 0.0), (2, 1.0), (3, 2.0)):
+        AddNodeCmd(node_id=nid, x=x, y=0.0).do(m)
+    # Element 1 (the survivor): outer=1, oriented 1→2; release at outer (=i).
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=1.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)
+    m.elements[0].release_i = True   # release on node 1
+    # Element 2: outer=3, oriented 2→3; release at outer (=j).
+    AddMemberCmd(x_i=1.0, y_i=0.0, x_j=2.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)
+    m.elements[1].release_j = True   # release on node 3
+    MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+    merged = next(e for e in m.elements if e.id == 1)
+    # Surviving was 1→2 (outer at i); merged should be 1→3, with
+    # release_i (= old surviving outer) AND release_j (= other outer).
+    assert (merged.node_i, merged.node_j) == (1, 3)
+    assert merged.release_i is True
+    assert merged.release_j is True
+
+
+def test_merge_unloaded_collinear_trusses_succeeds():
+    m = StructuralModel(title="truss")
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(
+        id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    for nid, x in ((1, 0.0), (2, 1.0), (3, 2.0)):
+        AddNodeCmd(node_id=nid, x=x, y=0.0).do(m)
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=1.0, y_j=0.0,
+                 kind="truss", section_id=1).do(m)
+    AddMemberCmd(x_i=1.0, y_i=0.0, x_j=2.0, y_j=0.0,
+                 kind="truss", section_id=1).do(m)
+    MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+    assert len(m.elements) == 1
+    assert isinstance(m.elements[0], TrussElement2D)
+
+
+def test_merge_blocks_non_collinear():
+    m = StructuralModel(title="bend")
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(
+        id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    for nid, xy in ((1, (0.0, 0.0)), (2, (1.0, 0.0)), (3, (1.0, 1.0))):
+        AddNodeCmd(node_id=nid, x=xy[0], y=xy[1]).do(m)
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=1.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)
+    AddMemberCmd(x_i=1.0, y_i=0.0, x_j=1.0, y_j=1.0,
+                 kind="frame", section_id=1).do(m)
+    with pytest.raises(ValueError, match="not collinear"):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+
+
+def test_merge_blocks_mixed_frame_and_truss():
+    m = StructuralModel(title="mix")
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(
+        id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3,
+    )
+    for nid, x in ((1, 0.0), (2, 1.0), (3, 2.0)):
+        AddNodeCmd(node_id=nid, x=x, y=0.0).do(m)
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=1.0, y_j=0.0,
+                 kind="frame", section_id=1).do(m)
+    AddMemberCmd(x_i=1.0, y_i=0.0, x_j=2.0, y_j=0.0,
+                 kind="truss", section_id=1).do(m)
+    with pytest.raises(ValueError, match="frame and a truss"):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+
+
+def test_merge_blocks_different_section():
+    m = _seed_line_of_frames(2)
+    m.sections[2] = Section(
+        id=2, name="S2", material_id=1, A=0.02, I=2e-4, depth=0.4,
+    )
+    m.elements[1].section_id = 2  # second element on different section
+    with pytest.raises(ValueError, match="different sections"):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+
+
+def test_merge_blocks_inner_release_at_middle_node():
+    m = _seed_line_of_frames(2)
+    # Element 1: 1→2 — release at node 2 = release_j.
+    m.elements[0].release_j = True
+    with pytest.raises(ValueError, match="released end"):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+
+
+def test_merge_blocks_support_at_middle_node():
+    m = _seed_line_of_frames(2)
+    SetSupportCmd(
+        support=Support(node_id=2, ux=True, uy=True, rz=False),
+    ).do(m)
+    with pytest.raises(ValueError, match="support"):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+
+
+def test_merge_blocks_support_settlement_at_middle_node():
+    m = _seed_line_of_frames(2)
+    m.supports[2] = Support(
+        node_id=2, ux=True, uy=True, rz=False,
+        settle_ux=0.005, settle_uy=None, settle_rz=None,
+    )
+    with pytest.raises(ValueError, match="settlement"):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+
+
+def test_merge_blocks_nodal_load_at_middle_node():
+    m = _seed_line_of_frames(2)
+    m.nodal_loads.append(NodalLoad(node_id=2, fy=-10.0))
+    with pytest.raises(ValueError, match="nodal load"):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+
+
+def test_merge_blocks_member_loaded_element_with_specified_message():
+    m = _seed_line_of_frames(2)
+    AddMemberLoadCmd(
+        elem_id=1, load=UniformDistributedLoad(wy=-3.0),
+    ).do(m)
+    with pytest.raises(
+        ValueError, match="Merging loaded elements requires load remapping",
+    ):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+
+
+def test_merge_blocks_more_than_two_incident_elements():
+    m = _seed_line_of_frames(2)
+    # Add a third element going perpendicular off the middle node.
+    AddNodeCmd(node_id=99, x=1.0, y=1.0).do(m)
+    AddMemberCmd(
+        x_i=1.0, y_i=0.0, x_j=1.0, y_j=1.0,
+        kind="frame", section_id=1,
+    ).do(m)
+    with pytest.raises(ValueError, match="exactly 2"):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)
+
+
+def test_merge_blocks_node_not_in_model():
+    m = _seed_line_of_frames(2)
+    with pytest.raises(ValueError, match="not found"):
+        MergeAdjacentElementsCmd(middle_node_id=999).do(m)
+
+
+def test_merge_undo_restores_elements_and_middle_node():
+    m = _seed_line_of_frames(3)
+    nodes_before = dict(m.nodes)
+    elems_before = list(m.elements)
+    ids_before = [e.id for e in m.elements]
+    cmd = MergeAdjacentElementsCmd(middle_node_id=2)
+    cmd.do(m)
+    cmd.undo(m)
+    assert dict(m.nodes) == nodes_before
+    assert m.elements == elems_before
+    assert [e.id for e in m.elements] == ids_before
+
+
+# ── check_merge_preconditions (v0.24.1) ───────────────────────
+
+
+def test_check_merge_allows_eligible_pair():
+    m = _seed_line_of_frames(2)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is True
+    assert reason is None
+
+
+def test_check_merge_not_exactly_two_elements():
+    m = _seed_line_of_frames(2)
+    # Node 1 has only one incident element.
+    ok, reason = check_merge_preconditions(m, 1)
+    assert ok is False
+    assert reason is not None
+    assert "2" in reason and "found" in reason
+
+
+def test_check_merge_not_collinear():
+    m = StructuralModel(title="bend")
+    m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
+    m.sections[1] = Section(id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3)
+    AddMemberCmd(x_i=0.0, y_i=0.0, x_j=1.0, y_j=0.0, kind="frame", section_id=1).do(m)
+    AddMemberCmd(x_i=1.0, y_i=0.0, x_j=1.0, y_j=1.0, kind="frame", section_id=1).do(m)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "collinear" in reason
+
+
+def test_check_merge_different_sections():
+    m = _seed_line_of_frames(2)
+    m.sections[2] = Section(id=2, name="S2", material_id=1, A=0.02, I=2e-4, depth=0.4)
+    m.elements[1].section_id = 2
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "section" in reason
+
+
+def test_check_merge_support_at_middle_node():
+    m = _seed_line_of_frames(2)
+    SetSupportCmd(support=Support(node_id=2, ux=True, uy=True, rz=False)).do(m)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "support" in reason
+
+
+def test_check_merge_support_settlement_at_middle_node():
+    m = _seed_line_of_frames(2)
+    from structural_analysis.model import Support as _Support
+    m.supports[2] = _Support(
+        node_id=2, ux=True, uy=True, rz=False,
+        settle_ux=0.005, settle_uy=None, settle_rz=None,
+    )
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "settlement" in reason
+
+
+def test_check_merge_nodal_load_at_middle_node():
+    m = _seed_line_of_frames(2)
+    m.nodal_loads.append(NodalLoad(node_id=2, fy=-10.0))
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "nodal load" in reason
+
+
+def test_check_merge_member_loads_gives_reason():
+    m = _seed_line_of_frames(2)
+    AddMemberLoadCmd(elem_id=1, load=UniformDistributedLoad(wy=-3.0)).do(m)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert reason is not None
+    assert "member load" in reason.lower() or "remapping" in reason.lower()
+
+
+def test_check_merge_and_command_agree_on_eligible_pair():
+    """check_merge_preconditions True → command succeeds."""
+    m = _seed_line_of_frames(2)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is True
+    MergeAdjacentElementsCmd(middle_node_id=2).do(m)  # must not raise
+
+
+def test_check_merge_and_command_agree_on_blocked_cases():
+    """When precheck returns False, the command must also raise."""
+    m = _seed_line_of_frames(2)
+    SetSupportCmd(support=Support(node_id=2, ux=True, uy=True, rz=False)).do(m)
+    ok, reason = check_merge_preconditions(m, 2)
+    assert ok is False
+    assert "support" in reason
+    with pytest.raises(ValueError, match="support"):
+        MergeAdjacentElementsCmd(middle_node_id=2).do(m)

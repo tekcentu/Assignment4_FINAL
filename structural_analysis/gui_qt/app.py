@@ -52,6 +52,7 @@ from ..gui_common.commands import (
     AddOrUpdateSectionCmd,
     BatchDeleteCmd,
     BatchUpdateElementsCmd,
+    check_merge_preconditions,
     ClearMemberLoadsCmd,
     Command,
     DeleteElementCmd,
@@ -60,6 +61,8 @@ from ..gui_common.commands import (
     DeleteNodeCmd,
     DeleteSectionCmd,
     DrawMemberWithSplitsCmd,
+    MergeAdjacentElementsCmd,
+    RenumberElementsCmd,
     ReplaceModelCmd,
     SetGridSystemCmd,
     SetSupportCmd,
@@ -105,6 +108,7 @@ from .dialogs import (
     MemberLoadDialog,
     NodalLoadManagerDialog,
     NodePropertiesDialog,
+    RenumberElementsDialog,
     SupportDialog,
 )
 from .grid import GridSystem
@@ -374,6 +378,19 @@ class MainWindow(QMainWindow):
             "Forget element defaults", self,
             triggered=self._forget_element_defaults,
         )
+        # v0.24.0 — manual element-ID cleanup. Opens a preview dialog
+        # so the user sees the old → new mapping before committing.
+        # Disabled when the model has zero elements.
+        self.act_renumber_elements = QAction(
+            "&Renumber elements…", self,
+            triggered=self._do_renumber_elements,
+        )
+        self.act_renumber_elements.setToolTip(
+            "Reassign element IDs to a clean 1..N sequence. Choose "
+            "from current ID order, geometric order, or selection-first. "
+            "Undoable; member loads stay attached to their physical "
+            "element; analysis results are invalidated."
+        )
         self.act_snap = QAction("Snap to grid", self, checkable=True, checked=True,
                                   triggered=self._toggle_snap)
         # Snap-kind toggles
@@ -517,6 +534,8 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_batch_assign)
         m_edit.addAction(self.act_materials)
         m_edit.addAction(self.act_forget_elem_defaults)
+        m_edit.addSeparator()
+        m_edit.addAction(self.act_renumber_elements)
 
         # Top-right corner of the menu bar: version + what's-new summary
         # so the user always sees which features ship in this build.
@@ -568,6 +587,22 @@ class MainWindow(QMainWindow):
             "intensity regardless of which case is active."
         )
         m_view.addAction(self.act_active_case_loads_only)
+        # Show local axes (v0.24.0) — draws each element's local x/y
+        # arrows plus i/j end labels so users can see element
+        # orientation at a glance. Matches the solver's local-axis
+        # convention (local x = i → j, local y = 90° CCW). Off by
+        # default so existing views stay uncluttered.
+        self.act_show_local_axes = QAction(
+            "Show local &axes", self, checkable=True,
+            checked=self.canvas.show_local_axes,
+            triggered=self._on_show_local_axes_toggled,
+        )
+        self.act_show_local_axes.setToolTip(
+            "Draw each element's local x/y arrows and i/j end labels. "
+            "Useful for spotting orientation-dependent loads and "
+            "release ends. Hidden automatically in dense models."
+        )
+        m_view.addAction(self.act_show_local_axes)
 
         # Load cases & combinations are model/analysis DEFINITIONS, not
         # view options — they live under a dedicated Model menu rather
@@ -1035,6 +1070,30 @@ class MainWindow(QMainWindow):
         self._sticky_element = None
         self.set_status("Cleared remembered element settings.")
 
+    def _merge_action_label_and_tooltip(
+        self, node_id: int
+    ) -> "tuple[str, bool, str | None]":
+        """Return *(label, enabled, tooltip)* for the merge context-menu action.
+
+        When merge is eligible the label is plain and tooltip is None.
+        When ineligible the label gets the reason appended after an em-dash
+        and the tooltip also carries the reason, so the user sees why
+        without having to open a dialog.
+        """
+        can, reason = check_merge_preconditions(self._model, node_id)
+        base = f"Node {node_id}: merge adjacent elements"
+        if can:
+            return base, True, None
+        return f"{base} — {reason}", False, reason
+
+    def _can_merge_node(self, node_id: int) -> bool:
+        """Return True iff the node is eligible for an adjacent-element merge.
+
+        Thin wrapper around :func:`check_merge_preconditions`; kept for
+        backwards-compatibility with tests that call it directly.
+        """
+        return self._merge_action_label_and_tooltip(node_id)[1]
+
     def show_node_menu(self, node_id: int, action: str | None = None) -> None:
         if action == "support":
             self._edit_support(node_id)
@@ -1042,15 +1101,29 @@ class MainWindow(QMainWindow):
         if action == "nodal_load":
             self._edit_nodal_load(node_id)
             return
+        if action == "merge":
+            self.execute(MergeAdjacentElementsCmd(middle_node_id=node_id))
+            return
         menu = QMenu(self)
         a1 = menu.addAction(f"Node {node_id}: edit support…")
         a2 = menu.addAction(f"Node {node_id}: edit nodal load…")
+        menu.addSeparator()
+        merge_label, merge_enabled, merge_tooltip = (
+            self._merge_action_label_and_tooltip(node_id)
+        )
+        a_merge = menu.addAction(merge_label)
+        a_merge.setEnabled(merge_enabled)
+        if merge_tooltip:
+            a_merge.setToolTip(merge_tooltip)
+        menu.addSeparator()
         a3 = menu.addAction(f"Node {node_id}: delete")
         chosen = menu.exec(self.cursor().pos())
         if chosen is a1:
             self._edit_support(node_id)
         elif chosen is a2:
             self._edit_nodal_load(node_id)
+        elif chosen is a_merge:
+            self.execute(MergeAdjacentElementsCmd(middle_node_id=node_id))
         elif chosen is a3:
             self.execute(DeleteNodeCmd(node_id=node_id))
 
@@ -1793,6 +1866,63 @@ class MainWindow(QMainWindow):
         x, y = d.result_value
         self.execute(AddNodeCmd(x=x, y=y))
 
+    def _do_renumber_elements(self) -> None:
+        """Open the RenumberElementsDialog, then execute the command and
+        translate the canvas selection + open inspector to the new ids."""
+        if not self._model.elements:
+            QMessageBox.information(
+                self, "Renumber elements",
+                "No elements to renumber.",
+            )
+            return
+        selected = frozenset(self.canvas.get_selected_elements())
+        try:
+            d = RenumberElementsDialog(
+                self, model=self._model, selected_ids=selected,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Renumber elements", str(exc))
+            return
+        if d.exec() != RenumberElementsDialog.DialogCode.Accepted:
+            return
+        mapping = d.result_value or {}
+        if not mapping or all(old == new for old, new in mapping.items()):
+            self.set_status("Renumber: ids already match the chosen order.")
+            return
+        # Remember the inspector target id (if any) so we can re-point
+        # at the same physical element under its new id post-execute.
+        inspector_old_id: int | None = None
+        if (
+            self._element_inspector is not None
+            and self._element_inspector.isVisible()
+        ):
+            inspector_old_id = getattr(
+                self._element_inspector, "_elem_id", None,
+            )
+        self.execute(RenumberElementsCmd(mapping=mapping))
+        # Translate selection.
+        new_sel = {mapping.get(eid, eid) for eid in selected}
+        self.canvas.clear_selection()
+        for eid in new_sel:
+            self.canvas.add_element_to_selection(eid)
+        self.canvas.redraw()
+        # Translate the inspector target.
+        if inspector_old_id is not None and inspector_old_id in mapping:
+            new_id = mapping[inspector_old_id]
+            try:
+                self._element_inspector.set_target(
+                    self._model, new_id, self._result,
+                    multi_result=self._multi_result,
+                )
+            except Exception:
+                # Defensive: if the inspector API drifts, fall back to
+                # closing it rather than crashing the renumber.
+                self._element_inspector.close()
+        self.set_status(
+            f"Renumbered {len(mapping)} element"
+            f"{'s' if len(mapping) != 1 else ''}."
+        )
+
     def _do_batch_assign_selected(self) -> None:
         """Open the BatchAssignDialog for the current element selection."""
         elems = list(self.canvas.get_selected_elements())
@@ -2471,6 +2601,11 @@ class MainWindow(QMainWindow):
         self._active_case_loads_only = bool(on)
         if hasattr(self.canvas, "set_active_case_loads_only"):
             self.canvas.set_active_case_loads_only(self._active_case_loads_only)
+
+    def _on_show_local_axes_toggled(self, on: bool) -> None:
+        """View → Show local axes slot."""
+        self.canvas.show_local_axes = bool(on)
+        self.canvas.redraw()
 
     def _show_load_case_manager(self) -> None:
         """Open the Load Case Manager dialog and apply its result.
