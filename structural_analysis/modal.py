@@ -29,8 +29,8 @@ import numpy as np
 import scipy.linalg
 
 from .assembler import DofManager, assemble_global_system
-from .mass import MassFormulation, assemble_mass_matrix
-from .model import StructuralModel
+from .mass import MassFormulation, assemble_mass_matrix, assemble_mass_matrix_with_source
+from .model import ModalMassSource, StructuralModel
 
 
 # Relative tolerance used to classify free DOFs as "mass-bearing" vs
@@ -86,6 +86,7 @@ class ModalResult:
     normalisation: str = "mass"
     dofs: DofManager | None = None
     mass_formulation: MassFormulation = "consistent"
+    mass_source_summary: str = "self-mass only"
 
 
 def _solve_modal_condensed(
@@ -195,12 +196,37 @@ def _solve_modal_condensed(
     return eigvals, eigvecs_free, n_modes, info
 
 
+def _build_mass_source_summary(
+    source: ModalMassSource,
+    model: StructuralModel,
+    info: list[str],
+) -> str:
+    """Build the human-readable mass-source summary line for ModalResult."""
+    parts: list[str] = []
+    if source.include_self_mass:
+        parts.append("self-mass")
+    if source.include_joint_masses and model.joint_masses:
+        n = len(model.joint_masses)
+        parts.append(f"joint masses ({n} {'entry' if n == 1 else 'entries'})")
+    if source.include_load_cases and source.load_case_factors:
+        active = {k: v for k, v in source.load_case_factors.items() if v > 0.0}
+        if active:
+            terms = ", ".join(
+                f"{k}×{v:g}" for k, v in sorted(active.items())
+            )
+            parts.append(f"cases ({terms})")
+    if not parts:
+        return "no mass sources active"
+    return " + ".join(parts)
+
+
 def solve_modal(
     model: StructuralModel,
     n_modes: int = 6,
     normalisation: str = "mass",
     *,
     mass_formulation: MassFormulation = "consistent",
+    mass_source: ModalMassSource | None = None,
 ) -> ModalResult:
     """Run a free-vibration analysis and return a :class:`ModalResult`.
 
@@ -245,15 +271,39 @@ def solve_modal(
             "expected 'consistent' or 'lumped'."
         )
 
-    if not any(getattr(elem, "rho", 0.0) > 0.0 for elem in model.elements):
+    # Resolve effective mass source (None → safe default = density only).
+    effective_source = mass_source if mass_source is not None else ModalMassSource()
+
+    # Pre-flight check: at least one mass source must be able to contribute.
+    # (The old density-only check is relaxed: joint masses or load-case mass
+    # also satisfy the requirement.)
+    _has_density = any(getattr(e, "rho", 0.0) > 0.0 for e in model.elements)
+    _has_joint = (
+        effective_source.include_joint_masses and bool(model.joint_masses)
+    )
+    _has_lc = (
+        effective_source.include_load_cases
+        and any(v > 0.0 for v in effective_source.load_case_factors.values())
+    )
+    if not (
+        (effective_source.include_self_mass and _has_density)
+        or _has_joint
+        or _has_lc
+    ):
         raise ValueError(
-            "Modal analysis requires at least one element whose material "
-            "carries a positive density. Set density on the Material "
-            "(kg/m³) before running modal."
+            "Modal analysis requires mass. Enable at least one of: element "
+            "material density (include_self_mass), joint masses "
+            "(include_joint_masses with entries in the model), or load-case "
+            "mass (include_load_cases with a positive factor). Configure in "
+            "Run → Modal mass source…"
         )
 
     K, _F, dofs, warnings, _elem_data = assemble_global_system(model)
-    M = assemble_mass_matrix(model, dofs, formulation=mass_formulation)
+    M, mass_info = assemble_mass_matrix_with_source(
+        model, dofs,
+        formulation=mass_formulation,
+        source=effective_source,
+    )
 
     free = list(dofs.free_indices)
     if not free:
@@ -261,11 +311,29 @@ def solve_modal(
             "Modal analysis has no free DOFs — the structure is fully "
             "restrained. Release at least one support DOF before running modal."
         )
+
+    # Verify assembled M has non-zero diagonal on free DOFs (guards against
+    # e.g. density=0 + joint masses only on restrained nodes).
+    M_ff_diag = np.diag(M)[free]
+    if not np.any(M_ff_diag > 0.0):
+        raise ValueError(
+            "The assembled mass matrix has no non-zero diagonals on free "
+            "DOFs.  Check that mass sources are connected to free (not "
+            "fully restrained) nodes."
+        )
     K_ff = K[np.ix_(free, free)]
     M_ff = M[np.ix_(free, free)]
 
+    # When M_ff has massless DOFs (zero diagonal entries) — either because
+    # lumped formulation was chosen, or because joint masses only cover some
+    # DOFs with no rotational inertia — the generalised eigh requires a
+    # positive-definite B matrix and will fail.  Route through the Guyan
+    # static-condensation path in both cases.
+    _diag_M_ff = np.diag(M_ff)
+    _has_massless = np.any(_diag_M_ff <= _LUMPED_MASS_REL_TOL * max(1.0, float(np.max(_diag_M_ff))))
+
     extra_warnings: list[str] = []
-    if mass_formulation == "lumped":
+    if mass_formulation == "lumped" or _has_massless:
         eigvals, modes_free, n_modes_returned, extra_warnings = (
             _solve_modal_condensed(K_ff, M_ff, n_modes)
         )
@@ -295,9 +363,11 @@ def solve_modal(
     free_idx = np.array(free, dtype=int)
     modes_full[free_idx, :] = modes_free
 
-    combined_warnings = list(warnings) + extra_warnings
+    combined_warnings = list(warnings) + extra_warnings + mass_info
     if mass_formulation == "lumped":
         combined_warnings.append(LUMPED_COMPARISON_NOTE)
+
+    summary = _build_mass_source_summary(effective_source, model, mass_info)
 
     return ModalResult(
         status="ok",
@@ -311,4 +381,5 @@ def solve_modal(
         normalisation=normalisation,
         dofs=dofs,
         mass_formulation=mass_formulation,
+        mass_source_summary=summary,
     )
