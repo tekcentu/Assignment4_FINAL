@@ -15,6 +15,7 @@ Design decisions
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -457,6 +458,85 @@ class LoadCombination:
                 )
 
 
+# ── Joint Masses (v0.25 — PR #40) ────────────────────────────
+
+
+@dataclass(frozen=True)
+class JointMass:
+    """User-defined translational mass at a node (kg).
+
+    Used by the modal solver when ``ModalMassSource.include_joint_masses``
+    is True.  Only translational components (no rotational inertia in V1).
+
+    Attributes:
+        node_id: Node the mass is applied to.
+        mx: Mass in kg contributing to the ux degree of freedom.
+        my: Mass in kg contributing to the uy degree of freedom.
+    """
+
+    node_id: int
+    mx: float = 0.0
+    my: float = 0.0
+
+    def __post_init__(self):
+        for name, v in (("mx", self.mx), ("my", self.my)):
+            if not math.isfinite(v) or v < 0.0:
+                raise ValueError(
+                    f"JointMass.{name} must be a finite non-negative number, "
+                    f"got {v!r}."
+                )
+
+
+@dataclass
+class ModalMassSource:
+    """Controls which contributions are assembled into the modal mass matrix.
+
+    Defaults give behaviour identical to the pre-v0.25 density-only path:
+    self-mass on, joint masses on (zero effect when none are assigned),
+    load-case mass off.
+
+    Attributes:
+        include_self_mass: Include element density × A × L contribution.
+        include_joint_masses: Include user-defined :class:`JointMass` entries.
+        include_load_cases: Convert gravity loads from selected load cases
+            to nodal mass (|Fy| / g added to **both** translational DOFs).
+        load_case_factors: ``{case_name: multiplier}`` used when
+            ``include_load_cases`` is True.  Multipliers must be >= 0.
+    """
+
+    include_self_mass: bool = True
+    include_joint_masses: bool = True
+    include_load_cases: bool = False
+    load_case_factors: dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self):
+        for name, mult in self.load_case_factors.items():
+            if not isinstance(mult, (int, float)) or isinstance(mult, bool):
+                raise ValueError(
+                    f"ModalMassSource.load_case_factors[{name!r}] must be a "
+                    f"number, got {mult!r}."
+                )
+            if not math.isfinite(mult):
+                raise ValueError(
+                    f"ModalMassSource.load_case_factors[{name!r}] must be "
+                    f"finite, got {mult!r}."
+                )
+            if mult < 0.0:
+                raise ValueError(
+                    f"ModalMassSource.load_case_factors[{name!r}] must be "
+                    f">= 0, got {mult!r}."
+                )
+
+    def is_default(self) -> bool:
+        """Return True when this source is equivalent to the safe default."""
+        return (
+            self.include_self_mass
+            and self.include_joint_masses
+            and not self.include_load_cases
+            and not self.load_case_factors
+        )
+
+
 # ── Structural Model ──────────────────────────────────────────
 
 
@@ -517,6 +597,18 @@ class StructuralModel:
     # on the result wrapper and is never serialised.
     load_combinations: dict[str, "LoadCombination"] = field(
         default_factory=dict,
+    )
+
+    # ── joint masses + modal mass source (v0.25 — PR #40) ──
+    # User-defined translational masses at nodes, keyed by node_id.
+    # Contributes to the modal mass matrix when
+    # ``modal_mass_source.include_joint_masses`` is True.
+    joint_masses: dict[int, "JointMass"] = field(default_factory=dict)
+
+    # Controls which contributions are assembled into M for modal analysis.
+    # Default is density-only (backward-compatible with all pre-v0.25 files).
+    modal_mass_source: "ModalMassSource" = field(
+        default_factory=ModalMassSource
     )
 
     def __post_init__(self):
