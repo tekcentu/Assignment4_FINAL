@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.24.0"
+__version__ = "0.25.0"
 __what_is_new__ = (
-    "Show local axes overlay (View menu) · "
-    "Renumber elements… preview + undo (Edit menu) · "
-    "Merge adjacent unloaded collinear elements (node right-click)"
+    "Modal Mass Source Settings (Run menu) · "
+    "Joint masses storage + file I/O · "
+    "New GUI models default self-weight to DEAD"
 )
 
 from .model import (

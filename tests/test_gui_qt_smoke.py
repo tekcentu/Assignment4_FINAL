@@ -7280,3 +7280,163 @@ def test_can_merge_node_consistent_with_check_merge(qt_app):
     for nid in list(w._model.nodes):
         ok, _ = check_merge_preconditions(w._model, nid)
         assert w._can_merge_node(nid) == ok
+
+
+# ── PR #40 — Modal Mass Source ───────────────────────────────────────────
+
+
+def test_run_menu_has_modal_mass_source_action(qt_app):
+    """Run menu must expose the Modal mass source… action."""
+    w = MainWindow()
+    qt_app.processEvents()
+    assert hasattr(w, "act_modal_mass_source")
+    assert w.act_modal_mass_source is not None
+
+
+def test_new_gui_model_has_dead_load_case_and_self_weight_case(qt_app):
+    """A brand-new GUI model must carry DEAD and self_weight_case == 'DEAD'."""
+    w = MainWindow()
+    qt_app.processEvents()
+    assert "DEAD" in w._model.load_cases
+    assert w._model.self_weight_case == "DEAD"
+
+
+def test_legacy_file_loads_with_original_self_weight_case(qt_app):
+    """An old input file that has no ANALYSIS_OPTIONS must keep self_weight_case='DEFAULT'."""
+    from structural_analysis.file_io import read_input_file
+    m = read_input_file("inputs/q2a_settlement.txt")
+    assert m.self_weight_case == "DEFAULT"
+
+
+def test_modal_mass_source_dialog_opens_and_accepts(qt_app):
+    """Open ModalMassSourceDialog, click OK, verify result_value is a ModalMassSource."""
+    from structural_analysis.gui_qt.dialogs import ModalMassSourceDialog
+    from structural_analysis.model import ModalMassSource
+    from PyQt6.QtWidgets import QDialogButtonBox
+
+    w = MainWindow()
+    qt_app.processEvents()
+    d = ModalMassSourceDialog(w, model=w._model)
+    # Simulate OK
+    d._accept()  # returns a ModalMassSource (or None on validation error)
+    result = d._accept()
+    assert isinstance(result, ModalMassSource)
+
+
+def test_modal_mass_source_dialog_table_disabled_when_lc_unchecked(qt_app):
+    from structural_analysis.gui_qt.dialogs import ModalMassSourceDialog
+    w = MainWindow()
+    d = ModalMassSourceDialog(w, model=w._model)
+    d._cb_lc.setChecked(False)
+    assert not d._table.isEnabled()
+    d._cb_lc.setChecked(True)
+    assert d._table.isEnabled()
+
+
+def test_modal_mass_source_dialog_double_count_label(qt_app):
+    """Warning label appears when self-mass + self_weight_case factor > 0."""
+    from structural_analysis.gui_qt.dialogs import ModalMassSourceDialog
+    from structural_analysis.model import LoadCase
+
+    w = MainWindow()
+    qt_app.processEvents()
+    # Enable self-weight so double-count logic fires
+    w._model.include_self_weight = True
+    w._model.self_weight_case = "DEAD"
+    if "DEAD" not in w._model.load_cases:
+        w._model.load_cases["DEAD"] = LoadCase(name="DEAD")
+
+    d = ModalMassSourceDialog(w, model=w._model)
+    d._cb_self.setChecked(True)
+    d._cb_lc.setChecked(True)
+    # Find DEAD row and set multiplier to 1.0
+    for row, name in enumerate(d._case_names):
+        if name == "DEAD":
+            from PyQt6.QtWidgets import QTableWidgetItem
+            d._table.setItem(row, 1, QTableWidgetItem("1.0"))
+            break
+    d._refresh_warnings()
+    assert d._warn_label.text() != ""
+
+
+def test_modal_mass_source_dialog_ok_still_works_with_warning(qt_app):
+    """OK remains functional even when a double-count warning is shown."""
+    from structural_analysis.gui_qt.dialogs import ModalMassSourceDialog
+    from structural_analysis.model import LoadCase, ModalMassSource
+
+    w = MainWindow()
+    w._model.include_self_weight = True
+    d = ModalMassSourceDialog(w, model=w._model)
+    d._cb_self.setChecked(True)
+    d._cb_lc.setChecked(True)
+    result = d._accept()
+    assert isinstance(result, ModalMassSource)
+
+
+def test_update_mass_source_command_undo_redo(qt_app):
+    """UpdateModalMassSourceCmd round-trips through undo/redo correctly."""
+    from structural_analysis.gui_common.commands import UpdateModalMassSourceCmd
+    from structural_analysis.model import ModalMassSource
+
+    w = MainWindow()
+    qt_app.processEvents()
+
+    original_src = w._model.modal_mass_source
+    new_src = ModalMassSource(
+        include_self_mass=False,
+        include_joint_masses=True,
+        include_load_cases=False,
+    )
+    cmd = UpdateModalMassSourceCmd(new_source=new_src)
+    w.execute(cmd)
+    qt_app.processEvents()
+
+    assert w._model.modal_mass_source is new_src
+
+    # Undo
+    w._do_undo()
+    qt_app.processEvents()
+    assert w._model.modal_mass_source.include_self_mass == original_src.include_self_mass
+
+    # Redo
+    w._do_redo()
+    qt_app.processEvents()
+    assert w._model.modal_mass_source is new_src
+
+
+def test_modal_view_header_shows_mass_source_summary(qt_app):
+    """ModalResultsDialog header label must include the mass source summary."""
+    from structural_analysis.gui_qt.modal_view import ModalResultsDialog
+    from structural_analysis.modal import ModalResult
+    import numpy as np
+
+    w = MainWindow()
+    qt_app.processEvents()
+
+    result = ModalResult(
+        status="ok", title="Test",
+        n_modes=1,
+        frequencies=np.array([5.0]),
+        periods=np.array([0.2]),
+        omegas=np.array([31.4]),
+        modes=np.zeros((1, 1)),
+        normalisation="mass",
+        mass_formulation="consistent",
+        mass_source_summary="self-mass + joint masses (2 entries)",
+    )
+
+    closed: list[bool] = []
+    dlg = ModalResultsDialog(
+        w, result,
+        on_select=lambda idx, sc: None,
+        on_close=lambda: closed.append(True),
+    )
+    qt_app.processEvents()
+    # The header QLabel should contain the summary text
+    from PyQt6.QtWidgets import QLabel
+    labels = dlg.findChildren(QLabel)
+    found = any(
+        "self-mass + joint masses" in (lbl.text() or "")
+        for lbl in labels
+    )
+    assert found, "Mass-source summary not found in modal view header"

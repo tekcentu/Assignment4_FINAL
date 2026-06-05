@@ -261,3 +261,58 @@ def test_density_zero_model_raises():
                           fix_left=True, fix_right=False)
     with pytest.raises(ValueError, match="density"):
         solve_modal(model)
+
+
+# ── 6. mass_source kwarg — backward-compat & equivalence ────────
+
+
+def test_solve_modal_default_source_matches_legacy():
+    """Explicit mass_source=None and source=ModalMassSource() both give
+    the same frequencies as the old API (no mass_source argument)."""
+    from structural_analysis.model import ModalMassSource
+
+    L, E, A, I, rho = 5.0, 200e6, 0.005, 1.0e-5, 7850.0
+    model = _uniform_beam(n_elems=8, L=L, E=E, A=A, I=I, rho=rho,
+                          fix_left=True, fix_right=False)
+
+    r_old = solve_modal(model, n_modes=4)
+    r_none = solve_modal(model, n_modes=4, mass_source=None)
+    r_default = solve_modal(model, n_modes=4, mass_source=ModalMassSource())
+
+    np.testing.assert_array_almost_equal(r_old.frequencies, r_none.frequencies, decimal=8)
+    np.testing.assert_array_almost_equal(r_old.frequencies, r_default.frequencies, decimal=8)
+
+
+def test_density_zero_with_joint_mass_succeeds():
+    """A ρ=0 model with a joint mass should produce a valid ModalResult
+    (the old density-only guard must not fire)."""
+    from structural_analysis.model import JointMass, Material, ModalMassSource, Section
+
+    L, E, A, I = 2.0, 200e6, 1e-2, 1e-4
+    model = StructuralModel()
+    model.materials[1] = Material(id=1, E=E, density=0.0)
+    model.sections[1] = Section(id=1, material_id=1, A=A, I=I, depth=0.1)
+    model.nodes[1] = Node(1, 0.0, 0.0)
+    model.nodes[2] = Node(2, L, 0.0)
+    model.supports[1] = Support(1, ux=True, uy=True, rz=True)
+    model.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2, E=E, A=A, I=I,
+        alpha=0.0, depth=0.1, rho=0.0, section_id=1,
+    ))
+    model.joint_masses[2] = JointMass(node_id=2, mx=500.0, my=500.0)
+    src = ModalMassSource(include_self_mass=False, include_joint_masses=True)
+
+    r = solve_modal(model, n_modes=2, mass_source=src)
+    assert r.status == "ok"
+    assert r.n_modes >= 1
+    assert np.all(r.frequencies >= 0.0)
+
+
+def test_modal_result_has_mass_source_summary():
+    """ModalResult.mass_source_summary must be a non-empty string."""
+    L, E, A, I, rho = 2.0, 200e6, 5e-3, 1e-5, 7850.0
+    model = _uniform_beam(n_elems=4, L=L, E=E, A=A, I=I, rho=rho,
+                          fix_left=True, fix_right=False)
+    r = solve_modal(model, n_modes=2)
+    assert isinstance(r.mass_source_summary, str)
+    assert r.mass_source_summary  # non-empty

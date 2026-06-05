@@ -12,6 +12,7 @@ from __future__ import annotations
 from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     FrameTemperatureLoad,
+    ModalMassSource,
     PointLoad,
     StructuralModel,
     TrussTemperatureLoad,
@@ -328,6 +329,39 @@ def write_input_file(model: StructuralModel, path: str) -> None:
     if opt_lines:
         out.append(f"ANALYSIS_OPTIONS {len(opt_lines)}")
         out.extend(opt_lines)
+        out.append("")
+
+    # JOINT_MASSES — omit entirely when the dict is empty.
+    joint_masses = getattr(model, "joint_masses", {}) or {}
+    if joint_masses:
+        jm_items = sorted(joint_masses.items())
+        out.append(f"JOINT_MASSES {len(jm_items)}")
+        for nid, jm in jm_items:
+            row = f"{nid}"
+            if jm.mx != 0.0:
+                row += f"  mx={_fmt(jm.mx)}"
+            if jm.my != 0.0:
+                row += f"  my={_fmt(jm.my)}"
+            out.append(row)
+        out.append("")
+
+    # MODAL_MASS_SOURCE — omit when the source matches the safe default.
+    mms: ModalMassSource = getattr(
+        model, "modal_mass_source", ModalMassSource()
+    )
+    if not mms.is_default():
+        rows: list[str] = []
+        if not mms.include_self_mass:
+            rows.append("include_self_mass=false")
+        if not mms.include_joint_masses:
+            rows.append("include_joint_masses=false")
+        if mms.include_load_cases:
+            rows.append("include_load_cases=true")
+        for case_name in sorted(mms.load_case_factors):
+            factor = mms.load_case_factors[case_name]
+            rows.append(f"case_factor:{case_name}={_fmt(factor)}")
+        out.append(f"MODAL_MASS_SOURCE {len(rows)}")
+        out.extend(rows)
         out.append("")
 
     with open(path, "w", encoding="utf-8") as f:

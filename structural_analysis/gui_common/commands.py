@@ -33,6 +33,7 @@ from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     NODE_COINCIDENCE_TOL,
     FrameTemperatureLoad,
+    JointMass,
     LoadCase,
     LoadCombination,
     Material,
@@ -164,6 +165,7 @@ class DeleteNodeCmd(Command):
     _saved_support: Support | None = None
     _saved_loads: list[NodalLoad] = field(default_factory=list)
     _saved_elements: list[object] = field(default_factory=list)
+    _saved_joint_mass: JointMass | None = None
     description: str = "delete node"
 
     def do(self, model: StructuralModel) -> None:
@@ -174,10 +176,12 @@ class DeleteNodeCmd(Command):
         self._saved_support = None
         self._saved_loads = []
         self._saved_elements = []
+        self._saved_joint_mass = None
         self._saved_node = model.nodes.pop(self.node_id)
         self._saved_support = model.supports.pop(self.node_id, None)
         self._saved_loads = [ld for ld in model.nodal_loads if ld.node_id == self.node_id]
         model.nodal_loads = [ld for ld in model.nodal_loads if ld.node_id != self.node_id]
+        self._saved_joint_mass = model.joint_masses.pop(self.node_id, None)
         kept = []
         for elem in model.elements:
             if elem.node_i == self.node_id or elem.node_j == self.node_id:
@@ -192,6 +196,8 @@ class DeleteNodeCmd(Command):
         if self._saved_support is not None:
             model.supports[self.node_id] = self._saved_support
         model.nodal_loads.extend(self._saved_loads)
+        if self._saved_joint_mass is not None:
+            model.joint_masses[self.node_id] = self._saved_joint_mass
         model.elements.extend(self._saved_elements)
         model.elements.sort(key=lambda e: e.id)
 
@@ -2533,3 +2539,31 @@ class MergeAdjacentElementsCmd(Command):
         # with the original lo element, then insert hi at hi_idx.
         model.elements[lo_idx] = lo_elem
         model.elements.insert(hi_idx, hi_elem)
+
+
+# ── modal mass source (v0.25 — PR #40) ──────────────────────────────────
+
+
+@dataclass
+class UpdateModalMassSourceCmd(Command):
+    """Replace ``model.modal_mass_source`` with a new :class:`ModalMassSource`.
+
+    Captured on both do and undo so the mass-source dialog's OK path can
+    be wired through ``host.execute(...)`` and receive the same undo/redo
+    treatment as all other model mutations.  The command never calls GUI
+    methods directly — result invalidation happens in ``MainWindow.execute``
+    via ``_invalidate_result``.
+    """
+
+    from ..model import ModalMassSource as _ModalMassSource  # type: ignore[misc]
+    new_source: object   # ModalMassSource
+    _previous: object | None = None
+    description: str = "update modal mass source"
+
+    def do(self, model: StructuralModel) -> None:
+        self._previous = getattr(model, "modal_mass_source", None)
+        model.modal_mass_source = self.new_source
+
+    def undo(self, model: StructuralModel) -> None:
+        if self._previous is not None:
+            model.modal_mass_source = self._previous
