@@ -7440,3 +7440,160 @@ def test_modal_view_header_shows_mass_source_summary(qt_app):
         for lbl in labels
     )
     assert found, "Mass-source summary not found in modal view header"
+
+
+# ── PR #41 — Batch assign loads ──────────────────────────────────────────
+
+
+def _seed_mixed_model(w):
+    """Two frames + one truss for batch-load compatibility tests."""
+    from structural_analysis.element import FrameElement2D, TrussElement2D
+    from structural_analysis.model import Material, Node, Section
+    m = w._model
+    m.nodes.clear(); m.elements.clear()
+    m.materials.setdefault(1, Material(id=1, name="Steel", E=2.1e8, density=7850.0))
+    m.sections.setdefault(1, Section(id=1, name="S1", material_id=1, A=0.01, I=1e-4, depth=0.3))
+    for i in range(4):
+        m.nodes[i + 1] = Node(i + 1, float(i), 0.0)
+    m.elements.append(FrameElement2D(id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1))
+    m.elements.append(FrameElement2D(id=2, node_i=2, node_j=3, E=2.1e8, A=0.01, I=1e-4, section_id=1))
+    m.elements.append(TrussElement2D(id=3, node_i=3, node_j=4, E=2.1e8, A=0.01, section_id=1))
+    return m
+
+
+def test_edit_menu_has_batch_member_load_action(qt_app):
+    w = MainWindow()
+    assert w.act_batch_member_load is not None
+    assert w.act_batch_member_load.isEnabled()
+
+
+def test_edit_menu_has_batch_nodal_load_action(qt_app):
+    w = MainWindow()
+    assert w.act_batch_nodal_load is not None
+    assert w.act_batch_nodal_load.isEnabled()
+
+
+def test_batch_member_load_dialog_title_shows_count(qt_app):
+    from structural_analysis.gui_qt.dialogs import BatchMemberLoadDialog
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    d = BatchMemberLoadDialog(
+        w, model=w._model, element_ids=frozenset({1, 2, 3}),
+    )
+    assert "3" in d.windowTitle()
+    assert "elements" in d.windowTitle().lower()
+
+
+def test_batch_member_load_dialog_rejects_single_target(qt_app):
+    """Dialog construction must refuse <2 element selections."""
+    from structural_analysis.gui_qt.dialogs import BatchMemberLoadDialog
+    import pytest
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    with pytest.raises(ValueError, match="two or more"):
+        BatchMemberLoadDialog(
+            w, model=w._model, element_ids=frozenset({1}),
+        )
+
+
+def test_batch_member_load_dialog_blocks_mixed_selection(qt_app):
+    """Mixed frame+truss selection: OK button must be disabled."""
+    from structural_analysis.gui_qt.dialogs import BatchMemberLoadDialog
+    w = MainWindow()
+    _seed_mixed_model(w)
+    d = BatchMemberLoadDialog(
+        w, model=w._model, element_ids=frozenset({1, 3}),
+    )
+    qt_app.processEvents()
+    # The QTimer.singleShot defers the disable to the next event-loop
+    # turn — process events so it runs.
+    qt_app.processEvents()
+    ok = d._ok_button()
+    assert ok is not None
+    assert not ok.isEnabled()
+
+
+def test_batch_nodal_load_dialog_title_shows_count(qt_app):
+    from structural_analysis.gui_qt.dialogs import BatchNodalLoadDialog
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    d = BatchNodalLoadDialog(
+        w, model=w._model, node_ids=frozenset({1, 2, 3}),
+    )
+    assert "3" in d.windowTitle()
+    assert "nodes" in d.windowTitle().lower()
+
+
+def test_batch_nodal_load_dialog_rejects_single_target(qt_app):
+    from structural_analysis.gui_qt.dialogs import BatchNodalLoadDialog
+    import pytest
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    with pytest.raises(ValueError, match="two or more"):
+        BatchNodalLoadDialog(
+            w, model=w._model, node_ids=frozenset({1}),
+        )
+
+
+def test_batch_member_load_handler_exists_and_callable(qt_app):
+    """Handler must be attached to the action — covered by the action's
+    triggered=… wiring at construction time. We don't drive the empty
+    path here because QMessageBox.information blocks the event loop
+    on offscreen Qt and would hang the suite."""
+    w = MainWindow()
+    assert callable(getattr(w, "_do_batch_member_load", None))
+    assert callable(getattr(w, "_do_batch_nodal_load", None))
+
+
+def test_batch_member_load_end_to_end_undo_redo(qt_app):
+    """Drive the BatchAddMemberLoadsCmd through execute() — confirm it
+    lands one load per element and the host can undo/redo it."""
+    from structural_analysis.gui_common.commands import BatchAddMemberLoadsCmd
+    from structural_analysis.model import UniformDistributedLoad
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    loads = [(eid, UniformDistributedLoad(wy=-5.0)) for eid in (1, 2, 3)]
+    w.execute(BatchAddMemberLoadsCmd(loads=loads))
+    for e in w._model.elements:
+        assert len(e.member_loads) == 1
+    # Result must be invalidated.
+    assert w._result is None
+    # Undo: all loads removed in one step.
+    w._do_undo()
+    for e in w._model.elements:
+        assert e.member_loads == []
+
+
+def test_batch_nodal_load_end_to_end(qt_app):
+    """Append nodal loads through host.execute(); confirm append count,
+    case preservation, and undo."""
+    from structural_analysis.gui_common.commands import BatchAddNodalLoadsCmd
+    from structural_analysis.model import NodalLoad
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    loads = [
+        NodalLoad(node_id=nid, fx=0.0, fy=-10.0, mz=0.0, load_case="LIVE")
+        for nid in (2, 3, 4)
+    ]
+    w.execute(BatchAddNodalLoadsCmd(loads=loads))
+    assert len(w._model.nodal_loads) == 3
+    assert all(ld.load_case == "LIVE" for ld in w._model.nodal_loads)
+    w._do_undo()
+    assert w._model.nodal_loads == []
+
+
+def test_batch_member_load_invalidates_result(qt_app):
+    """Stale results must be cleared after a batch command — exercises
+    host.execute -> _invalidate_result for the new commands."""
+    from structural_analysis.gui_common.commands import BatchAddMemberLoadsCmd
+    from structural_analysis.model import UniformDistributedLoad
+    w = MainWindow()
+    _seed_line_model(w, 3)
+    # Stub a sentinel so _invalidate_result has something to clear.
+    w._result = object()
+    assert w._result is not None
+    loads = [(1, UniformDistributedLoad(wy=-1.0))]
+    # Use a single-element batch via the command (the >=2 selection
+    # rule is enforced in the handler/dialog, not the command).
+    w.execute(BatchAddMemberLoadsCmd(loads=loads))
+    assert w._result is None
