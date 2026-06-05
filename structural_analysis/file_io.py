@@ -14,6 +14,7 @@ from .model import (
     UniformDistributedLoad, PointLoad,
     TrussTemperatureLoad, FrameTemperatureLoad,
     LoadCase, LoadCombination,
+    JointMass, ModalMassSource,
 )
 from .element import FrameElement2D, TrussElement2D
 
@@ -708,6 +709,129 @@ def read_input_file(filepath: str) -> StructuralModel:
                     name=comb_name, terms=terms, description=comb_desc,
                 )
 
+        elif keyword == "JOINT_MASSES":
+            # Format: JOINT_MASSES <count> followed by count rows of:
+            #   <node_id>  [mx=<float>]  [my=<float>]
+            # All mass values are optional and default to 0.0.
+            # Absent block → empty joint_masses dict (safe default).
+            count = int(tokens[1])
+            for _ in range(count):
+                i += 1
+                while i < len(lines) and (
+                    not lines[i].strip()
+                    or lines[i].lstrip().startswith("#")
+                ):
+                    i += 1
+                if i >= len(lines):
+                    raise ValueError(
+                        "Unexpected end of file inside JOINT_MASSES block "
+                        f"(expected {count} rows)."
+                    )
+                parts = lines[i].split("#")[0].split()
+                if not parts:
+                    raise ValueError(
+                        "JOINT_MASSES: encountered a blank row inside the block."
+                    )
+                try:
+                    node_id = int(parts[0])
+                except ValueError:
+                    raise ValueError(
+                        f"JOINT_MASSES: expected integer node_id, got {parts[0]!r}."
+                    )
+                if node_id not in model.nodes:
+                    raise ValueError(
+                        f"JOINT_MASSES: node_id={node_id} does not exist in the model."
+                    )
+                jm_kwargs: dict[str, float] = {}
+                for tok in parts[1:]:
+                    if "=" not in tok:
+                        raise ValueError(
+                            f"JOINT_MASSES row for node {node_id}: unexpected "
+                            f"positional token {tok!r}; use key=value pairs "
+                            "(e.g. mx=500.0 my=500.0)."
+                        )
+                    k, _, v = tok.partition("=")
+                    k = k.strip().lower()
+                    if k not in ("mx", "my"):
+                        raise ValueError(
+                            f"JOINT_MASSES row for node {node_id}: unknown "
+                            f"key {k!r}. Allowed: ['mx', 'my']."
+                        )
+                    try:
+                        jm_kwargs[k] = float(v)
+                    except ValueError:
+                        raise ValueError(
+                            f"JOINT_MASSES row for node {node_id}: "
+                            f"{k}={v!r} is not a valid float."
+                        )
+                model.joint_masses[node_id] = JointMass(node_id=node_id, **jm_kwargs)
+
+        elif keyword == "MODAL_MASS_SOURCE":
+            # Format: MODAL_MASS_SOURCE <count> followed by count key=value rows.
+            # Recognised keys:
+            #   include_self_mass=<bool>
+            #   include_joint_masses=<bool>
+            #   include_load_cases=<bool>
+            #   case_factor:<NAME>=<float>    (one per entry, multiple allowed)
+            # Absent block → default ModalMassSource() (safe default).
+            count = int(tokens[1])
+            mms_kwargs: dict = {
+                "include_self_mass": True,
+                "include_joint_masses": True,
+                "include_load_cases": False,
+            }
+            case_factors: dict[str, float] = {}
+            for _ in range(count):
+                i += 1
+                while i < len(lines) and (
+                    not lines[i].strip()
+                    or lines[i].lstrip().startswith("#")
+                ):
+                    i += 1
+                if i >= len(lines):
+                    raise ValueError(
+                        "Unexpected end of file inside MODAL_MASS_SOURCE "
+                        f"block (expected {count} key=value rows)."
+                    )
+                opt_line = lines[i].split("#")[0].strip()
+                if "=" not in opt_line:
+                    raise ValueError(
+                        f"MODAL_MASS_SOURCE row {opt_line!r} is not a "
+                        "key=value pair."
+                    )
+                key, _, val = opt_line.partition("=")
+                key = key.strip()
+                val = val.strip()
+                if key == "include_self_mass":
+                    mms_kwargs["include_self_mass"] = _parse_bool(val, key)
+                elif key == "include_joint_masses":
+                    mms_kwargs["include_joint_masses"] = _parse_bool(val, key)
+                elif key == "include_load_cases":
+                    mms_kwargs["include_load_cases"] = _parse_bool(val, key)
+                elif key.startswith("case_factor:"):
+                    case_name = key[len("case_factor:"):]
+                    if not case_name:
+                        raise ValueError(
+                            "MODAL_MASS_SOURCE: case_factor: requires a "
+                            "case name (e.g. case_factor:DEAD=1.0)."
+                        )
+                    try:
+                        factor = float(val)
+                    except ValueError:
+                        raise ValueError(
+                            f"MODAL_MASS_SOURCE: case_factor:{case_name}="
+                            f"{val!r} is not a valid float."
+                        )
+                    case_factors[case_name] = factor
+                else:
+                    raise ValueError(
+                        f"Unknown MODAL_MASS_SOURCE key {key!r}. Allowed: "
+                        "['include_self_mass', 'include_joint_masses', "
+                        "'include_load_cases', 'case_factor:<NAME>']."
+                    )
+            mms_kwargs["load_case_factors"] = case_factors
+            model.modal_mass_source = ModalMassSource(**mms_kwargs)
+
         i += 1
 
     # Final sweep: auto-create any case referenced by a load tag that
@@ -747,6 +871,15 @@ def read_input_file(filepath: str) -> StructuralModel:
             raise ValueError(
                 f"LOAD_COMBINATIONS: combination {comb.name!r} references "
                 f"load case(s) that do not exist: {', '.join(missing)}."
+            )
+
+    # Validate MODAL_MASS_SOURCE case_factor references after the full case
+    # set is known (same pattern as LOAD_COMBINATIONS validation above).
+    for case_name in model.modal_mass_source.load_case_factors:
+        if case_name not in model.load_cases:
+            raise ValueError(
+                f"MODAL_MASS_SOURCE: case_factor:{case_name} references a "
+                "load case that does not exist in the model."
             )
 
     return model
