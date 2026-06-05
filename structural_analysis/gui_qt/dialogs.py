@@ -4408,15 +4408,20 @@ class ModalMassSourceDialog(_ModalDialog):
         self._table.setEnabled(checked)
         self._refresh_warnings()
 
-    def _read_factors(self) -> dict[str, float]:
+    def _read_factors(self, *, strict: bool = False) -> dict[str, float]:
         factors: dict[str, float] = {}
         for row, name in enumerate(self._case_names):
             item = self._table.item(row, 1)
             if item is None:
                 continue
+            text = item.text().strip()
             try:
-                val = float(item.text())
+                val = float(text) if text else 0.0
             except ValueError:
+                if strict:
+                    raise ValueError(
+                        f"Multiplier for case {name!r} is not a valid number: {text!r}"
+                    )
                 val = 0.0
             factors[name] = val
         return factors
@@ -4446,7 +4451,12 @@ class ModalMassSourceDialog(_ModalDialog):
 
     def _accept(self):
         from ..model import ModalMassSource
-        factors = self._read_factors() if self._cb_lc.isChecked() else {}
+        try:
+            factors = self._read_factors(strict=True) if self._cb_lc.isChecked() else {}
+        except ValueError as exc:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Invalid multiplier", str(exc))
+            return None
         try:
             src = ModalMassSource(
                 include_self_mass=self._cb_self.isChecked(),

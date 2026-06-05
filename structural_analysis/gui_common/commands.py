@@ -33,6 +33,7 @@ from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     NODE_COINCIDENCE_TOL,
     FrameTemperatureLoad,
+    JointMass,
     LoadCase,
     LoadCombination,
     Material,
@@ -164,6 +165,7 @@ class DeleteNodeCmd(Command):
     _saved_support: Support | None = None
     _saved_loads: list[NodalLoad] = field(default_factory=list)
     _saved_elements: list[object] = field(default_factory=list)
+    _saved_joint_mass: JointMass | None = None
     description: str = "delete node"
 
     def do(self, model: StructuralModel) -> None:
@@ -174,10 +176,12 @@ class DeleteNodeCmd(Command):
         self._saved_support = None
         self._saved_loads = []
         self._saved_elements = []
+        self._saved_joint_mass = None
         self._saved_node = model.nodes.pop(self.node_id)
         self._saved_support = model.supports.pop(self.node_id, None)
         self._saved_loads = [ld for ld in model.nodal_loads if ld.node_id == self.node_id]
         model.nodal_loads = [ld for ld in model.nodal_loads if ld.node_id != self.node_id]
+        self._saved_joint_mass = model.joint_masses.pop(self.node_id, None)
         kept = []
         for elem in model.elements:
             if elem.node_i == self.node_id or elem.node_j == self.node_id:
@@ -192,6 +196,8 @@ class DeleteNodeCmd(Command):
         if self._saved_support is not None:
             model.supports[self.node_id] = self._saved_support
         model.nodal_loads.extend(self._saved_loads)
+        if self._saved_joint_mass is not None:
+            model.joint_masses[self.node_id] = self._saved_joint_mass
         model.elements.extend(self._saved_elements)
         model.elements.sort(key=lambda e: e.id)
 

@@ -7,7 +7,10 @@ from structural_analysis.model import (
     ModalMassSource,
     StructuralModel,
     Node,
+    Material,
+    Section,
 )
+from structural_analysis.element import FrameElement2D
 
 
 # ── JointMass ──────────────────────────────────────────────────
@@ -124,3 +127,51 @@ class TestModalMassSource:
     def test_model_joint_masses_default_empty(self):
         model = StructuralModel()
         assert model.joint_masses == {}
+
+
+# ── DeleteNodeCmd joint-mass cascade ─────────────────────────────────────
+
+
+def _two_node_model():
+    """Minimal model: two nodes, one frame element, joint mass on node 2."""
+    m = StructuralModel()
+    m.materials[1] = Material(id=1, E=2.1e8, alpha=1e-5, density=7850.0)
+    m.sections[1] = Section(id=1, material_id=1, A=0.01, I=1e-4, depth=0.3)
+    m.nodes[1] = Node(1, 0.0, 0.0)
+    m.nodes[2] = Node(2, 1.0, 0.0)
+    m.elements.append(
+        FrameElement2D(id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4, section_id=1)
+    )
+    m.joint_masses[2] = JointMass(node_id=2, mx=500.0, my=500.0)
+    return m
+
+
+def test_delete_node_removes_joint_mass():
+    """DeleteNodeCmd.do() must remove the joint mass from the deleted node."""
+    from structural_analysis.gui_common.commands import DeleteNodeCmd
+    m = _two_node_model()
+    cmd = DeleteNodeCmd(node_id=2)
+    cmd.do(m)
+    assert 2 not in m.joint_masses
+
+
+def test_delete_node_undo_restores_joint_mass():
+    """DeleteNodeCmd.undo() must restore the saved joint mass."""
+    from structural_analysis.gui_common.commands import DeleteNodeCmd
+    m = _two_node_model()
+    cmd = DeleteNodeCmd(node_id=2)
+    cmd.do(m)
+    cmd.undo(m)
+    assert 2 in m.joint_masses
+    assert m.joint_masses[2].mx == 500.0
+    assert m.joint_masses[2].my == 500.0
+
+
+def test_delete_node_without_joint_mass_does_not_crash():
+    """Deleting a node that has no joint mass must not raise."""
+    from structural_analysis.gui_common.commands import DeleteNodeCmd
+    m = _two_node_model()
+    # node 1 has no joint mass
+    cmd = DeleteNodeCmd(node_id=1)
+    cmd.do(m)
+    assert 1 not in m.joint_masses
