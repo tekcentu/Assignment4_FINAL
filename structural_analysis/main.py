@@ -19,7 +19,7 @@ from .postprocessor import compute_member_forces, compute_reactions, equilibrium
 
 
 @contextmanager
-def _filter_loads_to_case(model: StructuralModel, case: str):
+def filter_loads_to_case(model: StructuralModel, case: str):
     """Temporarily restrict ``model``'s nodal + member loads to the
     given case, and toggle ``include_self_weight`` so self-weight is
     applied only for ``model.self_weight_case``. Restored on exit, even
@@ -84,7 +84,7 @@ def run_analysis(
         reactions) or partial results with error messages if analysis fails.
     """
     if case is not None:
-        with _filter_loads_to_case(model, case):
+        with filter_loads_to_case(model, case):
             return run_analysis(model, verbose=verbose, case=None)
 
     lines: list[str] = []
