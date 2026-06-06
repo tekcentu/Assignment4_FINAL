@@ -4961,15 +4961,27 @@ class GroupManagerDialog(QDialog):
         self._rebuild_table()
 
     def _on_add_selection(self) -> None:
-        self._host._group_add_selection()
+        name = self._selected_group_name()
+        if name is None:
+            QMessageBox.information(self, "Add current selection", "Select a group row first.")
+            return
+        self._host._group_add_selection(name)
         self._rebuild_table()
 
     def _on_replace(self) -> None:
-        self._host._group_replace_with_selection()
+        name = self._selected_group_name()
+        if name is None:
+            QMessageBox.information(self, "Replace group", "Select a group row first.")
+            return
+        self._host._group_replace_with_selection(name)
         self._rebuild_table()
 
     def _on_remove_selection(self) -> None:
-        self._host._group_remove_selection()
+        name = self._selected_group_name()
+        if name is None:
+            QMessageBox.information(self, "Remove current selection", "Select a group row first.")
+            return
+        self._host._group_remove_selection(name)
         self._rebuild_table()
 
     def _on_select(self) -> None:

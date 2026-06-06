@@ -1099,12 +1099,12 @@ class MainWindow(QMainWindow):
         ref_elem = next(e for e in self._model.elements if e.id == ref_id)
         ref_sec = self._model.sections.get(getattr(ref_elem, "section_id", None))
         ref_mat_id = (
-            getattr(ref_elem, "material_override_id", None)
+            getattr(ref_elem, "material_id_override", None)
             or (ref_sec.material_id if ref_sec else None)
         )
         def _eff_mat(e):
             sec = self._model.sections.get(getattr(e, "section_id", None))
-            return getattr(e, "material_override_id", None) or (
+            return getattr(e, "material_id_override", None) or (
                 sec.material_id if sec else None
             )
         keep = frozenset(
@@ -1183,12 +1183,12 @@ class MainWindow(QMainWindow):
         if ref is None:
             return
         ref_sec = self._model.sections.get(getattr(ref, "section_id", None))
-        ref_mat = getattr(ref, "material_override_id", None) or (
+        ref_mat = getattr(ref, "material_id_override", None) or (
             ref_sec.material_id if ref_sec else None
         )
         def _eff(e):
             sec = self._model.sections.get(getattr(e, "section_id", None))
-            return getattr(e, "material_override_id", None) or (
+            return getattr(e, "material_id_override", None) or (
                 sec.material_id if sec else None
             )
         self.canvas.clear_selection()
@@ -1250,7 +1250,7 @@ class MainWindow(QMainWindow):
             f"Created group '{name}': {len(node_ids)} node(s), {len(elem_ids)} element(s)."
         )
 
-    def _group_add_selection(self) -> None:
+    def _group_add_selection(self, name: str | None = None) -> None:
         from .project_io import SelectionGroup
         from PyQt6.QtWidgets import QInputDialog
         node_ids = list(self.canvas.get_selected_nodes())
@@ -1266,11 +1266,14 @@ class MainWindow(QMainWindow):
                 "No groups exist. Create one first (Selection → Groups → Create from Selection).",
             )
             return
-        names = sorted(self._groups)
-        name, ok = QInputDialog.getItem(
-            self, "Add to group", "Choose group:", names, 0, False,
-        )
-        if not ok:
+        if name is None:
+            names = sorted(self._groups)
+            name, ok = QInputDialog.getItem(
+                self, "Add to group", "Choose group:", names, 0, False,
+            )
+            if not ok:
+                return
+        elif name not in self._groups:
             return
         g = self._groups[name]
         new_nodes = sorted(set(g.node_ids) | set(node_ids))
@@ -1284,7 +1287,7 @@ class MainWindow(QMainWindow):
             f"Added to group '{name}': now {len(new_nodes)} node(s), {len(new_elems)} element(s)."
         )
 
-    def _group_replace_with_selection(self) -> None:
+    def _group_replace_with_selection(self, name: str | None = None) -> None:
         from .project_io import SelectionGroup
         from PyQt6.QtWidgets import QInputDialog
         node_ids = list(self.canvas.get_selected_nodes())
@@ -1292,11 +1295,14 @@ class MainWindow(QMainWindow):
         if not self._groups:
             QMessageBox.information(self, "Replace group", "No groups exist.")
             return
-        names = sorted(self._groups)
-        name, ok = QInputDialog.getItem(
-            self, "Replace group with selection", "Choose group:", names, 0, False,
-        )
-        if not ok:
+        if name is None:
+            names = sorted(self._groups)
+            name, ok = QInputDialog.getItem(
+                self, "Replace group with selection", "Choose group:", names, 0, False,
+            )
+            if not ok:
+                return
+        elif name not in self._groups:
             return
         self._groups[name] = SelectionGroup(
             name=name, node_ids=node_ids, element_ids=elem_ids,
@@ -1307,7 +1313,7 @@ class MainWindow(QMainWindow):
             f"Replaced group '{name}': {len(node_ids)} node(s), {len(elem_ids)} element(s)."
         )
 
-    def _group_remove_selection(self) -> None:
+    def _group_remove_selection(self, name: str | None = None) -> None:
         from .project_io import SelectionGroup
         from PyQt6.QtWidgets import QInputDialog
         node_ids = set(self.canvas.get_selected_nodes())
@@ -1318,11 +1324,14 @@ class MainWindow(QMainWindow):
         if not self._groups:
             QMessageBox.information(self, "Remove from group", "No groups exist.")
             return
-        names = sorted(self._groups)
-        name, ok = QInputDialog.getItem(
-            self, "Remove from group", "Choose group:", names, 0, False,
-        )
-        if not ok:
+        if name is None:
+            names = sorted(self._groups)
+            name, ok = QInputDialog.getItem(
+                self, "Remove from group", "Choose group:", names, 0, False,
+            )
+            if not ok:
+                return
+        elif name not in self._groups:
             return
         g = self._groups[name]
         new_nodes = sorted(set(g.node_ids) - node_ids)
@@ -1400,12 +1409,13 @@ class MainWindow(QMainWindow):
         g = self._groups.get(name)
         if g is None:
             return
+        existing_eids = {e.id for e in self._model.elements}
         self.canvas.clear_selection()
         for nid in g.node_ids:
             if nid in self._model.nodes:
                 self.canvas.add_node_to_selection(nid)
         for eid in g.element_ids:
-            if any(e.id == eid for e in self._model.elements):
+            if eid in existing_eids:
                 self.canvas.add_element_to_selection(eid)
         self._update_selection_status()
         self.canvas.redraw()
@@ -1414,11 +1424,12 @@ class MainWindow(QMainWindow):
         g = self._groups.get(name)
         if g is None:
             return
+        existing_eids = {e.id for e in self._model.elements}
         for nid in g.node_ids:
             if nid in self._model.nodes:
                 self.canvas.add_node_to_selection(nid)
         for eid in g.element_ids:
-            if any(e.id == eid for e in self._model.elements):
+            if eid in existing_eids:
                 self.canvas.add_element_to_selection(eid)
         self._update_selection_status()
         self.canvas.redraw()
@@ -1446,7 +1457,7 @@ class MainWindow(QMainWindow):
             a.setEnabled(False)
             return
         for name in sorted(self._groups):
-            menu.addAction(name, lambda n=name: callback(n))
+            menu.addAction(name, lambda _, n=name: callback(n))
 
     def _assign_to_group(
         self,
