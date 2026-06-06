@@ -4556,8 +4556,9 @@ class BatchMemberLoadDialog(_ModalDialog):
         if self._is_mixed:
             warn = QLabel(
                 "Batch member loads require a uniform element type. "
-                "The current selection mixes frame and truss elements — "
-                "deselect one kind and reopen this dialog.",
+                "The current selection mixes frame and truss elements.\n"
+                "Tip: Use Selection → Keep Frames Only, Keep Trusses Only, "
+                "or Select Group first.",
                 body,
             )
             warn.setWordWrap(True)
@@ -4844,3 +4845,158 @@ class BatchNodalLoadDialog(_ModalDialog):
                 "At least one of Fx, Fy, Mz must be non-zero."
             )
         return {"fx": fx, "fy": fy, "mz": mz, "load_case": case}
+
+
+# ── Group Manager dialog (v0.27.0) ─────────────────────────────────────────
+
+
+class GroupManagerDialog(QDialog):
+    """Manage named selection groups.
+
+    Lists all groups in a table (Name / Nodes / Elements) and provides
+    buttons to Create, Edit Members, Rename, Delete, Select, and adjust
+    canvas selection from groups.  Every group mutation is reflected
+    immediately in the table.  Groups are GUI/project metadata only —
+    the solver is never involved.
+    """
+
+    def __init__(
+        self,
+        parent: "QWidget | None",
+        *,
+        host: "Any",
+        groups: "dict[str, Any]",
+        model: "StructuralModel",
+    ) -> None:
+        super().__init__(parent)
+        self._host = host
+        self._groups = groups
+        self._model = model
+        self.setWindowTitle("Group Manager")
+        self.setModal(True)
+        self.resize(520, 380)
+        self._build_ui()
+        self._rebuild_table()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Named groups let you save and recall selections of nodes and elements.\n"
+            "Groups are stored with the .spa.json project file.",
+            self,
+        ))
+
+        self._table = QTableWidget(0, 3, self)
+        self._table.setHorizontalHeaderLabels(["Name", "Nodes", "Elements"])
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.verticalHeader().setVisible(False)
+        layout.addWidget(self._table)
+
+        # ── action buttons ──
+        btn_row1 = QHBoxLayout()
+        self._btn_create = QPushButton("Create from Selection", self)
+        self._btn_create.clicked.connect(self._on_create)
+        btn_row1.addWidget(self._btn_create)
+        self._btn_add_sel = QPushButton("Add Current Selection", self)
+        self._btn_add_sel.clicked.connect(self._on_add_selection)
+        btn_row1.addWidget(self._btn_add_sel)
+        self._btn_replace = QPushButton("Replace with Selection", self)
+        self._btn_replace.clicked.connect(self._on_replace)
+        btn_row1.addWidget(self._btn_replace)
+        self._btn_remove_sel = QPushButton("Remove Current Selection", self)
+        self._btn_remove_sel.clicked.connect(self._on_remove_selection)
+        btn_row1.addWidget(self._btn_remove_sel)
+        layout.addLayout(btn_row1)
+
+        btn_row2 = QHBoxLayout()
+        self._btn_select = QPushButton("Select", self)
+        self._btn_select.clicked.connect(self._on_select)
+        btn_row2.addWidget(self._btn_select)
+        self._btn_add_to = QPushButton("Add to Selection", self)
+        self._btn_add_to.clicked.connect(self._on_add_to_selection)
+        btn_row2.addWidget(self._btn_add_to)
+        self._btn_rem_from = QPushButton("Remove from Selection", self)
+        self._btn_rem_from.clicked.connect(self._on_remove_from_selection)
+        btn_row2.addWidget(self._btn_rem_from)
+        btn_row2.addStretch()
+        self._btn_rename = QPushButton("Rename…", self)
+        self._btn_rename.clicked.connect(self._on_rename)
+        btn_row2.addWidget(self._btn_rename)
+        self._btn_delete = QPushButton("Delete", self)
+        self._btn_delete.clicked.connect(self._on_delete)
+        btn_row2.addWidget(self._btn_delete)
+        layout.addLayout(btn_row2)
+
+        close_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        close_box.rejected.connect(self.reject)
+        layout.addWidget(close_box)
+
+    def _rebuild_table(self) -> None:
+        self._table.setRowCount(0)
+        for row, (name, g) in enumerate(sorted(self._groups.items())):
+            self._table.insertRow(row)
+            item_name = QTableWidgetItem(name)
+            item_name.setData(Qt.ItemDataRole.UserRole, name)
+            self._table.setItem(row, 0, item_name)
+            self._table.setItem(row, 1, QTableWidgetItem(str(len(g.node_ids))))
+            self._table.setItem(row, 2, QTableWidgetItem(str(len(g.element_ids))))
+
+    def _selected_group_name(self) -> "str | None":
+        row = self._table.currentRow()
+        if row < 0:
+            return None
+        item = self._table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    # ── button handlers ──
+
+    def _on_create(self) -> None:
+        self._host._group_create_from_selection()
+        self._rebuild_table()
+
+    def _on_add_selection(self) -> None:
+        self._host._group_add_selection()
+        self._rebuild_table()
+
+    def _on_replace(self) -> None:
+        self._host._group_replace_with_selection()
+        self._rebuild_table()
+
+    def _on_remove_selection(self) -> None:
+        self._host._group_remove_selection()
+        self._rebuild_table()
+
+    def _on_select(self) -> None:
+        name = self._selected_group_name()
+        if name is None:
+            QMessageBox.information(self, "Select group", "Select a group row first.")
+            return
+        self._host._group_select(name)
+
+    def _on_add_to_selection(self) -> None:
+        name = self._selected_group_name()
+        if name is None:
+            QMessageBox.information(self, "Add to selection", "Select a group row first.")
+            return
+        self._host._group_add_to_selection(name)
+
+    def _on_remove_from_selection(self) -> None:
+        name = self._selected_group_name()
+        if name is None:
+            QMessageBox.information(self, "Remove from selection", "Select a group row first.")
+            return
+        self._host._group_remove_from_selection(name)
+
+    def _on_rename(self) -> None:
+        self._host._group_rename()
+        self._rebuild_table()
+
+    def _on_delete(self) -> None:
+        self._host._group_delete()
+        self._rebuild_table()
