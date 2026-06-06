@@ -1,7 +1,7 @@
 """JSON project I/O — saves both the structural model (as the canonical
 ``.txt`` text emitted by :func:`gui_common.file_writer.write_input_file`) and
-GUI-only state (labeled grid system, view limits, snap settings) in a
-single ``.spa.json`` file.
+GUI-only state (labeled grid system, view limits, snap settings, named groups)
+in a single ``.spa.json`` file.
 
 The embedded ``model_txt`` is exactly what the solver consumes, so a
 project written from the GUI can be exported back to a plain ``.txt``
@@ -55,10 +55,39 @@ class ViewState:
 
 
 @dataclass
+class SelectionGroup:
+    """Named set of node IDs and element IDs — GUI/project metadata only.
+
+    Groups are never passed to the solver.  They are persisted in the
+    ``.spa.json`` project wrapper under the top-level ``"groups"`` key.
+    """
+
+    name: str
+    node_ids: list[int] = field(default_factory=list)
+    element_ids: list[int] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "node_ids": sorted(self.node_ids),
+            "element_ids": sorted(self.element_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SelectionGroup":
+        return cls(
+            name=str(data.get("name", "")),
+            node_ids=[int(i) for i in (data.get("node_ids") or [])],
+            element_ids=[int(i) for i in (data.get("element_ids") or [])],
+        )
+
+
+@dataclass
 class Project:
     model: StructuralModel
     grid: GridSystem = field(default_factory=GridSystem)
     view: ViewState = field(default_factory=ViewState)
+    groups: list[SelectionGroup] = field(default_factory=list)
     title: str = "Untitled"
 
 
@@ -88,6 +117,7 @@ def save_project_json(project: Project, path: str) -> None:
         "units": "kN_m",
         "grid": project.grid.to_dict(),
         "view": project.view.to_dict(),
+        "groups": [g.to_dict() for g in project.groups],
         "model_txt": model_txt,
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -130,4 +160,7 @@ def load_project_json(path: str) -> Project:
     grid = GridSystem.from_dict(payload.get("grid") or {})
     view = ViewState.from_dict(payload.get("view"))
     title = payload.get("title", model.title)
-    return Project(model=model, grid=grid, view=view, title=title)
+    # "groups" key absent in old files → empty list (backward compat).
+    raw_groups = payload.get("groups") or []
+    groups = [SelectionGroup.from_dict(g) for g in raw_groups if isinstance(g, dict)]
+    return Project(model=model, grid=grid, view=view, groups=groups, title=title)

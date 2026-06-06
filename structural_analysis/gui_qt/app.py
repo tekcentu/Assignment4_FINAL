@@ -108,6 +108,7 @@ from .dialogs import (
     FineNodeDialog,
     GridDialog,
     GridSpacingDialog,
+    GroupManagerDialog,
     MaterialListDialog,
     MemberLoadDialog,
     NodalLoadManagerDialog,
@@ -233,6 +234,10 @@ class MainWindow(QMainWindow):
         self._redo: list[Command] = []
         self._modified = False
         self._current_path: Optional[str] = None
+        # Named selection groups — GUI/project metadata, never touches the
+        # solver.  Keyed by group name; persisted in .spa.json only.
+        from .project_io import SelectionGroup as _SG
+        self._groups: dict[str, _SG] = {}
         # Single-case "active" result (kept as a plain attribute so all
         # existing consumers — canvas, inspector, overlay handlers —
         # keep working). It's a *view* into ``_multi_result.cases``
@@ -514,6 +519,59 @@ class MainWindow(QMainWindow):
         self.act_clear_result = QAction("&Clear results", self,
                                           triggered=self._clear_result)
 
+        # ── v0.27.0 Selection menu actions ──
+        self.act_sel_frames = QAction(
+            "Keep &Frames Only", self, triggered=self._filter_sel_frames_only,
+        )
+        self.act_sel_trusses = QAction(
+            "Keep &Trusses Only", self, triggered=self._filter_sel_trusses_only,
+        )
+        self.act_sel_same_section = QAction(
+            "Keep Same &Section", self, triggered=self._filter_sel_same_section,
+        )
+        self.act_sel_same_material = QAction(
+            "Keep Same &Material", self, triggered=self._filter_sel_same_material,
+        )
+        self.act_sel_clear = QAction(
+            "C&lear Selection", self, shortcut="Escape",
+            triggered=self._filter_sel_clear,
+        )
+        self.act_sel_all_elements = QAction(
+            "Select All &Elements", self, triggered=self._select_all_elements,
+        )
+        self.act_sel_all_nodes = QAction(
+            "Select All &Nodes", self, triggered=self._select_all_nodes,
+        )
+        self.act_sel_all = QAction(
+            "Select &All", self, shortcut="Ctrl+A",
+            triggered=self._select_all,
+        )
+        self.act_group_create = QAction(
+            "Create Group from &Selection…", self,
+            triggered=self._group_create_from_selection,
+        )
+        self.act_group_add = QAction(
+            "&Add Selection to Group…", self,
+            triggered=self._group_add_selection,
+        )
+        self.act_group_replace = QAction(
+            "Replace Group with &Selection…", self,
+            triggered=self._group_replace_with_selection,
+        )
+        self.act_group_remove_sel = QAction(
+            "Remove Selection from &Group…", self,
+            triggered=self._group_remove_selection,
+        )
+        self.act_group_rename = QAction(
+            "Rename Group…", self, triggered=self._group_rename,
+        )
+        self.act_group_delete = QAction(
+            "Delete Group…", self, triggered=self._group_delete,
+        )
+        self.act_group_manager = QAction(
+            "Group &Manager…", self, triggered=self._open_group_manager,
+        )
+
         # Tool actions (mutually exclusive)
         self._tool_actions: dict[str, QAction] = {}
         group = QActionGroup(self)
@@ -590,6 +648,45 @@ class MainWindow(QMainWindow):
         self.menuBar().setCornerWidget(
             self._version_label, Qt.Corner.TopRightCorner,
         )
+
+        # ── Selection menu (v0.27.0) ──
+        m_sel = self.menuBar().addMenu("Se&lection")
+        m_sel.addAction(self.act_sel_frames)
+        m_sel.addAction(self.act_sel_trusses)
+        m_sel.addAction(self.act_sel_same_section)
+        m_sel.addAction(self.act_sel_same_material)
+        m_sel.addSeparator()
+        m_sel.addAction(self.act_sel_clear)
+        m_sel.addAction(self.act_sel_all_elements)
+        m_sel.addAction(self.act_sel_all_nodes)
+        m_sel.addAction(self.act_sel_all)
+        m_sel.addSeparator()
+        m_groups = m_sel.addMenu("&Groups")
+        m_groups.addAction(self.act_group_create)
+        m_groups.addAction(self.act_group_add)
+        m_groups.addAction(self.act_group_replace)
+        m_groups.addAction(self.act_group_remove_sel)
+        m_groups.addSeparator()
+        m_groups.addAction(self.act_group_rename)
+        m_groups.addAction(self.act_group_delete)
+        m_groups.addSeparator()
+        m_groups.addAction(self.act_group_manager)
+        m_groups.addSeparator()
+        # Dynamic "Select Group ▶" / "Add Group to Selection ▶" /
+        # "Remove Group from Selection ▶" submenus: populated on aboutToShow.
+        self._m_sel_group = m_groups.addMenu("Select Group ▶")
+        self._m_add_group = m_groups.addMenu("Add Group to Selection ▶")
+        self._m_rem_group = m_groups.addMenu("Remove Group from Selection ▶")
+        self._m_sel_group.aboutToShow.connect(
+            lambda: self._populate_group_submenu(self._m_sel_group, self._group_select)
+        )
+        self._m_add_group.aboutToShow.connect(
+            lambda: self._populate_group_submenu(self._m_add_group, self._group_add_to_selection)
+        )
+        self._m_rem_group.aboutToShow.connect(
+            lambda: self._populate_group_submenu(self._m_rem_group, self._group_remove_from_selection)
+        )
+        self._m_selection = m_sel  # keep reference for tests
 
         m_view = self.menuBar().addMenu("&View")
         m_view.addAction(self.act_fit_view)
@@ -924,6 +1021,508 @@ class MainWindow(QMainWindow):
                 text += f"  Loads: {summary}."
         self.set_status(text)
 
+    # ── v0.27.0 selection filters ────────────────────────────────────────
+    # These operate on canvas selection state only — no model mutation, no
+    # undo entry.  Selecting is a view concern; the solver never sees it.
+
+    def _filter_sel_frames_only(self) -> None:
+        from ..element import FrameElement2D as _FE
+        sel = self.canvas.get_selected_elements()
+        if not sel:
+            self.set_status("No elements selected.")
+            return
+        keep = frozenset(
+            e.id for e in self._model.elements
+            if e.id in sel and isinstance(e, _FE)
+        )
+        self.canvas.clear_selection()
+        for eid in keep:
+            self.canvas.add_element_to_selection(eid)
+        n = len(keep)
+        self.set_status(f"Selection filtered: {n} frame element{'s' if n != 1 else ''} selected.")
+        self.canvas.redraw()
+
+    def _filter_sel_trusses_only(self) -> None:
+        from ..element import TrussElement2D as _TE
+        sel = self.canvas.get_selected_elements()
+        if not sel:
+            self.set_status("No elements selected.")
+            return
+        keep = frozenset(
+            e.id for e in self._model.elements
+            if e.id in sel and isinstance(e, _TE)
+        )
+        self.canvas.clear_selection()
+        for eid in keep:
+            self.canvas.add_element_to_selection(eid)
+        n = len(keep)
+        self.set_status(f"Selection filtered: {n} truss element{'s' if n != 1 else ''} selected.")
+        self.canvas.redraw()
+
+    def _filter_sel_same_section(self) -> None:
+        sel = self.canvas.get_selected_elements()
+        if not sel:
+            self.set_status("No elements selected.")
+            return
+        ref_id = next(
+            (e.id for e in self._model.elements if e.id in sel), None
+        )
+        if ref_id is None:
+            return
+        ref_elem = next(e for e in self._model.elements if e.id == ref_id)
+        ref_sec = getattr(ref_elem, "section_id", None)
+        keep = frozenset(
+            e.id for e in self._model.elements
+            if e.id in sel and getattr(e, "section_id", None) == ref_sec
+        )
+        self.canvas.clear_selection()
+        for eid in keep:
+            self.canvas.add_element_to_selection(eid)
+        sec = self._model.sections.get(ref_sec)
+        sec_name = (sec.name if sec and sec.name else f"section {ref_sec}") if ref_sec else "unknown"
+        n = len(keep)
+        self.set_status(
+            f"Selection filtered: {n} element{'s' if n != 1 else ''} with section '{sec_name}'."
+        )
+        self.canvas.redraw()
+
+    def _filter_sel_same_material(self) -> None:
+        sel = self.canvas.get_selected_elements()
+        if not sel:
+            self.set_status("No elements selected.")
+            return
+        ref_id = next(
+            (e.id for e in self._model.elements if e.id in sel), None
+        )
+        if ref_id is None:
+            return
+        ref_elem = next(e for e in self._model.elements if e.id == ref_id)
+        ref_sec = self._model.sections.get(getattr(ref_elem, "section_id", None))
+        ref_mat_id = (
+            getattr(ref_elem, "material_id_override", None)
+            or (ref_sec.material_id if ref_sec else None)
+        )
+        def _eff_mat(e):
+            sec = self._model.sections.get(getattr(e, "section_id", None))
+            return getattr(e, "material_id_override", None) or (
+                sec.material_id if sec else None
+            )
+        keep = frozenset(
+            e.id for e in self._model.elements
+            if e.id in sel and _eff_mat(e) == ref_mat_id
+        )
+        self.canvas.clear_selection()
+        for eid in keep:
+            self.canvas.add_element_to_selection(eid)
+        mat = self._model.materials.get(ref_mat_id)
+        mat_name = (mat.name if mat and mat.name else f"material {ref_mat_id}") if ref_mat_id else "unknown"
+        n = len(keep)
+        self.set_status(
+            f"Selection filtered: {n} element{'s' if n != 1 else ''} with material '{mat_name}'."
+        )
+        self.canvas.redraw()
+
+    def _filter_sel_clear(self) -> None:
+        self.canvas.clear_selection()
+        self.set_status("Selection cleared.")
+        self.canvas.redraw()
+
+    def _select_all_elements(self) -> None:
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            self.canvas.add_element_to_selection(e.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _select_all_nodes(self) -> None:
+        self.canvas.clear_selection()
+        for nid in self._model.nodes:
+            self.canvas.add_node_to_selection(nid)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _select_all(self) -> None:
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            self.canvas.add_element_to_selection(e.id)
+        for nid in self._model.nodes:
+            self.canvas.add_node_to_selection(nid)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    # ── v0.27.0 select similar ───────────────────────────────────────────
+    # Each method takes the clicked element ID as reference; the clicked
+    # element does NOT need to be already selected.
+
+    def _select_similar_type(self, ref_elem_id: int) -> None:
+        ref = next((e for e in self._model.elements if e.id == ref_elem_id), None)
+        if ref is None:
+            return
+        ref_type = type(ref)
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            if type(e) is ref_type:
+                self.canvas.add_element_to_selection(e.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _select_similar_section(self, ref_elem_id: int) -> None:
+        ref = next((e for e in self._model.elements if e.id == ref_elem_id), None)
+        if ref is None:
+            return
+        ref_sec = getattr(ref, "section_id", None)
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            if getattr(e, "section_id", None) == ref_sec:
+                self.canvas.add_element_to_selection(e.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _select_similar_material(self, ref_elem_id: int) -> None:
+        ref = next((e for e in self._model.elements if e.id == ref_elem_id), None)
+        if ref is None:
+            return
+        ref_sec = self._model.sections.get(getattr(ref, "section_id", None))
+        ref_mat = getattr(ref, "material_id_override", None) or (
+            ref_sec.material_id if ref_sec else None
+        )
+        def _eff(e):
+            sec = self._model.sections.get(getattr(e, "section_id", None))
+            return getattr(e, "material_id_override", None) or (
+                sec.material_id if sec else None
+            )
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            if _eff(e) == ref_mat:
+                self.canvas.add_element_to_selection(e.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _select_similar_type_and_section(self, ref_elem_id: int) -> None:
+        ref = next((e for e in self._model.elements if e.id == ref_elem_id), None)
+        if ref is None:
+            return
+        ref_type = type(ref)
+        ref_sec = getattr(ref, "section_id", None)
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            if type(e) is ref_type and getattr(e, "section_id", None) == ref_sec:
+                self.canvas.add_element_to_selection(e.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    # ── v0.27.0 group actions ────────────────────────────────────────────
+    # Groups live in self._groups (dict[str, SelectionGroup]).  They are
+    # NOT on the undo stack — group edits are non-undoable in v0.27.
+
+    def _group_create_from_selection(self) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        node_ids = list(self.canvas.get_selected_nodes())
+        elem_ids = list(self.canvas.get_selected_elements())
+        if not node_ids and not elem_ids:
+            QMessageBox.information(
+                self, "Create group",
+                "Select nodes or elements first, then create a group.",
+            )
+            return
+        name, ok = QInputDialog.getText(
+            self, "Create group", "Group name (e.g. COLUMNS, FLOOR_2):"
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, "Create group", "Group name cannot be empty.")
+            return
+        if name in self._groups:
+            QMessageBox.warning(
+                self, "Create group",
+                f"Group '{name}' already exists. Use 'Replace with selection' to overwrite.",
+            )
+            return
+        self._groups[name] = SelectionGroup(
+            name=name, node_ids=node_ids, element_ids=elem_ids,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(
+            f"Created group '{name}': {len(node_ids)} node(s), {len(elem_ids)} element(s)."
+        )
+
+    def _group_add_selection(self, name: str | None = None) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        node_ids = list(self.canvas.get_selected_nodes())
+        elem_ids = list(self.canvas.get_selected_elements())
+        if not node_ids and not elem_ids:
+            QMessageBox.information(
+                self, "Add to group", "Select nodes or elements first.",
+            )
+            return
+        if not self._groups:
+            QMessageBox.information(
+                self, "Add to group",
+                "No groups exist. Create one first (Selection → Groups → Create from Selection).",
+            )
+            return
+        if name is None:
+            names = sorted(self._groups)
+            name, ok = QInputDialog.getItem(
+                self, "Add to group", "Choose group:", names, 0, False,
+            )
+            if not ok:
+                return
+        elif name not in self._groups:
+            return
+        g = self._groups[name]
+        new_nodes = sorted(set(g.node_ids) | set(node_ids))
+        new_elems = sorted(set(g.element_ids) | set(elem_ids))
+        self._groups[name] = SelectionGroup(
+            name=name, node_ids=new_nodes, element_ids=new_elems,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(
+            f"Added to group '{name}': now {len(new_nodes)} node(s), {len(new_elems)} element(s)."
+        )
+
+    def _group_replace_with_selection(self, name: str | None = None) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        node_ids = list(self.canvas.get_selected_nodes())
+        elem_ids = list(self.canvas.get_selected_elements())
+        if not self._groups:
+            QMessageBox.information(self, "Replace group", "No groups exist.")
+            return
+        if name is None:
+            names = sorted(self._groups)
+            name, ok = QInputDialog.getItem(
+                self, "Replace group with selection", "Choose group:", names, 0, False,
+            )
+            if not ok:
+                return
+        elif name not in self._groups:
+            return
+        self._groups[name] = SelectionGroup(
+            name=name, node_ids=node_ids, element_ids=elem_ids,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(
+            f"Replaced group '{name}': {len(node_ids)} node(s), {len(elem_ids)} element(s)."
+        )
+
+    def _group_remove_selection(self, name: str | None = None) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        node_ids = set(self.canvas.get_selected_nodes())
+        elem_ids = set(self.canvas.get_selected_elements())
+        if not node_ids and not elem_ids:
+            QMessageBox.information(self, "Remove from group", "Select nodes or elements first.")
+            return
+        if not self._groups:
+            QMessageBox.information(self, "Remove from group", "No groups exist.")
+            return
+        if name is None:
+            names = sorted(self._groups)
+            name, ok = QInputDialog.getItem(
+                self, "Remove from group", "Choose group:", names, 0, False,
+            )
+            if not ok:
+                return
+        elif name not in self._groups:
+            return
+        g = self._groups[name]
+        new_nodes = sorted(set(g.node_ids) - node_ids)
+        new_elems = sorted(set(g.element_ids) - elem_ids)
+        self._groups[name] = SelectionGroup(
+            name=name, node_ids=new_nodes, element_ids=new_elems,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(
+            f"Updated group '{name}': {len(new_nodes)} node(s), {len(new_elems)} element(s)."
+        )
+
+    def _group_rename(self) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        if not self._groups:
+            QMessageBox.information(self, "Rename group", "No groups exist.")
+            return
+        names = sorted(self._groups)
+        old_name, ok = QInputDialog.getItem(
+            self, "Rename group", "Choose group to rename:", names, 0, False,
+        )
+        if not ok:
+            return
+        new_name, ok2 = QInputDialog.getText(
+            self, "Rename group", f"New name for '{old_name}':",
+        )
+        if not ok2:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            QMessageBox.warning(self, "Rename group", "Name cannot be empty.")
+            return
+        if new_name == old_name:
+            return
+        if new_name in self._groups:
+            QMessageBox.warning(
+                self, "Rename group", f"A group named '{new_name}' already exists.",
+            )
+            return
+        g = self._groups.pop(old_name)
+        self._groups[new_name] = SelectionGroup(
+            name=new_name, node_ids=g.node_ids, element_ids=g.element_ids,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(f"Renamed group '{old_name}' → '{new_name}'.")
+
+    def _group_delete(self) -> None:
+        from PyQt6.QtWidgets import QInputDialog
+        if not self._groups:
+            QMessageBox.information(self, "Delete group", "No groups exist.")
+            return
+        names = sorted(self._groups)
+        name, ok = QInputDialog.getItem(
+            self, "Delete group", "Choose group to delete:", names, 0, False,
+        )
+        if not ok:
+            return
+        ans = QMessageBox.question(
+            self, "Delete group",
+            f"Delete group '{name}'? This does not delete model nodes or elements.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        del self._groups[name]
+        self._modified = True
+        self._update_title()
+        self.set_status(f"Deleted group '{name}'.")
+
+    def _group_select(self, name: str) -> None:
+        g = self._groups.get(name)
+        if g is None:
+            return
+        existing_eids = {e.id for e in self._model.elements}
+        self.canvas.clear_selection()
+        for nid in g.node_ids:
+            if nid in self._model.nodes:
+                self.canvas.add_node_to_selection(nid)
+        for eid in g.element_ids:
+            if eid in existing_eids:
+                self.canvas.add_element_to_selection(eid)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _group_add_to_selection(self, name: str) -> None:
+        g = self._groups.get(name)
+        if g is None:
+            return
+        existing_eids = {e.id for e in self._model.elements}
+        for nid in g.node_ids:
+            if nid in self._model.nodes:
+                self.canvas.add_node_to_selection(nid)
+        for eid in g.element_ids:
+            if eid in existing_eids:
+                self.canvas.add_element_to_selection(eid)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _group_remove_from_selection(self, name: str) -> None:
+        g = self._groups.get(name)
+        if g is None:
+            return
+        for nid in g.node_ids:
+            self.canvas.remove_node_from_selection(nid)
+        for eid in g.element_ids:
+            self.canvas.remove_element_from_selection(eid)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _open_group_manager(self) -> None:
+        from .dialogs import GroupManagerDialog
+        d = GroupManagerDialog(self, host=self, groups=self._groups, model=self._model)
+        d.exec()
+
+    def _populate_group_submenu(self, menu: "QMenu", callback) -> None:
+        menu.clear()
+        if not self._groups:
+            a = menu.addAction("(no groups)")
+            a.setEnabled(False)
+            return
+        for name in sorted(self._groups):
+            menu.addAction(name, lambda _, n=name: callback(n))
+
+    def _assign_to_group(
+        self,
+        node_ids: list[int] | None = None,
+        element_ids: list[int] | None = None,
+    ) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        node_ids = node_ids or []
+        element_ids = element_ids or []
+        if not node_ids and not element_ids:
+            QMessageBox.information(self, "Assign to group", "Nothing to assign.")
+            return
+        if not self._groups:
+            ans = QMessageBox.question(
+                self, "Assign to group",
+                "No groups exist. Create a new group with this item?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            name, ok = QInputDialog.getText(
+                self, "Create group", "Group name:"
+            )
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+            self._groups[name] = SelectionGroup(
+                name=name, node_ids=node_ids, element_ids=element_ids,
+            )
+            self._modified = True
+            self._update_title()
+            self.set_status(f"Created group '{name}' with the selected item(s).")
+            return
+        names = sorted(self._groups) + ["[ Create new group… ]"]
+        name, ok = QInputDialog.getItem(
+            self, "Assign to group", "Choose group:", names, 0, False,
+        )
+        if not ok:
+            return
+        if name == "[ Create new group… ]":
+            name, ok2 = QInputDialog.getText(
+                self, "Create group", "Group name:",
+            )
+            if not ok2 or not name.strip():
+                return
+            name = name.strip()
+            if name in self._groups:
+                QMessageBox.warning(
+                    self, "Assign to group",
+                    f"Group '{name}' already exists. Items added to it.",
+                )
+        g = self._groups.get(name)
+        new_nodes = sorted(set(g.node_ids if g else []) | set(node_ids))
+        new_elems = sorted(set(g.element_ids if g else []) | set(element_ids))
+        self._groups[name] = SelectionGroup(
+            name=name, node_ids=new_nodes, element_ids=new_elems,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(
+            f"Assigned to group '{name}': {len(new_nodes)} node(s), {len(new_elems)} element(s)."
+        )
+
     def execute(self, command: Command) -> None:
         try:
             command.do(self._model)
@@ -1165,6 +1764,8 @@ class MainWindow(QMainWindow):
         if merge_tooltip:
             a_merge.setToolTip(merge_tooltip)
         menu.addSeparator()
+        a_assign_grp = menu.addAction(f"Assign node {node_id} to group…")
+        menu.addSeparator()
         a3 = menu.addAction(f"Node {node_id}: delete")
         chosen = menu.exec(self.cursor().pos())
         if chosen is a1:
@@ -1175,6 +1776,8 @@ class MainWindow(QMainWindow):
             self._do_batch_nodal_load()
         elif chosen is a_merge:
             self.execute(MergeAdjacentElementsCmd(middle_node_id=node_id))
+        elif chosen is a_assign_grp:
+            self._assign_to_group(node_ids=[node_id])
         elif chosen is a3:
             self.execute(DeleteNodeCmd(node_id=node_id))
 
@@ -1218,6 +1821,15 @@ class MainWindow(QMainWindow):
                 f"Batch assign member load to {len(sel_elems)} elements…"
             )
             a_batch.setEnabled(not edits_locked)
+        # Select Similar submenu (v0.27.0)
+        menu.addSeparator()
+        sim_menu = menu.addMenu(f"Select similar to element {elem_id}…")
+        a_sim_type = sim_menu.addAction("Same type")
+        a_sim_sec = sim_menu.addAction("Same section")
+        a_sim_mat = sim_menu.addAction("Same material")
+        a_sim_ts = sim_menu.addAction("Same type + section")
+        # Assign to group (v0.27.0)
+        a_assign_grp = menu.addAction(f"Assign element {elem_id} to group…")
         menu.addSeparator()
         a_edit = menu.addAction(f"Element {elem_id}: edit section/material…")
         a_clear_loads = menu.addAction(
@@ -1233,6 +1845,16 @@ class MainWindow(QMainWindow):
             self._open_element_inspector(elem_id, tab="loads")
         elif a_batch is not None and chosen is a_batch:
             self._do_batch_member_load()
+        elif chosen is a_sim_type:
+            self._select_similar_type(elem_id)
+        elif chosen is a_sim_sec:
+            self._select_similar_section(elem_id)
+        elif chosen is a_sim_mat:
+            self._select_similar_material(elem_id)
+        elif chosen is a_sim_ts:
+            self._select_similar_type_and_section(elem_id)
+        elif chosen is a_assign_grp:
+            self._assign_to_group(element_ids=[elem_id])
         elif chosen is a_edit:
             self._edit_element(elem_id)
         elif chosen is a_clear_loads:
@@ -2278,6 +2900,7 @@ class MainWindow(QMainWindow):
             return
         self._model = _build_starter_model()
         self._grid = GridSystem()
+        self._groups = {}
         self._undo.clear()
         self._redo.clear()
         self._modified = False
@@ -2309,9 +2932,11 @@ class MainWindow(QMainWindow):
                 new_model = project.model
                 new_grid = project.grid
                 new_view = project.view
+                new_groups = {g.name: g for g in project.groups}
             else:
                 new_model = read_input_file(path)
                 new_grid = GridSystem()
+                new_groups = {}
         except FileNotFoundError:
             QMessageBox.warning(self, "Open failed",
                                   f"File not found: {path}")
@@ -2325,6 +2950,7 @@ class MainWindow(QMainWindow):
             return
         self._model = new_model
         self._grid = new_grid
+        self._groups = new_groups
         self._undo.clear()
         self._redo.clear()
         self._modified = False
@@ -2384,7 +3010,9 @@ class MainWindow(QMainWindow):
                 )
                 project = Project(
                     model=self._model, grid=self._grid,
-                    view=view, title=self._model.title,
+                    view=view,
+                    groups=list(self._groups.values()),
+                    title=self._model.title,
                 )
                 save_project_json(project, path)
             else:
