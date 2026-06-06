@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 __what_is_new__ = (
-    "Batch assign member loads to selected elements (Edit menu · context menu) · "
-    "Batch assign nodal loads to selected nodes · "
-    "Relative point-load position for batch · one undo per batch"
+    "Selection menu: filter by type/section/material · "
+    "Select Similar (right-click) · "
+    "Named groups: create/select/manage (Selection → Groups)"
 )
 
 from .model import (
