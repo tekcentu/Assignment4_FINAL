@@ -11,7 +11,7 @@ from typing import Any, Optional
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -4469,3 +4469,378 @@ class ModalMassSourceDialog(_ModalDialog):
             QMessageBox.warning(self, "Invalid mass source", str(exc))
             return None
         return src
+
+
+# ── batch load dialogs (v0.26 — PR #41) ─────────────────────────────────
+
+
+class BatchMemberLoadDialog(_ModalDialog):
+    """Define one member-load spec to be applied to N selected elements.
+
+    Mirrors :class:`MemberLoadDialog`'s field set but emits a spec dict
+    (not a load instance) because the same spec turns into different
+    per-element loads — most importantly, batch point loads use a
+    relative position ``ratio ∈ [0, 1]`` that is converted to the
+    correct absolute ``a = ratio * L`` per element in the app handler.
+
+    Compatibility is decided ONCE at open time from the selection's
+    element kinds:
+      - all frame   → mechanical + thermal (uniform + gradient)
+      - all truss   → thermal uniform only (mechanical + gradient blocked)
+      - mixed       → OK button disabled; warning label names the rule.
+
+    ``result_value`` on accept is a dict; see :meth:`_accept` for keys.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        model: StructuralModel,
+        element_ids: "frozenset[int] | set[int]",
+    ) -> None:
+        if len(element_ids) < 2:
+            raise ValueError(
+                "Batch member-load dialog requires two or more selected "
+                f"elements (got {len(element_ids)})."
+            )
+        self._model = model
+        self._element_ids = frozenset(element_ids)
+        # Classify the selection up-front so _build_body can disable
+        # incompatible radios cleanly.
+        elements = [e for e in model.elements if e.id in self._element_ids]
+        missing = self._element_ids - {e.id for e in elements}
+        if missing:
+            raise ValueError(
+                f"Elements not in model: {sorted(missing)}"
+            )
+        self._elements = elements
+        self._has_frame = any(isinstance(e, FrameElement2D) for e in elements)
+        self._has_truss = any(isinstance(e, TrussElement2D) for e in elements)
+        self._is_mixed = self._has_frame and self._has_truss
+        self._all_truss = self._has_truss and not self._has_frame
+        super().__init__(
+            parent,
+            f"Batch member load — {len(self._element_ids)} elements",
+        )
+
+    def _ok_button(self):
+        if not hasattr(self, "_cached_ok_button"):
+            cached = None
+            for child in self.findChildren(QDialogButtonBox):
+                cached = child.button(QDialogButtonBox.StandardButton.Ok)
+                break
+            self._cached_ok_button = cached
+        return self._cached_ok_button
+
+    def _build_body(self, body: QWidget) -> None:
+        from PyQt6.QtWidgets import QButtonGroup, QRadioButton, QFormLayout
+        v = QVBoxLayout(body)
+
+        # Heading + selection summary.
+        v.addWidget(QLabel(
+            f"<b>Apply the same member load to "
+            f"{len(self._element_ids)} selected elements.</b>",
+            body,
+        ))
+        kinds: list[str] = []
+        if self._has_frame:
+            kinds.append(f"{sum(isinstance(e, FrameElement2D) for e in self._elements)} frame")
+        if self._has_truss:
+            kinds.append(f"{sum(isinstance(e, TrussElement2D) for e in self._elements)} truss")
+        v.addWidget(QLabel(f"Selection: {', '.join(kinds)}.", body))
+
+        # If mixed, block at the dialog: no field choice can make a
+        # mixed batch valid (every member-load type is rejected by at
+        # least one of the two element kinds).
+        if self._is_mixed:
+            warn = QLabel(
+                "Batch member loads require a uniform element type. "
+                "The current selection mixes frame and truss elements — "
+                "deselect one kind and reopen this dialog.",
+                body,
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet(
+                "color: #b00020; font-weight: bold; padding: 6px;"
+            )
+            v.addWidget(warn)
+            # Build no further fields; disable OK after the buttonbox
+            # exists (deferred via singleShot since _ok_button can only
+            # find the buttonbox after _build_body returns).
+            QTimer.singleShot(0, lambda: self._ok_button() and self._ok_button().setEnabled(False))
+            return
+
+        # ── Category radios (Mechanical / Thermal) ────────────────────
+        # Mechanical is disabled for all-truss selections (mirrors the
+        # single-element MemberLoadDialog rule at dialogs.py:1679).
+        v.addWidget(QLabel("Load category:", body))
+        self._cat_group = QButtonGroup(body)
+        self._rb_mech = QRadioButton("Mechanical", body)
+        self._rb_therm = QRadioButton("Thermal", body)
+        if self._all_truss:
+            self._rb_mech.setEnabled(False)
+            self._rb_mech.setToolTip(
+                "Truss elements support thermal loads only — UDL / point "
+                "loads require frame bending DOFs."
+            )
+            self._rb_therm.setChecked(True)
+        else:
+            self._rb_mech.setChecked(True)
+        self._cat_group.addButton(self._rb_mech)
+        self._cat_group.addButton(self._rb_therm)
+        v.addWidget(self._rb_mech)
+        v.addWidget(self._rb_therm)
+        self._rb_mech.toggled.connect(self._refresh)
+        self._rb_therm.toggled.connect(self._refresh)
+
+        # ── Mechanical subform: UDL / Point + Local/Global/Gravity ────
+        self._mech_widget = QWidget(body)
+        mv = QVBoxLayout(self._mech_widget)
+        mv.setContentsMargins(0, 4, 0, 0)
+        mv.addWidget(QLabel("Type:", self._mech_widget))
+        self._kind_group = QButtonGroup(self._mech_widget)
+        self._rb_udl = QRadioButton("Uniform Distributed Load", self._mech_widget)
+        self._rb_point = QRadioButton("Point Load (relative position)", self._mech_widget)
+        self._kind_group.addButton(self._rb_udl)
+        self._kind_group.addButton(self._rb_point)
+        self._rb_udl.setChecked(True)
+        mv.addWidget(self._rb_udl)
+        mv.addWidget(self._rb_point)
+        self._rb_udl.toggled.connect(self._refresh)
+        self._rb_point.toggled.connect(self._refresh)
+        mv.addWidget(QLabel("Direction:", self._mech_widget))
+        self._coord_group = QButtonGroup(self._mech_widget)
+        self._rb_local = QRadioButton("Local", self._mech_widget)
+        self._rb_global = QRadioButton("Global", self._mech_widget)
+        self._rb_gravity = QRadioButton("Gravity (global -Y)", self._mech_widget)
+        self._rb_local.setChecked(True)
+        for rb in (self._rb_local, self._rb_global, self._rb_gravity):
+            self._coord_group.addButton(rb)
+            mv.addWidget(rb)
+            rb.toggled.connect(self._refresh)
+        v.addWidget(self._mech_widget)
+
+        # ── Thermal subform ───────────────────────────────────────────
+        self._therm_widget = QWidget(body)
+        tv = QVBoxLayout(self._therm_widget)
+        tv.setContentsMargins(0, 4, 0, 0)
+        tv.addWidget(QLabel("Thermal type:", self._therm_widget))
+        self._therm_group = QButtonGroup(self._therm_widget)
+        self._rb_t_uniform = QRadioButton("Uniform ΔT", self._therm_widget)
+        self._rb_t_gradient = QRadioButton("Top / bottom gradient", self._therm_widget)
+        if self._all_truss:
+            self._rb_t_gradient.setEnabled(False)
+            self._rb_t_gradient.setToolTip(
+                "Thermal gradient requires frame bending DOFs."
+            )
+        self._therm_group.addButton(self._rb_t_uniform)
+        self._therm_group.addButton(self._rb_t_gradient)
+        self._rb_t_uniform.setChecked(True)
+        tv.addWidget(self._rb_t_uniform)
+        tv.addWidget(self._rb_t_gradient)
+        self._rb_t_uniform.toggled.connect(self._refresh)
+        self._rb_t_gradient.toggled.connect(self._refresh)
+        v.addWidget(self._therm_widget)
+
+        # ── Numeric fields container ──────────────────────────────────
+        self._field_container = QWidget(body)
+        self._field_form = QFormLayout(self._field_container)
+        v.addWidget(self._field_container)
+        self._fields: dict[str, QLineEdit] = {}
+
+        # ── Load case combo (mirrors MemberLoadDialog) ────────────────
+        v.addWidget(QLabel("Load case:", body))
+        self._case_combo = _make_load_case_combo(body, "DEFAULT", model=self._model)
+        v.addWidget(self._case_combo)
+
+        self._refresh()
+
+    def _current_category(self) -> str:
+        return "thermal" if self._rb_therm.isChecked() else "mechanical"
+
+    def _current_coord(self) -> str:
+        if self._rb_gravity.isChecked():
+            return "gravity"
+        if self._rb_global.isChecked():
+            return "global"
+        return "local"
+
+    def _refresh(self) -> None:
+        # Clear the field container.
+        while self._field_form.count():
+            item = self._field_form.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        self._fields = {}
+
+        cat = self._current_category()
+        self._mech_widget.setVisible(cat == "mechanical")
+        self._therm_widget.setVisible(cat == "thermal")
+
+        if cat == "mechanical":
+            cs = self._current_coord()
+            kind = "point" if self._rb_point.isChecked() else "udl"
+            if kind == "udl":
+                if cs == "gravity":
+                    self._add_field("qg (kN/m, +ve downward)", "wy")
+                else:
+                    xname = "qX (kN/m, global X)" if cs == "global" else "wx (kN/m, local x)"
+                    yname = "qY (kN/m, global Y)" if cs == "global" else "wy (kN/m, local y)"
+                    self._add_field(xname, "wx")
+                    self._add_field(yname, "wy")
+            else:
+                if cs == "gravity":
+                    self._add_field("Pg (kN, +ve downward)", "py")
+                else:
+                    xname = "PX (kN, global X)" if cs == "global" else "Px (kN, local x)"
+                    yname = "PY (kN, global Y)" if cs == "global" else "Py (kN, local y)"
+                    self._add_field(xname, "px")
+                    self._add_field(yname, "py")
+                # Relative position is the only mode in V1 — the value
+                # is converted to absolute a = ratio * L per element by
+                # the app-layer handler.
+                self._add_field(
+                    "Position ratio (0.0 = start, 1.0 = end)",
+                    "ratio",
+                )
+                self._fields["ratio"].setText("0.5")
+        else:
+            tkind = "gradient" if self._rb_t_gradient.isChecked() else "uniform"
+            if tkind == "uniform":
+                self._add_field("ΔT (°C)", "delta_T")
+            else:
+                self._add_field("t_top (°C)", "t_top")
+                self._add_field("t_bottom (°C)", "t_bottom")
+
+    def _add_field(self, label: str, key: str) -> None:
+        le = QLineEdit(self._field_container)
+        self._field_form.addRow(label, le)
+        self._fields[key] = le
+
+    def _accept(self) -> dict:
+        if self._is_mixed:
+            # Defensive — OK is disabled in the mixed branch, but reject
+            # programmatic accepts too rather than emitting garbage.
+            raise ValueError("Selection mixes frame and truss elements.")
+        load_case = _normalize_load_case(self._case_combo.currentText())
+        cat = self._current_category()
+        if cat == "mechanical":
+            cs = self._current_coord()
+            kind = "point" if self._rb_point.isChecked() else "udl"
+            if kind == "udl":
+                if cs == "gravity":
+                    wy = parse_float(self._fields["wy"].text(), "qg")
+                    return {
+                        "kind": "udl", "coord_system": cs, "load_case": load_case,
+                        "wx": 0.0, "wy": wy,
+                    }
+                xname = "qX" if cs == "global" else "wx"
+                yname = "qY" if cs == "global" else "wy"
+                wx = parse_float(self._fields["wx"].text(), xname, allow_blank=True) or 0.0
+                wy = parse_float(self._fields["wy"].text(), yname)
+                return {
+                    "kind": "udl", "coord_system": cs, "load_case": load_case,
+                    "wx": wx, "wy": wy,
+                }
+            # Point load (relative position).
+            if cs == "gravity":
+                py = parse_float(self._fields["py"].text(), "Pg")
+                px = 0.0
+            else:
+                xname = "PX" if cs == "global" else "Px"
+                yname = "PY" if cs == "global" else "Py"
+                px = parse_float(self._fields["px"].text(), xname, allow_blank=True) or 0.0
+                py = parse_float(self._fields["py"].text(), yname)
+            ratio = parse_float(self._fields["ratio"].text(), "Position ratio")
+            if ratio < 0.0 or ratio > 1.0:
+                raise ValueError(
+                    f"Position ratio must lie within [0.0, 1.0]; got {ratio}."
+                )
+            return {
+                "kind": "point", "coord_system": cs, "load_case": load_case,
+                "px": px, "py": py, "ratio": ratio,
+            }
+        # Thermal.
+        tkind = "gradient" if self._rb_t_gradient.isChecked() else "uniform"
+        if tkind == "uniform":
+            dT = parse_float(self._fields["delta_T"].text(), "ΔT")
+            return {
+                "kind": "thermal_uniform", "load_case": load_case,
+                "delta_T": dT,
+            }
+        # Gradient — disallowed on truss; OK is enabled only when all-frame.
+        return {
+            "kind": "thermal_gradient", "load_case": load_case,
+            "t_top": parse_float(self._fields["t_top"].text(), "t_top"),
+            "t_bottom": parse_float(self._fields["t_bottom"].text(), "t_bottom"),
+        }
+
+
+class BatchNodalLoadDialog(_ModalDialog):
+    """Define one nodal-load row to be appended to each of N selected nodes.
+
+    Appends — does NOT overwrite existing nodal loads on the target
+    nodes. ``result_value`` on accept is a dict: ``{fx, fy, mz, case}``.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        model: StructuralModel,
+        node_ids: "frozenset[int] | set[int]",
+    ) -> None:
+        if len(node_ids) < 2:
+            raise ValueError(
+                "Batch nodal-load dialog requires two or more selected "
+                f"nodes (got {len(node_ids)})."
+            )
+        self._model = model
+        self._node_ids = frozenset(node_ids)
+        missing = self._node_ids - set(model.nodes)
+        if missing:
+            raise ValueError(f"Nodes not in model: {sorted(missing)}")
+        super().__init__(
+            parent,
+            f"Batch nodal load — {len(self._node_ids)} nodes",
+        )
+
+    def _build_body(self, body: QWidget) -> None:
+        from PyQt6.QtWidgets import QFormLayout
+        v = QVBoxLayout(body)
+        v.addWidget(QLabel(
+            f"<b>Append the same nodal load to "
+            f"{len(self._node_ids)} selected nodes.</b>",
+            body,
+        ))
+        v.addWidget(QLabel(
+            "Existing nodal loads on each node are preserved — this dialog "
+            "appends a new row.",
+            body,
+        ))
+        form_widget = QWidget(body)
+        form = QFormLayout(form_widget)
+        self._fx = QLineEdit(form_widget); self._fx.setText("0")
+        self._fy = QLineEdit(form_widget); self._fy.setText("0")
+        self._mz = QLineEdit(form_widget); self._mz.setText("0")
+        form.addRow("Fx (kN, global X):", self._fx)
+        form.addRow("Fy (kN, global Y):", self._fy)
+        form.addRow("Mz (kN·m, +CCW):", self._mz)
+        v.addWidget(form_widget)
+        v.addWidget(QLabel("Load case:", body))
+        self._case_combo = _make_load_case_combo(body, "DEFAULT", model=self._model)
+        v.addWidget(self._case_combo)
+
+    def _accept(self) -> dict:
+        fx = parse_float(self._fx.text(), "Fx", allow_blank=True) or 0.0
+        fy = parse_float(self._fy.text(), "Fy", allow_blank=True) or 0.0
+        mz = parse_float(self._mz.text(), "Mz", allow_blank=True) or 0.0
+        case = _normalize_load_case(self._case_combo.currentText())
+        if fx == 0.0 and fy == 0.0 and mz == 0.0:
+            raise ValueError(
+                "At least one of Fx, Fy, Mz must be non-zero."
+            )
+        return {"fx": fx, "fy": fy, "mz": mz, "load_case": case}

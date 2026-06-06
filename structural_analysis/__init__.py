@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.25.0"
+__version__ = "0.26.0"
 __what_is_new__ = (
-    "Modal Mass Source Settings (Run menu) · "
-    "Joint masses storage + file I/O · "
-    "New GUI models default self-weight to DEAD"
+    "Batch assign member loads to selected elements (Edit menu · context menu) · "
+    "Batch assign nodal loads to selected nodes · "
+    "Relative point-load position for batch · one undo per batch"
 )
 
 from .model import (

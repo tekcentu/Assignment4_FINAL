@@ -2567,3 +2567,107 @@ class UpdateModalMassSourceCmd(Command):
     def undo(self, model: StructuralModel) -> None:
         if self._previous is not None:
             model.modal_mass_source = self._previous
+
+
+# ── batch load assignment (v0.26 — PR #41) ──────────────────────────────
+
+
+@dataclass
+class BatchAddMemberLoadsCmd(Command):
+    """Append one pre-built member load to each of several elements
+    atomically: either every load lands or none does.
+
+    ``loads`` is a list of ``(elem_id, load)`` pairs; the caller is
+    responsible for constructing the load instance per element (so e.g.
+    a point-load batch with a relative position is converted to the
+    correct absolute ``a`` per element in the GUI layer before reaching
+    here).  Validation runs over the whole batch before any element is
+    mutated so a single incompatible element rejects the whole batch
+    and the model is left untouched.
+
+    Undo is index-based, not identity-based: the inserted position is
+    captured per row in ``_inserted_indices`` so undo removes exactly
+    the rows this command added even when the user already had an
+    equal load on the element.
+    """
+
+    loads: list[tuple[int, object]] = field(default_factory=list)
+    _inserted_indices: list[tuple[int, int]] = field(
+        default_factory=list, init=False,
+    )
+    description: str = "batch add member loads"
+
+    def do(self, model: StructuralModel) -> None:
+        from ..model import FrameTemperatureLoad, TrussTemperatureLoad
+        elements_by_id = {e.id: e for e in model.elements}
+        # Validate the whole batch first — fail-fast so partial state
+        # cannot leak. Missing element → ValueError; wrong load type
+        # for that element's kind → ValueError.
+        for elem_id, load in self.loads:
+            elem = elements_by_id.get(elem_id)
+            if elem is None:
+                raise ValueError(f"Element {elem_id} does not exist.")
+            if (
+                isinstance(elem, TrussElement2D)
+                and isinstance(load, FrameTemperatureLoad)
+            ):
+                raise ValueError(
+                    f"Element {elem_id} is a truss — FrameTemperatureLoad "
+                    "is only valid on frame elements."
+                )
+            if (
+                isinstance(elem, FrameElement2D)
+                and isinstance(load, TrussTemperatureLoad)
+            ):
+                raise ValueError(
+                    f"Element {elem_id} is a frame — TrussTemperatureLoad "
+                    "is only valid on truss elements."
+                )
+        # All valid — record do-state and mutate.
+        self._inserted_indices = []
+        for elem_id, load in self.loads:
+            elem = elements_by_id[elem_id]
+            elem.member_loads.append(load)
+            self._inserted_indices.append((elem_id, len(elem.member_loads) - 1))
+
+    def undo(self, model: StructuralModel) -> None:
+        elements_by_id = {e.id: e for e in model.elements}
+        # Remove in reverse insertion order — for a single element the
+        # appended row is always the last, so reverse pop() is correct
+        # even if the user inserted other rows after this command (an
+        # undo stack pushed past it would itself be popped first).
+        for elem_id, idx in reversed(self._inserted_indices):
+            elem = elements_by_id.get(elem_id)
+            if elem is None or idx >= len(elem.member_loads):
+                continue
+            elem.member_loads.pop(idx)
+
+
+@dataclass
+class BatchAddNodalLoadsCmd(Command):
+    """Append one pre-built :class:`NodalLoad` per selected node.
+
+    Existing nodal loads on each node are preserved; this command only
+    appends. Validates that every target node exists before mutating
+    so a typo cannot leave the model half-updated. Undo pops the rows
+    by their captured insertion indices into ``model.nodal_loads``
+    (newest-first) so even pre-existing equal rows are not touched.
+    """
+
+    loads: list[NodalLoad] = field(default_factory=list)
+    _inserted_indices: list[int] = field(default_factory=list, init=False)
+    description: str = "batch add nodal loads"
+
+    def do(self, model: StructuralModel) -> None:
+        for ld in self.loads:
+            if ld.node_id not in model.nodes:
+                raise ValueError(f"Node {ld.node_id} does not exist.")
+        self._inserted_indices = []
+        for ld in self.loads:
+            model.nodal_loads.append(ld)
+            self._inserted_indices.append(len(model.nodal_loads) - 1)
+
+    def undo(self, model: StructuralModel) -> None:
+        for idx in reversed(self._inserted_indices):
+            if 0 <= idx < len(model.nodal_loads):
+                model.nodal_loads.pop(idx)

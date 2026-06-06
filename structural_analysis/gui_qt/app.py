@@ -50,6 +50,8 @@ from ..gui_common.commands import (
     AddNodeCmd,
     AddOrUpdateMaterialCmd,
     AddOrUpdateSectionCmd,
+    BatchAddMemberLoadsCmd,
+    BatchAddNodalLoadsCmd,
     BatchDeleteCmd,
     BatchUpdateElementsCmd,
     check_merge_preconditions,
@@ -98,6 +100,8 @@ from .controllers import (
 from .dialogs import (
     AnalysisSettingsDialog,
     BatchAssignDialog,
+    BatchMemberLoadDialog,
+    BatchNodalLoadDialog,
     BuildingWizardDialog,
     ElementDialog,
     ElementPropertiesDialog,
@@ -363,6 +367,28 @@ class MainWindow(QMainWindow):
             "Apply section / material override to all selected elements "
             "in one undoable step."
         )
+        # v0.26 — batch load assignment (PR #41). Both actions are
+        # always enabled; the handlers verify a >=2-element / >=2-node
+        # selection at runtime and surface a status-bar message
+        # otherwise, mirroring how act_renumber_elements handles the
+        # empty-model case.
+        self.act_batch_member_load = QAction(
+            "Batch assign &member load…", self,
+            triggered=self._do_batch_member_load,
+        )
+        self.act_batch_member_load.setToolTip(
+            "Apply the same UDL / point / thermal load to every "
+            "selected element in one undoable step. Requires 2+ "
+            "selected elements."
+        )
+        self.act_batch_nodal_load = QAction(
+            "Batch assign &nodal load…", self,
+            triggered=self._do_batch_nodal_load,
+        )
+        self.act_batch_nodal_load.setToolTip(
+            "Append the same Fx / Fy / Mz to every selected node in "
+            "one undoable step. Requires 2+ selected nodes."
+        )
         self.act_add_node_coords = QAction(
             "Add node at &coordinates…", self,
             shortcut="Shift+N",
@@ -542,6 +568,8 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_building_wizard)
         m_edit.addAction(self.act_add_node_coords)
         m_edit.addAction(self.act_batch_assign)
+        m_edit.addAction(self.act_batch_member_load)
+        m_edit.addAction(self.act_batch_nodal_load)
         m_edit.addAction(self.act_materials)
         m_edit.addAction(self.act_forget_elem_defaults)
         m_edit.addSeparator()
@@ -1119,6 +1147,16 @@ class MainWindow(QMainWindow):
         a1 = menu.addAction(f"Node {node_id}: edit support…")
         a2 = menu.addAction(f"Node {node_id}: edit nodal load…")
         menu.addSeparator()
+        # Batch action — visible only when the user has multi-selected
+        # nodes (single-node right-click keeps the normal Add/Edit
+        # workflow, per the PR-41 brief).
+        sel_nodes = self.canvas.get_selected_nodes()
+        a_batch = None
+        if len(sel_nodes) >= 2 and node_id in sel_nodes:
+            a_batch = menu.addAction(
+                f"Batch assign nodal load to {len(sel_nodes)} nodes…"
+            )
+            menu.addSeparator()
         merge_label, merge_enabled, merge_tooltip = (
             self._merge_action_label_and_tooltip(node_id)
         )
@@ -1133,6 +1171,8 @@ class MainWindow(QMainWindow):
             self._edit_support(node_id)
         elif chosen is a2:
             self._edit_nodal_load(node_id)
+        elif a_batch is not None and chosen is a_batch:
+            self._do_batch_nodal_load()
         elif chosen is a_merge:
             self.execute(MergeAdjacentElementsCmd(middle_node_id=node_id))
         elif chosen is a3:
@@ -1168,6 +1208,16 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         a_details = menu.addAction(f"Element {elem_id}: Element Details…")
         a_loads = menu.addAction(f"Element {elem_id}: Edit member loads…")
+        # Batch action — visible only when multi-selected (single-element
+        # right-click keeps the normal per-element load workflow above).
+        sel_elems = self.canvas.get_selected_elements()
+        a_batch = None
+        if len(sel_elems) >= 2 and elem_id in sel_elems:
+            menu.addSeparator()
+            a_batch = menu.addAction(
+                f"Batch assign member load to {len(sel_elems)} elements…"
+            )
+            a_batch.setEnabled(not edits_locked)
         menu.addSeparator()
         a_edit = menu.addAction(f"Element {elem_id}: edit section/material…")
         a_clear_loads = menu.addAction(
@@ -1181,6 +1231,8 @@ class MainWindow(QMainWindow):
             self._open_element_inspector(elem_id, tab="properties")
         elif chosen is a_loads:
             self._open_element_inspector(elem_id, tab="loads")
+        elif a_batch is not None and chosen is a_batch:
+            self._do_batch_member_load()
         elif chosen is a_edit:
             self._edit_element(elem_id)
         elif chosen is a_clear_loads:
@@ -1960,6 +2012,148 @@ class MainWindow(QMainWindow):
             material_override_id=result.get("material_override_id"),
         )
         self.execute(cmd)
+
+    # ── batch load assignment (v0.26 — PR #41) ─────────────────────────
+
+    def _do_batch_member_load(self) -> None:
+        """Open BatchMemberLoadDialog for the current element selection.
+
+        Requires ≥ 2 selected elements; otherwise surfaces a clear
+        QMessageBox and returns. Builds the per-element load instances
+        from the dialog spec (handling relative point-load position →
+        absolute a per element here, NOT in the command) so the
+        command receives concrete load objects and stays geometry-free.
+        """
+        elem_ids = self.canvas.get_selected_elements()
+        if len(elem_ids) < 2:
+            QMessageBox.information(
+                self, "Batch member load",
+                "Select two or more elements to batch assign member "
+                "loads (box-drag in Select mode or Shift-click to "
+                "multi-pick).",
+            )
+            return
+        try:
+            d = BatchMemberLoadDialog(
+                self, model=self._model, element_ids=elem_ids,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Batch member load", str(exc))
+            return
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        spec = d.result_value
+        if not spec:
+            return
+        try:
+            loads = self._build_batch_member_loads(spec, elem_ids)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Batch member load", str(exc))
+            return
+        self.execute(BatchAddMemberLoadsCmd(loads=loads))
+
+    def _build_batch_member_loads(
+        self, spec: dict, elem_ids: "frozenset[int]"
+    ) -> list[tuple[int, object]]:
+        """Turn the dialog's spec dict + the selected element set into
+        a list of (elem_id, load_instance) pairs ready for
+        :class:`BatchAddMemberLoadsCmd`.
+
+        Point-load relative-position conversion happens here (NOT in
+        the command), so the command stores absolute ``a`` per
+        element exactly matching the existing PointLoad data shape.
+        """
+        from ..model import (
+            FrameTemperatureLoad,
+            PointLoad,
+            TrussTemperatureLoad,
+            UniformDistributedLoad,
+        )
+        kind = spec["kind"]
+        case = spec["load_case"]
+        elems = [e for e in self._model.elements if e.id in elem_ids]
+        # Stable order — sorted by id — so the resulting nodal_loads /
+        # member_loads order is deterministic across runs and tests can
+        # rely on it.
+        elems.sort(key=lambda e: e.id)
+        result: list[tuple[int, object]] = []
+        if kind == "udl":
+            for e in elems:
+                load = UniformDistributedLoad(
+                    wy=spec["wy"], wx=spec["wx"],
+                    coord_system=spec["coord_system"],
+                    load_case=case,
+                )
+                result.append((e.id, load))
+        elif kind == "point":
+            ratio = spec["ratio"]
+            for e in elems:
+                ni = self._model.nodes[e.node_i]
+                nj = self._model.nodes[e.node_j]
+                L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+                a = ratio * L
+                load = PointLoad(
+                    py=spec["py"], a=a, px=spec["px"],
+                    coord_system=spec["coord_system"],
+                    load_case=case,
+                )
+                result.append((e.id, load))
+        elif kind == "thermal_uniform":
+            from ..element import TrussElement2D
+            dT = spec["delta_T"]
+            for e in elems:
+                if isinstance(e, TrussElement2D):
+                    load = TrussTemperatureLoad(delta_T=dT, load_case=case)
+                else:
+                    load = FrameTemperatureLoad(
+                        t_top=dT, t_bottom=dT, load_case=case,
+                    )
+                result.append((e.id, load))
+        elif kind == "thermal_gradient":
+            for e in elems:
+                load = FrameTemperatureLoad(
+                    t_top=spec["t_top"], t_bottom=spec["t_bottom"],
+                    load_case=case,
+                )
+                result.append((e.id, load))
+        else:
+            raise ValueError(f"Unknown batch member-load kind: {kind!r}.")
+        return result
+
+    def _do_batch_nodal_load(self) -> None:
+        """Open BatchNodalLoadDialog for the current node selection.
+
+        Requires ≥ 2 selected nodes. Appends one NodalLoad per node;
+        does NOT overwrite existing nodal loads.
+        """
+        from ..model import NodalLoad
+        node_ids = self.canvas.get_selected_nodes()
+        if len(node_ids) < 2:
+            QMessageBox.information(
+                self, "Batch nodal load",
+                "Select two or more nodes to batch assign nodal loads.",
+            )
+            return
+        try:
+            d = BatchNodalLoadDialog(
+                self, model=self._model, node_ids=node_ids,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Batch nodal load", str(exc))
+            return
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        spec = d.result_value
+        if not spec:
+            return
+        loads = [
+            NodalLoad(
+                node_id=nid, fx=spec["fx"], fy=spec["fy"], mz=spec["mz"],
+                load_case=spec["load_case"],
+            )
+            for nid in sorted(node_ids)
+        ]
+        self.execute(BatchAddNodalLoadsCmd(loads=loads))
 
     def _do_building_wizard(self) -> None:
         try:
