@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.28.0"
+__version__ = "0.29.2"
 __what_is_new__ = (
-    "Edit menu shows 'Undo <action>' / 'Redo <action>' · "
-    "Tooltips and status bar describe the next undo/redo · "
-    "Plain disabled labels when stacks are empty"
+    "Condition-estimate SVD breakdown (σmax / σmin → κ) on Global K and Kff · "
+    "Updated help tooltip · "
+    "Skip message shown for large matrices"
 )
 
 from .model import (
