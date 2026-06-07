@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.27.0"
+__version__ = "0.28.0"
 __what_is_new__ = (
-    "Selection menu: filter by type/section/material · "
-    "Select Similar (right-click) · "
-    "Named groups: create/select/manage (Selection → Groups)"
+    "Edit menu shows 'Undo <action>' / 'Redo <action>' · "
+    "Tooltips and status bar describe the next undo/redo · "
+    "Plain disabled labels when stacks are empty"
 )
 
 from .model import (
