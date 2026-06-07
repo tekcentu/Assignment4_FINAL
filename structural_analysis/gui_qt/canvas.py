@@ -1612,12 +1612,14 @@ class ModelCanvas(QWidget):
                 color="#888888", linestyle=":", linewidth=1.0, alpha=0.6,
                 zorder=2,
             )
-            self.ax.plot(
-                [ni.x + scale * uxi, nj.x + scale * uxj],
-                [ni.y + scale * uyi, nj.y + scale * uyj],
-                color="#d62728", linestyle="-", linewidth=1.8, alpha=0.85,
-                zorder=4,
-            )
+            # Skip red overlay for zero-displacement elements (inactive component).
+            if uxi**2 + uyi**2 + uxj**2 + uyj**2 >= 1e-20 * max_disp**2:
+                self.ax.plot(
+                    [ni.x + scale * uxi, nj.x + scale * uxj],
+                    [ni.y + scale * uyi, nj.y + scale * uyj],
+                    color="#d62728", linestyle="-", linewidth=1.8, alpha=0.85,
+                    zorder=4,
+                )
         f = float(mr.frequencies[k])
         T = float(mr.periods[k])
         self.ax.annotate(
