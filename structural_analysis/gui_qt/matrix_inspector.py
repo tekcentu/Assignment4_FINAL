@@ -30,10 +30,12 @@ _DISPLAY_GUARD = 400   # max n_total to render K / Kff grid cells
 _RANK_GUARD = 100      # max n_free for SVD rank / condition estimate
 _ROW_HEIGHT = 22       # compact vertical-header row height
 _COND_TOOLTIP = (
-    "Condition estimate approximates matrix conditioning. "
-    "Larger values mean the system is more sensitive to numerical error; "
-    "very large values can indicate near-singularity or instability."
+    "Condition estimate is computed from the ratio of the largest to "
+    "smallest singular value. Larger values mean the matrix solution is "
+    "more sensitive to numerical error. Very large values may indicate "
+    "near-singularity or instability."
 )
+_COND_SKIPPED_MSG = "Condition calculation skipped for large matrix."
 
 
 # ── formatting helpers ────────────────────────────────────────────────────────
@@ -123,6 +125,33 @@ def _make_placeholder(msg: str, parent: QWidget) -> QWidget:
 def _html(text: str) -> QLabel:
     lbl = QLabel(text)
     lbl.setTextFormat(Qt.TextFormat.RichText)
+    return lbl
+
+
+def _make_cond_panel(sv: np.ndarray, label: str, parent: QWidget) -> QLabel:
+    """Multi-line label explaining the condition-estimate calculation.
+
+    Shows σmax, σmin, and the ratio formula κ = σmax / σmin. The same
+    tooltip used by the one-line summary is attached so hovering anywhere
+    on the panel gives the help text.
+    """
+    smax = float(sv[0])
+    smin = float(sv[-1])
+    if smin > 0:
+        kappa_str = f"{smax / smin:.3e}"
+    else:
+        kappa_str = "∞"
+    text = (
+        "Condition estimate:\n"
+        f"κ({label}) = σmax / σmin\n"
+        f"σmax = {smax:.3e}\n"
+        f"σmin = {smin:.3e}\n"
+        f"κ = {smax:.3e} / {smin:.3e} = {kappa_str}"
+    )
+    lbl = QLabel(text, parent)
+    lbl.setObjectName("conditionEstimatePanel")
+    lbl.setToolTip(_COND_TOOLTIP)
+    lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     return lbl
 
 
@@ -406,11 +435,8 @@ class MatrixDofInspectorWindow(QWidget):
                 sv = np.linalg.svd(Kff_loc, compute_uv=False)
                 tol = max(Kff_loc.shape) * sv[0] * 1e-12
                 rank = int(np.sum(sv > tol))
-                cond = float(sv[0] / sv[-1]) if sv[-1] > 0 else float("inf")
                 lay.addWidget(QLabel(f"Kff rank: {rank}/{nf}"))
-                cond_lbl = QLabel(f"Kff condition estimate: {cond:.2e}")
-                cond_lbl.setToolTip(_COND_TOOLTIP)
-                lay.addWidget(cond_lbl)
+                lay.addWidget(_make_cond_panel(sv, "Kff", container))
                 if rank < nf:
                     lay.addWidget(QLabel(
                         "⚠ WARNING: Singular or near-singular "
@@ -421,9 +447,9 @@ class MatrixDofInspectorWindow(QWidget):
         elif nf == 0:
             lay.addWidget(QLabel("All DOFs restrained — Kff is empty."))
         else:
-            lay.addWidget(QLabel(
-                f"Rank/condition: skipped (n_free = {nf} > {_RANK_GUARD})"
-            ))
+            skipped = QLabel(_COND_SKIPPED_MSG)
+            skipped.setToolTip(_COND_TOOLTIP)
+            lay.addWidget(skipped)
 
         if n <= _DISPLAY_GUARD:
             lbls = [dof_labels.get(i, str(i)) for i in range(n)]
@@ -471,11 +497,8 @@ class MatrixDofInspectorWindow(QWidget):
                 sv = np.linalg.svd(Kff, compute_uv=False)
                 tol = max(Kff.shape) * sv[0] * 1e-12
                 rank = int(np.sum(sv > tol))
-                cond = float(sv[0] / sv[-1]) if sv[-1] > 0 else float("inf")
                 lay.addWidget(QLabel(f"Rank: {rank}/{nf}"))
-                cond_lbl = QLabel(f"Condition estimate: {cond:.2e}")
-                cond_lbl.setToolTip(_COND_TOOLTIP)
-                lay.addWidget(cond_lbl)
+                lay.addWidget(_make_cond_panel(sv, "Kff", container))
                 if rank < nf:
                     lay.addWidget(QLabel(
                         "⚠ WARNING: Singular or near-singular "
@@ -484,9 +507,9 @@ class MatrixDofInspectorWindow(QWidget):
             except Exception as exc:
                 lay.addWidget(QLabel(f"Rank/condition: error ({exc})"))
         else:
-            lay.addWidget(QLabel(
-                f"Rank/condition: skipped (n_free = {nf} > {_RANK_GUARD})"
-            ))
+            skipped = QLabel(_COND_SKIPPED_MSG)
+            skipped.setToolTip(_COND_TOOLTIP)
+            lay.addWidget(skipped)
 
         if nf <= _DISPLAY_GUARD:
             free_lbls = [dof_labels.get(i, str(i)) for i in dofs.free_indices]

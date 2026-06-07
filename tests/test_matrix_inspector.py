@@ -575,3 +575,95 @@ def test_main_window_open_inspector_passes_canvas_selection(qt_app):
     assert combo.currentData() == 2
     insp.close()
     w.close()
+
+
+# ── PR polish: condition-estimate SVD breakdown ──────────────────────────────
+
+
+def _find_cond_panel_text(tab) -> str | None:
+    """Return the text of the SVD-breakdown panel in a tab, or None."""
+    from PyQt6.QtWidgets import QLabel
+    for lbl in tab.findChildren(QLabel):
+        if lbl.objectName() == "conditionEstimatePanel":
+            return lbl.text()
+    return None
+
+
+def test_kff_tab_shows_svd_breakdown(qt_app):
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _frame_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    text = _find_cond_panel_text(w._tabs.widget(3))   # Kff
+    assert text is not None
+    assert "Condition estimate" in text
+    assert "κ(Kff) = σmax / σmin" in text
+    assert "σmax =" in text
+    assert "σmin =" in text
+    assert " / " in text and " = " in text   # full ratio line
+    w.close()
+
+
+def test_global_k_tab_shows_svd_breakdown(qt_app):
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _frame_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    text = _find_cond_panel_text(w._tabs.widget(2))   # Global K
+    assert text is not None
+    assert "Condition estimate" in text
+    assert "κ(Kff) = σmax / σmin" in text   # Global K tab reports Kff κ
+    assert "σmax =" in text
+    assert "σmin =" in text
+    w.close()
+
+
+def test_cond_panel_tooltip_explains_svd(qt_app):
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    from PyQt6.QtWidgets import QLabel
+    model = _frame_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    for idx in (2, 3):
+        for lbl in w._tabs.widget(idx).findChildren(QLabel):
+            if lbl.objectName() == "conditionEstimatePanel":
+                tip = lbl.toolTip().lower()
+                assert "ratio" in tip and "singular value" in tip
+                assert "numerical error" in tip
+                assert "near-singular" in tip or "singularity" in tip
+                w.close()
+                return
+    w.close()
+    pytest.fail("no condition-estimate panel found")
+
+
+def test_cond_panel_ratio_matches_smax_over_smin(qt_app):
+    """κ printed on the last line must equal σmax / σmin (within format)."""
+    import re
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _frame_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    text = _find_cond_panel_text(w._tabs.widget(3))
+    assert text is not None
+    smax = float(re.search(r"σmax\s*=\s*([\-0-9.eE+]+)", text).group(1))
+    smin = float(re.search(r"σmin\s*=\s*([\-0-9.eE+]+)", text).group(1))
+    kappa_line = text.splitlines()[-1]
+    kappa_val = float(re.search(r"=\s*([\-0-9.eE+]+)\s*$", kappa_line).group(1))
+    assert kappa_val == pytest.approx(smax / smin, rel=1e-2)
+    w.close()
+
+
+def test_cond_large_matrix_shows_skipped_message(qt_app, monkeypatch):
+    """When n_free > _RANK_GUARD the SVD must be skipped and the user
+    sees the documented skip message instead of the breakdown panel."""
+    from PyQt6.QtWidgets import QLabel
+    from structural_analysis.gui_qt import matrix_inspector as mi
+    monkeypatch.setattr(mi, "_RANK_GUARD", 0)   # force skip path
+    model = _frame_model()
+    w = mi.MatrixDofInspectorWindow(None, lambda: model)
+    for idx in (2, 3):
+        tab = w._tabs.widget(idx)
+        # No breakdown panel
+        assert _find_cond_panel_text(tab) is None
+        # Documented skip message present
+        texts = [lbl.text() for lbl in tab.findChildren(QLabel)]
+        assert any("Condition calculation skipped" in t for t in texts), \
+            f"skip message missing in tab {idx}: {texts}"
+    w.close()

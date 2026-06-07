@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.29.1"
+__version__ = "0.29.2"
 __what_is_new__ = (
-    "Matrix / DOF Inspector polish · "
-    "Larger default window, expanding K/Kff tables, element sub-tabs · "
-    "Condition-estimate tooltip"
+    "Condition-estimate SVD breakdown (σmax / σmin → κ) on Global K and Kff · "
+    "Updated help tooltip · "
+    "Skip message shown for large matrices"
 )
 
 from .model import (
