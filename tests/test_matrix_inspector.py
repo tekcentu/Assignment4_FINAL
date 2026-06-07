@@ -9,17 +9,23 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# Skip the entire module when PyQt6 (or its system libs, e.g. libGL / libEGL)
+# is unavailable — the helpers under test live in a Qt-importing module so
+# even non-Qt helper tests need PyQt6 importable.
 try:
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWidgets import QApplication  # noqa: F401
     _has_qt = True
 except Exception:
     _has_qt = False
 
+if not _has_qt:
+    pytest.skip("PyQt6 unavailable", allow_module_level=True)
+
+from PyQt6.QtWidgets import QApplication  # noqa: E402
+
 
 @pytest.fixture(scope="module")
 def qt_app():
-    if not _has_qt:
-        pytest.skip("PyQt6 unavailable")
     return QApplication.instance() or QApplication([])
 
 
@@ -520,4 +526,52 @@ def test_matrix_table_uses_compact_row_height(qt_app):
     table = _find_table(tab)
     assert table is not None
     assert table.verticalHeader().defaultSectionSize() == _ROW_HEIGHT
+    w.close()
+
+
+# ── PR review: initial-open respects canvas selection ────────────────────────
+
+
+def test_constructor_selected_element_id_is_applied_on_first_open(qt_app):
+    """Passing selected_element_id to __init__ must drive the Element Matrix
+    tab on the *first* refresh (which runs inside __init__)."""
+    from PyQt6.QtWidgets import QComboBox
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _mixed_model()  # has elements 1 (frame) and 2 (truss)
+    w = MatrixDofInspectorWindow(None, lambda: model, selected_element_id=2)
+    tab = w._tabs.widget(1)
+    combo = tab.findChild(QComboBox)
+    assert combo is not None
+    assert combo.currentData() == 2
+    w.close()
+
+
+def test_constructor_without_selection_defaults_to_first(qt_app):
+    from PyQt6.QtWidgets import QComboBox
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _mixed_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    tab = w._tabs.widget(1)
+    combo = tab.findChild(QComboBox)
+    assert combo is not None
+    assert combo.currentData() == 1
+    w.close()
+
+
+def test_main_window_open_inspector_passes_canvas_selection(qt_app):
+    """First-open path in MainWindow must pre-seed the selection so the
+    Element Matrix tab opens on the canvas-selected element."""
+    from PyQt6.QtWidgets import QComboBox
+    from structural_analysis.gui_qt.app import MainWindow
+    w = MainWindow()
+    w._model = _mixed_model()
+    w.canvas.select_element(2)
+    w._open_matrix_inspector()
+    insp = w._matrix_inspector_window
+    assert insp is not None
+    tab = insp._tabs.widget(1)
+    combo = tab.findChild(QComboBox)
+    assert combo is not None
+    assert combo.currentData() == 2
+    insp.close()
     w.close()

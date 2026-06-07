@@ -2320,10 +2320,8 @@ class MainWindow(QMainWindow):
         if self._matrix_inspector_window is None:
             sel = next(iter(self.canvas.get_selected_elements()), None)
             self._matrix_inspector_window = MatrixDofInspectorWindow(
-                self, lambda: self._model,
+                self, lambda: self._model, selected_element_id=sel,
             )
-            if sel is not None:
-                self._matrix_inspector_window.set_selected_element(sel)
         else:
             sel = next(iter(self.canvas.get_selected_elements()), None)
             if sel is not None:

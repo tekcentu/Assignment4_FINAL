@@ -136,13 +136,21 @@ class MatrixDofInspectorWindow(QWidget):
     Use :meth:`set_selected_element` to pre-select an element in tab 2.
     """
 
-    def __init__(self, parent: QWidget, model_fn) -> None:
+    def __init__(
+        self,
+        parent: QWidget,
+        model_fn,
+        *,
+        selected_element_id: int | None = None,
+    ) -> None:
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle("Matrix / DOF Inspector")
         self.resize(1100, 800)
         self.setMinimumSize(850, 600)
         self._model_fn = model_fn
-        self._sel_elem_id: int | None = None
+        # Apply selection before refresh() so the Element Matrix tab opens
+        # on the canvas-selected element on first open.
+        self._sel_elem_id: int | None = selected_element_id
 
         self._tabs = QTabWidget(self)
 
