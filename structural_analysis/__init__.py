@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.29.0"
+__version__ = "0.29.1"
 __what_is_new__ = (
-    "Matrix / DOF Inspector (Run menu) · "
-    "Shows DOF map, element k_local/T/k_global, global K, Kff · "
-    "Read-only; copyable via Ctrl+C"
+    "Matrix / DOF Inspector polish · "
+    "Larger default window, expanding K/Kff tables, element sub-tabs · "
+    "Condition-estimate tooltip"
 )
 
 from .model import (

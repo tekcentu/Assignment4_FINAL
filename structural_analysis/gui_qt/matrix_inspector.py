@@ -18,7 +18,6 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -29,6 +28,12 @@ from PyQt6.QtWidgets import (
 
 _DISPLAY_GUARD = 400   # max n_total to render K / Kff grid cells
 _RANK_GUARD = 100      # max n_free for SVD rank / condition estimate
+_ROW_HEIGHT = 22       # compact vertical-header row height
+_COND_TOOLTIP = (
+    "Condition estimate approximates matrix conditioning. "
+    "Larger values mean the system is more sensitive to numerical error; "
+    "very large values can indicate near-singularity or instability."
+)
 
 
 # ── formatting helpers ────────────────────────────────────────────────────────
@@ -86,6 +91,8 @@ def _make_matrix_table(
     table.setHorizontalHeaderLabels(col_labels)
     table.setVerticalHeaderLabels(row_labels)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    table.verticalHeader().setDefaultSectionSize(_ROW_HEIGHT)
     for i in range(nrows):
         for j in range(ncols):
             item = QTableWidgetItem(_fmt(float(mat[i, j])))
@@ -132,7 +139,8 @@ class MatrixDofInspectorWindow(QWidget):
     def __init__(self, parent: QWidget, model_fn) -> None:
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle("Matrix / DOF Inspector")
-        self.resize(820, 640)
+        self.resize(1100, 800)
+        self.setMinimumSize(850, 600)
         self._model_fn = model_fn
         self._sel_elem_id: int | None = None
 
@@ -218,6 +226,8 @@ class MatrixDofInspectorWindow(QWidget):
             ["Eq# (global)", "Node", "DOF", "Status", "Free Eq#"]
         )
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        table.verticalHeader().setDefaultSectionSize(_ROW_HEIGHT)
         for row_idx, (eq, node, dof, status, feq) in enumerate(rows):
             for col, val in enumerate((str(eq), node, dof, status, feq)):
                 item = QTableWidgetItem(val)
@@ -268,28 +278,37 @@ class MatrixDofInspectorWindow(QWidget):
         info_lbl = QLabel("", container)
         info_lbl.setWordWrap(True)
 
-        scroll = QScrollArea(container)
-        scroll.setWidgetResizable(True)
-        mat_widget = QWidget()
-        mat_lay = QVBoxLayout(mat_widget)
-        scroll.setWidget(mat_widget)
+        sub_tabs = QTabWidget(container)
+        sub_tabs.setObjectName("elementMatrixSubTabs")
+
+        def _wrap(widget: QWidget) -> QWidget:
+            """Wrap a matrix table in a layout that lets it fill the sub-tab."""
+            page = QWidget()
+            pl = QVBoxLayout(page)
+            pl.setContentsMargins(2, 2, 2, 2)
+            pl.addWidget(widget)
+            return page
 
         def _render(combo_idx: int) -> None:
-            while mat_lay.count():
-                item = mat_lay.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
+            for i in range(sub_tabs.count()):
+                w = sub_tabs.widget(i)
+                if w is not None:
+                    w.deleteLater()
+            sub_tabs.clear()
 
             eid = combo.itemData(combo_idx)
             elem = next((e for e in model.elements if e.id == eid), None)
             if elem is None:
-                mat_lay.addWidget(QLabel("Element not found."))
+                sub_tabs.addTab(_make_placeholder("Element not found.", container), "—")
                 return
 
             try:
                 L, c, s = elem.length_cos_sin(model.nodes)
             except Exception as exc:
-                mat_lay.addWidget(QLabel(f"Cannot compute geometry: {exc}"))
+                sub_tabs.addTab(
+                    _make_placeholder(f"Cannot compute geometry: {exc}", container),
+                    "—",
+                )
                 return
 
             kind = getattr(elem, "kind", elem.__class__.__name__)
@@ -303,35 +322,46 @@ class MatrixDofInspectorWindow(QWidget):
 
             lbls = _elem_dof_labels(elem, dofs)
 
-            # k_local raw
+            # k_local (raw)
             k_raw = elem.raw_local_stiffness(model.nodes)
-            mat_lay.addWidget(_html("<b>k_local (raw)</b>"))
-            mat_lay.addWidget(_make_matrix_table(k_raw, lbls, lbls, mat_widget))
+            sub_tabs.addTab(
+                _wrap(_make_matrix_table(k_raw, lbls, lbls, container)),
+                "k_local (raw)",
+            )
 
-            # k_local condensed — only if releases change it
+            # k_local (condensed) — show table when releases change it,
+            # else a placeholder so the sub-tab is still present.
             try:
                 k_cond, _ = elem.assembled_local_stiffness_and_load(model.nodes)
             except Exception:
                 k_cond = k_raw
             if float(np.max(np.abs(k_cond - k_raw))) > 1e-30:
-                mat_lay.addWidget(_html("<b>k_local (condensed — after moment releases)</b>"))
-                mat_lay.addWidget(_make_matrix_table(k_cond, lbls, lbls, mat_widget))
+                sub_tabs.addTab(
+                    _wrap(_make_matrix_table(k_cond, lbls, lbls, container)),
+                    "k_local (condensed)",
+                )
             else:
-                mat_lay.addWidget(_html(
-                    "<i>k_local (condensed): no releases — identical to raw</i>"
-                ))
+                sub_tabs.addTab(
+                    _make_placeholder(
+                        "k_local (condensed): no releases — identical to raw.",
+                        container,
+                    ),
+                    "k_local (condensed)",
+                )
 
-            # Transformation matrix T  (global→local)
+            # T (global → local)
             T = elem.transformation_matrix(model.nodes)
-            mat_lay.addWidget(_html("<b>T  (global→local)</b>"))
-            mat_lay.addWidget(_make_matrix_table(T, lbls, lbls, mat_widget))
+            sub_tabs.addTab(
+                _wrap(_make_matrix_table(T, lbls, lbls, container)),
+                "T (g→l)",
+            )
 
             # k_global = Tᵀ k_local T
             k_global, _ = elem.global_stiffness_and_load(model.nodes)
-            mat_lay.addWidget(_html("<b>k_global = T<sup>T</sup> k_local T</b>"))
-            mat_lay.addWidget(_make_matrix_table(k_global, lbls, lbls, mat_widget))
-
-            mat_lay.addStretch()
+            sub_tabs.addTab(
+                _wrap(_make_matrix_table(k_global, lbls, lbls, container)),
+                "k_global",
+            )
 
         combo.currentIndexChanged.connect(_render)
         _render(default_idx)
@@ -342,7 +372,7 @@ class MatrixDofInspectorWindow(QWidget):
         top.addStretch()
         lay.addLayout(top)
         lay.addWidget(info_lbl)
-        lay.addWidget(scroll)
+        lay.addWidget(sub_tabs, 1)
         return container
 
     # ── Tab 3: Global K ───────────────────────────────────────────────────
@@ -370,7 +400,9 @@ class MatrixDofInspectorWindow(QWidget):
                 rank = int(np.sum(sv > tol))
                 cond = float(sv[0] / sv[-1]) if sv[-1] > 0 else float("inf")
                 lay.addWidget(QLabel(f"Kff rank: {rank}/{nf}"))
-                lay.addWidget(QLabel(f"Kff condition estimate: {cond:.2e}"))
+                cond_lbl = QLabel(f"Kff condition estimate: {cond:.2e}")
+                cond_lbl.setToolTip(_COND_TOOLTIP)
+                lay.addWidget(cond_lbl)
                 if rank < nf:
                     lay.addWidget(QLabel(
                         "⚠ WARNING: Singular or near-singular "
@@ -387,13 +419,13 @@ class MatrixDofInspectorWindow(QWidget):
 
         if n <= _DISPLAY_GUARD:
             lbls = [dof_labels.get(i, str(i)) for i in range(n)]
-            lay.addWidget(_make_matrix_table(K, lbls, lbls, container))
+            lay.addWidget(_make_matrix_table(K, lbls, lbls, container), 1)
         else:
             lay.addWidget(QLabel(
                 f"Matrix too large to display ({n} × {n} > {_DISPLAY_GUARD}).\n"
                 "Use a smaller model to view the full grid."
             ))
-        lay.addStretch()
+            lay.addStretch()
         return container
 
     # ── Tab 4: Kff ────────────────────────────────────────────────────────
@@ -433,7 +465,9 @@ class MatrixDofInspectorWindow(QWidget):
                 rank = int(np.sum(sv > tol))
                 cond = float(sv[0] / sv[-1]) if sv[-1] > 0 else float("inf")
                 lay.addWidget(QLabel(f"Rank: {rank}/{nf}"))
-                lay.addWidget(QLabel(f"Condition estimate: {cond:.2e}"))
+                cond_lbl = QLabel(f"Condition estimate: {cond:.2e}")
+                cond_lbl.setToolTip(_COND_TOOLTIP)
+                lay.addWidget(cond_lbl)
                 if rank < nf:
                     lay.addWidget(QLabel(
                         "⚠ WARNING: Singular or near-singular "
@@ -448,11 +482,13 @@ class MatrixDofInspectorWindow(QWidget):
 
         if nf <= _DISPLAY_GUARD:
             free_lbls = [dof_labels.get(i, str(i)) for i in dofs.free_indices]
-            lay.addWidget(_make_matrix_table(Kff, free_lbls, free_lbls, container))
+            lay.addWidget(
+                _make_matrix_table(Kff, free_lbls, free_lbls, container), 1
+            )
         else:
             lay.addWidget(QLabel(
                 f"Kff too large to display ({nf} × {nf} > {_DISPLAY_GUARD}).\n"
                 "Use a smaller model to view the full grid."
             ))
-        lay.addStretch()
+            lay.addStretch()
         return container

@@ -408,3 +408,116 @@ def test_run_menu_has_matrix_inspector_action(qt_app):
     assert hasattr(w, "act_matrix_inspector")
     assert w.act_matrix_inspector.text() == "Matrix / &DOF Inspector…"
     w.close()
+
+
+# ── PR polish: sizing, layout, condition tooltip ──────────────────────────────
+
+
+def test_window_default_size_is_polished(qt_app):
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _frame_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    assert w.width() >= 1100 and w.height() >= 800
+    mn = w.minimumSize()
+    assert mn.width() >= 850 and mn.height() >= 600
+    w.close()
+
+
+def _find_table(widget, type_name="QTableWidget"):
+    from PyQt6.QtWidgets import QTableWidget
+    if isinstance(widget, QTableWidget):
+        return widget
+    for child in widget.findChildren(QTableWidget):
+        return child
+    return None
+
+
+def test_global_k_table_expands_to_fill(qt_app):
+    from PyQt6.QtWidgets import QSizePolicy
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _frame_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    # Tab index 2 = Global K
+    tab = w._tabs.widget(2)
+    table = _find_table(tab)
+    assert table is not None
+    pol = table.sizePolicy()
+    assert pol.horizontalPolicy() == QSizePolicy.Policy.Expanding
+    assert pol.verticalPolicy() == QSizePolicy.Policy.Expanding
+    w.close()
+
+
+def test_kff_table_expands_to_fill(qt_app):
+    from PyQt6.QtWidgets import QSizePolicy
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _frame_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    # Tab index 3 = Kff
+    tab = w._tabs.widget(3)
+    table = _find_table(tab)
+    assert table is not None
+    pol = table.sizePolicy()
+    assert pol.horizontalPolicy() == QSizePolicy.Policy.Expanding
+    assert pol.verticalPolicy() == QSizePolicy.Policy.Expanding
+    w.close()
+
+
+def test_element_matrix_tab_uses_sub_tabs(qt_app):
+    from PyQt6.QtWidgets import QTabWidget
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _frame_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    tab = w._tabs.widget(1)  # Element Matrix
+    sub = tab.findChild(QTabWidget, "elementMatrixSubTabs")
+    assert sub is not None
+    labels = [sub.tabText(i) for i in range(sub.count())]
+    assert "k_local (raw)" in labels
+    assert "k_local (condensed)" in labels
+    assert any(l.startswith("T") for l in labels)
+    assert "k_global" in labels
+    w.close()
+
+
+def test_element_matrix_sub_tabs_present_for_truss(qt_app):
+    """All four sub-tabs exist even when condensed == raw."""
+    from PyQt6.QtWidgets import QTabWidget
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _truss_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    tab = w._tabs.widget(1)
+    sub = tab.findChild(QTabWidget, "elementMatrixSubTabs")
+    assert sub is not None
+    assert sub.count() == 4
+    w.close()
+
+
+def test_condition_estimate_label_has_tooltip(qt_app):
+    from PyQt6.QtWidgets import QLabel
+    from structural_analysis.gui_qt.matrix_inspector import MatrixDofInspectorWindow
+    model = _frame_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    # Look across Global K and Kff tabs for the condition-estimate label.
+    found = False
+    for idx in (2, 3):
+        tab = w._tabs.widget(idx)
+        for lbl in tab.findChildren(QLabel):
+            if "condition estimate" in lbl.text().lower():
+                tip = lbl.toolTip().lower()
+                assert "condition" in tip and "numerical error" in tip
+                assert "near-singular" in tip or "singularity" in tip
+                found = True
+    assert found, "no condition-estimate label found across K / Kff tabs"
+    w.close()
+
+
+def test_matrix_table_uses_compact_row_height(qt_app):
+    from structural_analysis.gui_qt.matrix_inspector import (
+        MatrixDofInspectorWindow, _ROW_HEIGHT,
+    )
+    model = _frame_model()
+    w = MatrixDofInspectorWindow(None, lambda: model)
+    tab = w._tabs.widget(2)  # Global K
+    table = _find_table(tab)
+    assert table is not None
+    assert table.verticalHeader().defaultSectionSize() == _ROW_HEIGHT
+    w.close()
