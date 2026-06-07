@@ -2898,9 +2898,9 @@ class MainWindow(QMainWindow):
             else command.mapping
         )
         for group in self._groups.values():
-            group.element_ids = [
+            group.element_ids = sorted({
                 mapping.get(eid, eid) for eid in group.element_ids
-            ]
+            })
 
     # ── file menu actions ──
 
