@@ -93,7 +93,10 @@ def _make_matrix_table(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
             table.setItem(i, j, item)
-    table.resizeColumnsToContents()
+    if ncols > 20:
+        table.horizontalHeader().setDefaultSectionSize(85)
+    else:
+        table.resizeColumnsToContents()
     install_table_copy(table, include_headers=True)
     return table
 
@@ -170,6 +173,10 @@ class MatrixDofInspectorWindow(QWidget):
             dofs = K = F = Kff = dof_labels = elem_data = None
             error = str(exc)
 
+        for i in range(self._tabs.count()):
+            widget = self._tabs.widget(i)
+            if widget is not None:
+                widget.deleteLater()
         self._tabs.clear()
         self._tabs.addTab(self._build_dof_tab(dofs, error), "DOF Map")
         self._tabs.addTab(
