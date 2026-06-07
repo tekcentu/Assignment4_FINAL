@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.28.0"
+__version__ = "0.29.0"
 __what_is_new__ = (
-    "Edit menu shows 'Undo <action>' / 'Redo <action>' · "
-    "Tooltips and status bar describe the next undo/redo · "
-    "Plain disabled labels when stacks are empty"
+    "Matrix / DOF Inspector (Run menu) · "
+    "Shows DOF map, element k_local/T/k_global, global K, Kff · "
+    "Read-only; copyable via Ctrl+C"
 )
 
 from .model import (

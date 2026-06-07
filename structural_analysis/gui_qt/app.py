@@ -261,6 +261,7 @@ class MainWindow(QMainWindow):
         self._view3d_window = None
         self._mass_summary_window = None
         self._joint_masses_window = None
+        self._matrix_inspector_window = None
         # Singleton element-detail inspector. Held alive across closes
         # so right-clicking a different element reuses the same window
         # (see _open_element_inspector). MainWindow owns the
@@ -513,6 +514,10 @@ class MainWindow(QMainWindow):
         self.act_joint_masses = QAction(
             "&Assembled joint masses…", self,
             triggered=self._show_joint_masses,
+        )
+        self.act_matrix_inspector = QAction(
+            "Matrix / &DOF Inspector…", self,
+            triggered=self._open_matrix_inspector,
         )
         self.act_modal_mass_source = QAction(
             "Modal mass &source…", self,
@@ -779,6 +784,7 @@ class MainWindow(QMainWindow):
         m_run.addAction(self.act_analysis_settings)
         m_run.addAction(self.act_mass_summary)
         m_run.addAction(self.act_joint_masses)
+        m_run.addAction(self.act_matrix_inspector)
         m_run.addSeparator()
         m_run.addAction(self.act_clear_result)
 
@@ -2301,6 +2307,31 @@ class MainWindow(QMainWindow):
         self._joint_masses_window.show()
         self._joint_masses_window.raise_()
         self._joint_masses_window.activateWindow()
+
+    def _open_matrix_inspector(self) -> None:
+        """Open the non-modal Matrix / DOF Inspector, or raise it.
+
+        The inspector refreshes on reopen so it always reflects the
+        current model state. Singleton pattern mirrors
+        :meth:`_show_mass_summary`.
+        """
+        from .matrix_inspector import MatrixDofInspectorWindow
+
+        if self._matrix_inspector_window is None:
+            sel = next(iter(self.canvas.get_selected_elements()), None)
+            self._matrix_inspector_window = MatrixDofInspectorWindow(
+                self, lambda: self._model,
+            )
+            if sel is not None:
+                self._matrix_inspector_window.set_selected_element(sel)
+        else:
+            sel = next(iter(self.canvas.get_selected_elements()), None)
+            if sel is not None:
+                self._matrix_inspector_window.set_selected_element(sel)
+            self._matrix_inspector_window.refresh()
+        self._matrix_inspector_window.show()
+        self._matrix_inspector_window.raise_()
+        self._matrix_inspector_window.activateWindow()
 
     def _open_element_inspector(
         self, elem_id: int, *, tab: str = "properties",
