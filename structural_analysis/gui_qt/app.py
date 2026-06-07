@@ -232,6 +232,7 @@ class MainWindow(QMainWindow):
         self._grid: GridSystem = GridSystem()
         self._undo: list[Command] = []
         self._redo: list[Command] = []
+        self._editing_locked: bool = False
         self._modified = False
         self._current_path: Optional[str] = None
         # Named selection groups — GUI/project metadata, never touches the
@@ -299,6 +300,7 @@ class MainWindow(QMainWindow):
 
         self._update_title()
         self.canvas.redraw()
+        self._refresh_undo_redo()
 
         if initial_path:
             # defer to event loop start
@@ -602,8 +604,12 @@ class MainWindow(QMainWindow):
         # view-only (pan, zoom, solve, overlay toggles, View menu,
         # 3D viewer, fit) stays enabled and is *intentionally* not in
         # this list.
+        # Note: ``act_undo`` / ``act_redo`` are intentionally NOT in this
+        # list — their enabled state is owned by ``_refresh_undo_redo``,
+        # which also honours the editing-lock flag.  Keeping them out of
+        # ``_lockable_actions`` makes ``_refresh_undo_redo`` the single
+        # source of truth for their text, tooltip and enabled state.
         self._lockable_actions = [
-            self.act_undo, self.act_redo,
             self.act_building_wizard, self.act_add_node_coords,
             self.act_materials, self.act_forget_elem_defaults,
         ]
@@ -1545,6 +1551,9 @@ class MainWindow(QMainWindow):
         self._refresh_case_selector_combo()
         self._update_title()
         self.canvas.redraw()
+        label = self._command_label(command)
+        self.set_status(f"{label} done. Undo: {label}.")
+        self._refresh_undo_redo()
 
     def open_element_dialog_for_pair(
         self, n_i: int, n_j: int, kind: str | None = None
@@ -2479,12 +2488,16 @@ class MainWindow(QMainWindow):
         the inspector is open. When locking, also forces the active
         tool back to "select" so pending left-clicks can't add nodes /
         elements / loads."""
+        self._editing_locked = bool(locked)
         for name, action in self._tool_actions.items():
             action.setEnabled((not locked) or name == "select")
         for action in self._lockable_actions:
             action.setEnabled(not locked)
         if locked and self._active_tool.name != "select":
             self._select_tool("select")
+        # Undo / Redo aren't in ``_lockable_actions``; ``_refresh_undo_redo``
+        # owns their enabled state and reads ``_editing_locked``.
+        self._refresh_undo_redo()
 
     def _populate_examples_menu(self) -> None:
         """Fill the File → Open example submenu from ``inputs/``."""
@@ -2860,6 +2873,13 @@ class MainWindow(QMainWindow):
         self._invalidate_result()
         self._update_title()
         self.canvas.redraw()
+        undone = self._command_label(cmd)
+        if self._undo:
+            nxt = self._command_label(self._undo[-1])
+            self.set_status(f"Undid {undone}. Undo: {nxt}. Redo: {undone}.")
+        else:
+            self.set_status(f"Undid {undone}. Redo: {undone}.")
+        self._refresh_undo_redo()
 
     def _do_redo(self) -> None:
         if not self._redo:
@@ -2876,6 +2896,47 @@ class MainWindow(QMainWindow):
         self._invalidate_result()
         self._update_title()
         self.canvas.redraw()
+        redone = self._command_label(cmd)
+        if self._redo:
+            nxt = self._command_label(self._redo[-1])
+            self.set_status(f"Redid {redone}. Undo: {redone}. Redo: {nxt}.")
+        else:
+            self.set_status(f"Redid {redone}. Undo: {redone}.")
+        self._refresh_undo_redo()
+
+    _CMD_LABEL_OVERRIDES = {
+        "batch assign properties": "Batch Edit Element Properties",
+        "edit nodal load row":     "Edit Nodal Load",
+        "delete nodal load row":   "Delete Nodal Load",
+        "replace model":           "Replace Model",
+    }
+
+    def _command_label(self, command: Command) -> str:
+        """Human-readable Title-Case label for the Edit menu / status bar."""
+        desc = str(getattr(command, "description", "") or "command").strip()
+        if desc in self._CMD_LABEL_OVERRIDES:
+            return self._CMD_LABEL_OVERRIDES[desc]
+        return desc.title() if desc else "Command"
+
+    def _refresh_undo_redo(self) -> None:
+        """Single source of truth for Undo/Redo action text, tooltip and
+        enabled state. Honors the editing-lock flag and the stack contents."""
+        locked = self._editing_locked
+        self._set_history_action(self.act_undo, self._undo, "Undo", locked)
+        self._set_history_action(self.act_redo, self._redo, "Redo", locked)
+
+    def _set_history_action(
+        self, action: QAction, stack: list[Command], prefix: str, locked: bool,
+    ) -> None:
+        if stack:
+            lbl = self._command_label(stack[-1])
+            action.setText(f"&{prefix} {lbl}")
+            action.setToolTip(f"{prefix} {lbl}")
+            action.setEnabled(not locked)
+        else:
+            action.setText(f"&{prefix}")
+            action.setToolTip(prefix)
+            action.setEnabled(False)
 
     # ── file menu actions ──
 
@@ -2908,6 +2969,7 @@ class MainWindow(QMainWindow):
         self._clear_result()
         self._update_title()
         self.canvas.fit_to_view()
+        self._refresh_undo_redo()
 
     def _do_open(self) -> None:
         if not self._confirm_discard():
@@ -2957,6 +3019,7 @@ class MainWindow(QMainWindow):
         self._current_path = path
         self._clear_result()
         self._update_title()
+        self._refresh_undo_redo()
         # New file → fit the view by default; if the project carries a
         # saved ViewState, that overrides the fit a moment later.
         self.canvas.fit_to_view()
