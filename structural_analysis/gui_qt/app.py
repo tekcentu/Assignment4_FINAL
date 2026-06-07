@@ -2922,24 +2922,21 @@ class MainWindow(QMainWindow):
         """Single source of truth for Undo/Redo action text, tooltip and
         enabled state. Honors the editing-lock flag and the stack contents."""
         locked = self._editing_locked
-        if self._undo:
-            lbl = self._command_label(self._undo[-1])
-            self.act_undo.setText(f"&Undo {lbl}")
-            self.act_undo.setToolTip(f"Undo {lbl}")
-            self.act_undo.setEnabled(not locked)
+        self._set_history_action(self.act_undo, self._undo, "Undo", locked)
+        self._set_history_action(self.act_redo, self._redo, "Redo", locked)
+
+    def _set_history_action(
+        self, action: QAction, stack: list[Command], prefix: str, locked: bool,
+    ) -> None:
+        if stack:
+            lbl = self._command_label(stack[-1])
+            action.setText(f"&{prefix} {lbl}")
+            action.setToolTip(f"{prefix} {lbl}")
+            action.setEnabled(not locked)
         else:
-            self.act_undo.setText("&Undo")
-            self.act_undo.setToolTip("Undo")
-            self.act_undo.setEnabled(False)
-        if self._redo:
-            lbl = self._command_label(self._redo[-1])
-            self.act_redo.setText(f"&Redo {lbl}")
-            self.act_redo.setToolTip(f"Redo {lbl}")
-            self.act_redo.setEnabled(not locked)
-        else:
-            self.act_redo.setText("&Redo")
-            self.act_redo.setToolTip("Redo")
-            self.act_redo.setEnabled(False)
+            action.setText(f"&{prefix}")
+            action.setToolTip(prefix)
+            action.setEnabled(False)
 
     # ── file menu actions ──
 
