@@ -1537,6 +1537,7 @@ class MainWindow(QMainWindow):
         self._redo.clear()
         self._modified = True
         self._invalidate_result()
+        self._remap_groups_for_renumber(command)
         # Load-case CRUD (or any command that mutates ``model.load_cases``
         # / ``self_weight_case`` / load ``load_case`` tags) needs the
         # toolbar combo to repaint even on a fresh model where
@@ -2858,6 +2859,7 @@ class MainWindow(QMainWindow):
         self._redo.append(cmd)
         self._modified = True
         self._invalidate_result()
+        self._remap_groups_for_renumber(cmd, inverse=True)
         self._update_title()
         self.canvas.redraw()
 
@@ -2874,8 +2876,31 @@ class MainWindow(QMainWindow):
         self._undo.append(cmd)
         self._modified = True
         self._invalidate_result()
+        self._remap_groups_for_renumber(cmd)
         self._update_title()
         self.canvas.redraw()
+
+    def _remap_groups_for_renumber(
+        self, command: Command, *, inverse: bool = False,
+    ) -> None:
+        """Remap group element_ids when RenumberElementsCmd runs or is undone.
+
+        Groups store element IDs as bare ints; when element IDs change the
+        group memberships must follow.  Node IDs are never changed by renumber
+        so node_ids are untouched.
+        """
+        from ..gui_common.commands import RenumberElementsCmd
+        if not isinstance(command, RenumberElementsCmd):
+            return
+        mapping = (
+            {v: k for k, v in command.mapping.items()}
+            if inverse
+            else command.mapping
+        )
+        for group in self._groups.values():
+            group.element_ids = [
+                mapping.get(eid, eid) for eid in group.element_ids
+            ]
 
     # ── file menu actions ──
 
