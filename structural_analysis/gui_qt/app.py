@@ -3659,9 +3659,19 @@ class MainWindow(QMainWindow):
             self, modal_result, on_select=_select, on_close=_on_close,
         )
         self._modal_results_dialog.show()
+        _comp_note = (
+            f" · {modal_result.component_summary}"
+            if getattr(modal_result, "component_summary", "")
+            else ""
+        )
+        # For multi-component results the flat `frequencies` array is
+        # grouped by component (not globally ascending), so the model's
+        # true fundamental is the minimum across all components.
+        _f_min = float(min(modal_result.frequencies))
         self.set_status(
             f"Modal analysis: {modal_result.n_modes} modes · "
-            f"f₁ = {float(modal_result.frequencies[0]):.4g} Hz"
+            f"f₁ = {_f_min:.4g} Hz"
+            f"{_comp_note}"
         )
 
     def _do_modal_mass_source(self) -> None:

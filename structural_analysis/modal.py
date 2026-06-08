@@ -22,15 +22,15 @@ GUI dispatches on the result type.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Literal
 
 import numpy as np
 import scipy.linalg
 
-from .assembler import DofManager, assemble_global_system
+from .assembler import DofManager, _connectivity_components, assemble_global_system
 from .mass import MassFormulation, assemble_mass_matrix, assemble_mass_matrix_with_source
-from .model import ModalMassSource, StructuralModel
+from .model import ModalMassSource, StructuralModel, Support
 
 
 # Relative tolerance used to classify free DOFs as "mass-bearing" vs
@@ -49,6 +49,33 @@ LUMPED_COMPARISON_NOTE: str = (
 
 
 @dataclass
+class ComponentModalResult:
+    """Modal result for a single connected component.
+
+    When a model contains multiple disconnected but individually stable
+    structures, :func:`solve_modal` solves each component separately and
+    returns one :class:`ComponentModalResult` per component inside
+    :attr:`ModalResult.components`.
+
+    Mode vectors are stored in the **global DOF order** (length
+    ``n_total``) with zeros at DOFs belonging to other components, so
+    the canvas can display them without any extra bookkeeping.
+    """
+
+    component_id: int           # 1-indexed
+    node_ids: list[int]         # sorted list of node IDs in this component
+    element_ids: list[int]      # sorted list of element IDs whose both nodes are in this component
+    is_supported: bool          # at least one support restraint in this component
+    is_singular: bool           # Kff rank < n_comp_free_dofs (detected via SVD)
+    skip_reason: str | None     # None when successfully solved
+    n_modes: int
+    frequencies: np.ndarray
+    periods: np.ndarray
+    omegas: np.ndarray
+    global_mode_offset: int     # first column index in ModalResult.modes for this component
+
+
+@dataclass
 class ModalResult:
     """Output of a free-vibration analysis.
 
@@ -58,7 +85,11 @@ class ModalResult:
         warnings: Validation warnings carried over from the assembler.
         n_modes: Number of returned modes (may be less than requested
             when there are fewer free DOFs).
-        frequencies: 1-D array of natural frequencies in Hz, ascending.
+        frequencies: 1-D array of natural frequencies in Hz. Ascending
+            for single-component models. For multi-component models the
+            array is grouped by component (C1 modes, then C2 modes, …)
+            and is ascending WITHIN each component but NOT globally —
+            use ``min(result.frequencies)`` for the true fundamental.
         periods: 1-D array of natural periods in s (∞ where f = 0).
         omegas: 1-D array of natural angular frequencies in rad/s.
         modes: ``n_total × n_modes`` array. Each column is a mode shape
@@ -73,6 +104,11 @@ class ModalResult:
         mass_formulation: ``"consistent"`` (default) or ``"lumped"`` —
             records which modal mass matrix produced these frequencies
             so the GUI / report can display it.
+        components: Per-component results when the model has >1 connected
+            component; empty list for single-component models (flat-array
+            fields are the authoritative data in both cases).
+        component_summary: Human-readable summary of component-solve
+            status; empty string for single-component models.
     """
 
     status: str = "ok"
@@ -87,6 +123,8 @@ class ModalResult:
     dofs: DofManager | None = None
     mass_formulation: MassFormulation = "consistent"
     mass_source_summary: str = "self-mass only"
+    components: list[ComponentModalResult] = field(default_factory=list)
+    component_summary: str = ""
 
 
 def _solve_modal_condensed(
@@ -220,6 +258,236 @@ def _build_mass_source_summary(
     return " + ".join(parts)
 
 
+def _solve_components(
+    model: StructuralModel,
+    K: np.ndarray,
+    M: np.ndarray,
+    dofs: DofManager,
+    n_modes_request: int,
+    normalisation: str,
+    mass_formulation: str,
+) -> tuple[list[ComponentModalResult], np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """Solve modal eigenproblem independently per connected component.
+
+    Returns:
+        ``(components, freqs_all, periods_all, omegas_all, modes_all, warnings)``
+        where the ``*_all`` arrays are the concatenated flat results in
+        component order (C1 modes, then C2 modes, …) ready to drop into
+        :class:`ModalResult`.
+
+    Each component's mode vectors are embedded into the full global DOF
+    space (length ``n_total``) with zeros at DOFs outside that component.
+    """
+    raw_components = _connectivity_components(model)
+    n_total = dofs.n_total
+    free_set = set(dofs.free_indices)
+    supported_nodes = set(model.supports.keys())
+
+    components: list[ComponentModalResult] = []
+    all_freqs: list[np.ndarray] = []
+    all_periods: list[np.ndarray] = []
+    all_omegas: list[np.ndarray] = []
+    all_modes: list[np.ndarray] = []
+    extra_warnings: list[str] = []
+    global_offset = 0
+
+    for cid, node_set in enumerate(raw_components, start=1):
+        node_ids = sorted(node_set)
+
+        # Elements whose both endpoints are in this component
+        elem_ids = sorted(
+            e.id for e in model.elements
+            if e.node_i in node_set and e.node_j in node_set
+        )
+
+        # Orphan node: belongs to no element
+        if not elem_ids:
+            components.append(ComponentModalResult(
+                component_id=cid,
+                node_ids=node_ids,
+                element_ids=[],
+                is_supported=any(n in supported_nodes for n in node_ids),
+                is_singular=False,
+                skip_reason="orphan node — no elements",
+                n_modes=0,
+                frequencies=np.zeros(0),
+                periods=np.zeros(0),
+                omegas=np.zeros(0),
+                global_mode_offset=global_offset,
+            ))
+            extra_warnings.append(
+                f"Component {cid} (node {node_ids[0]}): orphan node — skipped."
+            )
+            continue
+
+        # Support check
+        is_supported = any(n in supported_nodes for n in node_ids)
+        if not is_supported:
+            components.append(ComponentModalResult(
+                component_id=cid,
+                node_ids=node_ids,
+                element_ids=elem_ids,
+                is_supported=False,
+                is_singular=False,
+                skip_reason="no supports (unsupported disconnected component)",
+                n_modes=0,
+                frequencies=np.zeros(0),
+                periods=np.zeros(0),
+                omegas=np.zeros(0),
+                global_mode_offset=global_offset,
+            ))
+            extra_warnings.append(
+                f"Component {cid} ({len(node_ids)} nodes, {len(elem_ids)} elements): "
+                f"no supports — modal analysis skipped for this component."
+            )
+            continue
+
+        # Collect free DOF indices for this component
+        comp_free: list[int] = []
+        for nid in node_ids:
+            m = dofs.active_map.get(nid, {})
+            for idx in m.values():
+                if idx is not None and idx in free_set:
+                    comp_free.append(idx)
+        comp_free = sorted(set(comp_free))
+
+        if not comp_free:
+            components.append(ComponentModalResult(
+                component_id=cid,
+                node_ids=node_ids,
+                element_ids=elem_ids,
+                is_supported=True,
+                is_singular=False,
+                skip_reason="no free DOFs (fully restrained)",
+                n_modes=0,
+                frequencies=np.zeros(0),
+                periods=np.zeros(0),
+                omegas=np.zeros(0),
+                global_mode_offset=global_offset,
+            ))
+            continue
+
+        # Extract submatrices
+        K_comp = K[np.ix_(comp_free, comp_free)]
+        M_comp = M[np.ix_(comp_free, comp_free)]
+
+        # Check for mass
+        M_comp_diag = np.diag(M_comp)
+        if not np.any(M_comp_diag > 0.0):
+            components.append(ComponentModalResult(
+                component_id=cid,
+                node_ids=node_ids,
+                element_ids=elem_ids,
+                is_supported=True,
+                is_singular=False,
+                skip_reason="no mass on free DOFs",
+                n_modes=0,
+                frequencies=np.zeros(0),
+                periods=np.zeros(0),
+                omegas=np.zeros(0),
+                global_mode_offset=global_offset,
+            ))
+            extra_warnings.append(
+                f"Component {cid} ({len(node_ids)} nodes): "
+                f"no mass on free DOFs — modal analysis skipped."
+            )
+            continue
+
+        # Solve
+        _diag_max = float(np.max(M_comp_diag))
+        _has_massless = np.any(
+            M_comp_diag <= _LUMPED_MASS_REL_TOL * max(1.0, _diag_max)
+        )
+        is_singular = False
+        comp_warn: list[str] = []
+        try:
+            if mass_formulation == "lumped" or _has_massless:
+                eigvals, modes_comp_free, n_comp_modes, comp_warn = (
+                    _solve_modal_condensed(K_comp, M_comp, n_modes_request)
+                )
+            else:
+                eigvals_all, eigvecs_all = scipy.linalg.eigh(K_comp, M_comp)
+                n_avail = eigvals_all.size
+                n_comp_modes = max(1, min(n_modes_request, n_avail))
+                eigvals = eigvals_all[:n_comp_modes]
+                modes_comp_free = eigvecs_all[:, :n_comp_modes].copy()
+        except ValueError as exc:
+            # Singular Kff within this component
+            is_singular = True
+            components.append(ComponentModalResult(
+                component_id=cid,
+                node_ids=node_ids,
+                element_ids=elem_ids,
+                is_supported=True,
+                is_singular=True,
+                skip_reason=f"singular stiffness: {exc}",
+                n_modes=0,
+                frequencies=np.zeros(0),
+                periods=np.zeros(0),
+                omegas=np.zeros(0),
+                global_mode_offset=global_offset,
+            ))
+            extra_warnings.append(
+                f"Component {cid} ({len(node_ids)} nodes): "
+                f"singular or near-singular stiffness — modal analysis skipped."
+            )
+            continue
+
+        eigvals = np.maximum(eigvals, 0.0)
+        comp_omegas = np.sqrt(eigvals)
+        comp_freqs = comp_omegas / (2.0 * np.pi)
+        with np.errstate(divide="ignore"):
+            comp_periods = np.where(
+                comp_freqs > 0.0,
+                1.0 / np.where(comp_freqs == 0.0, 1.0, comp_freqs),
+                np.inf,
+            )
+
+        if normalisation == "max":
+            for k in range(modes_comp_free.shape[1]):
+                peak = float(np.max(np.abs(modes_comp_free[:, k])))
+                if peak > 0.0:
+                    modes_comp_free[:, k] /= peak
+
+        # Embed into full-DOF global space
+        comp_free_arr = np.array(comp_free, dtype=int)
+        modes_global = np.zeros((n_total, n_comp_modes))
+        modes_global[comp_free_arr, :] = modes_comp_free
+
+        components.append(ComponentModalResult(
+            component_id=cid,
+            node_ids=node_ids,
+            element_ids=elem_ids,
+            is_supported=True,
+            is_singular=False,
+            skip_reason=None,
+            n_modes=n_comp_modes,
+            frequencies=comp_freqs,
+            periods=comp_periods,
+            omegas=comp_omegas,
+            global_mode_offset=global_offset,
+        ))
+        all_freqs.append(comp_freqs)
+        all_periods.append(comp_periods)
+        all_omegas.append(comp_omegas)
+        all_modes.append(modes_global)
+        extra_warnings.extend(comp_warn)
+        global_offset += n_comp_modes
+
+    if all_modes:
+        freqs_all = np.concatenate(all_freqs)
+        periods_all = np.concatenate(all_periods)
+        omegas_all = np.concatenate(all_omegas)
+        modes_all = np.concatenate(all_modes, axis=1)
+    else:
+        freqs_all = np.zeros(0)
+        periods_all = np.zeros(0)
+        omegas_all = np.zeros(0)
+        modes_all = np.zeros((n_total, 0))
+
+    return components, freqs_all, periods_all, omegas_all, modes_all, extra_warnings
+
+
 def solve_modal(
     model: StructuralModel,
     n_modes: int = 6,
@@ -298,9 +566,40 @@ def solve_modal(
             "Run → Modal mass source…"
         )
 
-    K, _F, dofs, warnings, _elem_data = assemble_global_system(model)
+    # ── Pre-detect components (before assembly) ───────────────────────────
+    # Detect connected components so we can add dummy supports to floating
+    # components and remove orphan nodes from the assembly model. This
+    # prevents assemble_global_system() from raising for those cases,
+    # while keeping the original model clean for per-component classification.
+    raw_comps = _connectivity_components(model)
+    use_per_component = len(raw_comps) > 1
+
+    assembly_model = model
+    if use_per_component:
+        _real_supported = set(model.supports.keys())
+        _orphan_nids: set[int] = set()
+        _unsupported_nids: set[int] = set()
+        for _comp_nodes in raw_comps:
+            # _connectivity_components partitions by element connectivity,
+            # so any singleton component is an orphan node by construction.
+            if len(_comp_nodes) == 1:
+                _orphan_nids |= _comp_nodes
+            elif not any(n in _real_supported for n in _comp_nodes):
+                _unsupported_nids |= _comp_nodes
+
+        if _orphan_nids or _unsupported_nids:
+            _new_nodes = {
+                nid: n for nid, n in model.nodes.items()
+                if nid not in _orphan_nids
+            }
+            _new_supports = dict(model.supports)
+            for nid in _unsupported_nids:
+                _new_supports[nid] = Support(node_id=nid, ux=True, uy=True, rz=False)
+            assembly_model = _dc_replace(model, nodes=_new_nodes, supports=_new_supports)
+
+    K, _F, dofs, warnings, _elem_data = assemble_global_system(assembly_model)
     M, mass_info = assemble_mass_matrix_with_source(
-        model, dofs,
+        assembly_model, dofs,
         formulation=mass_formulation,
         source=effective_source,
     )
@@ -321,14 +620,68 @@ def solve_modal(
             "DOFs.  Check that mass sources are connected to free (not "
             "fully restrained) nodes."
         )
+
+    summary = _build_mass_source_summary(effective_source, model, mass_info)
+    combined_base = list(warnings) + mass_info
+    if mass_formulation == "lumped":
+        combined_base.append(LUMPED_COMPARISON_NOTE)
+
+    # ── Multi-component path ──────────────────────────────────────────────
+
+    if use_per_component:
+        components, freqs, periods, omegas, modes_full, comp_warns = (
+            _solve_components(
+                model, K, M, dofs, n_modes, normalisation, mass_formulation,
+            )
+        )
+
+        solved = [c for c in components if c.skip_reason is None]
+        if not solved:
+            skipped_reasons = "; ".join(
+                f"C{c.component_id}: {c.skip_reason}" for c in components
+            )
+            raise ValueError(
+                f"Modal analysis: all components were skipped. {skipped_reasons}"
+            )
+
+        n_modes_returned = sum(c.n_modes for c in components)
+        combined_warnings = combined_base + comp_warns
+
+        n_supported = sum(1 for c in components if c.is_supported)
+        n_skipped = sum(1 for c in components if c.skip_reason is not None)
+        comp_summary_parts = [
+            f"Model contains {len(components)} disconnected component"
+            f"{'s' if len(components) != 1 else ''}. "
+            f"Modal analysis solved each supported component separately."
+        ]
+        if n_skipped:
+            comp_summary_parts.append(
+                f"{n_skipped} component{'s' if n_skipped != 1 else ''} skipped "
+                f"(see warnings)."
+            )
+        component_summary = " ".join(comp_summary_parts)
+
+        return ModalResult(
+            status="ok",
+            title=model.title,
+            warnings=combined_warnings,
+            n_modes=n_modes_returned,
+            frequencies=freqs,
+            periods=periods,
+            omegas=omegas,
+            modes=modes_full,
+            normalisation=normalisation,
+            dofs=dofs,
+            mass_formulation=mass_formulation,
+            mass_source_summary=summary,
+            components=components,
+            component_summary=component_summary,
+        )
+
+    # ── Single-component path (existing behaviour, unchanged) ─────────────
     K_ff = K[np.ix_(free, free)]
     M_ff = M[np.ix_(free, free)]
 
-    # When M_ff has massless DOFs (zero diagonal entries) — either because
-    # lumped formulation was chosen, or because joint masses only cover some
-    # DOFs with no rotational inertia — the generalised eigh requires a
-    # positive-definite B matrix and will fail.  Route through the Guyan
-    # static-condensation path in both cases.
     _diag_M_ff = np.diag(M_ff)
     _has_massless = np.any(_diag_M_ff <= _LUMPED_MASS_REL_TOL * max(1.0, float(np.max(_diag_M_ff))))
 
@@ -344,7 +697,6 @@ def solve_modal(
         eigvals = eigvals_all[:n_modes_returned]
         modes_free = eigvecs_all[:, :n_modes_returned].copy()
 
-    # Small negative numerical noise on near-rigid-body modes.
     eigvals = np.maximum(eigvals, 0.0)
     omegas = np.sqrt(eigvals)
 
@@ -363,11 +715,7 @@ def solve_modal(
     free_idx = np.array(free, dtype=int)
     modes_full[free_idx, :] = modes_free
 
-    combined_warnings = list(warnings) + extra_warnings + mass_info
-    if mass_formulation == "lumped":
-        combined_warnings.append(LUMPED_COMPARISON_NOTE)
-
-    summary = _build_mass_source_summary(effective_source, model, mass_info)
+    combined_warnings = combined_base + extra_warnings
 
     return ModalResult(
         status="ok",
@@ -382,4 +730,6 @@ def solve_modal(
         dofs=dofs,
         mass_formulation=mass_formulation,
         mass_source_summary=summary,
+        components=[],
+        component_summary="",
     )

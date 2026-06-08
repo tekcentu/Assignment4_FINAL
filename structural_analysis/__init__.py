@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.29.2"
+__version__ = "0.30.0"
 __what_is_new__ = (
-    "Condition-estimate SVD breakdown (σmax / σmin → κ) on Global K and Kff · "
-    "Updated help tooltip · "
-    "Skip message shown for large matrices"
+    "Component-aware modal analysis: disconnected structures solved separately · "
+    "Multi-component results grouped by component in modal table · "
+    "Canvas skips red overlay for inactive-component elements"
 )
 
 from .model import (
