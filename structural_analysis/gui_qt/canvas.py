@@ -521,13 +521,25 @@ class ModelCanvas(QWidget):
     def eventFilter(self, obj, event) -> bool:
         """Forward ESC key events from the embedded matplotlib canvas up to
         the top-level MainWindow so the existing ESC handler runs regardless
-        of which widget currently holds keyboard focus."""
-        if obj is self._mpl_canvas and event.type() == QEvent.Type.KeyPress:
-            if event.key() == Qt.Key.Key_Escape:
-                top = self.window()
-                if top is not None and top is not self:
-                    top.keyPressEvent(event)
-                    return True
+        of which widget currently holds keyboard focus.
+
+        We must also intercept ShortcutOverride: Qt fires this before KeyPress
+        to let actions claim a key. MainWindow has act_sel_clear with
+        shortcut="Escape"; if we don't claim ESC here, that action fires
+        first and the KeyPress never reaches MainWindow.keyPressEvent."""
+        if obj is self._mpl_canvas:
+            t = event.type()
+            if t in (QEvent.Type.KeyPress, QEvent.Type.ShortcutOverride):
+                if event.key() == Qt.Key.Key_Escape:
+                    if t == QEvent.Type.ShortcutOverride:
+                        # Claim ESC so act_sel_clear's Escape shortcut does
+                        # not fire before MainWindow.keyPressEvent is reached.
+                        event.accept()
+                        return True
+                    top = self.window()
+                    if top is not None and top is not self:
+                        top.keyPressEvent(event)
+                        return True
         return super().eventFilter(obj, event)
 
     # ── event forwarding ──

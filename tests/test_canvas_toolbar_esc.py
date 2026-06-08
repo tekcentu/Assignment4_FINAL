@@ -113,11 +113,11 @@ def test_main_window_has_strong_focus(qt_app):
 # ── ESC routing via eventFilter ────────────────────────────────────────────
 
 
-def _make_esc_key_event():
+def _make_esc_key_event(event_type=None):
     from PyQt6.QtCore import QEvent, Qt
     from PyQt6.QtGui import QKeyEvent
-    return QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
-                     Qt.KeyboardModifier.NoModifier)
+    t = event_type if event_type is not None else QEvent.Type.KeyPress
+    return QKeyEvent(t, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
 
 
 def test_esc_via_event_filter_cancels_frame_tool(qt_app):
@@ -166,6 +166,41 @@ def test_esc_noop_when_no_tool_active(qt_app):
 
     assert len(w._undo) == undo_before  # no side-effect
     assert w._active_tool is w._tools["select"]
+
+
+def test_shortcut_override_is_claimed_by_event_filter(qt_app):
+    """ShortcutOverride for ESC must be accepted so act_sel_clear's Escape
+    shortcut does not fire before MainWindow.keyPressEvent is reached."""
+    from PyQt6.QtCore import QEvent
+    w = MainWindow()
+    evt = _make_esc_key_event(QEvent.Type.ShortcutOverride)
+    # eventFilter must return True (consumed) and accept the event.
+    result = w.canvas.eventFilter(w.canvas._mpl_canvas, evt)
+    assert result is True
+    assert evt.isAccepted()
+
+
+def test_esc_unknown_mode_falls_through_to_tool_cancel(qt_app):
+    """If toolbar.mode is truthy but neither pan nor zoom, ESC must still
+    cancel the active tool — not be silently swallowed."""
+    w = MainWindow()
+    w._select_tool("frame")
+    tool = w._tools["frame"]
+    tool._first = (0.0, 0.0, None, None)
+    w.canvas.toolbar.mode = "some_future_mode"
+
+    class _FakeEsc:
+        def key(self):
+            from PyQt6.QtCore import Qt
+            return Qt.Key.Key_Escape
+        def accept(self):
+            pass
+
+    w.keyPressEvent(_FakeEsc())
+    # Should still fall through to the tool-cancel + Select path.
+    assert w._active_tool is w._tools["select"]
+
+    w.canvas.toolbar.mode = ""  # cleanup
 
 
 # ── ESC pan/zoom priority ──────────────────────────────────────────────────

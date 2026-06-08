@@ -3795,13 +3795,16 @@ class MainWindow(QMainWindow):
         if event.key() == Qt.Key.Key_Escape:
             # First priority: if the matplotlib nav toolbar is in pan or zoom
             # mode, a single ESC exits that mode without switching the active
-            # drawing tool.
-            mode = str(getattr(self.canvas.toolbar, "mode", "") or "").lower()
-            if mode:
-                if "pan" in mode:
-                    self.canvas.toolbar.pan()
-                elif "zoom" in mode:
-                    self.canvas.toolbar.zoom()
+            # drawing tool. Only accept+return when we actually toggled a mode
+            # — unknown future modes must not silently swallow ESC.
+            toolbar = getattr(self.canvas, "toolbar", None)
+            mode = str(getattr(toolbar, "mode", "") or "").lower()
+            if "pan" in mode:
+                toolbar.pan()
+                event.accept()
+                return
+            elif "zoom" in mode:
+                toolbar.zoom()
                 event.accept()
                 return
             try:
