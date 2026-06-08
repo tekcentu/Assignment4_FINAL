@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+
+# Session handoff notes (local agent context, not part of any feature)
+SESSION_HANDOFF.md
