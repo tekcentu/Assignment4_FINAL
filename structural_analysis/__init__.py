@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.30.1"
+__version__ = "0.30.2"
 __what_is_new__ = (
-    "Toolbar: Subplots/Customize removed, Fit button added · "
-    "ESC exits pan/zoom mode first, then cancels active tool · "
-    "Canvas ESC now reliable regardless of keyboard focus"
+    "Modal results say 'Structure' not 'Component' · "
+    "Per-structure explanatory note in modal dialog · "
+    "Internal code names unchanged"
 )
 
 from .model import (

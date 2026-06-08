@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..modal import ModalResult
+from ..gui_common.results_view import relabel_component_to_structure
 
 
 class ModalResultsDialog(QDialog):
@@ -72,11 +73,25 @@ class ModalResultsDialog(QDialog):
         if getattr(result, "component_summary", ""):
             header_text += (
                 f"<br><span style='color:#2060a0;font-size:9pt;'>"
-                f"{result.component_summary}</span>"
+                f"{relabel_component_to_structure(result.component_summary)}</span>"
             )
         header_lbl = QLabel(header_text, self)
         header_lbl.setTextFormat(Qt.TextFormat.RichText)
         v.addWidget(header_lbl)
+        # When the model splits into multiple disconnected structures, make
+        # the per-structure solve explicit for the user.
+        if bool(getattr(result, "components", [])):
+            note = QLabel(
+                "Disconnected structures are solved separately. "
+                "Modes are shown per structure.",
+                self,
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet(
+                "color: #2060a0; font-style: italic; "
+                "font-size: 9pt; padding: 2px 0;"
+            )
+            v.addWidget(note)
         if result.mass_formulation == "lumped":
             note = QLabel(
                 "Lumped translational mass is a comparison aid. "
@@ -182,14 +197,14 @@ class ModalResultsDialog(QDialog):
         for comp in result.components:
             if comp.skip_reason:
                 label = (
-                    f"Component {comp.component_id} — "
+                    f"Structure {comp.component_id} — "
                     f"{len(comp.node_ids)} node{'s' if len(comp.node_ids) != 1 else ''}, "
                     f"{len(comp.element_ids)} element{'s' if len(comp.element_ids) != 1 else ''} "
-                    f"[skipped: {comp.skip_reason}]"
+                    f"[skipped: {relabel_component_to_structure(comp.skip_reason)}]"
                 )
             else:
                 label = (
-                    f"Component {comp.component_id} — "
+                    f"Structure {comp.component_id} — "
                     f"{len(comp.node_ids)} nodes, "
                     f"{len(comp.element_ids)} elements, "
                     f"{comp.n_modes} modes"

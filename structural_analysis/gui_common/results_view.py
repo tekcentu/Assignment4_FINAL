@@ -8,10 +8,42 @@ never drift between them).
 
 from __future__ import annotations
 
+import re
+
 from ..element import FrameElement2D
 from ..model import AnalysisResult, StructuralModel
 from ..multi_case_result import MultiCaseAnalysisResult, SUM_ALL_KEY
 from .validation import used_case_names
+
+
+_COMPONENT_WORD_RE = re.compile(r"\bcomponents?\b", re.IGNORECASE)
+
+
+def _component_to_structure_word(match: re.Match) -> str:
+    """Map one ``component``/``components`` match to ``structure``/``structures``
+    while preserving the matched casing (Title or lower)."""
+    word = match.group(0)
+    plural = word[-1] in ("s", "S")
+    base = "Structure" if word[:1].isupper() else "structure"
+    return base + ("s" if plural else "")
+
+
+def relabel_component_to_structure(text: str) -> str:
+    """Convert user-facing 'component' wording to 'structure' at the display
+    boundary.
+
+    The solver layer (``modal.py``) speaks of "components" internally; the GUI
+    shows disconnected structures as "Structure N" to match structural-
+    engineering language. This helper does a whole-word, case-aware swap so
+    solver-sourced prose (e.g. ``ModalResult.component_summary``) can be shown
+    in user terms WITHOUT touching the solver. Only the surface forms
+    ``Component`` / ``component`` / ``Components`` / ``components`` are mapped;
+    substrings like ``componentry`` are left untouched by the ``\\b`` guards.
+    """
+    if not text:
+        return text
+    return _COMPONENT_WORD_RE.sub(_component_to_structure_word, text)
+
 
 
 def case_combo_entries(
