@@ -20,6 +20,7 @@ from matplotlib.backends.backend_qtagg import (
 )
 from matplotlib.ticker import MultipleLocator
 
+from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 
 from ..element import FrameElement2D, TrussElement2D
@@ -38,6 +39,32 @@ from .element_graphics import (
     sample_internal_force as _diagram_ordinates,
     internal_force_at as _diagram_value,
 )
+
+
+_TOOLBAR_REMOVE = {"Subplots", "Customize"}
+
+
+class AppNavigationToolbar(NavigationToolbar2QT):
+    """Filtered matplotlib navigation toolbar.
+
+    Removes raw plot-configuration actions (Subplots, Customize) that are
+    meaningless in a structural-analysis context, and adds a Fit button that
+    calls the canvas's fit_to_view method.
+    """
+
+    toolitems = [t for t in NavigationToolbar2QT.toolitems
+                 if t[0] not in _TOOLBAR_REMOVE]
+
+    def __init__(self, canvas, parent, *, fit_callback=None):
+        super().__init__(canvas, parent)
+        if fit_callback is not None:
+            self.addSeparator()
+            act = self.addAction("Fit")
+            act.setToolTip("Fit view to model (Home key)")
+            act.triggered.connect(fit_callback)
+            self._fit_action = act
+        else:
+            self._fit_action = None
 
 
 @dataclass
@@ -210,13 +237,21 @@ class ModelCanvas(QWidget):
         self.ax.callbacks.connect("ylim_changed", self._on_limits_changed)
 
         self._mpl_canvas = FigureCanvasQTAgg(self.fig)
-        self.toolbar = NavigationToolbar2QT(self._mpl_canvas, self)
+        self.toolbar = AppNavigationToolbar(
+            self._mpl_canvas, self, fit_callback=self.fit_to_view,
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.toolbar)
         layout.addWidget(self._mpl_canvas)
         self.setLayout(layout)
+
+        # Allow ESC key events to propagate up to MainWindow regardless
+        # of which widget has focus.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._mpl_canvas.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._mpl_canvas.installEventFilter(self)
 
         self._mpl_canvas.mpl_connect("button_press_event", self._handle_click)
         self._mpl_canvas.mpl_connect("button_release_event", self._handle_release)
@@ -482,6 +517,30 @@ class ModelCanvas(QWidget):
             return
         self._set_axes_limits()
         self._mpl_canvas.draw_idle()
+
+    def eventFilter(self, obj, event) -> bool:
+        """Forward ESC key events from the embedded matplotlib canvas up to
+        the top-level MainWindow so the existing ESC handler runs regardless
+        of which widget currently holds keyboard focus.
+
+        We must also intercept ShortcutOverride: Qt fires this before KeyPress
+        to let actions claim a key. MainWindow has act_sel_clear with
+        shortcut="Escape"; if we don't claim ESC here, that action fires
+        first and the KeyPress never reaches MainWindow.keyPressEvent."""
+        if obj is self._mpl_canvas:
+            t = event.type()
+            if t in (QEvent.Type.KeyPress, QEvent.Type.ShortcutOverride):
+                if event.key() == Qt.Key.Key_Escape:
+                    if t == QEvent.Type.ShortcutOverride:
+                        # Claim ESC so act_sel_clear's Escape shortcut does
+                        # not fire before MainWindow.keyPressEvent is reached.
+                        event.accept()
+                        return True
+                    top = self.window()
+                    if top is not None and top is not self:
+                        top.keyPressEvent(event)
+                        return True
+        return super().eventFilter(obj, event)
 
     # ── event forwarding ──
 

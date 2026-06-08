@@ -311,6 +311,7 @@ class MainWindow(QMainWindow):
     # ── layout ──
 
     def _build_ui(self) -> None:
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         splitter = QSplitter(Qt.Orientation.Vertical, self)
         self.canvas = ModelCanvas(splitter, lambda: self._model,
                                     grid_provider=lambda: self._grid)
@@ -3792,6 +3793,20 @@ class MainWindow(QMainWindow):
         drag rects, etc.). ESC never touches the model and never pushes
         an undo entry."""
         if event.key() == Qt.Key.Key_Escape:
+            # First priority: if the matplotlib nav toolbar is in pan or zoom
+            # mode, a single ESC exits that mode without switching the active
+            # drawing tool. Only accept+return when we actually toggled a mode
+            # — unknown future modes must not silently swallow ESC.
+            toolbar = getattr(self.canvas, "toolbar", None)
+            mode = str(getattr(toolbar, "mode", "") or "").lower()
+            if "pan" in mode:
+                toolbar.pan()
+                event.accept()
+                return
+            elif "zoom" in mode:
+                toolbar.zoom()
+                event.accept()
+                return
             try:
                 self._active_tool.on_key("escape")
             except Exception:
