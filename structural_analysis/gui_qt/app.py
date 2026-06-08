@@ -35,29 +35,55 @@ from PyQt6.QtWidgets import (
 )
 
 from ..file_io import read_input_file
-from ..main import run_analysis
+from ..main import run_analysis, run_multi_case_analysis
 from ..model import AnalysisResult, Material, Section, StructuralModel
+from ..multi_case_result import (
+    SUM_ALL_KEY,
+    MultiCaseAnalysisResult,
+    make_active_case_safe,
+)
 from .. import __version__, __what_is_new__
 from ..gui_common.commands import (
     AddElementCmd,
+    AddMemberCmd,
     AddMemberLoadCmd,
     AddNodeCmd,
     AddOrUpdateMaterialCmd,
     AddOrUpdateSectionCmd,
+    BatchAddMemberLoadsCmd,
+    BatchAddNodalLoadsCmd,
+    BatchDeleteCmd,
+    BatchUpdateElementsCmd,
+    check_merge_preconditions,
     ClearMemberLoadsCmd,
     Command,
     DeleteElementCmd,
     DeleteMaterialCmd,
+    DeleteMemberLoadCmd,
     DeleteNodeCmd,
     DeleteSectionCmd,
+    DrawMemberWithSplitsCmd,
+    MergeAdjacentElementsCmd,
+    RenumberElementsCmd,
     ReplaceModelCmd,
     SetGridSystemCmd,
-    SetNodalLoadCmd,
     SetSupportCmd,
     UpdateElementCmd,
+    UpdateMemberLoadCmd,
 )
 from ..gui_common.file_writer import write_input_file
-from ..gui_common.results_view import format_result
+from ..gui_common.results_view import (
+    case_combo_entries,
+    format_result,
+    resolve_view,
+)
+from ..gui_common.validation import (
+    ModelValidationResult,
+    cases_with_loads,
+    sync_load_case_registry,
+    used_case_names,
+    validate_model,
+)
 
 from .canvas import HitResult, ModelCanvas
 from .controllers import (
@@ -72,16 +98,22 @@ from .controllers import (
     TrussTool,
 )
 from .dialogs import (
+    AnalysisSettingsDialog,
+    BatchAssignDialog,
+    BatchMemberLoadDialog,
+    BatchNodalLoadDialog,
     BuildingWizardDialog,
     ElementDialog,
     ElementPropertiesDialog,
     FineNodeDialog,
     GridDialog,
     GridSpacingDialog,
+    GroupManagerDialog,
     MaterialListDialog,
     MemberLoadDialog,
-    NodalLoadDialog,
+    NodalLoadManagerDialog,
     NodePropertiesDialog,
+    RenumberElementsDialog,
     SupportDialog,
 )
 from .grid import GridSystem
@@ -104,54 +136,58 @@ def _make_building_icon() -> QIcon:
     return QIcon(pm)
 
 
-def _validate_model_for_solve(model: StructuralModel) -> tuple[list[str], list[str]]:
-    """Run lightweight pre-solve checks. Returns (fatal, warnings).
-
-    Fatal issues block the solve outright; warnings are non-blocking.
-    The solver itself does a more thorough pass during assembly — this
-    pass exists so the GUI can show a friendly summary first.
+def _push_validation_to_canvas(
+    canvas, result: ModelValidationResult,
+) -> None:
+    """Plumb a :class:`ModelValidationResult` to the canvas highlight
+    layer so problem nodes and elements light up while the user reads
+    the report.  Pre-PR-#31 we had no way to surface *which* node was
+    broken; now the canvas paints amber (warning) and red (error)
+    markers that map straight back to the report bullets.
     """
-    fatal: list[str] = []
-    warnings: list[str] = []
+    canvas.set_validation_highlights(
+        warning_node_ids=result.warning_node_ids,
+        error_node_ids=result.error_node_ids,
+        warning_element_ids=result.warning_element_ids,
+        error_element_ids=result.error_element_ids,
+    )
 
-    if not model.materials:
-        fatal.append("No materials defined.")
-    if not model.sections:
-        fatal.append("No sections defined.")
-    for sec in model.sections.values():
-        if sec.material_id not in model.materials:
-            fatal.append(
-                f"Section {sec.id} references missing material "
-                f"{sec.material_id}."
-            )
-    if not model.elements:
-        fatal.append("Model has no elements.")
-    for elem in model.elements:
-        if elem.node_i not in model.nodes:
-            fatal.append(f"Element {elem.id} references missing start "
-                         f"node {elem.node_i}.")
-        if elem.node_j not in model.nodes:
-            fatal.append(f"Element {elem.id} references missing end "
-                         f"node {elem.node_j}.")
-    used_nodes = set()
-    for elem in model.elements:
-        used_nodes.add(elem.node_i)
-        used_nodes.add(elem.node_j)
-    isolated = sorted(set(model.nodes) - used_nodes)
-    if isolated:
-        warnings.append(
-            f"Isolated nodes (not connected to any element): {isolated}."
-        )
-    if not model.supports:
-        warnings.append(
-            "No supports defined — the stiffness matrix will be singular."
-        )
-    for ld in model.nodal_loads:
-        if ld.node_id not in model.nodes:
-            fatal.append(
-                f"Nodal load references missing node {ld.node_id}."
-            )
-    return fatal, warnings
+
+def _show_orphan_nodes_dialog(parent: "QWidget", node_ids: list[int]) -> str:
+    """Present the orphan-node remediation dialog before a solve attempt.
+
+    Returns:
+        ``'delete'``   — delete the listed nodes then proceed to solve.
+        ``'continue'`` — solve with the orphan nodes still present.
+        ``'cancel'``   — abort the solve and return to editing.
+    """
+    nodes_str = ", ".join(str(n) for n in sorted(node_ids))
+    plural = "nodes are" if len(node_ids) > 1 else "node is"
+    msg = QMessageBox(parent)
+    msg.setWindowTitle("Orphan nodes found")
+    msg.setIcon(QMessageBox.Icon.Warning)
+    msg.setText(
+        f"The following {plural} not connected to any element: {nodes_str}.\n\n"
+        "Orphan nodes are often leftover geometry from accidental clicks. "
+        "They do not affect analysis results but are usually unintentional."
+    )
+    delete_btn = msg.addButton(
+        "Delete orphan(s) and solve", QMessageBox.ButtonRole.AcceptRole
+    )
+    continue_btn = msg.addButton(
+        "Continue anyway", QMessageBox.ButtonRole.YesRole
+    )
+    # Cancel button binds to the Reject role; its return is the
+    # fall-through case below, so we don't need to keep a handle to it.
+    msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+    msg.setDefaultButton(delete_btn)
+    msg.exec()
+    clicked = msg.clickedButton()
+    if clicked is delete_btn:
+        return "delete"
+    if clicked is continue_btn:
+        return "continue"
+    return "cancel"
 
 
 def _build_starter_model() -> StructuralModel:
@@ -175,6 +211,12 @@ def _build_starter_model() -> StructuralModel:
         2: Section(id=2, name="Concrete_30x50", material_id=2,
                    A=0.150,   I=3.125e-3, depth=0.500),
     }
+    # v0.25: seed a DEAD load case so new models are ready for dead-load
+    # self-weight tracking out of the box.  Old files keep whatever
+    # self_weight_case they stored (typically "DEFAULT").
+    from ..model import LoadCase as _LC
+    m.load_cases["DEAD"] = _LC(name="DEAD")
+    m.self_weight_case = "DEAD"
     return m
 
 
@@ -190,12 +232,44 @@ class MainWindow(QMainWindow):
         self._grid: GridSystem = GridSystem()
         self._undo: list[Command] = []
         self._redo: list[Command] = []
+        self._editing_locked: bool = False
         self._modified = False
         self._current_path: Optional[str] = None
+        # Named selection groups — GUI/project metadata, never touches the
+        # solver.  Keyed by group name; persisted in .spa.json only.
+        from .project_io import SelectionGroup as _SG
+        self._groups: dict[str, _SG] = {}
+        # Single-case "active" result (kept as a plain attribute so all
+        # existing consumers — canvas, inspector, overlay handlers —
+        # keep working). It's a *view* into ``_multi_result.cases``
+        # selected by ``_active_case``; ``_push_active_case_to_canvas``
+        # is the canonical write path.
         self._result: Optional[AnalysisResult] = None
+        # PR-A: wrapper holding one AnalysisResult per solved case
+        # plus the SUM_ALL view machinery. None pre-solve.
+        self._multi_result: Optional[MultiCaseAnalysisResult] = None
+        # Active case name shown in the toolbar combo / window title.
+        # Initialises to DEFAULT — guaranteed to exist on every model
+        # (see StructuralModel.__post_init__).
+        self._active_case: str = "DEFAULT"
+        # PR-A canvas overlay: when True, dim all non-active loads;
+        # when False, draw all loads at full intensity. Wired to the
+        # View → "Active case loads only" toggle.
+        self._active_case_loads_only: bool = True
         self._modal_result = None
         self._modal_results_dialog = None
         self._view3d_window = None
+        self._mass_summary_window = None
+        self._joint_masses_window = None
+        self._matrix_inspector_window = None
+        # Singleton element-detail inspector. Held alive across closes
+        # so right-clicking a different element reuses the same window
+        # (see _open_element_inspector). MainWindow owns the
+        # "locked while open" UX so the inspector dialog itself can
+        # stay non-modal without losing the safety of "no edits while
+        # inspecting".
+        self._element_inspector: ElementPropertiesDialog | None = None
+        self._lockable_actions: list[QAction] = []
         # Sticky element-creation defaults (None = ask the user on the
         # next pair-click). When the ElementDialog's "Remember" box is
         # checked these are saved and applied silently for subsequent
@@ -222,10 +296,12 @@ class MainWindow(QMainWindow):
 
         self.canvas.on_click = self._on_canvas_click
         self.canvas.on_motion = self._on_canvas_motion
+        self.canvas.on_release = self._on_canvas_release
         self.canvas.on_nav_mode_block = self._on_nav_mode_block
 
         self._update_title()
         self.canvas.redraw()
+        self._refresh_undo_redo()
 
         if initial_path:
             # defer to event loop start
@@ -291,6 +367,36 @@ class MainWindow(QMainWindow):
                        "bays, and dimensions (Ctrl+B).",
             triggered=self._do_building_wizard,
         )
+        self.act_batch_assign = QAction(
+            "&Batch assign properties…", self,
+            triggered=self._do_batch_assign_selected,
+        )
+        self.act_batch_assign.setToolTip(
+            "Apply section / material override to all selected elements "
+            "in one undoable step."
+        )
+        # v0.26 — batch load assignment (PR #41). Both actions are
+        # always enabled; the handlers verify a >=2-element / >=2-node
+        # selection at runtime and surface a status-bar message
+        # otherwise, mirroring how act_renumber_elements handles the
+        # empty-model case.
+        self.act_batch_member_load = QAction(
+            "Batch assign &member load…", self,
+            triggered=self._do_batch_member_load,
+        )
+        self.act_batch_member_load.setToolTip(
+            "Apply the same UDL / point / thermal load to every "
+            "selected element in one undoable step. Requires 2+ "
+            "selected elements."
+        )
+        self.act_batch_nodal_load = QAction(
+            "Batch assign &nodal load…", self,
+            triggered=self._do_batch_nodal_load,
+        )
+        self.act_batch_nodal_load.setToolTip(
+            "Append the same Fx / Fy / Mz to every selected node in "
+            "one undoable step. Requires 2+ selected nodes."
+        )
         self.act_add_node_coords = QAction(
             "Add node at &coordinates…", self,
             shortcut="Shift+N",
@@ -311,6 +417,19 @@ class MainWindow(QMainWindow):
         self.act_forget_elem_defaults = QAction(
             "Forget element defaults", self,
             triggered=self._forget_element_defaults,
+        )
+        # v0.24.0 — manual element-ID cleanup. Opens a preview dialog
+        # so the user sees the old → new mapping before committing.
+        # Disabled when the model has zero elements.
+        self.act_renumber_elements = QAction(
+            "&Renumber elements…", self,
+            triggered=self._do_renumber_elements,
+        )
+        self.act_renumber_elements.setToolTip(
+            "Reassign element IDs to a clean 1..N sequence. Choose "
+            "from current ID order, geometric order, or selection-first. "
+            "Undoable; member loads stay attached to their physical "
+            "element; analysis results are invalidated."
         )
         self.act_snap = QAction("Snap to grid", self, checkable=True, checked=True,
                                   triggered=self._toggle_snap)
@@ -373,12 +492,92 @@ class MainWindow(QMainWindow):
             deformed_scale_group.addAction(a)
             self._deformed_scale_actions[v] = a
 
-        self.act_solve = QAction("&Solve", self, shortcut="F5",
+        self.act_solve = QAction("&Solve all cases", self, shortcut="F5",
                                    triggered=self._do_solve)
+        # Shift+F5 runs only the currently-selected case — useful for
+        # iterative model edits on a multi-case model where running
+        # every case each time is overkill.
+        self.act_solve_active = QAction(
+            "Solve &active case only", self, shortcut="Shift+F5",
+            triggered=self._do_solve_active_only,
+        )
         self.act_modal = QAction("&Modal analysis…", self, shortcut="F6",
                                    triggered=self._do_modal)
+        self.act_analysis_settings = QAction(
+            "Analysis &settings…", self,
+            triggered=self._edit_analysis_settings,
+        )
+        self.act_mass_summary = QAction(
+            "&Mass / self-weight summary…", self,
+            triggered=self._show_mass_summary,
+        )
+        self.act_joint_masses = QAction(
+            "&Assembled joint masses…", self,
+            triggered=self._show_joint_masses,
+        )
+        self.act_matrix_inspector = QAction(
+            "Matrix / &DOF Inspector…", self,
+            triggered=self._open_matrix_inspector,
+        )
+        self.act_modal_mass_source = QAction(
+            "Modal mass &source…", self,
+            triggered=self._do_modal_mass_source,
+        )
         self.act_clear_result = QAction("&Clear results", self,
                                           triggered=self._clear_result)
+
+        # ── v0.27.0 Selection menu actions ──
+        self.act_sel_frames = QAction(
+            "Keep &Frames Only", self, triggered=self._filter_sel_frames_only,
+        )
+        self.act_sel_trusses = QAction(
+            "Keep &Trusses Only", self, triggered=self._filter_sel_trusses_only,
+        )
+        self.act_sel_same_section = QAction(
+            "Keep Same &Section", self, triggered=self._filter_sel_same_section,
+        )
+        self.act_sel_same_material = QAction(
+            "Keep Same &Material", self, triggered=self._filter_sel_same_material,
+        )
+        self.act_sel_clear = QAction(
+            "C&lear Selection", self, shortcut="Escape",
+            triggered=self._filter_sel_clear,
+        )
+        self.act_sel_all_elements = QAction(
+            "Select All &Elements", self, triggered=self._select_all_elements,
+        )
+        self.act_sel_all_nodes = QAction(
+            "Select All &Nodes", self, triggered=self._select_all_nodes,
+        )
+        self.act_sel_all = QAction(
+            "Select &All", self, shortcut="Ctrl+A",
+            triggered=self._select_all,
+        )
+        self.act_group_create = QAction(
+            "Create Group from &Selection…", self,
+            triggered=self._group_create_from_selection,
+        )
+        self.act_group_add = QAction(
+            "&Add Selection to Group…", self,
+            triggered=self._group_add_selection,
+        )
+        self.act_group_replace = QAction(
+            "Replace Group with &Selection…", self,
+            triggered=self._group_replace_with_selection,
+        )
+        self.act_group_remove_sel = QAction(
+            "Remove Selection from &Group…", self,
+            triggered=self._group_remove_selection,
+        )
+        self.act_group_rename = QAction(
+            "Rename Group…", self, triggered=self._group_rename,
+        )
+        self.act_group_delete = QAction(
+            "Delete Group…", self, triggered=self._group_delete,
+        )
+        self.act_group_manager = QAction(
+            "Group &Manager…", self, triggered=self._open_group_manager,
+        )
 
         # Tool actions (mutually exclusive)
         self._tool_actions: dict[str, QAction] = {}
@@ -402,6 +601,24 @@ class MainWindow(QMainWindow):
             self._tool_actions[name] = a
         self._tool_actions["select"].setChecked(True)
 
+        # Actions disabled while the element-detail inspector is open.
+        # Editing the model from underneath an open inspector would
+        # produce a stale view of the very element under inspection;
+        # locking these on inspector-open enforces the "view-only
+        # while inspecting" invariant the user asked for. Anything
+        # view-only (pan, zoom, solve, overlay toggles, View menu,
+        # 3D viewer, fit) stays enabled and is *intentionally* not in
+        # this list.
+        # Note: ``act_undo`` / ``act_redo`` are intentionally NOT in this
+        # list — their enabled state is owned by ``_refresh_undo_redo``,
+        # which also honours the editing-lock flag.  Keeping them out of
+        # ``_lockable_actions`` makes ``_refresh_undo_redo`` the single
+        # source of truth for their text, tooltip and enabled state.
+        self._lockable_actions = [
+            self.act_building_wizard, self.act_add_node_coords,
+            self.act_materials, self.act_forget_elem_defaults,
+        ]
+
     def _build_menus(self) -> None:
         m_file = self.menuBar().addMenu("&File")
         m_file.addAction(self.act_new)
@@ -419,8 +636,13 @@ class MainWindow(QMainWindow):
         m_edit.addSeparator()
         m_edit.addAction(self.act_building_wizard)
         m_edit.addAction(self.act_add_node_coords)
+        m_edit.addAction(self.act_batch_assign)
+        m_edit.addAction(self.act_batch_member_load)
+        m_edit.addAction(self.act_batch_nodal_load)
         m_edit.addAction(self.act_materials)
         m_edit.addAction(self.act_forget_elem_defaults)
+        m_edit.addSeparator()
+        m_edit.addAction(self.act_renumber_elements)
 
         # Top-right corner of the menu bar: version + what's-new summary
         # so the user always sees which features ship in this build.
@@ -437,6 +659,45 @@ class MainWindow(QMainWindow):
         self.menuBar().setCornerWidget(
             self._version_label, Qt.Corner.TopRightCorner,
         )
+
+        # ── Selection menu (v0.27.0) ──
+        m_sel = self.menuBar().addMenu("Se&lection")
+        m_sel.addAction(self.act_sel_frames)
+        m_sel.addAction(self.act_sel_trusses)
+        m_sel.addAction(self.act_sel_same_section)
+        m_sel.addAction(self.act_sel_same_material)
+        m_sel.addSeparator()
+        m_sel.addAction(self.act_sel_clear)
+        m_sel.addAction(self.act_sel_all_elements)
+        m_sel.addAction(self.act_sel_all_nodes)
+        m_sel.addAction(self.act_sel_all)
+        m_sel.addSeparator()
+        m_groups = m_sel.addMenu("&Groups")
+        m_groups.addAction(self.act_group_create)
+        m_groups.addAction(self.act_group_add)
+        m_groups.addAction(self.act_group_replace)
+        m_groups.addAction(self.act_group_remove_sel)
+        m_groups.addSeparator()
+        m_groups.addAction(self.act_group_rename)
+        m_groups.addAction(self.act_group_delete)
+        m_groups.addSeparator()
+        m_groups.addAction(self.act_group_manager)
+        m_groups.addSeparator()
+        # Dynamic "Select Group ▶" / "Add Group to Selection ▶" /
+        # "Remove Group from Selection ▶" submenus: populated on aboutToShow.
+        self._m_sel_group = m_groups.addMenu("Select Group ▶")
+        self._m_add_group = m_groups.addMenu("Add Group to Selection ▶")
+        self._m_rem_group = m_groups.addMenu("Remove Group from Selection ▶")
+        self._m_sel_group.aboutToShow.connect(
+            lambda: self._populate_group_submenu(self._m_sel_group, self._group_select)
+        )
+        self._m_add_group.aboutToShow.connect(
+            lambda: self._populate_group_submenu(self._m_add_group, self._group_add_to_selection)
+        )
+        self._m_rem_group.aboutToShow.connect(
+            lambda: self._populate_group_submenu(self._m_rem_group, self._group_remove_from_selection)
+        )
+        self._m_selection = m_sel  # keep reference for tests
 
         m_view = self.menuBar().addMenu("&View")
         m_view.addAction(self.act_fit_view)
@@ -459,10 +720,72 @@ class MainWindow(QMainWindow):
         deformed_scale_menu.setStatusTip(self._deformed_scale_tooltip)
         for a in self._deformed_scale_actions.values():
             deformed_scale_menu.addAction(a)
+        m_view.addSeparator()
+        # Active-case loads-only toggle (PR-A v0.18).
+        self.act_active_case_loads_only = QAction(
+            "&Active case loads only", self, checkable=True,
+            checked=self._active_case_loads_only,
+            triggered=self._on_active_case_loads_only_toggled,
+        )
+        self.act_active_case_loads_only.setToolTip(
+            "When on, loads attached to non-active load cases render "
+            "dimmed on the canvas. When off, every load draws at full "
+            "intensity regardless of which case is active."
+        )
+        m_view.addAction(self.act_active_case_loads_only)
+        # Show local axes (v0.24.0) — draws each element's local x/y
+        # arrows plus i/j end labels so users can see element
+        # orientation at a glance. Matches the solver's local-axis
+        # convention (local x = i → j, local y = 90° CCW). Off by
+        # default so existing views stay uncluttered.
+        self.act_show_local_axes = QAction(
+            "Show local &axes", self, checkable=True,
+            checked=self.canvas.show_local_axes,
+            triggered=self._on_show_local_axes_toggled,
+        )
+        self.act_show_local_axes.setToolTip(
+            "Draw each element's local x/y arrows and i/j end labels. "
+            "Useful for spotting orientation-dependent loads and "
+            "release ends. Hidden automatically in dense models."
+        )
+        m_view.addAction(self.act_show_local_axes)
+
+        # Load cases & combinations are model/analysis DEFINITIONS, not
+        # view options — they live under a dedicated Model menu rather
+        # than View (where they were easy to miss / mistake for display
+        # toggles).
+        self.act_load_cases = QAction(
+            "Load &cases…", self,
+            triggered=self._show_load_case_manager,
+        )
+        self.act_load_cases.setToolTip(
+            "Add, rename, delete, enable/disable load cases. Also sets "
+            "which case absorbs the self-weight contribution."
+        )
+        self.act_load_combinations = QAction(
+            "Load com&binations…", self,
+            triggered=self._show_load_combination_manager,
+        )
+        self.act_load_combinations.setToolTip(
+            "Add, rename, delete coefficient combinations of load cases "
+            "(e.g. 1.2 DEAD + 1.6 LIVE). Combinations are derived views "
+            "computed from solved case results."
+        )
+        m_model = self.menuBar().addMenu("&Model")
+        m_model.addAction(self.act_load_cases)
+        m_model.addAction(self.act_load_combinations)
 
         m_run = self.menuBar().addMenu("&Run")
         m_run.addAction(self.act_solve)
+        m_run.addAction(self.act_solve_active)
         m_run.addAction(self.act_modal)
+        m_run.addAction(self.act_modal_mass_source)
+        m_run.addSeparator()
+        m_run.addAction(self.act_analysis_settings)
+        m_run.addAction(self.act_mass_summary)
+        m_run.addAction(self.act_joint_masses)
+        m_run.addAction(self.act_matrix_inspector)
+        m_run.addSeparator()
         m_run.addAction(self.act_clear_result)
 
     def _build_toolbar(self) -> None:
@@ -474,7 +797,34 @@ class MainWindow(QMainWindow):
             tb.addAction(self._tool_actions[name])
         tb.addSeparator()
         tb.addAction(self.act_building_wizard)
+
+        # Case selector — sits IMMEDIATELY above Solve so the
+        # toolbar reads "[case combo] → Solve". The combo is hidden
+        # behind a thin wrapper widget that adds a label; the combo
+        # itself lives on ``self._case_combo`` so tests and code can
+        # toggle it directly.
+        from PyQt6.QtWidgets import QComboBox
+        self._case_combo = QComboBox(self)
+        self._case_combo.setToolTip(
+            "Active load case — which solved result is shown on the "
+            "canvas and in the element-detail inspector. Switching "
+            "here updates diagrams, deformed shape, and reactions."
+        )
+        self._case_combo.setMinimumWidth(110)
+        self._case_combo.currentTextChanged.connect(
+            self._on_active_case_changed
+        )
+        case_wrap = QWidget(self)
+        case_wrap_layout = QVBoxLayout(case_wrap)
+        case_wrap_layout.setContentsMargins(2, 0, 2, 0)
+        case_wrap_layout.setSpacing(1)
+        case_wrap_layout.addWidget(QLabel("Case:", case_wrap))
+        case_wrap_layout.addWidget(self._case_combo)
+        tb.addWidget(case_wrap)
+        self._refresh_case_selector_combo()
+
         tb.addAction(self.act_solve)
+        tb.addAction(self.act_solve_active)
         tb.addAction(self.act_materials)
         tb.addSeparator()
 
@@ -526,6 +876,16 @@ class MainWindow(QMainWindow):
         self.canvas.set_element_preview(start_node_id, end_x, end_y, kind)
         self.canvas.redraw()
 
+    def set_element_preview_free(
+        self,
+        start_x: float, start_y: float, end_x: float, end_y: float,
+        kind: str,
+    ) -> None:
+        self.canvas.set_element_preview_free(
+            start_x, start_y, end_x, end_y, kind,
+        )
+        self.canvas.redraw()
+
     def clear_element_preview(self) -> None:
         self.canvas.clear_element_preview()
         self.canvas.redraw()
@@ -571,6 +931,610 @@ class MainWindow(QMainWindow):
         self.set_status("Selection cleared. Click a node or element to inspect it.")
         self.canvas.redraw()
 
+    # ── v0.13.0 multi-select ────────────────────────────────────────────
+
+    def toggle_node_in_selection(self, node_id: int) -> None:
+        if node_id not in self._model.nodes:
+            return
+        if node_id in self.canvas.get_selected_nodes():
+            self.canvas.remove_node_from_selection(node_id)
+        else:
+            self.canvas.add_node_to_selection(node_id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def toggle_element_in_selection(self, element_id: int) -> None:
+        if not any(e.id == element_id for e in self._model.elements):
+            return
+        if element_id in self.canvas.get_selected_elements():
+            self.canvas.remove_element_from_selection(element_id)
+        else:
+            self.canvas.add_element_to_selection(element_id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def set_drag_rect(
+        self, x0: float, y0: float, x1: float, y1: float,
+        is_crossing: bool,
+    ) -> None:
+        self.canvas.set_drag_rect(x0, y0, x1, y1, is_crossing)
+        self.canvas.redraw()
+
+    def clear_drag_rect(self) -> None:
+        self.canvas.clear_drag_rect()
+        self.canvas.redraw()
+
+    def apply_box_select(
+        self,
+        rect: tuple[float, float, float, float],
+        shift: bool,
+        is_crossing: bool,
+    ) -> None:
+        """Resolve a finished drag rect into a selection update.
+
+        Nodes are picked on point-in-rect (inclusive) in both modes.
+        Elements use Window vs Crossing rules: Window needs both
+        endpoints inside; Crossing also accepts segment-intersects.
+        Without Shift the existing selection is cleared first; with
+        Shift the rect's hits are added to whatever was already selected.
+        """
+        from .canvas import _point_in_world_rect, _segment_intersects_rect
+        if not shift:
+            self.canvas.clear_selection()
+        rx0, ry0, rx1, ry1 = rect
+        for nid, node in self._model.nodes.items():
+            if _point_in_world_rect(node.x, node.y, rx0, ry0, rx1, ry1):
+                self.canvas.add_node_to_selection(nid)
+        for elem in self._model.elements:
+            ni = self._model.nodes.get(elem.node_i)
+            nj = self._model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            i_in = _point_in_world_rect(ni.x, ni.y, rx0, ry0, rx1, ry1)
+            j_in = _point_in_world_rect(nj.x, nj.y, rx0, ry0, rx1, ry1)
+            if is_crossing:
+                hit = i_in or j_in or _segment_intersects_rect(
+                    ni.x, ni.y, nj.x, nj.y, rx0, ry0, rx1, ry1,
+                )
+            else:
+                hit = i_in and j_in
+            if hit:
+                self.canvas.add_element_to_selection(elem.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def select_to_neutral_mode(self) -> None:
+        """Switch the active tool back to Select. Used after ESC."""
+        self._select_tool("select")
+
+    def _update_selection_status(self) -> None:
+        nn = len(self.canvas.get_selected_nodes())
+        elem_ids = self.canvas.get_selected_elements()
+        ne = len(elem_ids)
+        if nn == 0 and ne == 0:
+            self.set_status("No selection.")
+            return
+        parts: list[str] = []
+        if nn:
+            parts.append(f"{nn} node{'s' if nn > 1 else ''}")
+        if ne:
+            parts.append(f"{ne} element{'s' if ne > 1 else ''}")
+        text = ", ".join(parts) + " selected."
+        # Grouped load counts only when >1 element is selected — for a
+        # single element the inspector itself shows the full table.
+        if ne > 1:
+            from .load_summary import (
+                format_selection_load_counts,
+                summarize_selection_loads,
+            )
+            counts = summarize_selection_loads(self._model, elem_ids)
+            summary = format_selection_load_counts(counts)
+            if summary:
+                text += f"  Loads: {summary}."
+        self.set_status(text)
+
+    # ── v0.27.0 selection filters ────────────────────────────────────────
+    # These operate on canvas selection state only — no model mutation, no
+    # undo entry.  Selecting is a view concern; the solver never sees it.
+
+    def _filter_sel_frames_only(self) -> None:
+        from ..element import FrameElement2D as _FE
+        sel = self.canvas.get_selected_elements()
+        if not sel:
+            self.set_status("No elements selected.")
+            return
+        keep = frozenset(
+            e.id for e in self._model.elements
+            if e.id in sel and isinstance(e, _FE)
+        )
+        self.canvas.clear_selection()
+        for eid in keep:
+            self.canvas.add_element_to_selection(eid)
+        n = len(keep)
+        self.set_status(f"Selection filtered: {n} frame element{'s' if n != 1 else ''} selected.")
+        self.canvas.redraw()
+
+    def _filter_sel_trusses_only(self) -> None:
+        from ..element import TrussElement2D as _TE
+        sel = self.canvas.get_selected_elements()
+        if not sel:
+            self.set_status("No elements selected.")
+            return
+        keep = frozenset(
+            e.id for e in self._model.elements
+            if e.id in sel and isinstance(e, _TE)
+        )
+        self.canvas.clear_selection()
+        for eid in keep:
+            self.canvas.add_element_to_selection(eid)
+        n = len(keep)
+        self.set_status(f"Selection filtered: {n} truss element{'s' if n != 1 else ''} selected.")
+        self.canvas.redraw()
+
+    def _filter_sel_same_section(self) -> None:
+        sel = self.canvas.get_selected_elements()
+        if not sel:
+            self.set_status("No elements selected.")
+            return
+        ref_id = next(
+            (e.id for e in self._model.elements if e.id in sel), None
+        )
+        if ref_id is None:
+            return
+        ref_elem = next(e for e in self._model.elements if e.id == ref_id)
+        ref_sec = getattr(ref_elem, "section_id", None)
+        keep = frozenset(
+            e.id for e in self._model.elements
+            if e.id in sel and getattr(e, "section_id", None) == ref_sec
+        )
+        self.canvas.clear_selection()
+        for eid in keep:
+            self.canvas.add_element_to_selection(eid)
+        sec = self._model.sections.get(ref_sec)
+        sec_name = (sec.name if sec and sec.name else f"section {ref_sec}") if ref_sec else "unknown"
+        n = len(keep)
+        self.set_status(
+            f"Selection filtered: {n} element{'s' if n != 1 else ''} with section '{sec_name}'."
+        )
+        self.canvas.redraw()
+
+    def _filter_sel_same_material(self) -> None:
+        sel = self.canvas.get_selected_elements()
+        if not sel:
+            self.set_status("No elements selected.")
+            return
+        ref_id = next(
+            (e.id for e in self._model.elements if e.id in sel), None
+        )
+        if ref_id is None:
+            return
+        ref_elem = next(e for e in self._model.elements if e.id == ref_id)
+        ref_sec = self._model.sections.get(getattr(ref_elem, "section_id", None))
+        ref_mat_id = (
+            getattr(ref_elem, "material_id_override", None)
+            or (ref_sec.material_id if ref_sec else None)
+        )
+        def _eff_mat(e):
+            sec = self._model.sections.get(getattr(e, "section_id", None))
+            return getattr(e, "material_id_override", None) or (
+                sec.material_id if sec else None
+            )
+        keep = frozenset(
+            e.id for e in self._model.elements
+            if e.id in sel and _eff_mat(e) == ref_mat_id
+        )
+        self.canvas.clear_selection()
+        for eid in keep:
+            self.canvas.add_element_to_selection(eid)
+        mat = self._model.materials.get(ref_mat_id)
+        mat_name = (mat.name if mat and mat.name else f"material {ref_mat_id}") if ref_mat_id else "unknown"
+        n = len(keep)
+        self.set_status(
+            f"Selection filtered: {n} element{'s' if n != 1 else ''} with material '{mat_name}'."
+        )
+        self.canvas.redraw()
+
+    def _filter_sel_clear(self) -> None:
+        self.canvas.clear_selection()
+        self.set_status("Selection cleared.")
+        self.canvas.redraw()
+
+    def _select_all_elements(self) -> None:
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            self.canvas.add_element_to_selection(e.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _select_all_nodes(self) -> None:
+        self.canvas.clear_selection()
+        for nid in self._model.nodes:
+            self.canvas.add_node_to_selection(nid)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _select_all(self) -> None:
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            self.canvas.add_element_to_selection(e.id)
+        for nid in self._model.nodes:
+            self.canvas.add_node_to_selection(nid)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    # ── v0.27.0 select similar ───────────────────────────────────────────
+    # Each method takes the clicked element ID as reference; the clicked
+    # element does NOT need to be already selected.
+
+    def _select_similar_type(self, ref_elem_id: int) -> None:
+        ref = next((e for e in self._model.elements if e.id == ref_elem_id), None)
+        if ref is None:
+            return
+        ref_type = type(ref)
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            if type(e) is ref_type:
+                self.canvas.add_element_to_selection(e.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _select_similar_section(self, ref_elem_id: int) -> None:
+        ref = next((e for e in self._model.elements if e.id == ref_elem_id), None)
+        if ref is None:
+            return
+        ref_sec = getattr(ref, "section_id", None)
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            if getattr(e, "section_id", None) == ref_sec:
+                self.canvas.add_element_to_selection(e.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _select_similar_material(self, ref_elem_id: int) -> None:
+        ref = next((e for e in self._model.elements if e.id == ref_elem_id), None)
+        if ref is None:
+            return
+        ref_sec = self._model.sections.get(getattr(ref, "section_id", None))
+        ref_mat = getattr(ref, "material_id_override", None) or (
+            ref_sec.material_id if ref_sec else None
+        )
+        def _eff(e):
+            sec = self._model.sections.get(getattr(e, "section_id", None))
+            return getattr(e, "material_id_override", None) or (
+                sec.material_id if sec else None
+            )
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            if _eff(e) == ref_mat:
+                self.canvas.add_element_to_selection(e.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _select_similar_type_and_section(self, ref_elem_id: int) -> None:
+        ref = next((e for e in self._model.elements if e.id == ref_elem_id), None)
+        if ref is None:
+            return
+        ref_type = type(ref)
+        ref_sec = getattr(ref, "section_id", None)
+        self.canvas.clear_selection()
+        for e in self._model.elements:
+            if type(e) is ref_type and getattr(e, "section_id", None) == ref_sec:
+                self.canvas.add_element_to_selection(e.id)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    # ── v0.27.0 group actions ────────────────────────────────────────────
+    # Groups live in self._groups (dict[str, SelectionGroup]).  They are
+    # NOT on the undo stack — group edits are non-undoable in v0.27.
+
+    def _group_create_from_selection(self) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        node_ids = list(self.canvas.get_selected_nodes())
+        elem_ids = list(self.canvas.get_selected_elements())
+        if not node_ids and not elem_ids:
+            QMessageBox.information(
+                self, "Create group",
+                "Select nodes or elements first, then create a group.",
+            )
+            return
+        name, ok = QInputDialog.getText(
+            self, "Create group", "Group name (e.g. COLUMNS, FLOOR_2):"
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, "Create group", "Group name cannot be empty.")
+            return
+        if name in self._groups:
+            QMessageBox.warning(
+                self, "Create group",
+                f"Group '{name}' already exists. Use 'Replace with selection' to overwrite.",
+            )
+            return
+        self._groups[name] = SelectionGroup(
+            name=name, node_ids=node_ids, element_ids=elem_ids,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(
+            f"Created group '{name}': {len(node_ids)} node(s), {len(elem_ids)} element(s)."
+        )
+
+    def _group_add_selection(self, name: str | None = None) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        node_ids = list(self.canvas.get_selected_nodes())
+        elem_ids = list(self.canvas.get_selected_elements())
+        if not node_ids and not elem_ids:
+            QMessageBox.information(
+                self, "Add to group", "Select nodes or elements first.",
+            )
+            return
+        if not self._groups:
+            QMessageBox.information(
+                self, "Add to group",
+                "No groups exist. Create one first (Selection → Groups → Create from Selection).",
+            )
+            return
+        if name is None:
+            names = sorted(self._groups)
+            name, ok = QInputDialog.getItem(
+                self, "Add to group", "Choose group:", names, 0, False,
+            )
+            if not ok:
+                return
+        elif name not in self._groups:
+            return
+        g = self._groups[name]
+        new_nodes = sorted(set(g.node_ids) | set(node_ids))
+        new_elems = sorted(set(g.element_ids) | set(elem_ids))
+        self._groups[name] = SelectionGroup(
+            name=name, node_ids=new_nodes, element_ids=new_elems,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(
+            f"Added to group '{name}': now {len(new_nodes)} node(s), {len(new_elems)} element(s)."
+        )
+
+    def _group_replace_with_selection(self, name: str | None = None) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        node_ids = list(self.canvas.get_selected_nodes())
+        elem_ids = list(self.canvas.get_selected_elements())
+        if not self._groups:
+            QMessageBox.information(self, "Replace group", "No groups exist.")
+            return
+        if name is None:
+            names = sorted(self._groups)
+            name, ok = QInputDialog.getItem(
+                self, "Replace group with selection", "Choose group:", names, 0, False,
+            )
+            if not ok:
+                return
+        elif name not in self._groups:
+            return
+        self._groups[name] = SelectionGroup(
+            name=name, node_ids=node_ids, element_ids=elem_ids,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(
+            f"Replaced group '{name}': {len(node_ids)} node(s), {len(elem_ids)} element(s)."
+        )
+
+    def _group_remove_selection(self, name: str | None = None) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        node_ids = set(self.canvas.get_selected_nodes())
+        elem_ids = set(self.canvas.get_selected_elements())
+        if not node_ids and not elem_ids:
+            QMessageBox.information(self, "Remove from group", "Select nodes or elements first.")
+            return
+        if not self._groups:
+            QMessageBox.information(self, "Remove from group", "No groups exist.")
+            return
+        if name is None:
+            names = sorted(self._groups)
+            name, ok = QInputDialog.getItem(
+                self, "Remove from group", "Choose group:", names, 0, False,
+            )
+            if not ok:
+                return
+        elif name not in self._groups:
+            return
+        g = self._groups[name]
+        new_nodes = sorted(set(g.node_ids) - node_ids)
+        new_elems = sorted(set(g.element_ids) - elem_ids)
+        self._groups[name] = SelectionGroup(
+            name=name, node_ids=new_nodes, element_ids=new_elems,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(
+            f"Updated group '{name}': {len(new_nodes)} node(s), {len(new_elems)} element(s)."
+        )
+
+    def _group_rename(self) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        if not self._groups:
+            QMessageBox.information(self, "Rename group", "No groups exist.")
+            return
+        names = sorted(self._groups)
+        old_name, ok = QInputDialog.getItem(
+            self, "Rename group", "Choose group to rename:", names, 0, False,
+        )
+        if not ok:
+            return
+        new_name, ok2 = QInputDialog.getText(
+            self, "Rename group", f"New name for '{old_name}':",
+        )
+        if not ok2:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            QMessageBox.warning(self, "Rename group", "Name cannot be empty.")
+            return
+        if new_name == old_name:
+            return
+        if new_name in self._groups:
+            QMessageBox.warning(
+                self, "Rename group", f"A group named '{new_name}' already exists.",
+            )
+            return
+        g = self._groups.pop(old_name)
+        self._groups[new_name] = SelectionGroup(
+            name=new_name, node_ids=g.node_ids, element_ids=g.element_ids,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(f"Renamed group '{old_name}' → '{new_name}'.")
+
+    def _group_delete(self) -> None:
+        from PyQt6.QtWidgets import QInputDialog
+        if not self._groups:
+            QMessageBox.information(self, "Delete group", "No groups exist.")
+            return
+        names = sorted(self._groups)
+        name, ok = QInputDialog.getItem(
+            self, "Delete group", "Choose group to delete:", names, 0, False,
+        )
+        if not ok:
+            return
+        ans = QMessageBox.question(
+            self, "Delete group",
+            f"Delete group '{name}'? This does not delete model nodes or elements.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        del self._groups[name]
+        self._modified = True
+        self._update_title()
+        self.set_status(f"Deleted group '{name}'.")
+
+    def _group_select(self, name: str) -> None:
+        g = self._groups.get(name)
+        if g is None:
+            return
+        existing_eids = {e.id for e in self._model.elements}
+        self.canvas.clear_selection()
+        for nid in g.node_ids:
+            if nid in self._model.nodes:
+                self.canvas.add_node_to_selection(nid)
+        for eid in g.element_ids:
+            if eid in existing_eids:
+                self.canvas.add_element_to_selection(eid)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _group_add_to_selection(self, name: str) -> None:
+        g = self._groups.get(name)
+        if g is None:
+            return
+        existing_eids = {e.id for e in self._model.elements}
+        for nid in g.node_ids:
+            if nid in self._model.nodes:
+                self.canvas.add_node_to_selection(nid)
+        for eid in g.element_ids:
+            if eid in existing_eids:
+                self.canvas.add_element_to_selection(eid)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _group_remove_from_selection(self, name: str) -> None:
+        g = self._groups.get(name)
+        if g is None:
+            return
+        for nid in g.node_ids:
+            self.canvas.remove_node_from_selection(nid)
+        for eid in g.element_ids:
+            self.canvas.remove_element_from_selection(eid)
+        self._update_selection_status()
+        self.canvas.redraw()
+
+    def _open_group_manager(self) -> None:
+        from .dialogs import GroupManagerDialog
+        d = GroupManagerDialog(self, host=self, groups=self._groups, model=self._model)
+        d.exec()
+
+    def _populate_group_submenu(self, menu: "QMenu", callback) -> None:
+        menu.clear()
+        if not self._groups:
+            a = menu.addAction("(no groups)")
+            a.setEnabled(False)
+            return
+        for name in sorted(self._groups):
+            menu.addAction(name, lambda _, n=name: callback(n))
+
+    def _assign_to_group(
+        self,
+        node_ids: list[int] | None = None,
+        element_ids: list[int] | None = None,
+    ) -> None:
+        from .project_io import SelectionGroup
+        from PyQt6.QtWidgets import QInputDialog
+        node_ids = node_ids or []
+        element_ids = element_ids or []
+        if not node_ids and not element_ids:
+            QMessageBox.information(self, "Assign to group", "Nothing to assign.")
+            return
+        if not self._groups:
+            ans = QMessageBox.question(
+                self, "Assign to group",
+                "No groups exist. Create a new group with this item?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            name, ok = QInputDialog.getText(
+                self, "Create group", "Group name:"
+            )
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+            self._groups[name] = SelectionGroup(
+                name=name, node_ids=node_ids, element_ids=element_ids,
+            )
+            self._modified = True
+            self._update_title()
+            self.set_status(f"Created group '{name}' with the selected item(s).")
+            return
+        names = sorted(self._groups) + ["[ Create new group… ]"]
+        name, ok = QInputDialog.getItem(
+            self, "Assign to group", "Choose group:", names, 0, False,
+        )
+        if not ok:
+            return
+        if name == "[ Create new group… ]":
+            name, ok2 = QInputDialog.getText(
+                self, "Create group", "Group name:",
+            )
+            if not ok2 or not name.strip():
+                return
+            name = name.strip()
+            if name in self._groups:
+                QMessageBox.warning(
+                    self, "Assign to group",
+                    f"Group '{name}' already exists. Items added to it.",
+                )
+        g = self._groups.get(name)
+        new_nodes = sorted(set(g.node_ids if g else []) | set(node_ids))
+        new_elems = sorted(set(g.element_ids if g else []) | set(element_ids))
+        self._groups[name] = SelectionGroup(
+            name=name, node_ids=new_nodes, element_ids=new_elems,
+        )
+        self._modified = True
+        self._update_title()
+        self.set_status(
+            f"Assigned to group '{name}': {len(new_nodes)} node(s), {len(new_elems)} element(s)."
+        )
+
     def execute(self, command: Command) -> None:
         try:
             command.do(self._model)
@@ -585,18 +1549,104 @@ class MainWindow(QMainWindow):
         self._redo.clear()
         self._modified = True
         self._invalidate_result()
+        self._remap_groups_for_renumber(command)
+        # Load-case CRUD (or any command that mutates ``model.load_cases``
+        # / ``self_weight_case`` / load ``load_case`` tags) needs the
+        # toolbar combo to repaint even on a fresh model where
+        # ``_invalidate_result`` was a no-op. Cheap call, runs after
+        # every execute so the source of truth stays the model.
+        self._refresh_case_selector_combo()
         self._update_title()
         self.canvas.redraw()
+        label = self._command_label(command)
+        self.set_status(f"{label} done. Undo: {label}.")
+        self._refresh_undo_redo()
 
     def open_element_dialog_for_pair(
         self, n_i: int, n_j: int, kind: str | None = None
     ) -> None:
+        """Compat wrapper for the legacy two-existing-nodes click flow.
+
+        Looks up node coordinates and forwards to
+        :meth:`open_element_dialog_for_member`, which is the primary
+        entry point as of v0.10.0.
+        """
+        ni = self._model.nodes.get(n_i)
+        nj = self._model.nodes.get(n_j)
+        if ni is None or nj is None:
+            QMessageBox.warning(
+                self, "Cannot add element",
+                "One of the requested nodes no longer exists.",
+            )
+            return
+        self.open_element_dialog_for_member(
+            first_x=ni.x, first_y=ni.y, first_node_id=n_i,
+            second_x=nj.x, second_y=nj.y, second_node_id=n_j,
+            kind=kind,
+        )
+
+    def open_element_dialog_for_member(
+        self,
+        *,
+        first_x: float, first_y: float, first_node_id: int | None,
+        second_x: float, second_y: float, second_node_id: int | None,
+        kind: str | None = None,
+        first_split_target: tuple[int, float, float] | None = None,
+        second_split_target: tuple[int, float, float] | None = None,
+    ) -> None:
+        """Open the element-properties dialog for a member draw.
+
+        v0.10.0: ``first_node_id`` / ``second_node_id`` may be ``None``
+        when the click was on empty space; the underlying
+        :class:`AddMemberCmd` will reuse a nearby node (within 1e-9
+        world units) or allocate a new one.
+
+        v0.11.0 (post-PR21): when ``first_split_target`` or
+        ``second_split_target`` is set, the dispatch builds a
+        :class:`DrawMemberWithSplitsCmd` instead of a plain
+        :class:`AddMemberCmd` — the split(s) and the member-add then
+        share one undo step, and cancelling this dialog leaves the
+        model untouched. When both targets are ``None`` (no element
+        interior involved) the existing :class:`AddMemberCmd` path
+        runs unchanged.
+        """
         if not self._model.materials:
             QMessageBox.warning(
                 self, "No materials defined",
                 "Define a material first (Edit → Materials…) before placing elements.",
             )
             return
+
+        def _dispatch(
+            section_id: int,
+            effective_kind: str,
+            release_i: bool,
+            release_j: bool,
+            material_override_id: int | None,
+        ) -> None:
+            if first_split_target is None and second_split_target is None:
+                # No splits involved — preserve the exact pre-existing
+                # path so the PR #20 / Stage A acceptance tests stay
+                # behaviour-identical.
+                self.execute(AddMemberCmd(
+                    x_i=first_x, y_i=first_y, node_i=first_node_id,
+                    x_j=second_x, y_j=second_y, node_j=second_node_id,
+                    section_id=section_id,
+                    kind=effective_kind,
+                    release_i=release_i,
+                    release_j=release_j,
+                    material_override_id=material_override_id,
+                ))
+                return
+            self.execute(DrawMemberWithSplitsCmd(
+                split_target_i=first_split_target,
+                split_target_j=second_split_target,
+                x_i=first_x, y_i=first_y, node_i_hint=first_node_id,
+                x_j=second_x, y_j=second_y, node_j_hint=second_node_id,
+                kind=effective_kind, section_id=section_id,
+                release_i=release_i, release_j=release_j,
+                material_override_id=material_override_id,
+            ))
 
         # Sticky path: if a previous element-pair click checked "Remember",
         # reuse the remembered section + releases without re-opening the
@@ -619,13 +1669,14 @@ class MainWindow(QMainWindow):
             else:
                 release_i = False
                 release_j = False
-            self.execute(AddElementCmd(
-                node_i=n_i, node_j=n_j,
-                section_id=sticky["section_id"],
-                kind=effective_kind,
-                release_i=release_i,
-                release_j=release_j,
-            ))
+            sticky_override = sticky.get("material_override_id")
+            if (sticky_override is not None
+                    and sticky_override not in self._model.materials):
+                sticky_override = None
+            _dispatch(
+                sticky["section_id"], effective_kind,
+                release_i, release_j, sticky_override,
+            )
             return
 
         try:
@@ -633,6 +1684,8 @@ class MainWindow(QMainWindow):
                 self, model=self._model,
                 existing_kind=kind or (sticky or {}).get("kind"),
                 existing_section_id=(sticky or {}).get("section_id"),
+                existing_material_override_id=(
+                    sticky or {}).get("material_override_id"),
             )
         except ValueError as e:
             QMessageBox.warning(self, "Cannot add element", str(e))
@@ -645,9 +1698,8 @@ class MainWindow(QMainWindow):
                     "section_id": rv["section_id"],
                     "release_i": rv["release_i"],
                     "release_j": rv["release_j"],
+                    "material_override_id": rv.get("material_override_id"),
                 }
-                # Hint the user that subsequent pair clicks will skip
-                # the dialog until they clear the setting.
                 sec = self._model.sections[rv["section_id"]]
                 label = (f"{rv['kind']} · section {sec.id}"
                          + (f" ({sec.name})" if sec.name else ""))
@@ -657,13 +1709,11 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self._sticky_element = None
-            self.execute(AddElementCmd(
-                node_i=n_i, node_j=n_j,
-                section_id=rv["section_id"],
-                kind=rv["kind"],
-                release_i=rv["release_i"],
-                release_j=rv["release_j"],
-            ))
+            _dispatch(
+                rv["section_id"], rv["kind"],
+                rv["release_i"], rv["release_j"],
+                rv.get("material_override_id"),
+            )
 
     def _forget_element_defaults(self) -> None:
         """Clear sticky element-creation settings so the next frame/truss
@@ -674,6 +1724,30 @@ class MainWindow(QMainWindow):
         self._sticky_element = None
         self.set_status("Cleared remembered element settings.")
 
+    def _merge_action_label_and_tooltip(
+        self, node_id: int
+    ) -> "tuple[str, bool, str | None]":
+        """Return *(label, enabled, tooltip)* for the merge context-menu action.
+
+        When merge is eligible the label is plain and tooltip is None.
+        When ineligible the label gets the reason appended after an em-dash
+        and the tooltip also carries the reason, so the user sees why
+        without having to open a dialog.
+        """
+        can, reason = check_merge_preconditions(self._model, node_id)
+        base = f"Node {node_id}: merge adjacent elements"
+        if can:
+            return base, True, None
+        return f"{base} — {reason}", False, reason
+
+    def _can_merge_node(self, node_id: int) -> bool:
+        """Return True iff the node is eligible for an adjacent-element merge.
+
+        Thin wrapper around :func:`check_merge_preconditions`; kept for
+        backwards-compatibility with tests that call it directly.
+        """
+        return self._merge_action_label_and_tooltip(node_id)[1]
+
     def show_node_menu(self, node_id: int, action: str | None = None) -> None:
         if action == "support":
             self._edit_support(node_id)
@@ -681,38 +1755,127 @@ class MainWindow(QMainWindow):
         if action == "nodal_load":
             self._edit_nodal_load(node_id)
             return
+        if action == "merge":
+            self.execute(MergeAdjacentElementsCmd(middle_node_id=node_id))
+            return
         menu = QMenu(self)
         a1 = menu.addAction(f"Node {node_id}: edit support…")
         a2 = menu.addAction(f"Node {node_id}: edit nodal load…")
+        menu.addSeparator()
+        # Batch action — visible only when the user has multi-selected
+        # nodes (single-node right-click keeps the normal Add/Edit
+        # workflow, per the PR-41 brief).
+        sel_nodes = self.canvas.get_selected_nodes()
+        a_batch = None
+        if len(sel_nodes) >= 2 and node_id in sel_nodes:
+            a_batch = menu.addAction(
+                f"Batch assign nodal load to {len(sel_nodes)} nodes…"
+            )
+            menu.addSeparator()
+        merge_label, merge_enabled, merge_tooltip = (
+            self._merge_action_label_and_tooltip(node_id)
+        )
+        a_merge = menu.addAction(merge_label)
+        a_merge.setEnabled(merge_enabled)
+        if merge_tooltip:
+            a_merge.setToolTip(merge_tooltip)
+        menu.addSeparator()
+        a_assign_grp = menu.addAction(f"Assign node {node_id} to group…")
+        menu.addSeparator()
         a3 = menu.addAction(f"Node {node_id}: delete")
         chosen = menu.exec(self.cursor().pos())
         if chosen is a1:
             self._edit_support(node_id)
         elif chosen is a2:
             self._edit_nodal_load(node_id)
+        elif a_batch is not None and chosen is a_batch:
+            self._do_batch_nodal_load()
+        elif chosen is a_merge:
+            self.execute(MergeAdjacentElementsCmd(middle_node_id=node_id))
+        elif chosen is a_assign_grp:
+            self._assign_to_group(node_ids=[node_id])
         elif chosen is a3:
             self.execute(DeleteNodeCmd(node_id=node_id))
 
     def show_element_menu(self, elem_id: int, action: str | None = None) -> None:
+        # Direct-action shortcuts used by other call sites (the load
+        # placement tool routes "member_load" here so the modal Add
+        # dialog still pops on a left-click; PR #35 adds "details" and
+        # "loads" so future callers can land on a specific tab without
+        # walking through the menu).
         if action == "member_load":
             self._add_member_load(elem_id)
             return
+        if action == "details":
+            self._open_element_inspector(elem_id, tab="properties")
+            return
+        if action == "loads":
+            self._open_element_inspector(elem_id, tab="loads")
+            return
+        # While the element-detail inspector is open the host has the
+        # rest of the editing surface locked (see _set_editing_locked).
+        # The right-click context menu's edit items are built fresh
+        # each time so they're not part of _lockable_actions — disable
+        # them here based on the inspector's visibility instead. The
+        # "Element Details" and "Edit member loads…" items stay enabled
+        # so the user can re-target / re-focus the open inspector from
+        # any right-click.
+        edits_locked = (
+            self._element_inspector is not None
+            and self._element_inspector.isVisible()
+        )
         menu = QMenu(self)
-        a1 = menu.addAction(f"Element {elem_id}: edit section/material...")
-        a2 = menu.addAction(f"Element {elem_id}: show results / FBD...")
-        a3 = menu.addAction(f"Element {elem_id}: add member load...")
-        a4 = menu.addAction(f"Element {elem_id}: clear member loads")
-        a5 = menu.addAction(f"Element {elem_id}: delete")
+        a_details = menu.addAction(f"Element {elem_id}: Element Details…")
+        a_loads = menu.addAction(f"Element {elem_id}: Edit member loads…")
+        # Batch action — visible only when multi-selected (single-element
+        # right-click keeps the normal per-element load workflow above).
+        sel_elems = self.canvas.get_selected_elements()
+        a_batch = None
+        if len(sel_elems) >= 2 and elem_id in sel_elems:
+            menu.addSeparator()
+            a_batch = menu.addAction(
+                f"Batch assign member load to {len(sel_elems)} elements…"
+            )
+            a_batch.setEnabled(not edits_locked)
+        # Select Similar submenu (v0.27.0)
+        menu.addSeparator()
+        sim_menu = menu.addMenu(f"Select similar to element {elem_id}…")
+        a_sim_type = sim_menu.addAction("Same type")
+        a_sim_sec = sim_menu.addAction("Same section")
+        a_sim_mat = sim_menu.addAction("Same material")
+        a_sim_ts = sim_menu.addAction("Same type + section")
+        # Assign to group (v0.27.0)
+        a_assign_grp = menu.addAction(f"Assign element {elem_id} to group…")
+        menu.addSeparator()
+        a_edit = menu.addAction(f"Element {elem_id}: edit section/material…")
+        a_clear_loads = menu.addAction(
+            f"Element {elem_id}: clear member loads"
+        )
+        a_delete = menu.addAction(f"Element {elem_id}: delete")
+        for act in (a_edit, a_clear_loads, a_delete):
+            act.setEnabled(not edits_locked)
         chosen = menu.exec(self.cursor().pos())
-        if chosen is a1:
+        if chosen is a_details:
+            self._open_element_inspector(elem_id, tab="properties")
+        elif chosen is a_loads:
+            self._open_element_inspector(elem_id, tab="loads")
+        elif a_batch is not None and chosen is a_batch:
+            self._do_batch_member_load()
+        elif chosen is a_sim_type:
+            self._select_similar_type(elem_id)
+        elif chosen is a_sim_sec:
+            self._select_similar_section(elem_id)
+        elif chosen is a_sim_mat:
+            self._select_similar_material(elem_id)
+        elif chosen is a_sim_ts:
+            self._select_similar_type_and_section(elem_id)
+        elif chosen is a_assign_grp:
+            self._assign_to_group(element_ids=[elem_id])
+        elif chosen is a_edit:
             self._edit_element(elem_id)
-        elif chosen is a2:
-            self._show_element_results(elem_id)
-        elif chosen is a3:
-            self._add_member_load(elem_id)
-        elif chosen is a4:
+        elif chosen is a_clear_loads:
             self.execute(ClearMemberLoadsCmd(elem_id=elem_id))
-        elif chosen is a5:
+        elif chosen is a_delete:
             self.execute(DeleteElementCmd(elem_id=elem_id))
 
     def show_node_details(self, node_id: int) -> None:
@@ -746,13 +1909,31 @@ class MainWindow(QMainWindow):
         self.execute(SetSupportCmd(support=support, node_id=node_id))
 
     def _edit_nodal_load(self, node_id: int) -> None:
-        existing = next((ld for ld in self._model.nodal_loads
-                         if ld.node_id == node_id), None)
-        d = NodalLoadDialog(self, existing=existing, node_id=node_id)
-        if d.exec() != QDialog.DialogCode.Accepted:
+        """Open the per-node nodal-load manager (v0.20 — PR #30).
+
+        Replaces the pre-v0.20 single-load editor: a node can now carry
+        multiple independent rows (one per case, several per case…), and
+        each Add / Edit / Delete is an individual undoable command. The
+        dialog dispatches commands immediately through ``self.execute``
+        so the model stays in sync with the table while it's open.
+        """
+        try:
+            d = NodalLoadManagerDialog(
+                self, host=self, model=self._model, node_id=node_id,
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Node not found", str(e))
             return
-        fx, fy, mz = d.result_value
-        self.execute(SetNodalLoadCmd(node_id=node_id, fx=fx, fy=fy, mz=mz))
+        d.exec()
+
+    def _ensure_load_case_exists(self, case_name: str) -> None:
+        """Auto-create the named load case if the user typed a new one
+        in the dialog combo (PR-A redirect #10). DEFAULT is always
+        present so no-op for it."""
+        if case_name in self._model.load_cases:
+            return
+        from ..gui_common.commands import AddLoadCaseCmd
+        self.execute(AddLoadCaseCmd(name=case_name))
 
     def _add_member_load(self, elem_id: int) -> None:
         try:
@@ -762,7 +1943,9 @@ class MainWindow(QMainWindow):
             return
         if d.exec() != QDialog.DialogCode.Accepted:
             return
-        self.execute(AddMemberLoadCmd(elem_id=elem_id, load=d.result_value))
+        load = d.result_value
+        self._ensure_load_case_exists(getattr(load, "load_case", "DEFAULT"))
+        self.execute(AddMemberLoadCmd(elem_id=elem_id, load=load))
 
     def _edit_element(self, elem_id: int) -> None:
         elem = next((e for e in self._model.elements if e.id == elem_id), None)
@@ -776,6 +1959,8 @@ class MainWindow(QMainWindow):
             existing_section_id=getattr(elem, "section_id", None),
             existing_release_i=getattr(elem, "release_i", False),
             existing_release_j=getattr(elem, "release_j", False),
+            existing_material_override_id=getattr(
+                elem, "material_id_override", None),
             remember_default=False,
         )
         if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
@@ -787,6 +1972,7 @@ class MainWindow(QMainWindow):
             kind=rv["kind"],
             release_i=rv["release_i"],
             release_j=rv["release_j"],
+            material_override_id=rv.get("material_override_id"),
         ))
         self.select_element(elem_id)
 
@@ -882,16 +2068,39 @@ class MainWindow(QMainWindow):
         else:
             self._active_tool.activate()
 
-    def _on_canvas_click(self, hit: HitResult, button: str) -> None:
+    def _on_canvas_click(
+        self, hit: HitResult, button: str,
+        press_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
         if button == "right":
-            if hit.node_id is not None:
-                self.show_node_menu(hit.node_id)
-                return
+            # Right-click on an element shows the context menu (edit /
+            # add load / clear loads / delete + the "show details" item
+            # that opens the inspector). While the inspector is open
+            # the edit items are greyed inside show_element_menu so the
+            # user can still pick "show details" to re-target it.
+            # Right-click on a node keeps the node context menu.
             if hit.element_id is not None:
                 self.show_element_menu(hit.element_id)
                 return
+            if hit.node_id is not None:
+                self.show_node_menu(hit.node_id)
+                return
         try:
-            self._active_tool.on_click(hit, button)
+            self._active_tool.on_click(hit, button, press_px=press_px, shift=shift)
+        except Exception as e:
+            QMessageBox.critical(self, "Tool error",
+                                  f"{type(e).__name__}: {e}")
+
+    def _on_canvas_release(
+        self, hit: HitResult, button: str,
+        release_px: tuple[float, float] = (0.0, 0.0),
+        shift: bool = False,
+    ) -> None:
+        try:
+            self._active_tool.on_release(
+                hit, button, release_px=release_px, shift=shift,
+            )
         except Exception as e:
             QMessageBox.critical(self, "Tool error",
                                   f"{type(e).__name__}: {e}")
@@ -907,7 +2116,10 @@ class MainWindow(QMainWindow):
             f"work again."
         )
 
-    def _on_canvas_motion(self, hit: HitResult) -> None:
+    def _on_canvas_motion(
+        self, hit: HitResult,
+        cursor_px: tuple[float, float] = (0.0, 0.0),
+    ) -> None:
         parts = [f"({hit.x:.3f}, {hit.y:.3f})"]
         if hit.snap_label:
             parts.append(f"Snap: {hit.snap_label}")
@@ -933,7 +2145,7 @@ class MainWindow(QMainWindow):
         # Repaint canvas if the snap marker changed.
         self.canvas.redraw()
         try:
-            self._active_tool.on_motion(hit)
+            self._active_tool.on_motion(hit, cursor_px=cursor_px)
         except Exception:
             pass
 
@@ -1032,6 +2244,291 @@ class MainWindow(QMainWindow):
         self._view3d_window.raise_()
         self._view3d_window.activateWindow()
 
+    def _edit_analysis_settings(self) -> None:
+        """Open the modal analysis-settings dialog.
+
+        v0.9.0 exposes a single switch — include self-weight in the
+        static solve. Accepting the dialog updates the model flag and
+        invalidates any stale results so the user knows to re-solve.
+        """
+        d = AnalysisSettingsDialog(
+            self,
+            include_self_weight=bool(
+                getattr(self._model, "include_self_weight", False)
+            ),
+        )
+        if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
+            return
+        new_flag = bool(d.result_value["include_self_weight"])
+        if new_flag != bool(getattr(self._model, "include_self_weight", False)):
+            self._model.include_self_weight = new_flag
+            self._modified = True
+            self._update_title()
+            self._invalidate_result()
+        # Even if the flag didn't change, the summary window header
+        # may need a refresh (idempotent — cheap).
+        if self._mass_summary_window is not None:
+            self._mass_summary_window.refresh()
+        self.set_status(
+            "Self-weight: enabled in solver."
+            if new_flag else "Self-weight: disabled in solver."
+        )
+
+    def _show_mass_summary(self) -> None:
+        """Open the non-modal mass / self-weight summary, or raise it.
+
+        Singleton pattern mirrors :meth:`_open_view3d`.
+        """
+        from .mass_summary import MassSummaryWindow
+
+        if self._mass_summary_window is None:
+            self._mass_summary_window = MassSummaryWindow(
+                self, lambda: self._model,
+            )
+        else:
+            self._mass_summary_window.refresh()
+        self._mass_summary_window.show()
+        self._mass_summary_window.raise_()
+        self._mass_summary_window.activateWindow()
+
+    def _show_joint_masses(self) -> None:
+        """Open the non-modal Assembled Joint Masses window, or raise it.
+
+        Singleton pattern mirrors :meth:`_show_mass_summary`.
+        """
+        from .joint_masses import JointMassesWindow
+
+        if self._joint_masses_window is None:
+            self._joint_masses_window = JointMassesWindow(
+                self, lambda: self._model,
+            )
+        else:
+            self._joint_masses_window.refresh()
+        self._joint_masses_window.show()
+        self._joint_masses_window.raise_()
+        self._joint_masses_window.activateWindow()
+
+    def _open_matrix_inspector(self) -> None:
+        """Open the non-modal Matrix / DOF Inspector, or raise it.
+
+        The inspector refreshes on reopen so it always reflects the
+        current model state. Singleton pattern mirrors
+        :meth:`_show_mass_summary`.
+        """
+        from .matrix_inspector import MatrixDofInspectorWindow
+
+        if self._matrix_inspector_window is None:
+            sel = next(iter(self.canvas.get_selected_elements()), None)
+            self._matrix_inspector_window = MatrixDofInspectorWindow(
+                self, lambda: self._model, selected_element_id=sel,
+            )
+        else:
+            sel = next(iter(self.canvas.get_selected_elements()), None)
+            if sel is not None:
+                self._matrix_inspector_window.set_selected_element(sel)
+            self._matrix_inspector_window.refresh()
+        self._matrix_inspector_window.show()
+        self._matrix_inspector_window.raise_()
+        self._matrix_inspector_window.activateWindow()
+
+    def _open_element_inspector(
+        self, elem_id: int, *, tab: str = "properties",
+    ) -> None:
+        """Open (or re-target) the non-modal tabbed element-detail
+        inspector and focus the requested tab.
+
+        The inspector is a singleton on ``self._element_inspector`` —
+        right-clicking a different element while it's open re-targets
+        the same window instead of stacking dialogs. While it's
+        visible the host locks the editing actions (see
+        :meth:`_set_editing_locked`); the inspector itself stays
+        non-modal so pan / zoom / solve / overlay buttons continue to
+        work on the main canvas.
+
+        ``tab`` selects the focused tab after opening: ``"properties"``
+        (default), ``"results"``, or ``"loads"``.  Used by the right-
+        click menu to land directly on "Edit member loads…" when the
+        user picked that item.
+        """
+        try:
+            if self._element_inspector is None:
+                self._element_inspector = ElementPropertiesDialog(
+                    self, self._model, elem_id, self._result,
+                    multi_result=self._multi_result,
+                )
+                self._element_inspector.finished.connect(
+                    self._on_element_inspector_closed
+                )
+                # Wire BEFORE re-rendering so the Add / Edit / Delete
+                # buttons render as enabled rather than greyed out (the
+                # initial __init__ build ran before this assignment).
+                self._element_inspector._host_delete_member_load = (
+                    self.delete_member_load
+                )
+                self._element_inspector._host_add_member_load = (
+                    self.add_member_load_from_inspector
+                )
+                self._element_inspector._host_edit_member_load = (
+                    self.edit_member_load_from_inspector
+                )
+                self._element_inspector.refresh_loads_only(
+                    self._model, self._result,
+                )
+            else:
+                self._element_inspector.set_target(
+                    self._model, elem_id, self._result,
+                    multi_result=self._multi_result,
+                )
+        except ValueError as e:
+            QMessageBox.warning(self, "Element not found", str(e))
+            return
+        self._element_inspector.set_initial_tab(tab)
+        self._set_editing_locked(True)
+        self._element_inspector.show()
+        self._element_inspector.raise_()
+        self._element_inspector.activateWindow()
+
+    def delete_member_load(self, elem_id: int, load_index: int) -> None:
+        """Host-side hook for the inspector's per-row Delete buttons.
+
+        Runs ``DeleteMemberLoadCmd`` through :meth:`execute` so it lands
+        on the undo stack like any other model mutation, then refreshes
+        the inspector. ``execute()`` invalidates ``self._result``, so
+        any previously-displayed end-force block / N·V·M diagrams would
+        otherwise keep painting forces for a load that no longer exists.
+        A full ``refresh()`` rebuilds the body against the now-``None``
+        result, clearing the stale diagrams. The loads table picks up
+        the row removal as part of that rebuild."""
+        cmd = DeleteMemberLoadCmd(
+            elem_id=elem_id, load_index=load_index,
+        )
+        self.execute(cmd)
+        if (self._element_inspector is not None
+                and self._element_inspector.isVisible()):
+            self._element_inspector.refresh(
+                self._model, self._result,
+                multi_result=self._multi_result,
+            )
+
+    def add_member_load_from_inspector(self, elem_id: int) -> None:
+        """Host-side hook for the inspector's "Add member load…" button.
+
+        Opens the existing :class:`MemberLoadDialog` (Add mode) and,
+        on Accept, lands the new load via :class:`AddMemberLoadCmd` so
+        the change is undoable. Refreshes the inspector against the now-
+        invalidated result so the Results tab shows the "No analysis
+        results yet" placeholder rather than stale N/V/M diagrams."""
+        try:
+            d = MemberLoadDialog(self, model=self._model, elem_id=elem_id)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot add member load", str(e))
+            return
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        load = d.result_value
+        if load is None:
+            return
+        # Register a newly-typed load case before the load references it,
+        # mirroring the _add_member_load path. Without this the load is
+        # stored against a case that model.load_cases never learns about,
+        # so cases_with_loads() / Solve All / the case selector ignore it.
+        self._ensure_load_case_exists(getattr(load, "load_case", "DEFAULT"))
+        try:
+            self.execute(AddMemberLoadCmd(elem_id=elem_id, load=load))
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot add member load", str(e))
+            return
+        if (self._element_inspector is not None
+                and self._element_inspector.isVisible()):
+            self._element_inspector.refresh(
+                self._model, self._result,
+                multi_result=self._multi_result,
+            )
+
+    def edit_member_load_from_inspector(
+        self, elem_id: int, load_index: int,
+    ) -> None:
+        """Host-side hook for the inspector's per-row Edit buttons.
+
+        Opens the :class:`MemberLoadDialog` pre-filled with the existing
+        row and, on Accept, swaps the row via :class:`UpdateMemberLoadCmd`
+        (single undo step, exact-instance restore on undo). Refreshes
+        the inspector — same stale-results-clearing path as Add / Delete."""
+        elem = next(
+            (e for e in self._model.elements if e.id == elem_id), None,
+        )
+        if elem is None:
+            QMessageBox.warning(
+                self, "Cannot edit member load",
+                f"Element {elem_id} does not exist.",
+            )
+            return
+        if not (0 <= load_index < len(elem.member_loads)):
+            QMessageBox.warning(
+                self, "Cannot edit member load",
+                f"Load index {load_index} out of range for element "
+                f"{elem_id}.",
+            )
+            return
+        existing = elem.member_loads[load_index]
+        try:
+            d = MemberLoadDialog(
+                self, model=self._model, elem_id=elem_id,
+                existing_load=existing, existing_index=load_index,
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot edit member load", str(e))
+            return
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_load = d.result_value
+        if new_load is None:
+            return
+        # Register a newly-typed load case before the swap references it
+        # (same gap the Add hook has — see add_member_load_from_inspector).
+        self._ensure_load_case_exists(getattr(new_load, "load_case", "DEFAULT"))
+        try:
+            self.execute(UpdateMemberLoadCmd(
+                elem_id=elem_id, load_index=load_index,
+                new_load=new_load,
+            ))
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot edit member load", str(e))
+            return
+        if (self._element_inspector is not None
+                and self._element_inspector.isVisible()):
+            self._element_inspector.refresh(
+                self._model, self._result,
+                multi_result=self._multi_result,
+            )
+
+    def _on_element_inspector_closed(self, _result_code=None) -> None:
+        """Re-enable the editing surface once the user closes the
+        inspector (Close button or window-close). Called by the dialog's
+        ``finished`` signal — the connection is wired once at
+        construction in :meth:`_open_element_inspector`."""
+        self._set_editing_locked(False)
+
+    def _set_editing_locked(self, locked: bool) -> None:
+        """Toggle the editing surface — tool palette (everything except
+        Select) and the explicit "Edit" QActions registered in
+        :attr:`_lockable_actions`. View, solve, modal, fit, snap,
+        diagram-station and deformed-scale actions stay enabled so the
+        user can still pan / zoom / re-solve / toggle overlays while
+        the inspector is open. When locking, also forces the active
+        tool back to "select" so pending left-clicks can't add nodes /
+        elements / loads."""
+        self._editing_locked = bool(locked)
+        for name, action in self._tool_actions.items():
+            action.setEnabled((not locked) or name == "select")
+        for action in self._lockable_actions:
+            action.setEnabled(not locked)
+        if locked and self._active_tool.name != "select":
+            self._select_tool("select")
+        # Undo / Redo aren't in ``_lockable_actions``; ``_refresh_undo_redo``
+        # owns their enabled state and reads ``_editing_locked``.
+        self._refresh_undo_redo()
+
     def _populate_examples_menu(self) -> None:
         """Fill the File → Open example submenu from ``inputs/``."""
         self._examples_menu.clear()
@@ -1096,6 +2593,232 @@ class MainWindow(QMainWindow):
             return
         x, y = d.result_value
         self.execute(AddNodeCmd(x=x, y=y))
+
+    def _do_renumber_elements(self) -> None:
+        """Open the RenumberElementsDialog, then execute the command and
+        translate the canvas selection + open inspector to the new ids."""
+        if not self._model.elements:
+            QMessageBox.information(
+                self, "Renumber elements",
+                "No elements to renumber.",
+            )
+            return
+        selected = frozenset(self.canvas.get_selected_elements())
+        try:
+            d = RenumberElementsDialog(
+                self, model=self._model, selected_ids=selected,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Renumber elements", str(exc))
+            return
+        if d.exec() != RenumberElementsDialog.DialogCode.Accepted:
+            return
+        mapping = d.result_value or {}
+        if not mapping or all(old == new for old, new in mapping.items()):
+            self.set_status("Renumber: ids already match the chosen order.")
+            return
+        # Remember the inspector target id (if any) so we can re-point
+        # at the same physical element under its new id post-execute.
+        inspector_old_id: int | None = None
+        if (
+            self._element_inspector is not None
+            and self._element_inspector.isVisible()
+        ):
+            inspector_old_id = getattr(
+                self._element_inspector, "_elem_id", None,
+            )
+        self.execute(RenumberElementsCmd(mapping=mapping))
+        # Translate selection.
+        new_sel = {mapping.get(eid, eid) for eid in selected}
+        self.canvas.clear_selection()
+        for eid in new_sel:
+            self.canvas.add_element_to_selection(eid)
+        self.canvas.redraw()
+        # Translate the inspector target.
+        if inspector_old_id is not None and inspector_old_id in mapping:
+            new_id = mapping[inspector_old_id]
+            try:
+                self._element_inspector.set_target(
+                    self._model, new_id, self._result,
+                    multi_result=self._multi_result,
+                )
+            except Exception:
+                # Defensive: if the inspector API drifts, fall back to
+                # closing it rather than crashing the renumber.
+                self._element_inspector.close()
+        self.set_status(
+            f"Renumbered {len(mapping)} element"
+            f"{'s' if len(mapping) != 1 else ''}."
+        )
+
+    def _do_batch_assign_selected(self) -> None:
+        """Open the BatchAssignDialog for the current element selection."""
+        elems = list(self.canvas.get_selected_elements())
+        if not elems:
+            QMessageBox.information(
+                self, "Batch assign",
+                "Select one or more elements first "
+                "(box-drag in Select mode or Shift-click to multi-pick).",
+            )
+            return
+        try:
+            d = BatchAssignDialog(
+                self, model=self._model, element_count=len(elems),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Batch assign", str(exc))
+            return
+        if d.exec() != BatchAssignDialog.DialogCode.Accepted:
+            return
+        result = d.result_value or {}
+        cmd = BatchUpdateElementsCmd(
+            element_ids=elems,
+            section_id=result.get("section_id"),
+            material_override_id=result.get("material_override_id"),
+        )
+        self.execute(cmd)
+
+    # ── batch load assignment (v0.26 — PR #41) ─────────────────────────
+
+    def _do_batch_member_load(self) -> None:
+        """Open BatchMemberLoadDialog for the current element selection.
+
+        Requires ≥ 2 selected elements; otherwise surfaces a clear
+        QMessageBox and returns. Builds the per-element load instances
+        from the dialog spec (handling relative point-load position →
+        absolute a per element here, NOT in the command) so the
+        command receives concrete load objects and stays geometry-free.
+        """
+        elem_ids = self.canvas.get_selected_elements()
+        if len(elem_ids) < 2:
+            QMessageBox.information(
+                self, "Batch member load",
+                "Select two or more elements to batch assign member "
+                "loads (box-drag in Select mode or Shift-click to "
+                "multi-pick).",
+            )
+            return
+        try:
+            d = BatchMemberLoadDialog(
+                self, model=self._model, element_ids=elem_ids,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Batch member load", str(exc))
+            return
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        spec = d.result_value
+        if not spec:
+            return
+        try:
+            loads = self._build_batch_member_loads(spec, elem_ids)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Batch member load", str(exc))
+            return
+        self.execute(BatchAddMemberLoadsCmd(loads=loads))
+
+    def _build_batch_member_loads(
+        self, spec: dict, elem_ids: "frozenset[int]"
+    ) -> list[tuple[int, object]]:
+        """Turn the dialog's spec dict + the selected element set into
+        a list of (elem_id, load_instance) pairs ready for
+        :class:`BatchAddMemberLoadsCmd`.
+
+        Point-load relative-position conversion happens here (NOT in
+        the command), so the command stores absolute ``a`` per
+        element exactly matching the existing PointLoad data shape.
+        """
+        from ..model import (
+            FrameTemperatureLoad,
+            PointLoad,
+            TrussTemperatureLoad,
+            UniformDistributedLoad,
+        )
+        kind = spec["kind"]
+        case = spec["load_case"]
+        elems = [e for e in self._model.elements if e.id in elem_ids]
+        # Stable order — sorted by id — so the resulting nodal_loads /
+        # member_loads order is deterministic across runs and tests can
+        # rely on it.
+        elems.sort(key=lambda e: e.id)
+        result: list[tuple[int, object]] = []
+        if kind == "udl":
+            for e in elems:
+                load = UniformDistributedLoad(
+                    wy=spec["wy"], wx=spec["wx"],
+                    coord_system=spec["coord_system"],
+                    load_case=case,
+                )
+                result.append((e.id, load))
+        elif kind == "point":
+            ratio = spec["ratio"]
+            for e in elems:
+                ni = self._model.nodes[e.node_i]
+                nj = self._model.nodes[e.node_j]
+                L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+                a = ratio * L
+                load = PointLoad(
+                    py=spec["py"], a=a, px=spec["px"],
+                    coord_system=spec["coord_system"],
+                    load_case=case,
+                )
+                result.append((e.id, load))
+        elif kind == "thermal_uniform":
+            from ..element import TrussElement2D
+            dT = spec["delta_T"]
+            for e in elems:
+                if isinstance(e, TrussElement2D):
+                    load = TrussTemperatureLoad(delta_T=dT, load_case=case)
+                else:
+                    load = FrameTemperatureLoad(
+                        t_top=dT, t_bottom=dT, load_case=case,
+                    )
+                result.append((e.id, load))
+        elif kind == "thermal_gradient":
+            for e in elems:
+                load = FrameTemperatureLoad(
+                    t_top=spec["t_top"], t_bottom=spec["t_bottom"],
+                    load_case=case,
+                )
+                result.append((e.id, load))
+        else:
+            raise ValueError(f"Unknown batch member-load kind: {kind!r}.")
+        return result
+
+    def _do_batch_nodal_load(self) -> None:
+        """Open BatchNodalLoadDialog for the current node selection.
+
+        Requires ≥ 2 selected nodes. Appends one NodalLoad per node;
+        does NOT overwrite existing nodal loads.
+        """
+        from ..model import NodalLoad
+        node_ids = self.canvas.get_selected_nodes()
+        if len(node_ids) < 2:
+            QMessageBox.information(
+                self, "Batch nodal load",
+                "Select two or more nodes to batch assign nodal loads.",
+            )
+            return
+        try:
+            d = BatchNodalLoadDialog(
+                self, model=self._model, node_ids=node_ids,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Batch nodal load", str(exc))
+            return
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        spec = d.result_value
+        if not spec:
+            return
+        loads = [
+            NodalLoad(
+                node_id=nid, fx=spec["fx"], fy=spec["fy"], mz=spec["mz"],
+                load_case=spec["load_case"],
+            )
+            for nid in sorted(node_ids)
+        ]
+        self.execute(BatchAddNodalLoadsCmd(loads=loads))
 
     def _do_building_wizard(self) -> None:
         try:
@@ -1178,8 +2901,16 @@ class MainWindow(QMainWindow):
         self._redo.append(cmd)
         self._modified = True
         self._invalidate_result()
+        self._remap_groups_for_renumber(cmd, inverse=True)
         self._update_title()
         self.canvas.redraw()
+        undone = self._command_label(cmd)
+        if self._undo:
+            nxt = self._command_label(self._undo[-1])
+            self.set_status(f"Undid {undone}. Undo: {nxt}. Redo: {undone}.")
+        else:
+            self.set_status(f"Undid {undone}. Redo: {undone}.")
+        self._refresh_undo_redo()
 
     def _do_redo(self) -> None:
         if not self._redo:
@@ -1194,8 +2925,72 @@ class MainWindow(QMainWindow):
         self._undo.append(cmd)
         self._modified = True
         self._invalidate_result()
+        self._remap_groups_for_renumber(cmd)
         self._update_title()
         self.canvas.redraw()
+        redone = self._command_label(cmd)
+        if self._redo:
+            nxt = self._command_label(self._redo[-1])
+            self.set_status(f"Redid {redone}. Undo: {redone}. Redo: {nxt}.")
+        else:
+            self.set_status(f"Redid {redone}. Undo: {redone}.")
+        self._refresh_undo_redo()
+
+    _CMD_LABEL_OVERRIDES = {
+        "batch assign properties": "Batch Edit Element Properties",
+        "edit nodal load row":     "Edit Nodal Load",
+        "delete nodal load row":   "Delete Nodal Load",
+        "replace model":           "Replace Model",
+    }
+
+    def _command_label(self, command: Command) -> str:
+        """Human-readable Title-Case label for the Edit menu / status bar."""
+        desc = str(getattr(command, "description", "") or "command").strip()
+        if desc in self._CMD_LABEL_OVERRIDES:
+            return self._CMD_LABEL_OVERRIDES[desc]
+        return desc.title() if desc else "Command"
+
+    def _refresh_undo_redo(self) -> None:
+        """Single source of truth for Undo/Redo action text, tooltip and
+        enabled state. Honors the editing-lock flag and the stack contents."""
+        locked = self._editing_locked
+        self._set_history_action(self.act_undo, self._undo, "Undo", locked)
+        self._set_history_action(self.act_redo, self._redo, "Redo", locked)
+
+    def _set_history_action(
+        self, action: QAction, stack: list[Command], prefix: str, locked: bool,
+    ) -> None:
+        if stack:
+            lbl = self._command_label(stack[-1])
+            action.setText(f"&{prefix} {lbl}")
+            action.setToolTip(f"{prefix} {lbl}")
+            action.setEnabled(not locked)
+        else:
+            action.setText(f"&{prefix}")
+            action.setToolTip(prefix)
+            action.setEnabled(False)
+
+    def _remap_groups_for_renumber(
+        self, command: Command, *, inverse: bool = False,
+    ) -> None:
+        """Remap group element_ids when RenumberElementsCmd runs or is undone.
+
+        Groups store element IDs as bare ints; when element IDs change the
+        group memberships must follow.  Node IDs are never changed by renumber
+        so node_ids are untouched.
+        """
+        from ..gui_common.commands import RenumberElementsCmd
+        if not isinstance(command, RenumberElementsCmd):
+            return
+        mapping = (
+            {v: k for k, v in command.mapping.items()}
+            if inverse
+            else command.mapping
+        )
+        for group in self._groups.values():
+            group.element_ids = sorted({
+                mapping.get(eid, eid) for eid in group.element_ids
+            })
 
     # ── file menu actions ──
 
@@ -1220,6 +3015,7 @@ class MainWindow(QMainWindow):
             return
         self._model = _build_starter_model()
         self._grid = GridSystem()
+        self._groups = {}
         self._undo.clear()
         self._redo.clear()
         self._modified = False
@@ -1227,6 +3023,7 @@ class MainWindow(QMainWindow):
         self._clear_result()
         self._update_title()
         self.canvas.fit_to_view()
+        self._refresh_undo_redo()
 
     def _do_open(self) -> None:
         if not self._confirm_discard():
@@ -1251,9 +3048,11 @@ class MainWindow(QMainWindow):
                 new_model = project.model
                 new_grid = project.grid
                 new_view = project.view
+                new_groups = {g.name: g for g in project.groups}
             else:
                 new_model = read_input_file(path)
                 new_grid = GridSystem()
+                new_groups = {}
         except FileNotFoundError:
             QMessageBox.warning(self, "Open failed",
                                   f"File not found: {path}")
@@ -1267,12 +3066,14 @@ class MainWindow(QMainWindow):
             return
         self._model = new_model
         self._grid = new_grid
+        self._groups = new_groups
         self._undo.clear()
         self._redo.clear()
         self._modified = False
         self._current_path = path
         self._clear_result()
         self._update_title()
+        self._refresh_undo_redo()
         # New file → fit the view by default; if the project carries a
         # saved ViewState, that overrides the fit a moment later.
         self.canvas.fit_to_view()
@@ -1326,7 +3127,9 @@ class MainWindow(QMainWindow):
                 )
                 project = Project(
                     model=self._model, grid=self._grid,
-                    view=view, title=self._model.title,
+                    view=view,
+                    groups=list(self._groups.values()),
+                    title=self._model.title,
                 )
                 save_project_json(project, path)
             else:
@@ -1343,6 +3146,18 @@ class MainWindow(QMainWindow):
     # ── solve ──
 
     def _do_solve(self) -> None:
+        """F5 — run every enabled load case."""
+        self._run_static_solve(active_only=False)
+
+    def _do_solve_active_only(self) -> None:
+        """Shift+F5 — run only the currently-selected case.
+
+        Replaces only that case's slot in ``_multi_result`` (or builds
+        a fresh wrapper containing just that case if there is none)
+        so the remaining solved cases stay valid."""
+        self._run_static_solve(active_only=True)
+
+    def _run_static_solve(self, *, active_only: bool) -> None:
         if not self._model.elements:
             QMessageBox.warning(
                 self, "Cannot solve",
@@ -1350,41 +3165,448 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Pre-solve validation — collect both fatal and warning issues.
-        fatal, warnings = _validate_model_for_solve(self._model)
-        if fatal:
+        # Load-case registry safety net: a load tagged with a case the
+        # registry never learned about (e.g. a dialog path that forgot to
+        # register, or a programmatic edit) would otherwise be silently
+        # dropped by cases_with_loads / Solve All. Auto-register any such
+        # orphan tags so every assigned case is treated as a real case.
+        auto_registered = sync_load_case_registry(self._model)
+        if auto_registered:
+            self._refresh_case_selector_combo()
+            self.set_status(
+                "Auto-registered load case(s): "
+                + ", ".join(auto_registered)
+            )
+
+        # PR #31 — pre-solve validation.  Errors block the solve, surface
+        # the report in the result panel, and paint problem nodes/elements
+        # on the canvas.  Warnings prompt the user to proceed.  Failed
+        # validation also blanks any stale solved result so the user can't
+        # mistake a previous run's diagrams for current state.
+        v_result = validate_model(self._model)
+        if v_result.has_errors:
+            self._clear_stale_result_state()
+            _push_validation_to_canvas(self.canvas, v_result)
+            self._show_validation_in_report(v_result)
             QMessageBox.critical(
                 self, "Model not ready to solve",
-                "The following problems must be fixed first:\n\n  - "
-                + "\n  - ".join(fatal),
+                v_result.format_report()
+                or "Validation failed for an unknown reason.",
             )
             return
-        if warnings:
+
+        # Orphan-node dedicated dialog: offer deletion, continue, or cancel.
+        # Orphan warnings are routed via the stable `code` tag (set by
+        # _find_orphan_nodes) so the UI doesn't depend on message wording.
+        # They are handled here and excluded from the generic warnings
+        # dialog below to avoid duplication.
+        orphan_issues = [
+            i for i in v_result.issues
+            if i.severity == "warning"
+            and getattr(i, "code", "") == "orphan_node"
+        ]
+        if orphan_issues:
+            # Deduplicate defensively — duplicate orphan ids would push the
+            # delete path through redundant DeleteNodeCmd attempts.
+            orphan_nids = sorted({
+                nid for issue in orphan_issues for nid in issue.node_ids
+            })
+            _push_validation_to_canvas(self.canvas, v_result)
+            self._show_validation_in_report(v_result)
+            choice = _show_orphan_nodes_dialog(self, orphan_nids)
+            if choice == "delete":
+                # Single undo step for the whole batch (one Ctrl+Z reverts
+                # all orphan deletions together, matching the behaviour of
+                # _delete_selected_objects).
+                self.execute(BatchDeleteCmd(
+                    node_ids=orphan_nids, element_ids=[],
+                ))
+                # Re-validate: execute() cleared highlights; re-check for
+                # any issues that survive after the deletion.
+                v_result = validate_model(self._model)
+                if v_result.has_errors:
+                    self._clear_stale_result_state()
+                    _push_validation_to_canvas(self.canvas, v_result)
+                    self._show_validation_in_report(v_result)
+                    QMessageBox.critical(
+                        self, "Model not ready to solve",
+                        v_result.format_report()
+                        or "Validation failed for an unknown reason.",
+                    )
+                    return
+            elif choice == "cancel":
+                self._clear_stale_result_state()
+                _push_validation_to_canvas(self.canvas, v_result)
+                self._show_validation_in_report(v_result)
+                return
+            # "continue": fall through with original v_result
+
+        # Generic warnings dialog for any remaining non-orphan warnings.
+        non_orphan_warnings = [
+            i for i in v_result.issues
+            if i.severity == "warning"
+            and getattr(i, "code", "") != "orphan_node"
+        ]
+        if non_orphan_warnings:
+            warnings_text = "\n".join(
+                f"  - {i.message}" for i in non_orphan_warnings
+            )
             ans = QMessageBox.question(
                 self, "Warnings before solve",
-                "The model has these warnings:\n\n  - "
-                + "\n  - ".join(warnings)
+                "The model has these warnings:\n\n"
+                + warnings_text
                 + "\n\nSolve anyway?",
                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             )
             if ans != QMessageBox.StandardButton.Ok:
+                # User cancelled — keep the warnings visible after the
+                # modal closes: highlights on the canvas, report in the
+                # text panel, and wipe any stale numeric result so a
+                # prior solve's diagrams don't confuse the picture.
+                self._clear_stale_result_state()
+                _push_validation_to_canvas(self.canvas, v_result)
+                self._show_validation_in_report(v_result)
+                return
+        # Validation passed (or user dismissed warnings).  Drop any
+        # leftover problem highlights from a prior failed pass.
+        self.canvas.clear_validation_highlights()
+        # PR #31 — for "Solve All Cases", restrict the request to cases
+        # that carry at least one load source.  This skips empty
+        # placeholders (WIND with no wind loads, THERMAL with no thermal
+        # loads, etc.) so the solver never wastes a factorisation on a
+        # zero force vector.  Active-only solve is untouched: the user
+        # picked that case explicitly.
+        skipped_cases: list[str] = []
+        if not active_only:
+            all_enabled = sorted(
+                n for n, lc in self._model.load_cases.items() if lc.enabled
+            )
+            active_cases = cases_with_loads(self._model)
+            skipped_cases = sorted(set(all_enabled) - set(active_cases))
+            if not active_cases:
+                self._clear_stale_result_state()
+                QMessageBox.warning(
+                    self, "Nothing to solve",
+                    "No active loads found. Add loads or enable "
+                    "self-weight before running analysis.",
+                )
+                self.set_status(
+                    "No active loads found — solve skipped."
+                )
                 return
         try:
-            self._result = run_analysis(self._model, verbose=False)
+            if active_only:
+                # Solve only the active case. If a previous multi-result
+                # exists, merge in the fresh single-case result so the
+                # other cases stay valid.
+                active = self._active_case
+                if active == SUM_ALL_KEY:
+                    # SUM_ALL isn't a real case to solve. Fall back to
+                    # full re-run.
+                    new_multi = run_multi_case_analysis(
+                        self._model, verbose=False,
+                    )
+                else:
+                    fresh = run_multi_case_analysis(
+                        self._model, verbose=False, cases=[active],
+                        active_case=active,
+                    )
+                    if self._multi_result is not None:
+                        prev = self._multi_result
+                        # Build a merged result: prior solved cases +
+                        # the fresh single-case one. When the
+                        # active-only re-solve FAILS we must drop the
+                        # prior result for the active case — otherwise
+                        # the canvas would keep showing a stale
+                        # success result while the wrapper claims the
+                        # case failed (Gemini PR #28 finding).
+                        merged_cases = dict(prev.cases)
+                        merged_failed = dict(prev.failed_cases)
+                        merged_requested = list(prev.requested_cases)
+                        if active in merged_failed:
+                            merged_failed.pop(active, None)
+                        if active in fresh.cases:
+                            merged_cases[active] = fresh.cases[active]
+                        elif active in fresh.failed_cases:
+                            merged_cases.pop(active, None)
+                            merged_failed[active] = fresh.failed_cases[active]
+                        if active not in merged_requested:
+                            merged_requested.append(active)
+                        new_multi = MultiCaseAnalysisResult(
+                            cases=merged_cases,
+                            active_case=active,
+                            failed_cases=merged_failed,
+                            requested_cases=merged_requested,
+                        )
+                    else:
+                        new_multi = fresh
+            else:
+                new_multi = run_multi_case_analysis(
+                    self._model, verbose=False, cases=active_cases,
+                )
         except Exception as e:
+            # PR #31 — solve crashed.  Treat this as a hard validation
+            # failure: clear stale results, surface the problem in the
+            # report, paint any pre-solve warnings/errors that we
+            # already know about, and tell the user.  Old result
+            # diagrams must NOT linger on the canvas.
+            self._clear_stale_result_state()
+            _push_validation_to_canvas(self.canvas, v_result)
+            self._result_text.setPlainText(
+                f"Analysis failed: {type(e).__name__}: {e}\n\n"
+                "The model is unchanged. Fix the highlighted problems "
+                "and try again."
+            )
             QMessageBox.critical(
                 self, "Analysis failed",
                 f"{type(e).__name__}: {e}\n\nThe model is unchanged.",
             )
             return
-        self.canvas.set_result(self._result)
-        self._update_result_text()
-        if self._result.status == "ok":
-            self.set_status(
-                f"Analysis complete · residual = {self._result.residual:.2e}"
+        self._multi_result = new_multi
+        # Pick a sensible active case for the freshly-solved result
+        # (may differ from the one the user was looking at if e.g. they
+        # had SUM_ALL and an enabled case just failed). A still-defined
+        # combination selection is preserved as-is — selecting it after
+        # a solve resolves to the combined result (or its placeholder).
+        if self._active_case not in self._model.load_combinations:
+            self._active_case = make_active_case_safe(
+                self._multi_result, self._active_case,
             )
+        self._refresh_case_selector_combo()
+        self._push_active_case_to_canvas()
+        self._update_window_title_with_case()
+        # Push the active case's result into an open inspector so
+        # the user doesn't have to close-and-reopen after a solve.
+        if (self._element_inspector is not None
+                and self._element_inspector.isVisible()):
+            self._element_inspector.refresh(self._model, self._result, multi_result=self._multi_result)
+        n_solved = len(new_multi.cases)
+        n_failed = len(new_multi.failed_cases)
+        skipped_suffix = (
+            f" · skipped unused load cases: {', '.join(skipped_cases)}"
+            if skipped_cases else ""
+        )
+        if n_failed:
+            failed_names = ", ".join(sorted(new_multi.failed_cases))
+            self.set_status(
+                f"Solved {n_solved}/{len(new_multi.requested_cases)} "
+                f"case(s); failed: {failed_names}{skipped_suffix}"
+            )
+        elif n_solved == 0:
+            self.set_status("No cases were solved.")
         else:
-            self.set_status(f"Analysis status: {self._result.status}")
+            active_r = new_multi.get(self._active_case)
+            if active_r is not None and getattr(active_r, "residual", None) is not None:
+                self.set_status(
+                    f"Solved {n_solved} case(s) · active = "
+                    f"{self._active_case} · "
+                    f"residual = {active_r.residual:.2e}{skipped_suffix}"
+                )
+            else:
+                self.set_status(
+                    f"Solved {n_solved} case(s) · active = "
+                    f"{self._active_case}{skipped_suffix}"
+                )
+
+    # ── PR-A: active case + multi-result plumbing ──────────────────
+
+    def _on_active_case_changed(self, new_name: str) -> None:
+        """Toolbar combo signal handler.
+
+        Empty signals are dropped (combo is repopulated by clearing →
+        adding items, which emits an empty currentTextChanged).
+
+        ``currentTextChanged`` emits the display label, which may carry
+        decorations such as ``"  [comb]"`` or ``"  (disabled)"``.  Read
+        the combo's ``currentData()`` (the UserData set by ``addItem``)
+        so ``_active_case`` always holds the bare case / combination
+        name, not a decorated label string."""
+        if not new_name:
+            return
+        # Display labels have decorations — userData is always the raw name.
+        raw_name: str = self._case_combo.currentData() or new_name
+        if raw_name == self._active_case:
+            return
+        self._active_case = raw_name
+        self._push_active_case_to_canvas()
+        self._update_window_title_with_case()
+        if (
+            self._element_inspector is not None
+            and self._element_inspector.isVisible()
+        ):
+            self._element_inspector.refresh(self._model, self._result, multi_result=self._multi_result)
+        # PR #29: when the user selects an unavailable combination,
+        # explain WHY there's no result rather than leaving a bare
+        # placeholder.
+        if (
+            raw_name in self._model.load_combinations
+            and self._result is None
+        ):
+            comb = self._model.load_combinations[raw_name]
+            if self._multi_result is None:
+                self.set_status(
+                    f"Combination {raw_name} needs a solve first (F5)."
+                )
+            else:
+                missing = self._multi_result.missing_cases_for(comb.terms)
+                if missing:
+                    # Distinguish "unsolved" from "unused" — a referenced
+                    # case with no assigned loads can never solve, so say
+                    # so plainly instead of an open-ended "needs solve".
+                    used = used_case_names(self._model)
+                    no_loads = [c for c in missing if c not in used]
+                    if no_loads:
+                        self.set_status(
+                            f"Combination {raw_name} requires solved "
+                            f"results for {', '.join(missing)}. "
+                            f"{', '.join(no_loads)} "
+                            f"{'have' if len(no_loads) > 1 else 'has'} "
+                            f"no assigned loads."
+                        )
+                    else:
+                        self.set_status(
+                            f"Combination {raw_name} requires solved "
+                            f"results for {', '.join(missing)}."
+                        )
+
+    def _refresh_case_selector_combo(self) -> None:
+        """Repopulate the toolbar combo from the model's case dict.
+
+        Includes SUM_ALL last when a multi_result with sum_all_available()
+        is in hand. Blocks signals during repopulation so the
+        currentTextChanged dance doesn't trigger a spurious
+        ``_on_active_case_changed`` mid-rebuild."""
+        if not hasattr(self, "_case_combo"):
+            return
+        combo = self._case_combo
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            # Shared entry list (label, raw_name) — same routing the
+            # per-element inspector's local result selector uses, so
+            # labels (incl. the "(no loads assigned)" tag for unused
+            # enabled cases) and the SUM_ALL / combination rules never
+            # drift between the toolbar combo and the dialog selector.
+            for label, raw_name in case_combo_entries(
+                self._model, self._multi_result,
+            ):
+                combo.addItem(label, raw_name)
+            # Restore selection by matching the userData (the raw
+            # case name, not the "(disabled)" label).
+            idx = combo.findData(self._active_case)
+            if idx < 0:
+                # Fall back to DEFAULT (or the first item).
+                idx = combo.findData("DEFAULT")
+                if idx < 0 and combo.count() > 0:
+                    idx = 0
+                if idx >= 0:
+                    self._active_case = combo.itemData(idx)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        finally:
+            combo.blockSignals(False)
+
+    def _resolve_active_result(self):
+        """Resolve ``self._active_case`` to a concrete ``AnalysisResult``
+        (or ``None`` for a pre-solve / unavailable selection).
+
+        Delegates to :func:`resolve_view` so case / SUM_ALL / combination
+        routing lives in one Qt-free place shared with the per-element
+        inspector's local result selector."""
+        result, _status = resolve_view(
+            self._model, self._multi_result, self._active_case,
+        )
+        return result
+
+    def _push_active_case_to_canvas(self) -> None:
+        """Sync ``self._result`` (the legacy single-case view) and the
+        canvas to whatever the active case / combination resolves to."""
+        self._result = self._resolve_active_result()
+        self.canvas.set_result(self._result)
+        if hasattr(self.canvas, "set_active_case"):
+            self.canvas.set_active_case(self._active_case)
+        # PR #29: when a combination (or SUM_ALL) is active, tell the
+        # canvas which cases contribute so its load-dimming highlights
+        # all of them rather than a single (misleading) case.
+        if hasattr(self.canvas, "set_active_combination_cases"):
+            if self._active_case in self._model.load_combinations:
+                comb = self._model.load_combinations[self._active_case]
+                self.canvas.set_active_combination_cases(
+                    set(comb.terms.keys())
+                )
+            elif (
+                self._active_case == SUM_ALL_KEY
+                and self._multi_result is not None
+            ):
+                # SUM_ALL = 1.0 × every solved case → highlight them all.
+                self.canvas.set_active_combination_cases(
+                    set(self._multi_result.cases.keys())
+                )
+            else:
+                self.canvas.set_active_combination_cases(None)
+        self._update_result_text()
+
+    def _on_active_case_loads_only_toggled(self, on: bool) -> None:
+        """View → Active case loads only slot."""
+        self._active_case_loads_only = bool(on)
+        if hasattr(self.canvas, "set_active_case_loads_only"):
+            self.canvas.set_active_case_loads_only(self._active_case_loads_only)
+
+    def _on_show_local_axes_toggled(self, on: bool) -> None:
+        """View → Show local axes slot."""
+        self.canvas.show_local_axes = bool(on)
+        self.canvas.redraw()
+
+    def _show_load_case_manager(self) -> None:
+        """Open the Load Case Manager dialog and apply its result.
+
+        The dialog returns a list of CRUD commands the host executes
+        through the standard ``execute()`` pipeline so every change is
+        undoable and goes through the invalidation surface (which
+        clears the multi-case result)."""
+        from .dialogs import LoadCaseManagerDialog
+        d = LoadCaseManagerDialog(self, model=self._model)
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        for cmd in d.result_value or []:
+            try:
+                self.execute(cmd)
+            except ValueError as e:
+                QMessageBox.warning(self, "Load case", str(e))
+                return
+        self._refresh_case_selector_combo()
+
+    def _show_load_combination_manager(self) -> None:
+        """Open the Load Combination Manager dialog and apply its
+        result commands through the undoable ``execute()`` pipeline."""
+        from .dialogs import LoadCombinationManagerDialog
+        d = LoadCombinationManagerDialog(self, model=self._model)
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        for cmd in d.result_value or []:
+            try:
+                self.execute(cmd)
+            except ValueError as e:
+                QMessageBox.warning(self, "Load combination", str(e))
+                return
+        self._refresh_case_selector_combo()
+
+    def _update_window_title_with_case(self) -> None:
+        """Reflect the active case / combination in the window title
+        when it differs from DEFAULT (so a single-case workflow's title
+        stays clean)."""
+        base = getattr(self, "_base_window_title", None)
+        if base is None:
+            base = self.windowTitle()
+            for sep in (" — case: ", " — comb: "):
+                base = base.split(sep)[0]
+            self._base_window_title = base
+        if self._active_case == "DEFAULT" or self._multi_result is None:
+            self.setWindowTitle(base)
+        elif self._active_case in self._model.load_combinations:
+            self.setWindowTitle(f"{base} — comb: {self._active_case}")
+        else:
+            self.setWindowTitle(f"{base} — case: {self._active_case}")
 
     def _do_modal(self) -> None:
         if not self._model.elements:
@@ -1405,6 +3627,10 @@ class MainWindow(QMainWindow):
                 self._model,
                 n_modes=d.result_value["n_modes"],
                 normalisation=d.result_value["normalisation"],
+                mass_formulation=d.result_value.get(
+                    "mass_formulation", "consistent",
+                ),
+                mass_source=getattr(self._model, "modal_mass_source", None),
             )
         except ValueError as e:
             QMessageBox.warning(self, "Modal analysis", str(e))
@@ -1433,22 +3659,93 @@ class MainWindow(QMainWindow):
             self, modal_result, on_select=_select, on_close=_on_close,
         )
         self._modal_results_dialog.show()
+        _comp_note = (
+            f" · {modal_result.component_summary}"
+            if getattr(modal_result, "component_summary", "")
+            else ""
+        )
+        # For multi-component results the flat `frequencies` array is
+        # grouped by component (not globally ascending), so the model's
+        # true fundamental is the minimum across all components.
+        _f_min = float(min(modal_result.frequencies))
         self.set_status(
             f"Modal analysis: {modal_result.n_modes} modes · "
-            f"f₁ = {float(modal_result.frequencies[0]):.4g} Hz"
+            f"f₁ = {_f_min:.4g} Hz"
+            f"{_comp_note}"
         )
+
+    def _do_modal_mass_source(self) -> None:
+        from .dialogs import ModalMassSourceDialog
+        from ..gui_common.commands import UpdateModalMassSourceCmd
+        d = ModalMassSourceDialog(self, model=self._model)
+        if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
+            return
+        self.execute(UpdateModalMassSourceCmd(new_source=d.result_value))
 
     def _clear_result(self) -> None:
         self._result = None
+        self._multi_result = None
         self._modal_result = None
         self.canvas.clear_result()
         self.canvas.clear_modal_result()
+        self._refresh_case_selector_combo()
+        self._update_window_title_with_case()
         self._update_result_text()
 
+    def _clear_stale_result_state(self) -> None:
+        """PR #31 — wipe every cached result surface after a failed
+        validation or failed solve so the user doesn't see stale
+        diagrams that look current.
+
+        Touches: ``_result`` (single-case view), ``_multi_result``
+        (multi-case bundle), canvas overlays, the case selector combo,
+        the window title, the element-inspector result, the modal
+        results dialog, and the result text panel (caller overwrites
+        that with the new validation report if there is one)."""
+        self._result = None
+        self._multi_result = None
+        self.canvas.clear_result()
+        self._refresh_case_selector_combo()
+        self._update_window_title_with_case()
+        if (
+            self._element_inspector is not None
+            and self._element_inspector.isVisible()
+        ):
+            self._element_inspector.refresh(self._model, None, multi_result=None)
+        if self._modal_result is not None:
+            self._modal_result = None
+            self.canvas.clear_modal_result()
+            if self._modal_results_dialog is not None:
+                self._modal_results_dialog.close()
+                self._modal_results_dialog = None
+        self._update_result_text()
+
+    def _show_validation_in_report(
+        self, v_result: ModelValidationResult,
+    ) -> None:
+        """Render the validation report in the result text panel and
+        echo a one-line summary in the status bar."""
+        self._result_text.setPlainText(v_result.format_report())
+        n_err = sum(1 for i in v_result.issues if i.severity == "error")
+        n_warn = sum(1 for i in v_result.issues if i.severity == "warning")
+        self.set_status(
+            f"Analysis blocked — {n_err} error(s), {n_warn} warning(s) "
+            "found by pre-solve validation."
+        )
+
     def _invalidate_result(self) -> None:
-        if self._result is not None:
+        # PR #31 — any model mutation invalidates validation highlights
+        # too: the offending node might have just been deleted, the
+        # support added, or the truss promoted to a frame.  Re-run
+        # validation on the next solve attempt.
+        if hasattr(self, "canvas"):
+            self.canvas.clear_validation_highlights()
+        if self._result is not None or self._multi_result is not None:
             self._result = None
+            self._multi_result = None
             self.canvas.clear_result()
+            self._refresh_case_selector_combo()
+            self._update_window_title_with_case()
             self._update_result_text()
         if self._modal_result is not None:
             self._modal_result = None
@@ -1456,6 +3753,23 @@ class MainWindow(QMainWindow):
             if self._modal_results_dialog is not None:
                 self._modal_results_dialog.close()
                 self._modal_results_dialog = None
+        # Mass / self-weight summary tracks ρ / A / L from the model;
+        # any edit that invalidates a result could also have changed
+        # those numbers. The window itself is non-modal and cheap to
+        # repopulate, so refresh unconditionally when it's open.
+        if self._mass_summary_window is not None:
+            self._mass_summary_window.refresh()
+        # Same story for the assembled-joint-masses window: any model
+        # edit (nodes, supports, sections) can change M's contents.
+        # Skip the refresh when the window is hidden — _show_joint_masses
+        # always refreshes on re-open, so a hidden singleton can't
+        # show stale data. Avoiding the call here means no mass-matrix
+        # assembly on every keystroke / drag when the panel isn't open.
+        if (
+            self._joint_masses_window is not None
+            and self._joint_masses_window.isVisible()
+        ):
+            self._joint_masses_window.refresh()
 
     def _update_result_text(self) -> None:
         text = format_result(self._model, self._result) if self._result \
@@ -1469,6 +3783,62 @@ class MainWindow(QMainWindow):
                 if self._current_path else "Untitled")
         mark = "*" if self._modified else ""
         self.setWindowTitle(f"{mark}{path} — Structural Analysis GUI (Qt)")
+
+    def keyPressEvent(self, event) -> None:
+        """Route ESC to the active tool and Delete/Backspace to batch-delete.
+
+        ESC ALWAYS lands the user in Select mode after the active tool
+        has cleaned up its own state (pending pair-tool draws, in-progress
+        drag rects, etc.). ESC never touches the model and never pushes
+        an undo entry."""
+        if event.key() == Qt.Key.Key_Escape:
+            try:
+                self._active_tool.on_key("escape")
+            except Exception:
+                pass
+            # Always end in Select mode. _select_tool() is idempotent
+            # when the active tool is already Select (deactivate +
+            # activate just refresh status).
+            if self._active_tool is not self._tools["select"]:
+                self._select_tool("select")
+            self.canvas.redraw()
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            inspector_open = (
+                self._element_inspector is not None
+                and self._element_inspector.isVisible()
+            )
+            if not inspector_open:
+                self._delete_selected_objects()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _delete_selected_objects(self) -> None:
+        """Delete every currently-selected node/element in one undo step.
+
+        Cascade follows existing DeleteNodeCmd semantics — deleting a
+        node still removes its supports, nodal loads, and connected
+        elements. We delete elements first to keep already-marked
+        elements out of the per-node cascade path."""
+        nodes = list(self.canvas.get_selected_nodes())
+        elems = list(self.canvas.get_selected_elements())
+        if not nodes and not elems:
+            self.set_status("Nothing selected to delete.")
+            return
+        cmd = BatchDeleteCmd(node_ids=nodes, element_ids=elems)
+        self.execute(cmd)
+        # Only deselect ids that were actually removed from the model;
+        # if execute() failed internally the model may be unchanged.
+        for nid in nodes:
+            if nid not in self._model.nodes:
+                self.canvas.remove_node_from_selection(nid)
+        for eid in elems:
+            if not any(e.id == eid for e in self._model.elements):
+                self.canvas.remove_element_from_selection(eid)
+        self._update_selection_status()
+        self.canvas.redraw()
 
     def closeEvent(self, event) -> None:
         if not self._confirm_discard():

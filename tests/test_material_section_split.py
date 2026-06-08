@@ -150,22 +150,31 @@ def test_identical_section_numerics_distinguished_by_section_id():
         os.unlink(tmp)
 
 
-def test_member_udl_rejects_non_zero_wx():
+def test_member_udl_accepts_non_zero_wx():
+    """v0.15.0 — axial UDL components (wx) are now valid; they
+    contribute to the local axial fixed-end force vector and the N
+    diagram. The legacy reader used to reject wx != 0; that guard was
+    removed when wx became a real physics field."""
     body = (
-        "TITLE\nrejects wx\nNODES 2\n"
+        "TITLE\nwx allowed\nNODES 2\n"
         "1 0 0\n2 4 0\n"
         "MATERIALS 1\n1  0.01  1e-4  2e8\n"
         "ELEMENTS 1\n1 1 2 1 FRAME\n"
         "SUPPORTS 1\n1 1 1 1\n"
         "LOADS 0\n"
-        "MEMBER_UDL 1\n1  3.0  0.0\n"  # non-zero wx
+        "MEMBER_UDL 1\n1  3.0  0.0\n"  # non-zero wx, zero wy
     )
     fd, tmp = tempfile.mkstemp(suffix=".txt")
     os.close(fd)
     try:
         with open(tmp, "w") as f:
             f.write(body)
-        with pytest.raises(ValueError, match="wx"):
-            read_input_file(tmp)
+        m = read_input_file(tmp)
+        elem = m.elements[0]
+        assert len(elem.member_loads) == 1
+        ld = elem.member_loads[0]
+        assert ld.wx == 3.0
+        assert ld.wy == 0.0
+        assert ld.coord_system == "local"
     finally:
         os.unlink(tmp)

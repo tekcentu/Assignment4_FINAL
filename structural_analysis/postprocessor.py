@@ -53,8 +53,14 @@ def compute_member_forces(
                 if fallback is not None and dof_name != "rz":
                     u_global_elem[local_idx] = D[fallback]
 
+        # Transient loads added directly to global F (currently:
+        # self-weight) leave a raw local fixed-end vector in elem_data so
+        # the K·d − p recovery sees the same load on both sides of the
+        # solve. Trusses don't get one — their self-weight is lumped at
+        # uy DOFs, so no member distributed-load term exists.
+        p_extra = ed.get("self_weight_p_local")
         d_local, q_local = elem.local_displacement_and_end_forces(
-            model.nodes, u_global_elem
+            model.nodes, u_global_elem, p_extra_local=p_extra,
         )
 
         results[elem.id] = {

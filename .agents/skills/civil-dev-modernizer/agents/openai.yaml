@@ -1,0 +1,4 @@
+interface:
+  display_name: "CIVIL DEV Modernizer"
+  short_description: "Pilot-first structural code modernization"
+  default_prompt: "Use $civil-dev-modernizer to plan a bounded modernization pilot before editing production code."

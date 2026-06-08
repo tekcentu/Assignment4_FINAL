@@ -62,6 +62,44 @@ def _rotation_matrix_6x6(c: float, s: float) -> np.ndarray:
     return R
 
 
+def _project_load_to_local(
+    cx: float, cy: float, coord_system: str, c: float, s: float,
+) -> tuple[float, float]:
+    """Project a 2-D mechanical load's (x, y) components into the
+    element's local axes.
+
+    The 2-D transformation matrix from global to local is
+    ``T = [[c, s], [-s, c]]`` (with ``c = cos θ``, ``s = sin θ``,
+    θ the angle of the element's +x_local axis measured from global
+    +X). This mirrors the upper-left 2x2 block of the 6×6 rotation
+    used by ``transformation_matrix``.
+
+    * ``"local"``: components returned unchanged.
+    * ``"global"``: components rotated into local axes, giving BOTH
+      an axial (local-x) and a transverse (local-y) contribution for
+      inclined members.
+    * ``"gravity"``: ``cy`` carries the (signed) gravity magnitude;
+      ``cx`` is expected to be 0 (validated at load-class construction
+      time, but tolerated here without an extra check). The effective
+      global components are ``(0, -cy)`` — positive ``cy`` means a
+      load in the global gravity direction (``-Y``) — and the result
+      is the same as calling this helper with those global components.
+    """
+    if coord_system == "local":
+        return cx, cy
+    if coord_system == "global":
+        return c * cx + s * cy, -s * cx + c * cy
+    if coord_system == "gravity":
+        # Magnitude in cy, direction global -Y. cx is ignored
+        # (validated to be 0 at construction).
+        gx, gy = 0.0, -cy
+        return c * gx + s * gy, -s * gx + c * gy
+    raise ValueError(
+        f"Unknown coord_system {coord_system!r}; "
+        f"expected 'local', 'global', or 'gravity'."
+    )
+
+
 @dataclass
 class Element2D:
     """Abstract base class for 2-D structural elements.
@@ -82,6 +120,14 @@ class Element2D:
             tests). Stiffness math ignores this — it's a back-reference used
             by the writer and the GUI command propagation logic to find
             elements that belong to a given Section/Material.
+        material_id_override: optional id of a :class:`Material` that takes
+            precedence over the section's default material for this element.
+            ``None`` means "use the section default". E / α / ρ on this
+            element are always populated from the *effective* material
+            (override if set, otherwise section default) — see
+            :func:`structural_analysis.model.effective_material`. Stiffness
+            math doesn't read this attribute directly; it reads ``self.E``
+            etc., which are written at construction / propagation time.
         member_loads: List of MemberLoad objects (UDL, PointLoad, thermal).
     """
 
@@ -94,6 +140,7 @@ class Element2D:
     depth: float = 0.0
     rho: float = 0.0
     section_id: int | None = None
+    material_id_override: int | None = None
     member_loads: list[MemberLoad] = field(default_factory=list)
 
     @property
@@ -126,6 +173,35 @@ class Element2D:
             Tuple (L, c, s) — length, cos θ, sin θ.
         """
         return _length_cos_sin(nodes[self.node_i], nodes[self.node_j])
+
+    def lumped_mass_local(self, nodes: dict) -> np.ndarray:
+        """Translational-only lumped mass matrix (shared by all 2-D elements).
+
+        Local DOFs: ``[u_i, v_i, θ_i, u_j, v_j, θ_j]``. Half the total
+        bar mass ``m = ρ·A·L`` is placed at each end on ux and uy;
+        rotational θ slots receive zero. The translational block is
+        isotropic (``m/2 · I₂``) so the matrix is rotation-invariant
+        (``R.T M_loc R = M_loc``). The modal solver detects the zero
+        rz diagonals and condenses them out — see
+        :func:`structural_analysis.modal.solve_modal`.
+
+        Implemented on the base class because the formula is identical
+        for frames and trusses; subclasses override only
+        ``consistent_mass_local`` since the consistent form *does*
+        differ between element kinds.
+        """
+        L, _, _ = self.length_cos_sin(nodes)
+        rho_consistent = self.rho / 1000.0  # kg/m³ → Mg/m³
+        m_bar = rho_consistent * self.A      # Mg/m
+        if m_bar <= 0.0:
+            return np.zeros((6, 6))
+        half = 0.5 * m_bar * L
+        M = np.zeros((6, 6))
+        M[0, 0] = half
+        M[1, 1] = half
+        M[3, 3] = half
+        M[4, 4] = half
+        return M
 
     def transformation_matrix(self, nodes: dict) -> np.ndarray:
         """Build the 6×6 rotation matrix R (local → global).
@@ -202,12 +278,21 @@ class Element2D:
         R = self.transformation_matrix(nodes)
         return R.T @ k_local @ R, R.T @ p_local
 
-    def local_displacement_and_end_forces(self, nodes: dict, u_global_elem: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def local_displacement_and_end_forces(
+        self,
+        nodes: dict,
+        u_global_elem: np.ndarray,
+        p_extra_local: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Compute local displacements and member end forces.
 
         Args:
             nodes: Dict mapping node IDs to Node objects.
             u_global_elem: 6-element array of element global displacements.
+            p_extra_local: Optional extra fixed-end vector to include in
+                the recovery alongside ``local_consistent_load``. Used to
+                feed back transient loads (e.g. self-weight) that were
+                added to global F but are not stored on the element.
 
         Returns:
             Tuple (d_local, q_local) where d_local is the 6-element local
@@ -223,7 +308,10 @@ class Element2D:
         """
         R = self.transformation_matrix(nodes)
         d_local = R @ u_global_elem
-        q_local = self.raw_local_stiffness(nodes) @ d_local - self.local_consistent_load(nodes)
+        p_full = self.local_consistent_load(nodes)
+        if p_extra_local is not None:
+            p_full = p_full + np.asarray(p_extra_local, dtype=float)
+        q_local = self.raw_local_stiffness(nodes) @ d_local - p_full
         return d_local, q_local
 
 
@@ -346,22 +434,47 @@ class FrameElement2D(Element2D):
             TypeError: If a TrussTemperatureLoad is applied to a frame element
                 (use FrameTemperatureLoad with equal t_top/t_bottom instead).
         """
-        L, _, _ = self.length_cos_sin(nodes)
+        L, c, s = self.length_cos_sin(nodes)
         p = np.zeros(6)
         for load in self.member_loads:
             if isinstance(load, UniformDistributedLoad):
-                w = load.wy
-                p += np.array([0, w*L/2, w*L**2/12, 0, w*L/2, -w*L**2/12])
+                wx_l, wy_l = _project_load_to_local(
+                    load.wx, load.wy, load.coord_system, c, s,
+                )
+                # Axial (linear shape functions): half to each end.
+                if wx_l != 0.0:
+                    p += np.array([wx_l*L/2, 0, 0, wx_l*L/2, 0, 0])
+                # Transverse (Hermite cubics): wL/2 and ±wL²/12.
+                if wy_l != 0.0:
+                    p += np.array([
+                        0, wy_l*L/2, wy_l*L**2/12,
+                        0, wy_l*L/2, -wy_l*L**2/12,
+                    ])
             elif isinstance(load, PointLoad):
                 a = float(load.a)
                 if not (0 <= a <= L + 1e-10):
                     raise ValueError(f"Element {self.id}: point load a={a:.3f} outside L={L:.3f}.")
-                xi = a / L if L > 0 else 0
-                n1 = 1 - 3*xi**2 + 2*xi**3
-                n2 = L*(xi - 2*xi**2 + xi**3)
-                n3 = 3*xi**2 - 2*xi**3
-                n4 = L*(-xi**2 + xi**3)
-                p += np.array([0, load.py*n1, load.py*n2, 0, load.py*n3, load.py*n4])
+                px_l, py_l = _project_load_to_local(
+                    load.px, load.py, load.coord_system, c, s,
+                )
+                if L > 0:
+                    # Axial linear shape functions: load splits by lever rule.
+                    if px_l != 0.0:
+                        p += np.array([
+                            px_l*(L - a)/L, 0, 0,
+                            px_l*a/L,       0, 0,
+                        ])
+                    # Transverse: cubic Hermite shape functions.
+                    if py_l != 0.0:
+                        xi = a / L
+                        n1 = 1 - 3*xi**2 + 2*xi**3
+                        n2 = L*(xi - 2*xi**2 + xi**3)
+                        n3 = 3*xi**2 - 2*xi**3
+                        n4 = L*(-xi**2 + xi**3)
+                        p += np.array([
+                            0, py_l*n1, py_l*n2,
+                            0, py_l*n3, py_l*n4,
+                        ])
             elif isinstance(load, FrameTemperatureLoad):
                 # Mean temperature → axial effect
                 dT_mean = 0.5 * (load.t_top + load.t_bottom)
@@ -410,6 +523,33 @@ class FrameElement2D(Element2D):
         if self.release_j: m[5] = None
         return m
 
+    def condense_local_load_for_releases(
+        self, p_local: np.ndarray, nodes: dict,
+    ) -> np.ndarray:
+        """Apply moment-release condensation to an arbitrary local load.
+
+        Same Schur-complement reduction as
+        ``assembled_local_stiffness_and_load``, but acting on any
+        fixed-fixed local 6-vector (member loads, self-weight, …):
+            p_c = p_a  − k_ab · k_bb⁻¹ · p_b   (released entries → 0)
+
+        Callers that build a self-weight or other equivalent nodal-load
+        vector outside ``local_consistent_load`` MUST route it through
+        this helper before transforming to global, otherwise released
+        rotational terms get silently dropped at assembly time.
+        """
+        released = self._released_dofs()
+        p_arr = np.asarray(p_local, dtype=float)
+        if not released:
+            return p_arr.copy()
+        retained = [i for i in range(6) if i not in released]
+        k = self.raw_local_stiffness(nodes)
+        kab = k[np.ix_(retained, released)]
+        kbb = k[np.ix_(released, released)]
+        p_out = np.zeros(6, dtype=float)
+        p_out[retained] = p_arr[retained] - kab @ np.linalg.solve(kbb, p_arr[released])
+        return p_out
+
     def assembled_local_stiffness_and_load(self, nodes: dict) -> tuple[np.ndarray, np.ndarray]:
         """Apply Schur-complement static condensation for moment releases.
 
@@ -436,12 +576,16 @@ class FrameElement2D(Element2D):
         kbb = k[np.ix_(released, released)]
         kbb_inv = np.linalg.inv(kbb)
         k_out = np.zeros_like(k)
-        p_out = np.zeros_like(p)
         k_out[np.ix_(retained, retained)] = kaa - kab @ kbb_inv @ kba
-        p_out[retained] = p[retained] - kab @ kbb_inv @ p[released]
+        p_out = self.condense_local_load_for_releases(p, nodes)
         return k_out, p_out
 
-    def local_displacement_and_end_forces(self, nodes: dict, u_global_elem: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def local_displacement_and_end_forces(
+        self,
+        nodes: dict,
+        u_global_elem: np.ndarray,
+        p_extra_local: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Recover local displacements and end forces (with back-substitution).
 
         For released elements, condensed-out rotational DOFs are recovered:
@@ -451,6 +595,10 @@ class FrameElement2D(Element2D):
         Args:
             nodes: Dict mapping node IDs to Node objects.
             u_global_elem: 6-element array of element global displacements.
+            p_extra_local: Optional extra raw (unreleased) fixed-end
+                vector folded into ``p_full``. Used to include self-weight
+                (or any other non-persisted member load) in both the
+                released-DOF back-substitution and the final ``q = K·d − p``.
 
         Returns:
             Tuple (d_local, q_local) where d_local includes recovered
@@ -460,6 +608,8 @@ class FrameElement2D(Element2D):
         d_from_global = R @ u_global_elem
         k_full = self.raw_local_stiffness(nodes)
         p_full = self.local_consistent_load(nodes)
+        if p_extra_local is not None:
+            p_full = p_full + np.asarray(p_extra_local, dtype=float)
         released = self._released_dofs()
         if not released:
             return d_from_global, k_full @ d_from_global - p_full

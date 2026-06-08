@@ -1,8 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.7.0"
+__version__ = "0.30.0"
 __what_is_new__ = (
-    "element detail · landscape N/V/M stack · crosshair tracker"
+    "Component-aware modal analysis: disconnected structures solved separately · "
+    "Multi-component results grouped by component in modal table · "
+    "Canvas skips red overlay for inactive-component elements"
 )
 
 from .model import (

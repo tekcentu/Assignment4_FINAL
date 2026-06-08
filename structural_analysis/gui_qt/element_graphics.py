@@ -17,8 +17,10 @@ Public surface:
 * :func:`draw_element_detail` — render the landscape-stacked detail
   block into a caller-supplied :class:`matplotlib.figure.Figure`.
   Returns an :class:`ElementDetailAxes` dict subclass that carries the
-  four standard keys (backward-compat) plus ``.ax_n``, ``.ax_v``,
-  ``.ax_m`` attributes for the interactive crosshair layer.
+  four standard keys (backward-compat with the smoke-test assertion
+  ``set(axes) == {"sketch", "fbd", "diagrams", "section"}``) plus
+  ``.ax_n``, ``.ax_v``, ``.ax_m`` attributes for the interactive
+  crosshair layer.
 """
 
 from __future__ import annotations
@@ -26,12 +28,11 @@ from __future__ import annotations
 import math
 from typing import Callable, Optional
 
-import matplotlib.patches as mpatches
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import MaxNLocator
 
-from ..element import FrameElement2D, TrussElement2D
+from ..element import FrameElement2D, TrussElement2D, _project_load_to_local
 from ..model import (
     AnalysisResult,
     FrameTemperatureLoad,
@@ -72,26 +73,52 @@ def evaluate_internal_force(
         return 0.0, None
     N_i, V_i, M_i, _N_j, _V_j, _M_j = (float(v) for v in f_local)
 
+    # Project each mechanical load onto the element's local axes so the
+    # diagram math sees the same (wx_l, wy_l) / (px_l, py_l) the FEM
+    # math used (see element._project_load_to_local). For local loads
+    # this is a no-op; for global loads inclined members pick up both
+    # axial and transverse contributions.
+    c, s = (nj.x - ni.x) / L, (nj.y - ni.y) / L
+    udl_wx_total = 0.0
+    udl_wy_total = 0.0
+    axial_points: list[tuple[float, float]] = []
+    transverse_points: list[tuple[float, float]] = []
+    for ml in getattr(elem, "member_loads", []):
+        if isinstance(ml, UniformDistributedLoad):
+            wx_l, wy_l = _project_load_to_local(
+                ml.wx, ml.wy, ml.coord_system, c, s,
+            )
+            udl_wx_total += wx_l
+            udl_wy_total += wy_l
+        elif isinstance(ml, PointLoad):
+            px_l, py_l = _project_load_to_local(
+                ml.px, ml.py, ml.coord_system, c, s,
+            )
+            if px_l != 0.0:
+                axial_points.append((ml.a, px_l))
+            if py_l != 0.0:
+                transverse_points.append((ml.a, py_l))
+
     if kind == "axial":
-        n_value = -N_i
-        return L, (lambda _x, _v=n_value: _v)
+        # N(x) tension-positive, derived from left-FBD equilibrium:
+        #   N(x) = -N_i - wx_local * x - Σ px_local for a < x
+        # When there are no axial member loads this collapses to the
+        # constant -N_i used by every existing test.
+        def axial(x):
+            n = -N_i - udl_wx_total * x
+            for a, px in axial_points:
+                if x > a:
+                    n -= px
+            return n
+        return L, axial
 
     if isinstance(elem, TrussElement2D):
         return L, None
 
-    udls: list[float] = []
-    points: list[tuple[float, float]] = []
-    for ml in getattr(elem, "member_loads", []):
-        if isinstance(ml, UniformDistributedLoad):
-            udls.append(ml.wy)
-        elif isinstance(ml, PointLoad):
-            points.append((ml.a, ml.py))
-    w = sum(udls)
-
     if kind == "shear":
         def shear(x):
-            v = V_i - w * x
-            for a, py in points:
+            v = V_i - udl_wy_total * x
+            for a, py in transverse_points:
                 if x > a:
                     v += py
             return v
@@ -99,8 +126,8 @@ def evaluate_internal_force(
 
     if kind == "moment":
         def moment(x):
-            m = -M_i + V_i * x - 0.5 * w * x * x
-            for a, py in points:
+            m = -M_i + V_i * x - 0.5 * udl_wy_total * x * x
+            for a, py in transverse_points:
                 if x > a:
                     m += py * (x - a)
             return m
@@ -153,7 +180,8 @@ def internal_force_at(
 class ElementDetailAxes(dict):
     """Backward-compatible dict returned by :func:`draw_element_detail`.
 
-    Carries exactly four standard keys so existing tests that assert
+    Carries exactly four standard keys (``"sketch"``, ``"fbd"``,
+    ``"diagrams"``, ``"section"``) so existing tests that assert
     ``set(axes) == {"sketch", "fbd", "diagrams", "section"}`` continue
     to pass.  The three N/V/M subplot axes are *also* accessible as
     instance attributes (``.ax_n``, ``.ax_v``, ``.ax_m``) for the
@@ -190,14 +218,14 @@ def _member_length(ni: Node, nj: Node) -> float:
 
 
 def _spine_clean(ax) -> None:
-    """Hide top and right spines; use light dotted y-grid."""
+    """Hide top and right spines (clean landscape look)."""
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
 
 def _draw_member_sketch(ax, elem, ni: Node, nj: Node,
                         section: Optional[Section] = None) -> None:
-    """Left-top panel — member in LOCAL coordinate frame (horizontal).
+    """Member sketch panel — local coordinate frame (horizontal).
 
     x = 0 at node i, x = L at node j.  The member is always drawn as
     a horizontal line so inclined members are still readable.
@@ -259,7 +287,7 @@ def _draw_member_sketch(ax, elem, ni: Node, nj: Node,
 def _draw_fbd(ax, elem, ni: Node, nj: Node,
               f_local: Optional[list],
               section: Optional[Section] = None) -> None:
-    """Top-right panel — free body diagram in LOCAL coordinate frame.
+    """Free body diagram in LOCAL coordinate frame.
 
     Member drawn as a horizontal line x ∈ [0, L].  Loads and end-force
     arrows are all projected into local coordinates so inclined members
@@ -291,14 +319,29 @@ def _draw_fbd(ax, elem, ni: Node, nj: Node,
     ax.plot([0, L], [0, 0], marker="o", linestyle="none",
             color=_MEMBER_COLOR, markersize=5, zorder=4)
 
+    # FBD shows arrows perpendicular to the (horizontal-drawn) member;
+    # that's the local-y projection for both local and global loads.
+    # Axial components don't get a perpendicular arrow here — the N
+    # subplot below makes axial behavior unambiguous.
+    if L > 0:
+        c_fbd = (nj.x - ni.x) / L
+        s_fbd = (nj.y - ni.y) / L
+    else:
+        c_fbd, s_fbd = 1.0, 0.0
     udls: list[float] = []
     points_list: list[tuple[float, float]] = []
     thermals: list[str] = []
     for ml in getattr(elem, "member_loads", []):
         if isinstance(ml, UniformDistributedLoad):
-            udls.append(ml.wy)
+            _wx_l, wy_l = _project_load_to_local(
+                ml.wx, ml.wy, ml.coord_system, c_fbd, s_fbd,
+            )
+            udls.append(wy_l)
         elif isinstance(ml, PointLoad):
-            points_list.append((ml.a, ml.py))
+            _px_l, py_l = _project_load_to_local(
+                ml.px, ml.py, ml.coord_system, c_fbd, s_fbd,
+            )
+            points_list.append((ml.a, py_l))
         elif isinstance(ml, FrameTemperatureLoad):
             thermals.append(f"ΔT_top={ml.t_top:g}, ΔT_bot={ml.t_bottom:g}")
         elif isinstance(ml, TrussTemperatureLoad):
@@ -346,18 +389,11 @@ def _draw_fbd(ax, elem, ni: Node, nj: Node,
 def _end_force_arrows(ax, x_node: float, L: float, h_ref: float,
                       arrow_h: float, N: float, V: float, M: float,
                       label: str, side_sign: int) -> None:
-    """Draw N, V, M arrows/indicators at one terminal of the member.
-
-    ``side_sign = -1`` for the i-end (arrows come from the left),
-    ``+1`` for the j-end (arrows come from the right).
-    """
+    """Draw N, V, M arrows/indicators at one terminal of the member."""
     offset = 0.10 * L * side_sign
 
     # Axial (N) — horizontal arrow
     n_col = _DIAGRAM_COLOR["axial"]
-    # Positive N_i = tension at i → element pulls node → reaction on node
-    # is axial compression toward the member.  We show the force ON the
-    # element end: for i-end, positive N means rightward on the member.
     ax.annotate(
         "", xy=(x_node, 0), xytext=(x_node - offset, 0),
         arrowprops=dict(arrowstyle="->", color=n_col, lw=1.2),
@@ -384,8 +420,7 @@ def _end_force_arrows(ax, x_node: float, L: float, h_ref: float,
 
 
 def _draw_single_nvm_diagram(ax, xs, ys, label: str, unit: str,
-                             color: str, *, invert: bool = False,
-                             n_samples: int = 11) -> None:
+                             color: str, *, invert: bool = False) -> None:
     """Render one of the N / V / M diagrams onto ``ax``.
 
     ``xs`` / ``ys`` are the sampled arrays (or ``None`` for inapplicable
@@ -439,7 +474,6 @@ def _draw_section_thumbnail(ax, section: Optional[Section]) -> None:
                 color="#b00", fontsize=8)
         return
 
-    # section_outline returns (y, z) tuples; z on horizontal, y on vertical
     zs = [p[1] for p in pts]
     ys = [p[0] for p in pts]
     ax.fill(zs, ys, facecolor="#cfe3f6", edgecolor=_MEMBER_COLOR,
@@ -464,10 +498,12 @@ def draw_element_detail(
     fig: Figure, elem, model: StructuralModel,
     result: Optional[AnalysisResult] = None,
     *, n_samples: int = 11,
+    section_fig: Optional[Figure] = None,
+    panels: str = "all",
 ) -> ElementDetailAxes:
     """Render the landscape-stacked element detail into ``fig``.
 
-    Layout (5 rows × 6 columns)::
+    Default layout (5 rows × 6 columns, section inside ``fig``)::
 
         Row 0, cols 0-1  →  section thumbnail
         Row 0, cols 2-5  →  member sketch   (local frame)
@@ -476,30 +512,128 @@ def draw_element_detail(
         Row 3, cols 0-5  →  V — shear  (kN)     .ax_v attribute
         Row 4, cols 0-5  →  M — moment (kN·m)   .ax_m attribute
 
-    Returns an :class:`ElementDetailAxes` dict with exactly four keys
-    ``{"sketch", "fbd", "diagrams", "section"}`` for backward compat;
-    ``.ax_n / .ax_v / .ax_m`` give the dialog access to all three
-    diagram sub-panels.
-    """
-    fig.clear()
-    gs = GridSpec(
-        5, 6, figure=fig,
-        hspace=0.60, wspace=0.40,
-        top=0.96, bottom=0.05, left=0.08, right=0.97,
-        height_ratios=[2, 2, 1.2, 1.2, 1.6],
-    )
+    When ``section_fig`` is provided, the section thumbnail is drawn
+    into that *separate* figure instead — letting the host dialog
+    place a compact section preview alongside its property form, so
+    the main ``fig`` only needs five thin rows for sketch + FBD +
+    N + V + M.  This trims the dialog's vertical footprint without
+    sacrificing the section drawing.
 
-    ax_section = fig.add_subplot(gs[0:2, 0:2])
-    ax_sketch  = fig.add_subplot(gs[0, 2:6])
-    ax_fbd     = fig.add_subplot(gs[1, 2:6])
-    ax_n       = fig.add_subplot(gs[2, 0:6])
-    ax_v       = fig.add_subplot(gs[3, 0:6], sharex=ax_n)
-    ax_m       = fig.add_subplot(gs[4, 0:6], sharex=ax_n)
+    ``panels`` controls which sub-panels are rendered (PR #35 — the
+    tabbed Element Detail Dialog uses two separate figures, one per
+    tab, and asks for either the upper or the lower half):
+
+    * ``"all"`` *(default)* — sketch + fbd + N + V + M (original
+      behaviour, unchanged).
+    * ``"properties"`` — sketch + fbd only (2 thin rows). N/V/M panels
+      omitted; the returned axes carry ``None`` for ``diagrams``,
+      ``ax_n``, ``ax_v``, ``ax_m``.
+    * ``"diagrams"`` — N + V + M only (3 rows). Sketch + FBD panels
+      omitted; the returned axes carry ``None`` for ``sketch`` and
+      ``fbd``.
+
+    Returns an :class:`ElementDetailAxes` dict with the four standard
+    keys ``{"sketch", "fbd", "diagrams", "section"}`` for backward
+    compat; values are ``None`` for panels omitted by ``panels``.
+    ``.ax_n / .ax_v / .ax_m`` give the dialog access to all three
+    diagram sub-panels.  When ``section_fig`` is given,
+    ``axes["section"]`` points at the axis inside that figure.
+    """
+    if panels not in ("all", "properties", "diagrams"):
+        raise ValueError(
+            f"panels must be 'all' | 'properties' | 'diagrams', got {panels!r}"
+        )
+    want_sketch_fbd = panels in ("all", "properties")
+    want_diagrams = panels in ("all", "diagrams")
+
+    fig.clear()
+    ax_section = None
+    ax_sketch = ax_fbd = None
+    ax_n = ax_v = ax_m = None
+
+    if section_fig is not None:
+        # Compact layout: section lives in its own figure (always
+        # cleared; rendered only when sketch/fbd are in scope), main
+        # figure is a single column showing only the requested panels.
+        section_fig.clear()
+        if want_sketch_fbd:
+            ax_section = section_fig.add_subplot(111)
+        if want_sketch_fbd and want_diagrams:
+            gs = GridSpec(
+                5, 1, figure=fig,
+                hspace=0.70,
+                top=0.96, bottom=0.06, left=0.14, right=0.97,
+                height_ratios=[1.3, 1.3, 1.0, 1.0, 1.4],
+            )
+            ax_sketch = fig.add_subplot(gs[0, 0])
+            ax_fbd    = fig.add_subplot(gs[1, 0])
+            ax_n      = fig.add_subplot(gs[2, 0])
+            ax_v      = fig.add_subplot(gs[3, 0], sharex=ax_n)
+            ax_m      = fig.add_subplot(gs[4, 0], sharex=ax_n)
+        elif want_sketch_fbd:
+            gs = GridSpec(
+                2, 1, figure=fig,
+                hspace=0.55,
+                top=0.94, bottom=0.10, left=0.14, right=0.97,
+                height_ratios=[1.3, 1.3],
+            )
+            ax_sketch = fig.add_subplot(gs[0, 0])
+            ax_fbd    = fig.add_subplot(gs[1, 0])
+        else:  # diagrams only
+            gs = GridSpec(
+                3, 1, figure=fig,
+                hspace=0.70,
+                top=0.95, bottom=0.08, left=0.14, right=0.97,
+                height_ratios=[1.0, 1.0, 1.4],
+            )
+            ax_n = fig.add_subplot(gs[0, 0])
+            ax_v = fig.add_subplot(gs[1, 0], sharex=ax_n)
+            ax_m = fig.add_subplot(gs[2, 0], sharex=ax_n)
+    else:
+        # section_fig is None: original 5-row × 6-col layout.  Only
+        # used in panels="all" mode by external callers; the tabbed
+        # inspector always passes a section_fig.  Sub-panel selection
+        # is still honoured for completeness.
+        if want_sketch_fbd and want_diagrams:
+            gs = GridSpec(
+                5, 6, figure=fig,
+                hspace=0.60, wspace=0.40,
+                top=0.96, bottom=0.05, left=0.08, right=0.97,
+                height_ratios=[2, 2, 1.2, 1.2, 1.6],
+            )
+            ax_section = fig.add_subplot(gs[0:2, 0:2])
+            ax_sketch  = fig.add_subplot(gs[0, 2:6])
+            ax_fbd     = fig.add_subplot(gs[1, 2:6])
+            ax_n       = fig.add_subplot(gs[2, 0:6])
+            ax_v       = fig.add_subplot(gs[3, 0:6], sharex=ax_n)
+            ax_m       = fig.add_subplot(gs[4, 0:6], sharex=ax_n)
+        elif want_sketch_fbd:
+            gs = GridSpec(
+                2, 6, figure=fig,
+                hspace=0.55, wspace=0.40,
+                top=0.94, bottom=0.10, left=0.08, right=0.97,
+                height_ratios=[2, 2],
+            )
+            ax_section = fig.add_subplot(gs[0:2, 0:2])
+            ax_sketch  = fig.add_subplot(gs[0, 2:6])
+            ax_fbd     = fig.add_subplot(gs[1, 2:6])
+        else:  # diagrams only
+            gs = GridSpec(
+                3, 1, figure=fig,
+                hspace=0.70,
+                top=0.95, bottom=0.08, left=0.10, right=0.97,
+                height_ratios=[1.0, 1.0, 1.4],
+            )
+            ax_n = fig.add_subplot(gs[0, 0])
+            ax_v = fig.add_subplot(gs[1, 0], sharex=ax_n)
+            ax_m = fig.add_subplot(gs[2, 0], sharex=ax_n)
 
     ni = model.nodes.get(getattr(elem, "node_i", None))
     nj = model.nodes.get(getattr(elem, "node_j", None))
     if ni is None or nj is None:
         for a in (ax_sketch, ax_fbd, ax_n, ax_v, ax_m, ax_section):
+            if a is None:
+                continue
             a.text(0.5, 0.5, "missing node", transform=a.transAxes,
                    ha="center", va="center", color="#b00", fontsize=9)
         axes = ElementDetailAxes(
@@ -522,46 +656,50 @@ def draw_element_detail(
             f_local = mr["f_local"]
 
     # ── Upper panels (local frame) ────────────────────────────────
-    _draw_member_sketch(ax_sketch, elem, ni, nj, section)
-    _draw_fbd(ax_fbd, elem, ni, nj, f_local, section)
-    _draw_section_thumbnail(ax_section, section)
-
-    # Shared x range for diagram axes
-    L = _member_length(ni, nj)
-    if L > 1e-12:
-        ax_n.set_xlim(0.0, L)
+    if want_sketch_fbd:
+        _draw_member_sketch(ax_sketch, elem, ni, nj, section)
+        _draw_fbd(ax_fbd, elem, ni, nj, f_local, section)
+        if ax_section is not None:
+            _draw_section_thumbnail(ax_section, section)
 
     # ── N / V / M diagrams ────────────────────────────────────────
-    if f_local is None:
-        # Pre-solve placeholder — zero lines, placeholder text on ax_n
-        ax_n.text(0.5, 0.5, "Run analysis to see N/V/M diagrams",
-                  transform=ax_n.transAxes, ha="center", va="center",
-                  color="#555", fontsize=9)
-        ax_n.set_xticks([])
-        ax_n.set_yticks([])
-        _spine_clean(ax_n)
-        for ax, lbl in ((ax_v, "V — shear"), (ax_m, "M — moment")):
-            ax.set_xticks([])
-            ax.set_yticks([])
-            _spine_clean(ax)
-            ax.text(0.5, 0.5, lbl, transform=ax.transAxes,
-                    ha="center", va="center", color="#bbb", fontsize=8,
-                    style="italic")
-    else:
-        xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local,
-                                            "axial",  n_samples)
-        xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local,
-                                            "shear",  n_samples)
-        xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local,
-                                            "moment", n_samples)
+    if want_diagrams:
+        L = _member_length(ni, nj)
+        if L > 1e-12:
+            ax_n.set_xlim(0.0, L)
+        if f_local is None:
+            # Pre-solve placeholder — zero lines, placeholder text on ax_n.
+            # The "Run analysis" text MUST land on ax_n because the smoke
+            # test asserts axes["diagrams"].texts (which is ax_n) contains
+            # "Run analysis".
+            ax_n.text(0.5, 0.5, "Run analysis to see N/V/M diagrams",
+                      transform=ax_n.transAxes, ha="center", va="center",
+                      color="#555", fontsize=9)
+            ax_n.set_xticks([])
+            ax_n.set_yticks([])
+            _spine_clean(ax_n)
+            for ax, lbl in ((ax_v, "V — shear"), (ax_m, "M — moment")):
+                ax.set_xticks([])
+                ax.set_yticks([])
+                _spine_clean(ax)
+                ax.text(0.5, 0.5, lbl, transform=ax.transAxes,
+                        ha="center", va="center", color="#bbb", fontsize=8,
+                        style="italic")
+        else:
+            xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local,
+                                                "axial",  n_samples)
+            xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local,
+                                                "shear",  n_samples)
+            xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local,
+                                                "moment", n_samples)
 
-        _draw_single_nvm_diagram(ax_n, xs_n, ys_n, "N", "kN",
-                                 color=_DIAGRAM_COLOR["axial"])
-        _draw_single_nvm_diagram(ax_v, xs_v, ys_v, "V", "kN",
-                                 color=_DIAGRAM_COLOR["shear"])
-        _draw_single_nvm_diagram(ax_m, xs_m, ys_m, "M", "kN·m",
-                                 color=_DIAGRAM_COLOR["moment"],
-                                 invert=True)
+            _draw_single_nvm_diagram(ax_n, xs_n, ys_n, "N", "kN",
+                                     color=_DIAGRAM_COLOR["axial"])
+            _draw_single_nvm_diagram(ax_v, xs_v, ys_v, "V", "kN",
+                                     color=_DIAGRAM_COLOR["shear"])
+            _draw_single_nvm_diagram(ax_m, xs_m, ys_m, "M", "kN·m",
+                                     color=_DIAGRAM_COLOR["moment"],
+                                     invert=True)
 
     axes = ElementDetailAxes(
         sketch=ax_sketch, fbd=ax_fbd, diagrams=ax_n, section=ax_section,

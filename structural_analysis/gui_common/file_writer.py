@@ -12,6 +12,7 @@ from __future__ import annotations
 from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     FrameTemperatureLoad,
+    ModalMassSource,
     PointLoad,
     StructuralModel,
     TrussTemperatureLoad,
@@ -24,6 +25,24 @@ def _fmt(x: float) -> str:
         return "0.0"
     # Use repr so that the value round-trips exactly through float(...).
     return repr(float(x))
+
+
+def _case_token(load_case: str) -> str:
+    """Return ``"  case=NAME"`` only when load_case differs from the
+    default. Whitespace or ``#`` would break the reader (whitespace
+    splits the row; ``#`` starts a comment) so reject those here
+    rather than silently emit a corrupt file.
+    """
+    if not load_case or load_case == "DEFAULT":
+        return ""
+    if any(ch.isspace() or ch == "#" for ch in load_case):
+        raise ValueError(
+            f"load_case {load_case!r} contains invalid characters "
+            "(whitespace or '#'); the input-file format stores it as "
+            "a single token and uses '#' for comments. Rename the "
+            "case (underscores or hyphens) before saving."
+        )
+    return f"  case={load_case}"
 
 
 def _check_name(kind: str, obj_id: int, name: str) -> None:
@@ -140,6 +159,20 @@ def write_input_file(model: StructuralModel, path: str) -> None:
                 line += "  START"
             elif elem.release_j:
                 line += "  END"
+        # Per-element material override — keyword-style trailing token so
+        # backward compatibility with files that don't carry it is
+        # automatic. Omitted entirely when the override is None. The
+        # referenced material id must still exist in MATERIALS, otherwise
+        # the file we'd write could not be reloaded.
+        override_id = getattr(elem, "material_id_override", None)
+        if override_id is not None:
+            if override_id not in model.materials:
+                raise ValueError(
+                    f"Element {elem.id} references material override "
+                    f"{override_id}, which is not in the model. "
+                    "Cannot serialise."
+                )
+            line += f"  material_override_id={override_id}"
         out.append(line)
     out.append("")
 
@@ -157,7 +190,11 @@ def write_input_file(model: StructuralModel, path: str) -> None:
 
     out.append(f"LOADS {len(model.nodal_loads)}")
     for ld in model.nodal_loads:
-        out.append(f"{ld.node_id}  {_fmt(ld.fx)}  {_fmt(ld.fy)}  {_fmt(ld.mz)}")
+        out.append(
+            f"{ld.node_id}  {_fmt(ld.fx)}  {_fmt(ld.fy)}  "
+            f"{_fmt(ld.mz)}"
+            + _case_token(getattr(ld, "load_case", "DEFAULT"))
+        )
     out.append("")
 
     udls: list[tuple[int, UniformDistributedLoad]] = []
@@ -178,22 +215,153 @@ def write_input_file(model: StructuralModel, path: str) -> None:
     if udls:
         out.append(f"MEMBER_UDL {len(udls)}")
         for eid, u in udls:
-            out.append(f"{eid}  0.0  {_fmt(u.wy)}")
+            row = f"{eid}  {_fmt(u.wx)}  {_fmt(u.wy)}"
+            # Emit the coord-system token only when it differs from the
+            # default. Legacy files (no global loads) round-trip
+            # byte-identical to pre-v0.15.0 output.
+            if u.coord_system != "local":
+                row += f"  {u.coord_system}"
+            row += _case_token(getattr(u, "load_case", "DEFAULT"))
+            out.append(row)
         out.append("")
     if points:
         out.append(f"MEMBER_POINT_LOADS {len(points)}")
         for eid, p in points:
-            out.append(f"{eid}  {_fmt(p.a)}  0.0  {_fmt(p.py)}")
+            row = f"{eid}  {_fmt(p.a)}  {_fmt(p.px)}  {_fmt(p.py)}"
+            if p.coord_system != "local":
+                row += f"  {p.coord_system}"
+            row += _case_token(getattr(p, "load_case", "DEFAULT"))
+            out.append(row)
         out.append("")
     if truss_temps:
         out.append(f"TRUSS_TEMPERATURE {len(truss_temps)}")
         for eid, t in truss_temps:
-            out.append(f"{eid}  {_fmt(t.delta_T)}")
+            out.append(
+                f"{eid}  {_fmt(t.delta_T)}"
+                + _case_token(getattr(t, "load_case", "DEFAULT"))
+            )
         out.append("")
     if frame_temps:
         out.append(f"FRAME_TEMPERATURE {len(frame_temps)}")
         for eid, t in frame_temps:
-            out.append(f"{eid}  {_fmt(t.t_top)}  {_fmt(t.t_bottom)}")
+            out.append(
+                f"{eid}  {_fmt(t.t_top)}  {_fmt(t.t_bottom)}"
+                + _case_token(getattr(t, "load_case", "DEFAULT"))
+            )
+        out.append("")
+
+    # LOAD_CASES — only when the model carries case data that the
+    # reader's auto-create pass couldn't reconstruct: extra cases
+    # beyond DEFAULT, or any disabled-but-defined case. Skipping the
+    # block on plain single-case models keeps every pre-v0.18 fixture's
+    # round-trip byte-identical.
+    #
+    # SUM_ALL is intentionally never serialised: it's a derived view
+    # the GUI computes on demand from the solved per-case results, not
+    # a stored case. If the user (or a programmatic bug) somehow put
+    # it in the dict, drop it here so it doesn't pollute the file.
+    case_names_for_disk = {
+        n for n in model.load_cases if n != "SUM_ALL"
+    }
+    needs_load_cases_block = any(
+        name != "DEFAULT" or not model.load_cases[name].enabled
+        for name in case_names_for_disk
+    )
+    if needs_load_cases_block:
+        # Stable order so round-trips are deterministic; DEFAULT first
+        # (when carried), then the rest alphabetically.
+        ordered_names = (
+            (["DEFAULT"] if "DEFAULT" in case_names_for_disk else [])
+            + sorted(n for n in case_names_for_disk if n != "DEFAULT")
+        )
+        # Drop a trailing DEFAULT row when it's at default state
+        # (enabled, no description) — the reader auto-creates it
+        # anyway, so emitting it would be noise.
+        def _is_default_row(name: str) -> bool:
+            lc = model.load_cases[name]
+            return name == "DEFAULT" and lc.enabled
+        rows = [n for n in ordered_names if not _is_default_row(n)]
+        if rows:
+            out.append(f"LOAD_CASES {len(rows)}")
+            for name in rows:
+                lc = model.load_cases[name]
+                row = name
+                if not lc.enabled:
+                    row += "  enabled=false"
+                out.append(row)
+            out.append("")
+
+    # LOAD_COMBINATIONS (v0.19 — PR #29). Only emitted when the model
+    # carries user-defined combinations. SUM_ALL is a derived view and
+    # is NEVER written here even if it somehow appears in the dict.
+    combos = {
+        name: c for name, c in model.load_combinations.items()
+        if name != "SUM_ALL"
+    }
+    if combos:
+        out.append(f"LOAD_COMBINATIONS {len(combos)}")
+        for name in sorted(combos):
+            c = combos[name]
+            # Deterministic term order so round-trips are stable.
+            term_str = "  ".join(
+                f"{coeff:g}*{case_name}"
+                for case_name, coeff in sorted(c.terms.items())
+            )
+            row = f"{name}  {term_str}"
+            # Persist the optional free-text description as a trailing
+            # ``# …`` (the reader captures the post-# text on a
+            # combination row as the description). A literal newline
+            # would corrupt the single-line row, so flatten it.
+            desc = (c.description or "").replace("\n", " ").replace("\r", " ").strip()
+            if desc:
+                row += f"  # {desc}"
+            out.append(row)
+        out.append("")
+
+    # ANALYSIS_OPTIONS — only when at least one option differs from
+    # the default. Omitting the block on default models keeps every
+    # existing fixture's round-trip byte-identical.
+    opt_lines: list[str] = []
+    if model.include_self_weight:
+        opt_lines.append("include_self_weight=true")
+    if model.self_weight_case != "DEFAULT":
+        opt_lines.append(f"self_weight_case={model.self_weight_case}")
+    if opt_lines:
+        out.append(f"ANALYSIS_OPTIONS {len(opt_lines)}")
+        out.extend(opt_lines)
+        out.append("")
+
+    # JOINT_MASSES — omit entirely when the dict is empty.
+    joint_masses = getattr(model, "joint_masses", {}) or {}
+    if joint_masses:
+        jm_items = sorted(joint_masses.items())
+        out.append(f"JOINT_MASSES {len(jm_items)}")
+        for nid, jm in jm_items:
+            row = f"{nid}"
+            if jm.mx != 0.0:
+                row += f"  mx={_fmt(jm.mx)}"
+            if jm.my != 0.0:
+                row += f"  my={_fmt(jm.my)}"
+            out.append(row)
+        out.append("")
+
+    # MODAL_MASS_SOURCE — omit when the source matches the safe default.
+    mms: ModalMassSource = getattr(
+        model, "modal_mass_source", ModalMassSource()
+    )
+    if not mms.is_default():
+        rows: list[str] = []
+        if not mms.include_self_mass:
+            rows.append("include_self_mass=false")
+        if not mms.include_joint_masses:
+            rows.append("include_joint_masses=false")
+        if mms.include_load_cases:
+            rows.append("include_load_cases=true")
+        for case_name in sorted(mms.load_case_factors):
+            factor = mms.load_case_factors[case_name]
+            rows.append(f"case_factor:{case_name}={_fmt(factor)}")
+        out.append(f"MODAL_MASS_SOURCE {len(rows)}")
+        out.extend(rows)
         out.append("")
 
     with open(path, "w", encoding="utf-8") as f:

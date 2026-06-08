@@ -14,6 +14,7 @@ import matplotlib
 matplotlib.use("QtAgg")  # noqa: E402  must precede pyplot import
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as _MplPolygon
+from matplotlib import patheffects as _path_effects
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT,
 )
@@ -33,6 +34,10 @@ from ..model import (
 )
 from .grid import GridSystem
 from .snap import SnapCandidate, SnapEngine
+from .element_graphics import (
+    sample_internal_force as _diagram_ordinates,
+    internal_force_at as _diagram_value,
+)
 
 
 @dataclass
@@ -51,6 +56,9 @@ class ModelCanvas(QWidget):
 
     NODE_PICK_RADIUS_PX = 12
     ELEM_PICK_RADIUS_PX = 8
+    MAX_AUTO_NODE_LABELS = 300
+    MAX_AUTO_ELEMENT_LABELS = 250
+    MAX_LABELED_GRID_LINES = 240
 
     def __init__(self, parent: QWidget | None,
                  model_provider: Callable[[], StructuralModel],
@@ -66,6 +74,10 @@ class ModelCanvas(QWidget):
         self.show_reactions: bool = True
         self.show_diagrams: bool = False
         self.show_section_labels: bool = False
+        # v0.24.0: optional overlay drawing local x/y axis arrows and
+        # i/j end labels on each element so users can see element
+        # orientation at a glance. Off by default — advanced view.
+        self.show_local_axes: bool = False
         self.diagram_kind: str = "moment"
         self.deformed_scale: float = 1.0
         self.diagram_scale: float = 1.0
@@ -77,13 +89,56 @@ class ModelCanvas(QWidget):
         self.deformed_stations: int = 21
         self.diagram_stations: int = 21
         self._result = None
+        # PR-A: which load case the host considers "active". Loads on
+        # the canvas whose ``load_case`` matches this string render at
+        # full alpha; others dim to ``_inactive_load_alpha`` when
+        # ``_active_case_loads_only`` is True (the View → "Active case
+        # loads only" toggle). The host (MainWindow) is the source of
+        # truth for the toggle — canvas just consumes the boolean.
+        self._active_case: str = "DEFAULT"
+        self._active_case_loads_only: bool = True
+        self._inactive_load_alpha: float = 0.35
+        # PR #29: when a load COMBINATION is active, this holds the set
+        # of constituent case names so loads from ANY of them render at
+        # full alpha (signalling "all these cases contribute") while
+        # other-case loads dim — instead of misleadingly highlighting a
+        # single case. ``None`` ⇒ a plain load case (or SUM_ALL) is
+        # active and the single-case dimming applies.
+        self._active_combination_cases: frozenset[str] | None = None
         self._modal_result = None    # ModalResult or None
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
+        # Either anchored at an existing node id (legacy) or a free
+        # start point (v0.10.0 — first click landed on empty space and
+        # no node has been created yet). Exactly one is non-None at a
+        # time.
         self._element_preview: tuple[int, float, float, str] | None = None
-        self._selected_node_id: int | None = None
-        self._selected_element_id: int | None = None
+        self._element_preview_free: (
+            tuple[float, float, float, float, str] | None
+        ) = None
+        # Multi-select state (v0.13.0). Each set holds all currently
+        # selected node / element ids. Single-object selection is just
+        # a one-element set; box-select fills these in bulk.
+        self._selected_node_ids: set[int] = set()
+        self._selected_element_ids: set[int] = set()
+        # Active drag-rectangle for box selection. Tuple:
+        # ``(x0, y0, x1, y1, is_crossing)`` in world coords, or None
+        # when no drag is in progress. ``is_crossing`` is True for
+        # right-to-left drags (Crossing mode) and False for
+        # left-to-right drags (Window mode).
+        self._drag_rect: (
+            tuple[float, float, float, float, bool] | None
+        ) = None
+        # PR #31 — pre-solve validation highlight layer.  Distinct from
+        # selection: amber = warning (orphan / advisory), red = error
+        # (mechanism / disconnected unsupported component).  Painted
+        # behind the selection layer so a selected problem node still
+        # shows the gold ring on top.
+        self._warning_node_ids: set[int] = set()
+        self._error_node_ids: set[int] = set()
+        self._warning_element_ids: set[int] = set()
+        self._error_element_ids: set[int] = set()
         # Per-element max / min markers on the currently-drawn moment /
         # shear / axial diagram. Populated by _draw_diagrams and fed
         # into the snap engine so the cursor snaps to those points in
@@ -107,14 +162,37 @@ class ModelCanvas(QWidget):
         # viewport — resize keeps the current limits and only fit_to_view
         # (View → Fit) takes the wheel back.
         self._user_view_dirty: bool = False
+        # Guard flipped to True while we (canvas internals) are
+        # programmatically setting xlim/ylim — first fit, redraw's
+        # save-and-restore, fit_to_view. The xlim/ylim-changed mpl
+        # callbacks consult this flag so the dirty bit only flips for
+        # *external* mutations (matplotlib navigation toolbar pan/zoom,
+        # programmatic test pokes, etc.).
+        self._setting_axes_limits: bool = False
 
         # Middle-mouse-drag pan state (display coordinates at drag start).
         self._pan_origin: tuple[float, float] | None = None
         self._pan_xlim0: tuple[float, float] = (0.0, 1.0)
         self._pan_ylim0: tuple[float, float] = (0.0, 1.0)
 
-        self.on_click: Callable[[HitResult, str], None] | None = None
-        self.on_motion: Callable[[HitResult], None] | None = None
+        # The pixel-coord parameter is passed alongside the world-coord
+        # HitResult so tools (currently SelectTool) can drive direction-
+        # aware drag selection independently of axis flips or zoom.
+        self.on_click: (
+            Callable[[HitResult, str, tuple[float, float], bool], None] | None
+        ) = None
+        self.on_motion: (
+            Callable[[HitResult, tuple[float, float]], None] | None
+        ) = None
+        self.on_release: (
+            Callable[[HitResult, str, tuple[float, float], bool], None] | None
+        ) = None
+        # Cache of the most recent hit + event pixel coords so
+        # _handle_release can route a HitResult without re-running the
+        # full hit-test (mpl release events sometimes arrive with no
+        # xdata/ydata, e.g. when the cursor leaves the axes mid-drag).
+        self._last_hit: HitResult | None = None
+        self._last_event_px: tuple[float, float] | None = None
 
         self.fig = plt.Figure(figsize=(7.5, 6.0), dpi=100)
         self.ax = self.fig.add_subplot(111)
@@ -123,6 +201,13 @@ class ModelCanvas(QWidget):
         # The legacy "datalim" mode would silently rewrite our limits
         # and emit "Ignoring fixed y limits…" on every redraw.
         self.ax.set_aspect("equal", adjustable="box")
+        # Mark the view dirty whenever something *outside* canvas
+        # internals changes the limits — most importantly the
+        # matplotlib navigation toolbar's pan/zoom modes, which
+        # otherwise leave _user_view_dirty False and let the next
+        # window resize silently discard the user's view.
+        self.ax.callbacks.connect("xlim_changed", self._on_limits_changed)
+        self.ax.callbacks.connect("ylim_changed", self._on_limits_changed)
 
         self._mpl_canvas = FigureCanvasQTAgg(self.fig)
         self.toolbar = NavigationToolbar2QT(self._mpl_canvas, self)
@@ -152,25 +237,78 @@ class ModelCanvas(QWidget):
     def set_element_preview(
         self, start_node_id: int, end_x: float, end_y: float, kind: str
     ) -> None:
-        """Show a temporary member preview while placing a frame/truss."""
+        """Show a temporary member preview anchored at an existing node."""
         self._element_preview = (
             int(start_node_id), float(end_x), float(end_y), str(kind)
         )
+        self._element_preview_free = None
+
+    def set_element_preview_free(
+        self,
+        start_x: float, start_y: float, end_x: float, end_y: float,
+        kind: str,
+    ) -> None:
+        """Show a temporary member preview when the start is empty space.
+
+        v0.10.0: the Frame / Truss tools now accept a first click on
+        empty space (a node will be auto-created on the second click).
+        While only the first click has landed, there is no existing
+        node id to anchor the preview to.
+        """
+        self._element_preview_free = (
+            float(start_x), float(start_y),
+            float(end_x), float(end_y),
+            str(kind),
+        )
+        self._element_preview = None
 
     def clear_element_preview(self) -> None:
         self._element_preview = None
+        self._element_preview_free = None
 
     def select_node(self, node_id: int) -> None:
-        self._selected_node_id = int(node_id)
-        self._selected_element_id = None
+        """Exclusive single-node selection — clears everything else."""
+        self._selected_node_ids = {int(node_id)}
+        self._selected_element_ids = set()
 
     def select_element(self, element_id: int) -> None:
-        self._selected_element_id = int(element_id)
-        self._selected_node_id = None
+        """Exclusive single-element selection — clears everything else."""
+        self._selected_element_ids = {int(element_id)}
+        self._selected_node_ids = set()
+
+    def add_node_to_selection(self, node_id: int) -> None:
+        self._selected_node_ids.add(int(node_id))
+
+    def remove_node_from_selection(self, node_id: int) -> None:
+        self._selected_node_ids.discard(int(node_id))
+
+    def add_element_to_selection(self, element_id: int) -> None:
+        self._selected_element_ids.add(int(element_id))
+
+    def remove_element_from_selection(self, element_id: int) -> None:
+        self._selected_element_ids.discard(int(element_id))
+
+    def get_selected_nodes(self) -> frozenset[int]:
+        return frozenset(self._selected_node_ids)
+
+    def get_selected_elements(self) -> frozenset[int]:
+        return frozenset(self._selected_element_ids)
 
     def clear_selection(self) -> None:
-        self._selected_node_id = None
-        self._selected_element_id = None
+        self._selected_node_ids = set()
+        self._selected_element_ids = set()
+
+    def set_drag_rect(
+        self, x0: float, y0: float, x1: float, y1: float,
+        is_crossing: bool,
+    ) -> None:
+        """Set the active box-select rectangle (world coords + direction)."""
+        self._drag_rect = (
+            float(x0), float(y0), float(x1), float(y1), bool(is_crossing),
+        )
+
+    def clear_drag_rect(self) -> None:
+        self._drag_rect = None
 
     def set_result(self, result) -> None:
         self._result = result
@@ -181,6 +319,55 @@ class ModelCanvas(QWidget):
     def clear_result(self) -> None:
         self._result = None
         self.redraw()
+
+    def set_active_case(self, name: str) -> None:
+        """Host signal: a new load case is active. Triggers a redraw so
+        the load-dimming and any case-tagged annotations update.
+        Idempotent on no-op."""
+        if name == self._active_case:
+            return
+        self._active_case = name
+        self.redraw()
+
+    def set_active_case_loads_only(self, on: bool) -> None:
+        """Host signal: toggle the "show only active-case loads" mode
+        (when off, all loads draw at full alpha)."""
+        if on == self._active_case_loads_only:
+            return
+        self._active_case_loads_only = bool(on)
+        self.redraw()
+
+    def set_active_combination_cases(
+        self, case_names: "frozenset[str] | set[str] | None",
+    ) -> None:
+        """Host signal (PR #29): a load COMBINATION is active. ``case_names``
+        is the set of constituent case names — loads from any of them
+        render at full alpha. Pass ``None`` when switching back to a
+        plain case / SUM_ALL selection."""
+        new_val = frozenset(case_names) if case_names is not None else None
+        if new_val == self._active_combination_cases:
+            return
+        self._active_combination_cases = new_val
+        self.redraw()
+
+    def _load_case_alpha(self, ld) -> float:
+        """Return the draw alpha for a load arrow.
+
+        * "active case only" toggle off ⇒ everything full intensity.
+        * a COMBINATION is active ⇒ loads belonging to any constituent
+          case are full, others dim (PR #29 — no misleading single-case
+          highlight).
+        * otherwise ⇒ loads matching the single active case are full,
+          others dim."""
+        if not self._active_case_loads_only:
+            return 1.0
+        case = getattr(ld, "load_case", "DEFAULT")
+        if self._active_combination_cases is not None:
+            return (
+                1.0 if case in self._active_combination_cases
+                else self._inactive_load_alpha
+            )
+        return 1.0 if case == self._active_case else self._inactive_load_alpha
 
     def set_modal_result(self, modal_result, mode_idx: int = 0,
                          scale: float = 1.0) -> None:
@@ -231,19 +418,28 @@ class ModelCanvas(QWidget):
         else:
             saved_xlim = saved_ylim = None
 
-        self.ax.clear()
-        self.ax.set_aspect("equal", adjustable="box")
+        # ax.clear() resets xlim/ylim and would fire the limit-changed
+        # callbacks; the restore call below would also fire them.
+        # Both are programmatic, so suppress the dirty-bit toggle for
+        # the duration. (_set_axes_limits handles its own guard.)
+        self._setting_axes_limits = True
+        try:
+            self.ax.clear()
+            self.ax.set_aspect("equal", adjustable="box")
 
-        if saved_xlim is not None:
-            self.ax.set_xlim(saved_xlim)
-            self.ax.set_ylim(saved_ylim)
-        else:
-            self._set_axes_limits()
-            self._view_initialised = True
+            if saved_xlim is not None:
+                self.ax.set_xlim(saved_xlim)
+                self.ax.set_ylim(saved_ylim)
+            else:
+                self._set_axes_limits()
+                self._view_initialised = True
+        finally:
+            self._setting_axes_limits = False
 
         self._draw_grid()
         self._draw_origin_axes()
         self._draw_model()
+        self._draw_validation_highlights()
         self._draw_selection()
         self._draw_element_preview()
         if self._result is not None and self._result.status == "ok":
@@ -262,6 +458,7 @@ class ModelCanvas(QWidget):
         else:
             self._diagram_critical_points = []
         self._draw_snap_marker()
+        self._draw_drag_rect()
         self._mpl_canvas.draw_idle()
 
     # ── Qt resize → re-fit while the user hasn't taken the wheel ──
@@ -315,7 +512,11 @@ class ModelCanvas(QWidget):
             return
         hit = self._hit_test(event)
         button_name = {1: "left", 2: "middle", 3: "right"}.get(event.button, "left")
-        self.on_click(hit, button_name)
+        event_px = (float(event.x), float(event.y))
+        self._last_hit = hit
+        self._last_event_px = event_px
+        shift = _shift_pressed()
+        self.on_click(hit, button_name, event_px, shift)
 
     def _handle_motion(self, event) -> None:
         if self._pan_origin is not None:
@@ -344,14 +545,40 @@ class ModelCanvas(QWidget):
         # marker can be drawn even when the snap engine has no
         # candidate (empty space between labeled grid lines).
         self._hover_xy = (hit.x, hit.y)
+        event_px = (float(event.x), float(event.y))
+        self._last_hit = hit
+        self._last_event_px = event_px
         try:
-            self.on_motion(hit)
+            self.on_motion(hit, event_px)
         except Exception:
             pass
 
     def _handle_release(self, event) -> None:
         if event.button == 2:
             self._pan_origin = None
+            return
+        if event.button != 1 or self.on_release is None:
+            return
+        # Release events sometimes lack xdata/ydata (cursor outside
+        # axes). Reuse the last recorded hit + pixel position so the
+        # tool can still finish a drag cleanly.
+        hit = self._last_hit
+        event_px = self._last_event_px
+        if event.xdata is not None and event.ydata is not None:
+            event_px = (float(event.x), float(event.y))
+            try:
+                hit = self._hit_test(event)
+                self._last_hit = hit
+                self._last_event_px = event_px
+            except Exception:
+                pass
+        if hit is None or event_px is None:
+            return
+        shift = _shift_pressed()
+        try:
+            self.on_release(hit, "left", event_px, shift)
+        except Exception:
+            pass
 
     def _handle_scroll(self, event) -> None:
         if event.inaxes is not self.ax or self.toolbar.mode:
@@ -406,12 +633,36 @@ class ModelCanvas(QWidget):
             elif candidate.kind in ("endpoint", "midpoint", "project",
                                      "diagram"):
                 hit.element_id = candidate.object_id
+            else:
+                # Non-element snap (e.g. "grid"): the snap engine
+                # prefers grid over project, so a click on an
+                # element's interior near a grid intersection arrives
+                # here. Still attach the nearest element so the
+                # NodeTool / _PairTool split path can engage —
+                # otherwise the disconnected-component bug returns
+                # whenever a labeled grid is configured (PR #21 review,
+                # codex P1).
+                hit.element_id = self._pick_nearest_element_px(
+                    event.xdata, event.ydata, px_per_dx, px_per_dy, model,
+                )
             return hit
 
         # No snap → fall back to rectangular-grid snapping + element pick.
         sx, sy = self._snap(event.xdata, event.ydata)
         hit = HitResult(x=sx, y=sy)
-        # Still try to pick a nearby element (for select/right-click on a line).
+        hit.element_id = self._pick_nearest_element_px(
+            event.xdata, event.ydata, px_per_dx, px_per_dy, model,
+        )
+        return hit
+
+    def _pick_nearest_element_px(
+        self, x: float, y: float,
+        px_per_dx: float, px_per_dy: float, model,
+    ) -> Optional[int]:
+        """Return the id of the element closest to ``(x, y)`` within
+        :attr:`ELEM_PICK_RADIUS_PX`, or ``None``. Shared by the
+        no-snap fallback and the grid-snap branch — keeps the
+        element-pick logic in one place (PR #21 review)."""
         best_eid = None
         best_dpx = self.ELEM_PICK_RADIUS_PX
         for elem in model.elements:
@@ -420,14 +671,12 @@ class ModelCanvas(QWidget):
             if ni is None or nj is None:
                 continue
             dpx = _point_segment_distance_px(
-                event.xdata, event.ydata, ni.x, ni.y, nj.x, nj.y,
-                px_per_dx, px_per_dy,
+                x, y, ni.x, ni.y, nj.x, nj.y, px_per_dx, px_per_dy,
             )
             if dpx < best_dpx:
                 best_dpx = dpx
                 best_eid = elem.id
-        hit.element_id = best_eid
-        return hit
+        return best_eid
 
     # ── drawing ──
 
@@ -441,26 +690,43 @@ class ModelCanvas(QWidget):
                          color="#cccccc")
             return
         # Draw the labeled grid manually. Don't enable matplotlib's auto-grid.
+        # Only draw lines that can be seen in the current viewport; this keeps
+        # pan/zoom responsive on large building grids and avoids edge labels
+        # piling up far outside the user's view.
         self.ax.grid(False)
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
-        # Adjust limits to encompass the grid extent if needed.
-        if grid.x_lines:
-            x0 = min(x0, min(ln.coord for ln in grid.x_lines))
-            x1 = max(x1, max(ln.coord for ln in grid.x_lines))
-        if grid.y_lines:
-            y0 = min(y0, min(ln.coord for ln in grid.y_lines))
-            y1 = max(y1, max(ln.coord for ln in grid.y_lines))
-        for ln in grid.x_lines:
+        x_pad = max(abs(x1 - x0) * 0.02, 1e-9)
+        y_pad = max(abs(y1 - y0) * 0.02, 1e-9)
+        x_lines = [
+            ln for ln in grid.x_lines
+            if min(x0, x1) - x_pad <= ln.coord <= max(x0, x1) + x_pad
+        ]
+        y_lines = [
+            ln for ln in grid.y_lines
+            if min(y0, y1) - y_pad <= ln.coord <= max(y0, y1) + y_pad
+        ]
+        total_visible = len(x_lines) + len(y_lines)
+        label_stride = max(
+            1,
+            (total_visible + self.MAX_LABELED_GRID_LINES - 1)
+            // self.MAX_LABELED_GRID_LINES,
+        )
+
+        for idx, ln in enumerate(x_lines):
             self.ax.axvline(ln.coord, color="#aac8ff", linewidth=0.7,
                             linestyle="-", alpha=0.6, zorder=0)
-            self.ax.text(ln.coord, y1, f"  {ln.label}", color="#3060c0",
-                         fontsize=8, va="bottom", ha="center", zorder=1)
-        for ln in grid.y_lines:
+            if idx % label_stride == 0:
+                self.ax.text(ln.coord, max(y0, y1), f"  {ln.label}",
+                             color="#3060c0", fontsize=8, va="bottom",
+                             ha="center", zorder=1)
+        for idx, ln in enumerate(y_lines):
             self.ax.axhline(ln.coord, color="#aac8ff", linewidth=0.7,
                             linestyle="-", alpha=0.6, zorder=0)
-            self.ax.text(x1, ln.coord, f"  {ln.label}", color="#3060c0",
-                         fontsize=8, va="center", ha="left", zorder=1)
+            if idx % label_stride == 0:
+                self.ax.text(max(x0, x1), ln.coord, f"  {ln.label}",
+                             color="#3060c0", fontsize=8, va="center",
+                             ha="left", zorder=1)
 
     def _draw_origin_axes(self) -> None:
         x0, x1 = self.ax.get_xlim()
@@ -517,17 +783,21 @@ class ModelCanvas(QWidget):
                      markeredgewidth=1.5, alpha=0.7, zorder=10)
 
     def _draw_element_preview(self) -> None:
-        if self._element_preview is None:
-            return
-        start_node_id, end_x, end_y, kind = self._element_preview
-        start = self._model().nodes.get(start_node_id)
-        if start is None:
+        if self._element_preview is not None:
+            start_node_id, end_x, end_y, kind = self._element_preview
+            start = self._model().nodes.get(start_node_id)
+            if start is None:
+                return
+            start_x, start_y = start.x, start.y
+        elif self._element_preview_free is not None:
+            start_x, start_y, end_x, end_y, kind = self._element_preview_free
+        else:
             return
         is_frame = kind == "frame"
         color = "#1f77b4" if is_frame else "#d62728"
         linestyle = "-" if is_frame else "--"
         self.ax.plot(
-            [start.x, end_x], [start.y, end_y],
+            [start_x, end_x], [start_y, end_y],
             color=color, linestyle=linestyle, linewidth=2.4,
             alpha=0.55, zorder=3,
         )
@@ -536,33 +806,221 @@ class ModelCanvas(QWidget):
             markerfacecolor="white", markeredgecolor=color,
             alpha=0.85, zorder=9,
         )
+        if self._element_preview_free is not None:
+            # Mark the free start point too (no real node there yet),
+            # so the user has visual confirmation of click 1.
+            self.ax.plot(
+                start_x, start_y, marker="o", markersize=5,
+                markerfacecolor="white", markeredgecolor=color,
+                alpha=0.85, zorder=9,
+            )
+
+    # ── PR #31 — pre-solve validation highlight layer ──────────────
+
+    def set_validation_highlights(
+        self,
+        *,
+        warning_node_ids: set[int] | None = None,
+        error_node_ids: set[int] | None = None,
+        warning_element_ids: set[int] | None = None,
+        error_element_ids: set[int] | None = None,
+    ) -> None:
+        """Push a set of problem ids onto the validation highlight
+        layer.  Any argument omitted (or ``None``) clears that band.
+
+        The canvas owns its own copies of the sets so later mutation of
+        the caller's set doesn't bleed into the painted highlights.
+        Triggers a redraw.
+        """
+        self._warning_node_ids = set(warning_node_ids or ())
+        self._error_node_ids = set(error_node_ids or ())
+        self._warning_element_ids = set(warning_element_ids or ())
+        self._error_element_ids = set(error_element_ids or ())
+        self.redraw()
+
+    def clear_validation_highlights(self) -> None:
+        """Erase the validation highlight layer.  Called after a
+        successful solve, after the user fixes the model (via the
+        invalidation surface), or when the user explicitly dismisses
+        the report."""
+        if (
+            self._warning_node_ids or self._error_node_ids
+            or self._warning_element_ids or self._error_element_ids
+        ):
+            self._warning_node_ids = set()
+            self._error_node_ids = set()
+            self._warning_element_ids = set()
+            self._error_element_ids = set()
+            self.redraw()
+
+    def has_validation_highlights(self) -> bool:
+        return bool(
+            self._warning_node_ids or self._error_node_ids
+            or self._warning_element_ids or self._error_element_ids
+        )
+
+    def _draw_validation_highlights(self) -> None:
+        """Paint warning (amber) and error (red) markers on top of
+        normal model draw but behind the selection layer.
+
+        Elements get a thick translucent band along their length;
+        nodes get a coloured ring/cross marker.  Error styling is
+        bolder than warning styling so the user can read severity at
+        a glance.
+
+        Every same-severity band/marker is plotted in a single
+        ``ax.plot`` call (segments separated by ``None``s for lines;
+        marker arrays for nodes) so a model with dozens of flagged
+        elements still adds only one ``Line2D`` artist per severity
+        instead of N — matters for redraw / pan / zoom responsiveness
+        on larger models.
+        """
+        model = self._model()
+        element_by_id = {elem.id: elem for elem in model.elements}
+        # ── elements: behind selection (zorder < _draw_selection's 1.5) ──
+        warn_xs: list[float | None] = []
+        warn_ys: list[float | None] = []
+        for eid in self._warning_element_ids:
+            elem = element_by_id.get(eid)
+            if elem is None:
+                continue
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            warn_xs.extend([ni.x, nj.x, None])
+            warn_ys.extend([ni.y, nj.y, None])
+        if warn_xs:
+            self.ax.plot(
+                warn_xs, warn_ys,
+                color="#f0a030", linewidth=5.0, alpha=0.55,
+                solid_capstyle="round", zorder=1.4,
+            )
+        err_xs: list[float | None] = []
+        err_ys: list[float | None] = []
+        for eid in self._error_element_ids:
+            elem = element_by_id.get(eid)
+            if elem is None:
+                continue
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            err_xs.extend([ni.x, nj.x, None])
+            err_ys.extend([ni.y, nj.y, None])
+        if err_xs:
+            self.ax.plot(
+                err_xs, err_ys,
+                color="#e03030", linewidth=5.5, alpha=0.65,
+                solid_capstyle="round", zorder=1.45,
+            )
+        # ── nodes: behind selection rings (selection is zorder 11) ──
+        warn_nx: list[float] = []
+        warn_ny: list[float] = []
+        for nid in self._warning_node_ids:
+            node = model.nodes.get(nid)
+            if node is None:
+                continue
+            warn_nx.append(node.x)
+            warn_ny.append(node.y)
+        if warn_nx:
+            self.ax.plot(
+                warn_nx, warn_ny, marker="D", markersize=13,
+                linestyle="None",
+                markerfacecolor="none", markeredgecolor="#f0a030",
+                markeredgewidth=2.2, zorder=9.5,
+            )
+        err_nx: list[float] = []
+        err_ny: list[float] = []
+        for nid in self._error_node_ids:
+            node = model.nodes.get(nid)
+            if node is None:
+                continue
+            err_nx.append(node.x)
+            err_ny.append(node.y)
+        if err_nx:
+            self.ax.plot(
+                err_nx, err_ny, marker="X", markersize=15,
+                linestyle="None",
+                markerfacecolor="#e03030", markeredgecolor="#7a1818",
+                markeredgewidth=1.6, zorder=10,
+            )
 
     def _draw_selection(self) -> None:
         model = self._model()
-        if self._selected_node_id is not None:
-            node = model.nodes.get(self._selected_node_id)
-            if node is not None:
-                self.ax.plot(
-                    node.x, node.y, marker="o", markersize=13,
-                    markerfacecolor="none", markeredgecolor="#ffbf00",
-                    markeredgewidth=2.4, zorder=11,
-                )
+        element_by_id = {elem.id: elem for elem in model.elements}
+        # Paint element-band highlights behind the element line so the
+        # crisp element stroke still reads through. Use one segmented plot
+        # instead of one artist per selected element for smoother redraws
+        # after window selections.
+        sel_xs: list[float | None] = []
+        sel_ys: list[float | None] = []
+        for eid in self._selected_element_ids:
+            elem = element_by_id.get(eid)
+            if elem is None:
+                continue
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            sel_xs.extend([ni.x, nj.x, None])
+            sel_ys.extend([ni.y, nj.y, None])
+        if sel_xs:
+            self.ax.plot(
+                sel_xs, sel_ys, color="#ffbf00", linewidth=6.0, alpha=0.45,
+                solid_capstyle="round", zorder=1.5,
+            )
+        # Paint node highlights on top (orange ring), again batched into
+        # a single marker artist.
+        sel_nx: list[float] = []
+        sel_ny: list[float] = []
+        for nid in self._selected_node_ids:
+            node = model.nodes.get(nid)
+            if node is None:
+                continue
+            sel_nx.append(node.x)
+            sel_ny.append(node.y)
+        if sel_nx:
+            self.ax.plot(
+                sel_nx, sel_ny, marker="o", markersize=13, linestyle="None",
+                markerfacecolor="none", markeredgecolor="#ffbf00",
+                markeredgewidth=2.4, zorder=11,
+            )
+
+    def _draw_drag_rect(self) -> None:
+        if self._drag_rect is None:
             return
-        if self._selected_element_id is None:
-            return
-        elem = next((e for e in model.elements
-                     if e.id == self._selected_element_id), None)
-        if elem is None:
-            return
-        ni = model.nodes.get(elem.node_i)
-        nj = model.nodes.get(elem.node_j)
-        if ni is None or nj is None:
-            return
-        self.ax.plot(
-            [ni.x, nj.x], [ni.y, nj.y],
-            color="#ffbf00", linewidth=6.0, alpha=0.45,
-            solid_capstyle="round", zorder=1.5,
+        from matplotlib.patches import Rectangle
+        x0, y0, x1, y1, is_crossing = self._drag_rect
+        rx = min(x0, x1)
+        ry = min(y0, y1)
+        rw = abs(x1 - x0)
+        rh = abs(y1 - y0)
+        if is_crossing:
+            # Right-to-left drag → Crossing mode: dashed green outline,
+            # semi-transparent green fill. Selects anything the rect
+            # touches.
+            edge = "#2da44e"
+            face = "#2da44e"
+            ls = "--"
+        else:
+            # Left-to-right drag → Window mode: solid blue outline,
+            # semi-transparent blue fill. Selects only fully enclosed
+            # objects.
+            edge = "#1f6feb"
+            face = "#1f6feb"
+            ls = "-"
+        rect = Rectangle(
+            (rx, ry), rw, rh,
+            edgecolor=edge, facecolor=face,
+            linestyle=ls, linewidth=1.4, alpha=0.10, fill=True,
+            zorder=12,
         )
+        # Re-apply edge alpha distinctly from face alpha so the outline
+        # stays legible even on busy canvases.
+        rect.set_edgecolor(edge)
+        rect.set_linewidth(1.4)
+        self.ax.add_patch(rect)
 
     def _draw_model(self) -> None:
         model = self._model()
@@ -579,9 +1037,13 @@ class ModelCanvas(QWidget):
         for elem in model.elements:
             for ml in getattr(elem, "member_loads", []):
                 if isinstance(ml, UniformDistributedLoad):
-                    max_udl = max(max_udl, abs(ml.wy))
+                    max_udl = max(
+                        max_udl, abs(ml.wy), abs(getattr(ml, "wx", 0.0)),
+                    )
                 elif isinstance(ml, PointLoad):
-                    max_point = max(max_point, abs(ml.py))
+                    max_point = max(
+                        max_point, abs(ml.py), abs(getattr(ml, "px", 0.0)),
+                    )
         span = self._model_span()
         # Map the largest load in each family to ~12% of the model
         # span on screen; smaller loads scale linearly down from there.
@@ -594,18 +1056,38 @@ class ModelCanvas(QWidget):
             "point": target / max_point if max_point > 0 else 0.0,
         }
 
+        draw_element_ids = len(model.elements) <= self.MAX_AUTO_ELEMENT_LABELS
+        draw_node_ids = len(model.nodes) <= self.MAX_AUTO_NODE_LABELS
+        frame_xs: list[float | None] = []
+        frame_ys: list[float | None] = []
+        truss_xs: list[float | None] = []
+        truss_ys: list[float | None] = []
+        release_xs: list[float] = []
+        release_ys: list[float] = []
+        release_edges: list[str] = []
+
         for elem in model.elements:
             ni = model.nodes.get(elem.node_i)
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
-            color = "#1f77b4" if isinstance(elem, FrameElement2D) else "#d62728"
-            ls = "-" if isinstance(elem, FrameElement2D) else "--"
-            self.ax.plot([ni.x, nj.x], [ni.y, nj.y], color=color, linestyle=ls,
-                         linewidth=2.0, zorder=2)
+            is_frame = isinstance(elem, FrameElement2D)
+            if is_frame:
+                frame_xs.extend([ni.x, nj.x, None])
+                frame_ys.extend([ni.y, nj.y, None])
+            else:
+                truss_xs.extend([ni.x, nj.x, None])
+                truss_ys.extend([ni.y, nj.y, None])
+            color = "#1f77b4" if is_frame else "#d62728"
             mx, my = (ni.x + nj.x) / 2, (ni.y + nj.y) / 2
-            self.ax.annotate(f"e{elem.id}", (mx, my), color=color,
-                             fontsize=8, ha="center", va="bottom", zorder=4)
+            if draw_element_ids:
+                text = self.ax.annotate(
+                    f"e{elem.id}", (mx, my), color=color, fontsize=8,
+                    ha="center", va="bottom", zorder=4,
+                )
+                text.set_path_effects([
+                    _path_effects.withStroke(linewidth=2.0, foreground="white"),
+                ])
             if self.show_section_labels:
                 section = model.sections.get(getattr(elem, "section_id", None))
                 if section is not None:
@@ -622,32 +1104,147 @@ class ModelCanvas(QWidget):
                                   fc="white", ec="#dddddd", alpha=0.82),
                         zorder=6,
                     )
-            if isinstance(elem, FrameElement2D):
+            if is_frame:
                 if elem.release_i:
-                    self.ax.plot(ni.x + 0.15 * (nj.x - ni.x),
-                                 ni.y + 0.15 * (nj.y - ni.y),
-                                 marker="o", color="white", markersize=7,
-                                 markeredgecolor=color, zorder=5)
+                    release_xs.append(ni.x + 0.15 * (nj.x - ni.x))
+                    release_ys.append(ni.y + 0.15 * (nj.y - ni.y))
+                    release_edges.append(color)
                 if elem.release_j:
-                    self.ax.plot(nj.x - 0.15 * (nj.x - ni.x),
-                                 nj.y - 0.15 * (nj.y - ni.y),
-                                 marker="o", color="white", markersize=7,
-                                 markeredgecolor=color, zorder=5)
+                    release_xs.append(nj.x - 0.15 * (nj.x - ni.x))
+                    release_ys.append(nj.y - 0.15 * (nj.y - ni.y))
+                    release_edges.append(color)
             self._draw_member_loads(elem, ni, nj, load_scales)
 
+        if frame_xs:
+            self.ax.plot(frame_xs, frame_ys, color="#1f77b4", linestyle="-",
+                         linewidth=2.0, zorder=2)
+        if truss_xs:
+            self.ax.plot(truss_xs, truss_ys, color="#d62728", linestyle="--",
+                         linewidth=2.0, zorder=2)
+        for rx, ry, edge in zip(release_xs, release_ys, release_edges):
+            self.ax.plot(rx, ry, marker="o", color="white", markersize=7,
+                         markeredgecolor=edge, zorder=5)
+
+        if self.show_local_axes:
+            self._draw_local_axes(model)
+
+        node_xs = [n.x for n in model.nodes.values()]
+        node_ys = [n.y for n in model.nodes.values()]
+        if node_xs:
+            self.ax.plot(node_xs, node_ys, "o", color="black", markersize=6,
+                         linestyle="None", zorder=5)
         for nid, n in model.nodes.items():
-            self.ax.plot(n.x, n.y, "o", color="black", markersize=6, zorder=5)
-            self.ax.annotate(f"n{nid}", (n.x, n.y), xytext=(5, 5),
-                             textcoords="offset points", fontsize=8, zorder=6)
+            if draw_node_ids:
+                text = self.ax.annotate(
+                    f"n{nid}", (n.x, n.y), xytext=(5, 5),
+                    textcoords="offset points", fontsize=8, zorder=6,
+                )
+                text.set_path_effects([
+                    _path_effects.withStroke(linewidth=2.0, foreground="white"),
+                ])
             sup = model.supports.get(nid)
             if sup is not None:
                 self._draw_support(sup, n.x, n.y)
+
+        if not draw_element_ids or not draw_node_ids:
+            hidden: list[str] = []
+            if not draw_element_ids:
+                hidden.append("element IDs")
+            if not draw_node_ids:
+                hidden.append("node IDs")
+            self.ax.annotate(
+                "Dense view: " + " and ".join(hidden) + " hidden",
+                (0.02, 0.02), xycoords="axes fraction", fontsize=8,
+                color="#666666", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white",
+                          ec="#dddddd", alpha=0.85),
+                zorder=20,
+            )
 
         for ld in model.nodal_loads:
             n = model.nodes.get(ld.node_id)
             if n is None:
                 continue
             self._draw_nodal_load(ld, n.x, n.y, load_scales["force"])
+
+    def _draw_local_axes(self, model: StructuralModel) -> None:
+        # Local-axis overlay (View → Show local axes). Convention is
+        # pinned to ``FrameElement2D.transformation_matrix`` /
+        # ``_length_cos_sin`` in ``element.py``:
+        #     local x = (nj - ni) / L
+        #     local y = (-dy, dx) / L           (i.e. 90° CCW from x)
+        # We honour the same dense-view cap as element labels so a
+        # 10 000-element model doesn't drown in arrows.
+        if len(model.elements) > self.MAX_AUTO_ELEMENT_LABELS:
+            return
+        # Cap arrow length against the visible diagonal so it stays
+        # legible at any zoom; on short elements we additionally cap to
+        # 18% of L so the arrow never overshoots the member.
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        view_diag = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+        diag_cap = 0.025 * view_diag if view_diag > 0 else 0.0
+        gray = "#3a3a3a"
+        for elem in model.elements:
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            dx = nj.x - ni.x
+            dy = nj.y - ni.y
+            L = (dx * dx + dy * dy) ** 0.5
+            if L < 1e-12:
+                continue
+            ex_x, ex_y = dx / L, dy / L
+            ey_x, ey_y = -dy / L, dx / L
+            arrow_len = min(0.18 * L, diag_cap) if diag_cap > 0 else 0.18 * L
+            mx = (ni.x + nj.x) / 2
+            my = (ni.y + nj.y) / 2
+            # Local x arrow (mid → mid + len * ex).
+            self.ax.annotate(
+                "", xy=(mx + arrow_len * ex_x, my + arrow_len * ex_y),
+                xytext=(mx, my),
+                arrowprops=dict(
+                    arrowstyle="->", color=gray, lw=1.0,
+                    shrinkA=0, shrinkB=0,
+                ),
+                annotation_clip=False, zorder=3.5,
+            )
+            # Local y arrow (mid → mid + len * ey).
+            self.ax.annotate(
+                "", xy=(mx + arrow_len * ey_x, my + arrow_len * ey_y),
+                xytext=(mx, my),
+                arrowprops=dict(
+                    arrowstyle="->", color=gray, lw=1.0,
+                    shrinkA=0, shrinkB=0,
+                ),
+                annotation_clip=False, zorder=3.5,
+            )
+            # Tip labels — placed slightly past the arrowhead.
+            tx = mx + arrow_len * 1.12 * ex_x
+            ty = my + arrow_len * 1.12 * ex_y
+            self.ax.text(
+                tx, ty, "x", color=gray, fontsize=7,
+                ha="center", va="center", zorder=3.6,
+            )
+            tx = mx + arrow_len * 1.12 * ey_x
+            ty = my + arrow_len * 1.12 * ey_y
+            self.ax.text(
+                tx, ty, "y", color=gray, fontsize=7,
+                ha="center", va="center", zorder=3.6,
+            )
+            # i / j end labels — 6% in from each end so they don't
+            # clash with the node marker or the release marker (15%).
+            ix, iy = ni.x + 0.06 * dx, ni.y + 0.06 * dy
+            jx, jy = nj.x - 0.06 * dx, nj.y - 0.06 * dy
+            for tx, ty, lbl in ((ix, iy, "i"), (jx, jy, "j")):
+                t = self.ax.text(
+                    tx, ty, lbl, color=gray, fontsize=7,
+                    ha="center", va="center", zorder=3.6,
+                )
+                t.set_path_effects([
+                    _path_effects.withStroke(linewidth=1.6, foreground="white"),
+                ])
 
     def _draw_support(self, sup: Support, x: float, y: float) -> None:
         if sup.ux and sup.uy and sup.rz:
@@ -679,6 +1276,9 @@ class ModelCanvas(QWidget):
         # ``force_scale`` is "world-units of arrow length per kN" so
         # arrow length is directly proportional to the load magnitude
         # (set by _draw_model from the largest nodal load in the model).
+        # ``case_alpha`` dims loads belonging to non-active load cases
+        # when the host has the "active case only" overlay on (PR-A).
+        case_alpha = self._load_case_alpha(ld)
         if force_scale > 0:
             if ld.fx:
                 dx = ld.fx * force_scale
@@ -686,75 +1286,108 @@ class ModelCanvas(QWidget):
                     "",
                     xy=(x, y),
                     xytext=(x - dx, y),
-                    arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=2),
+                    arrowprops=dict(
+                        arrowstyle="->", color="#2ca02c", lw=2,
+                        alpha=case_alpha,
+                    ),
                     zorder=5,
                 )
                 self.ax.annotate(f"Fx={ld.fx:+.3g}", (x - dx, y),
                                  xytext=(0, 5), textcoords="offset points",
-                                 fontsize=7, color="#2ca02c", zorder=6)
+                                 fontsize=7, color="#2ca02c", zorder=6,
+                                 alpha=case_alpha)
             if ld.fy:
                 dy = ld.fy * force_scale
                 self.ax.annotate(
                     "",
                     xy=(x, y),
                     xytext=(x, y - dy),
-                    arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=2),
+                    arrowprops=dict(
+                        arrowstyle="->", color="#2ca02c", lw=2,
+                        alpha=case_alpha,
+                    ),
                     zorder=5,
                 )
                 self.ax.annotate(f"Fy={ld.fy:+.3g}", (x, y - dy),
                                  xytext=(5, 0), textcoords="offset points",
-                                 fontsize=7, color="#2ca02c", zorder=6)
+                                 fontsize=7, color="#2ca02c", zorder=6,
+                                 alpha=case_alpha)
         if ld.mz:
             self.ax.annotate(f"M={ld.mz:+.3g}", (x, y), xytext=(8, -8),
                              textcoords="offset points", fontsize=7,
-                             color="#2ca02c", zorder=6)
+                             color="#2ca02c", zorder=6,
+                             alpha=case_alpha)
 
     def _draw_member_loads(self, elem, ni, nj, load_scales: dict) -> None:
+        """Draw each member load in its TRUE direction:
+
+        * ``coord_system == "local"`` — axial component along the member
+          tangent, transverse component perpendicular to the member.
+        * ``coord_system == "global"`` — qX and qY components in the true
+          global X / Y directions, regardless of the member's
+          orientation.
+        * ``coord_system == "gravity"`` — single component straight along
+          global -Y (positive magnitude = downward), regardless of
+          member orientation.
+
+        Each non-zero (direction, magnitude) pair produces one set of
+        arrows (UDL: six along the element; PointLoad: one at ``a``).
+        The arrow "tail offset" sign convention matches the legacy
+        renderer so visual orientation stays consistent for existing
+        local loads."""
         if not elem.member_loads:
             return
         L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
         if L < 1e-12:
             return
-        # Element local axes for drawing transverse loads on the member.
-        tx, ty = (nj.x - ni.x) / L, (nj.y - ni.y) / L   # axial
-        nx, ny = -ty, tx                                # transverse (+y_local)
+        tx, ty = (nj.x - ni.x) / L, (nj.y - ni.y) / L   # member tangent
+        nx, ny = -ty, tx                                # member +y_local
 
-        labels = []
+        labels: list[str] = []
         udl_scale = load_scales.get("udl", 0.0)
         point_scale = load_scales.get("point", 0.0)
+
         for ml in elem.member_loads:
+            # PR-A: dim loads belonging to non-active cases when the
+            # host has the "active case only" overlay on.
+            case_alpha = self._load_case_alpha(ml)
             if isinstance(ml, UniformDistributedLoad):
-                labels.append(f"UDL {ml.wy:+.3g}")
+                labels.append(_label_for_udl(ml))
                 if udl_scale > 0:
-                    h = ml.wy * udl_scale
-                    # Build a filled polygon showing the UDL band on
-                    # the +y_local side of the element. The band height
-                    # is proportional to the load intensity relative to
-                    # the model maximum.
-                    p0 = (ni.x,             ni.y            )
-                    p1 = (nj.x,             nj.y            )
-                    p2 = (nj.x + nx * h,    nj.y + ny * h    )
-                    p3 = (ni.x + nx * h,    ni.y + ny * h    )
-                    poly = _MplPolygon([p0, p1, p2, p3],
-                                        closed=True,
-                                        facecolor="#9467bd", alpha=0.18,
-                                        edgecolor="#9467bd", linewidth=0.5,
-                                        zorder=1)
-                    self.ax.add_patch(poly)
+                    for dx, dy, mag in _udl_visual_components(
+                        ml, tx, ty, nx, ny,
+                    ):
+                        if mag == 0.0:
+                            continue
+                        self._draw_udl_arrow_strip(
+                            ni, nj, dx, dy, mag, udl_scale,
+                            case_alpha=case_alpha,
+                        )
             elif isinstance(ml, PointLoad):
-                labels.append(f"P {ml.py:+.3g}@{ml.a:.3g}")
+                labels.append(_label_for_pointload(ml))
                 if point_scale > 0:
                     a = max(0.0, min(L, float(ml.a)))
                     bx = ni.x + tx * a
                     by = ni.y + ty * a
-                    h = ml.py * point_scale
-                    self.ax.annotate(
-                        "",
-                        xy=(bx, by),
-                        xytext=(bx + nx * h, by + ny * h),
-                        arrowprops=dict(arrowstyle="->", color="#9467bd", lw=2),
-                        zorder=5,
-                    )
+                    for dx, dy, mag in _pointload_visual_components(
+                        ml, tx, ty, nx, ny,
+                    ):
+                        if mag == 0.0:
+                            continue
+                        h = mag * point_scale
+                        # Tail OPPOSITE to load direction so the
+                        # arrowhead at xy=(bx,by) visually points along
+                        # (dx, dy) — matches the nodal-load convention.
+                        self.ax.annotate(
+                            "",
+                            xy=(bx, by),
+                            xytext=(bx - dx * h, by - dy * h),
+                            arrowprops=dict(
+                                arrowstyle="->", color="#9467bd", lw=2,
+                                alpha=case_alpha,
+                            ),
+                            zorder=5,
+                        )
             elif isinstance(ml, TrussTemperatureLoad):
                 labels.append(f"ΔT {ml.delta_T:+.3g}°")
             elif isinstance(ml, FrameTemperatureLoad):
@@ -764,6 +1397,42 @@ class ModelCanvas(QWidget):
             self.ax.annotate(", ".join(labels), (mx, my),
                              xytext=(0, -12), textcoords="offset points",
                              fontsize=7, color="#9467bd", ha="center", zorder=6)
+
+    def _draw_udl_arrow_strip(
+        self, ni, nj, dx: float, dy: float, magnitude: float,
+        udl_scale: float, n_arrows: int = 6,
+        *,
+        case_alpha: float = 1.0,
+    ) -> None:
+        """Draw ``n_arrows`` evenly spaced arrows along the element in
+        the direction ``(dx, dy)`` with length proportional to
+        ``magnitude * udl_scale``. The arrowhead lands on the member
+        and the tail sits OPPOSITE to the load direction so the visual
+        actually points the way the force acts — matching how nodal
+        loads are drawn (see ``_draw_nodal_load`` which also offsets
+        the tail by ``-`` the force components).
+
+        ``case_alpha`` multiplies the per-arrow alpha (PR-A) so loads
+        from non-active cases render at the host's configured dim
+        level."""
+        h = magnitude * udl_scale
+        if h == 0.0:
+            return
+        arrow_alpha = 0.85 * case_alpha
+        for i in range(n_arrows):
+            t = (i + 0.5) / n_arrows
+            bx = ni.x + (nj.x - ni.x) * t
+            by = ni.y + (nj.y - ni.y) * t
+            self.ax.annotate(
+                "",
+                xy=(bx, by),
+                xytext=(bx - dx * h, by - dy * h),
+                arrowprops=dict(
+                    arrowstyle="->", color="#9467bd", lw=1.0,
+                    alpha=arrow_alpha,
+                ),
+                zorder=4,
+            )
 
     def _node_displacement(self, nid: int) -> tuple[float, float]:
         result = self._result
@@ -943,12 +1612,14 @@ class ModelCanvas(QWidget):
                 color="#888888", linestyle=":", linewidth=1.0, alpha=0.6,
                 zorder=2,
             )
-            self.ax.plot(
-                [ni.x + scale * uxi, nj.x + scale * uxj],
-                [ni.y + scale * uyi, nj.y + scale * uyj],
-                color="#d62728", linestyle="-", linewidth=1.8, alpha=0.85,
-                zorder=4,
-            )
+            # Skip red overlay for zero-displacement elements (inactive component).
+            if uxi**2 + uyi**2 + uxj**2 + uyj**2 >= 1e-20 * max_disp**2:
+                self.ax.plot(
+                    [ni.x + scale * uxi, nj.x + scale * uxj],
+                    [ni.y + scale * uyi, nj.y + scale * uyj],
+                    color="#d62728", linestyle="-", linewidth=1.8, alpha=0.85,
+                    zorder=4,
+                )
         f = float(mr.frequencies[k])
         T = float(mr.periods[k])
         self.ax.annotate(
@@ -1162,8 +1833,190 @@ class ModelCanvas(QWidget):
         else:
             x_half = base
             y_half = base * (h_px / w_px)
-        self.ax.set_xlim(cx - x_half, cx + x_half)
-        self.ax.set_ylim(cy - y_half, cy + y_half)
+        self._setting_axes_limits = True
+        try:
+            self.ax.set_xlim(cx - x_half, cx + x_half)
+            self.ax.set_ylim(cy - y_half, cy + y_half)
+        finally:
+            self._setting_axes_limits = False
+
+    def _on_limits_changed(self, _ax) -> None:
+        """Mark the view as user-owned when xlim/ylim change for any
+        reason other than our own programmatic fits. The matplotlib
+        navigation toolbar's pan/zoom modes route through here, so
+        after the user pans/zooms via the toolbar a subsequent resize
+        no longer silently re-fits and throws their view away."""
+        if not self._setting_axes_limits:
+            self._user_view_dirty = True
+
+
+def _udl_visual_components(
+    ml: UniformDistributedLoad, tx: float, ty: float, nx: float, ny: float,
+) -> list[tuple[float, float, float]]:
+    """Return ``(direction_x, direction_y, magnitude)`` tuples for each
+    drawable component of a UDL, given the element's tangent ``(tx, ty)``
+    and +y_local normal ``(nx, ny)``.
+
+    * ``"local"``: two components — axial along the member tangent
+      (magnitude ``wx``) and transverse perpendicular to it (magnitude
+      ``wy``). Either component may be 0; the caller filters those out.
+    * ``"global"``: two components — ``qX`` along true global X
+      ``(1, 0)`` and ``qY`` along true global Y ``(0, 1)``. The
+      direction vectors are in WORLD axes, independent of the member's
+      orientation, so an inclined member draws horizontally / vertically
+      not perpendicular to itself.
+    * ``"gravity"``: one component straight along global ``-Y`` with
+      magnitude ``wy``. Positive magnitude → arrows pointing down."""
+    cs = getattr(ml, "coord_system", "local")
+    if cs == "local":
+        return [(tx, ty, ml.wx), (nx, ny, ml.wy)]
+    if cs == "global":
+        return [(1.0, 0.0, ml.wx), (0.0, 1.0, ml.wy)]
+    if cs == "gravity":
+        return [(0.0, -1.0, ml.wy)]
+    # Defensive: unknown — fall back to legacy local-y rendering.
+    return [(nx, ny, ml.wy)]
+
+
+def _pointload_visual_components(
+    ml: PointLoad, tx: float, ty: float, nx: float, ny: float,
+) -> list[tuple[float, float, float]]:
+    """Mirror :func:`_udl_visual_components` for a point load."""
+    cs = getattr(ml, "coord_system", "local")
+    if cs == "local":
+        return [(tx, ty, ml.px), (nx, ny, ml.py)]
+    if cs == "global":
+        return [(1.0, 0.0, ml.px), (0.0, 1.0, ml.py)]
+    if cs == "gravity":
+        return [(0.0, -1.0, ml.py)]
+    return [(nx, ny, ml.py)]
+
+
+def _label_for_udl(ml: UniformDistributedLoad) -> str:
+    """Short magnitude-and-direction tag rendered under the element."""
+    cs = getattr(ml, "coord_system", "local")
+    if cs == "gravity":
+        return f"UDL {ml.wy:+.3g} grav"
+    if cs == "global":
+        if ml.wx != 0.0 and ml.wy != 0.0:
+            return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g}) glob"
+        if ml.wx != 0.0:
+            return f"UDL qX={ml.wx:+.3g} glob"
+        return f"UDL qY={ml.wy:+.3g} glob"
+    # local
+    if ml.wx != 0.0 and ml.wy != 0.0:
+        return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g})"
+    if ml.wx != 0.0:
+        return f"UDL wx={ml.wx:+.3g}"
+    return f"UDL {ml.wy:+.3g}"
+
+
+def _label_for_pointload(ml: PointLoad) -> str:
+    cs = getattr(ml, "coord_system", "local")
+    suffix = ""
+    if cs == "gravity":
+        return f"P {ml.py:+.3g}@{ml.a:.3g} grav"
+    if cs == "global":
+        suffix = " glob"
+    if ml.px != 0.0 and ml.py != 0.0:
+        return f"P ({ml.px:+.3g},{ml.py:+.3g})@{ml.a:.3g}{suffix}"
+    if ml.px != 0.0:
+        return f"P px={ml.px:+.3g}@{ml.a:.3g}{suffix}"
+    return f"P {ml.py:+.3g}@{ml.a:.3g}{suffix}"
+
+
+def _shift_pressed() -> bool:
+    """True if the Shift modifier is currently held.
+
+    Read at click/motion/release time so tools see the live keyboard
+    state — matplotlib's `event.key` is unreliable for modifier-only
+    presses across backends/OSes."""
+    try:
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import Qt
+    except Exception:
+        return False
+    app = QApplication.instance()
+    if app is None:
+        return False
+    return bool(app.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+
+
+def _point_in_world_rect(
+    px: float, py: float,
+    rx0: float, ry0: float, rx1: float, ry1: float,
+) -> bool:
+    """True iff (px, py) lies inside or on the boundary of the axis-
+    aligned rectangle with corners (rx0, ry0)–(rx1, ry1).
+
+    Corner order is not assumed — the rect is normalised here so the
+    caller can pass world coords in any order (e.g. press point and
+    release point of a right-to-left drag)."""
+    lo_x = min(rx0, rx1)
+    hi_x = max(rx0, rx1)
+    lo_y = min(ry0, ry1)
+    hi_y = max(ry0, ry1)
+    return lo_x <= px <= hi_x and lo_y <= py <= hi_y
+
+
+def _segment_intersects_rect(
+    x1: float, y1: float, x2: float, y2: float,
+    rx0: float, ry0: float, rx1: float, ry1: float,
+) -> bool:
+    """True iff the segment (x1,y1)→(x2,y2) intersects or lies inside the
+    rect. Uses Cohen–Sutherland outcodes — both endpoints inside, any
+    endpoint inside, or a clipped segment with positive length all count
+    as a hit. Inclusive on the boundary."""
+    lo_x = min(rx0, rx1)
+    hi_x = max(rx0, rx1)
+    lo_y = min(ry0, ry1)
+    hi_y = max(ry0, ry1)
+
+    LEFT, RIGHT, BOTTOM, TOP = 1, 2, 4, 8
+
+    def code(x: float, y: float) -> int:
+        c = 0
+        if x < lo_x:
+            c |= LEFT
+        elif x > hi_x:
+            c |= RIGHT
+        if y < lo_y:
+            c |= BOTTOM
+        elif y > hi_y:
+            c |= TOP
+        return c
+
+    cx1, cy1 = x1, y1
+    cx2, cy2 = x2, y2
+    c1 = code(cx1, cy1)
+    c2 = code(cx2, cy2)
+    while True:
+        if c1 == 0 or c2 == 0:
+            return True            # at least one endpoint in rect
+        if c1 & c2:
+            return False           # both share an outside region
+        out = c1 or c2
+        nx, ny = cx1, cy1
+        dx = cx2 - cx1
+        dy = cy2 - cy1
+        if out & TOP:
+            nx = cx1 + dx * (hi_y - cy1) / dy if dy else cx1
+            ny = hi_y
+        elif out & BOTTOM:
+            nx = cx1 + dx * (lo_y - cy1) / dy if dy else cx1
+            ny = lo_y
+        elif out & RIGHT:
+            ny = cy1 + dy * (hi_x - cx1) / dx if dx else cy1
+            nx = hi_x
+        elif out & LEFT:
+            ny = cy1 + dy * (lo_x - cx1) / dx if dx else cy1
+            nx = lo_x
+        if out == c1:
+            cx1, cy1 = nx, ny
+            c1 = code(cx1, cy1)
+        else:
+            cx2, cy2 = nx, ny
+            c2 = code(cx2, cy2)
 
 
 def _point_segment_distance_px(px, py, x1, y1, x2, y2,
@@ -1183,90 +2036,6 @@ def _point_segment_distance_px(px, py, x1, y1, x2, y2,
     cx = ax + t * abx
     cy = ay + t * aby
     return ((qx - cx) ** 2 + (qy - cy) ** 2) ** 0.5
-
-
-def _diagram_evaluator(elem, ni, nj, f_local, kind: str):
-    """Build a single-x evaluator ``f(x_loc) -> value`` for ``kind`` on
-    this element. Returns ``(L, evaluator)``; ``evaluator`` is ``None``
-    when the requested kind doesn't apply (e.g. moment/shear on a truss
-    bar). Reused by both :func:`_diagram_ordinates` for drawing and by
-    the hover-status path for "value at the cursor's projected x_loc".
-
-    Sign convention. ``V_i`` and ``M_i`` are the local member-end
-    shear / moment at the i-end (``q_local = K·d − p_local`` entries
-    from :meth:`FrameElement2D.local_displacement_and_end_forces`).
-    ``w`` is the summed UDL intensity in +y_local. ``points`` are
-    in-span point loads with ``py`` in +y_local. The point-load terms
-    in ``shear`` and ``moment`` carry the **same** sign of ``py`` so
-    ``dM/dx = V`` holds across the discontinuity (regression in
-    ``tests/test_diagram_signs.py``).
-    """
-    L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
-    if L < 1e-12:
-        return 0.0, None
-    N_i, V_i, M_i, _N_j, _V_j, _M_j = (float(v) for v in f_local)
-
-    if kind == "axial":
-        # Axial: plot ``-N_i`` so compression reads positive on the
-        # page (the local-frame member-end axial force is positive in
-        # the +x_local direction, which is tension on the i-end;
-        # flipping the sign gives compression-positive).
-        n_value = -N_i
-        return L, (lambda _x, _v=n_value: _v)
-
-    if isinstance(elem, TrussElement2D):
-        # Truss elements don't carry shear or bending.
-        return L, None
-
-    udls = []
-    points = []
-    for ml in getattr(elem, "member_loads", []):
-        if isinstance(ml, UniformDistributedLoad):
-            udls.append(ml.wy)
-        elif isinstance(ml, PointLoad):
-            points.append((ml.a, ml.py))
-    w = sum(udls)
-
-    if kind == "shear":
-        def shear(x):
-            v = V_i - w * x
-            for a, py in points:
-                if x > a:
-                    v += py
-            return v
-        return L, shear
-
-    if kind == "moment":
-        def moment(x):
-            m = -M_i + V_i * x - 0.5 * w * x * x
-            for a, py in points:
-                if x > a:
-                    m += py * (x - a)
-            return m
-        return L, moment
-
-    return L, None
-
-
-def _diagram_ordinates(elem, ni, nj, f_local, kind: str,
-                        n_samples: int = 21):
-    L, fn = _diagram_evaluator(elem, ni, nj, f_local, kind)
-    if fn is None:
-        return None, None
-    xs = [i * L / (n_samples - 1) for i in range(n_samples)]
-    ys = [fn(x) for x in xs]
-    return xs, ys
-
-
-def _diagram_value(elem, ni, nj, f_local, kind: str, x_loc: float):
-    """Return the diagram value at arc-length ``x_loc`` along the element,
-    or ``None`` if the kind doesn't apply to this element. Used by the
-    canvas hover handler to report the value at the projected cursor."""
-    L, fn = _diagram_evaluator(elem, ni, nj, f_local, kind)
-    if fn is None:
-        return None
-    x = max(0.0, min(L, float(x_loc)))
-    return float(fn(x))
 
 
 _DIAGRAM_UNITS = {"moment": "kN·m", "shear": "kN", "axial": "kN"}

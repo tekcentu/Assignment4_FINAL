@@ -30,8 +30,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .element import Element2D, FrameElement2D
-from .model import StructuralModel
+from .element import Element2D, FrameElement2D, TrussElement2D
+from .model import NODE_COINCIDENCE_TOL, STANDARD_GRAVITY, StructuralModel
+
+
+# Cap the coincident-pair list shown in the warning to keep the
+# results panel readable on pathological imports. The full set is
+# always available by re-running the check.
+_MAX_COINCIDENT_PAIRS_IN_WARNING: int = 10
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -261,6 +267,46 @@ def _connectivity_components(model: StructuralModel) -> list[set[int]]:
     return components
 
 
+def _find_coincident_node_pairs(
+    model: StructuralModel,
+    *,
+    tol: float = NODE_COINCIDENCE_TOL,
+) -> list[tuple[int, int, float]]:
+    """Return pairs of nodes within ``tol`` of each other (id_a < id_b).
+
+    Returns a list of ``(id_a, id_b, distance)`` tuples. The
+    O(n²) pairwise comparison is fine for typical model sizes
+    (< few hundred nodes); for larger imports a spatial index would
+    help but is out of scope for the Stage B-lite minimal audit.
+
+    Used by :func:`validate_model` to emit a non-fatal warning when
+    the model has duplicate nodes that the add-time block in
+    ``AddNodeCmd`` didn't catch (most commonly: nodes that drifted
+    into coincidence through file import or manual moves).
+    """
+    nodes = list(model.nodes.values())
+    pairs: list[tuple[int, int, float]] = []
+    for i, ni in enumerate(nodes):
+        for nj in nodes[i + 1:]:
+            dx = ni.x - nj.x
+            dy = ni.y - nj.y
+            # Cheap bounding-box pre-filter rules out the obviously-
+            # distant majority before the hypot call. The strict
+            # Euclidean check below is what actually decides whether
+            # the pair counts as coincident — using only the box
+            # check could flag pairs whose Euclidean distance reaches
+            # √2·tol, contradicting the warning message's "Δ ≤ tol"
+            # claim (per gemini PR-21 review).
+            if abs(dx) >= tol or abs(dy) >= tol:
+                continue
+            dist = float(np.hypot(dx, dy))
+            if dist >= tol:
+                continue
+            a, b = (ni.id, nj.id) if ni.id < nj.id else (nj.id, ni.id)
+            pairs.append((a, b, dist))
+    return pairs
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Validation
 # ═══════════════════════════════════════════════════════════════
@@ -310,6 +356,26 @@ def validate_model(model: StructuralModel, dofs: DofManager) -> list[str]:
         raise ValueError(
             f"Isolated nodes with no elements: {isolated}. "
             f"Remove them or connect them."
+        )
+
+    # v0.11.0 Stage B-lite: coincident-node audit. The add-time block
+    # in `AddNodeCmd` prevents new duplicates, but nothing today
+    # catches duplicates introduced by file import or by manual node
+    # moves. Surfaced as a non-fatal warning so existing fatal checks
+    # (orphan / disconnected-unsupported) stay fatal — only the
+    # missing-from-today's-validation case is added.
+    pairs = _find_coincident_node_pairs(model, tol=NODE_COINCIDENCE_TOL)
+    if pairs:
+        shown = pairs[:_MAX_COINCIDENT_PAIRS_IN_WARNING]
+        suffix = (
+            f" …(+{len(pairs) - _MAX_COINCIDENT_PAIRS_IN_WARNING} more)"
+            if len(pairs) > _MAX_COINCIDENT_PAIRS_IN_WARNING
+            else ""
+        )
+        pair_text = ", ".join(f"({a}, {b})" for a, b, _ in shown) + suffix
+        warnings.append(
+            f"Coincident nodes detected "
+            f"(Δ ≤ {NODE_COINCIDENCE_TOL:.0e} m): pairs {pair_text}."
         )
 
     # Connectivity — each component must have at least one support
@@ -412,4 +478,90 @@ def assemble_global_system(
             "L": L, "c": c, "s": s,
         }
 
+    # Self-weight pass — applied directly to F, never persisted to the model.
+    # Per-element raw fixed-end vectors are stashed in ``elem_data`` so the
+    # postprocessor can feed them into ``q = K·d − p`` recovery without
+    # the loads ever being attached as member_loads.
+    if model.include_self_weight:
+        _apply_self_weight(model, dofs, F, elem_data)
+
     return K, F, dofs, warnings, elem_data
+
+
+def _apply_self_weight(
+    model: StructuralModel,
+    dofs: DofManager,
+    F: np.ndarray,
+    elem_data: dict[int, dict],
+) -> None:
+    """Inject gravity loads on every element into the global F vector.
+
+    Gravity is hard-coded to global -Y at g = STANDARD_GRAVITY in v0.9.0.
+
+    Frame elements get a full local 6-DOF fixed-end force vector built
+    from the same equivalent-load sign convention as the UDL path in
+    ``FrameElement2D.assembled_local_stiffness_and_load`` (see
+    element.py UDL block) — i.e. ``p`` is the equivalent nodal load
+    that is *added* to F, not the fixed-end reaction. The local
+    components of gravity are derived from the element's orientation:
+    a body-force of magnitude ``w = ρ·A·g/1000`` (kN/m) in global -Y
+    projects to ``w_local_x = -w·sin θ`` (axial) and
+    ``w_local_y = -w·cos θ`` (transverse), then transformed back to
+    global via ``Rᵀ``.
+
+    Truss elements take half the bar weight lumped at each endpoint
+    in global -Y. This bypasses the existing TrussElement2D invariant
+    that rejects member loads (only TrussTemperatureLoad is allowed),
+    because the contribution is applied directly to F at the uy DOF
+    of each endpoint — no member-load object is ever attached.
+
+    Elements with ``ρ = 0`` or ``A = 0`` contribute nothing.
+    """
+    g = STANDARD_GRAVITY
+    for elem in model.elements:
+        rho = float(getattr(elem, "rho", 0.0))
+        A = float(getattr(elem, "A", 0.0))
+        if rho == 0.0 or A == 0.0:
+            continue
+
+        L, c, s = elem.length_cos_sin(model.nodes)
+        if L <= 0.0:
+            continue
+
+        w = rho * A * g / 1000.0  # kN/m, magnitude in global -Y
+
+        if isinstance(elem, FrameElement2D):
+            w_local_x = -w * s
+            w_local_y = -w * c
+            p_local_raw = np.array([
+                w_local_x * L / 2.0,
+                w_local_y * L / 2.0,
+                w_local_y * L ** 2 / 12.0,
+                w_local_x * L / 2.0,
+                w_local_y * L / 2.0,
+                -w_local_y * L ** 2 / 12.0,
+            ])
+            # Stash the RAW (uncondensed) fixed-end vector so the
+            # postprocessor can include it in q = K·d − p recovery. The
+            # back-substitution path needs p_b at released DOFs, so the
+            # condensed (zero-at-released) version is the wrong thing to
+            # hand off — see Element2D.local_displacement_and_end_forces.
+            elem_data[elem.id]["self_weight_p_local"] = p_local_raw
+            # Released rotational DOFs are unassembled (mapping[r]=None);
+            # without this Schur reduction the released-end moment FEF
+            # would be silently dropped instead of redistributed to the
+            # retained DOFs.
+            p_local = elem.condense_local_load_for_releases(p_local_raw, model.nodes)
+            R = elem.transformation_matrix(model.nodes)
+            p_global = R.T @ p_local
+            mapping = dofs.element_dof_map(elem)
+            for a, I in enumerate(mapping):
+                if I is None:
+                    continue
+                F[I] += p_global[a]
+        elif isinstance(elem, TrussElement2D):
+            half_kN = w * L / 2.0
+            for nid in (elem.node_i, elem.node_j):
+                idx = dofs.index(nid, "uy")
+                if idx is not None:
+                    F[idx] -= half_kN

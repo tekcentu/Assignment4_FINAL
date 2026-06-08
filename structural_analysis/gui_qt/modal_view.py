@@ -4,6 +4,10 @@ Shows a frequency/period table per mode and lets the user pick which
 mode to display on the canvas (with a deformation-scale slider). The
 dialog is non-modal so the user can keep interacting with the model.
 
+When the model has multiple disconnected components, modes are grouped
+by component in a parent/child tree.  Skipped components (no supports,
+orphan nodes, etc.) appear as non-selectable header rows.
+
 The optional time-domain animation toggle is wired here; if matplotlib
 animation is not available, the toggle silently keeps the static
 overlay (the static plot is the required deliverable per the proposal).
@@ -14,6 +18,7 @@ from __future__ import annotations
 from typing import Callable
 
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -51,26 +56,64 @@ class ModalResultsDialog(QDialog):
 
         v = QVBoxLayout(self)
 
-        v.addWidget(QLabel(
+        _mass_label = (
+            "consistent"
+            if result.mass_formulation == "consistent"
+            else "lumped translational"
+        )
+        _src_summary = getattr(result, "mass_source_summary", "self-mass only")
+        header_text = (
             f"<b>{result.title or 'Model'}</b> · {result.n_modes} modes · "
-            f"normalisation: {result.normalisation}",
-            self,
-        ))
+            f"mass: {_mass_label} · "
+            f"normalisation: {result.normalisation}<br>"
+            f"<span style='color:#555;font-size:9pt;'>"
+            f"mass source: {_src_summary}</span>"
+        )
+        if getattr(result, "component_summary", ""):
+            header_text += (
+                f"<br><span style='color:#2060a0;font-size:9pt;'>"
+                f"{result.component_summary}</span>"
+            )
+        header_lbl = QLabel(header_text, self)
+        header_lbl.setTextFormat(Qt.TextFormat.RichText)
+        v.addWidget(header_lbl)
+        if result.mass_formulation == "lumped":
+            note = QLabel(
+                "Lumped translational mass is a comparison aid. "
+                "Agreement with external software depends on matching "
+                "units, density/mass source, section properties, mesh, "
+                "boundary conditions, restraints, and mass formulation.",
+                self,
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet(
+                "color: #a06000; font-style: italic; "
+                "font-size: 9pt; padding: 2px 0;"
+            )
+            v.addWidget(note)
 
         self._tree = QTreeWidget(self)
+        from .table_copy import install_table_copy
+        install_table_copy(self._tree, include_headers=True)
         self._tree.setHeaderLabels(
             ["mode", "f (Hz)", "T (s)", "ω (rad/s)"]
         )
         self._tree.header().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
         )
-        for k in range(result.n_modes):
-            QTreeWidgetItem(self._tree, [
-                str(k + 1),
-                f"{float(result.frequencies[k]):.6g}",
-                f"{float(result.periods[k]):.6g}",
-                f"{float(result.omegas[k]):.6g}",
-            ])
+
+        self._is_grouped = bool(getattr(result, "components", []))
+
+        if self._is_grouped:
+            self._build_grouped_tree(result)
+        else:
+            for k in range(result.n_modes):
+                QTreeWidgetItem(self._tree, [
+                    str(k + 1),
+                    f"{float(result.frequencies[k]):.6g}",
+                    f"{float(result.periods[k]):.6g}",
+                    f"{float(result.omegas[k]):.6g}",
+                ])
         v.addWidget(self._tree)
 
         # Mode selector — built before connecting the tree's selection
@@ -87,7 +130,15 @@ class ModalResultsDialog(QDialog):
         # the initial selection.
         self._tree.currentItemChanged.connect(self._on_row_changed)
         if result.n_modes > 0:
-            self._tree.setCurrentItem(self._tree.topLevelItem(0))
+            if self._is_grouped:
+                # Select first child of first non-empty component group
+                for ci in range(self._tree.topLevelItemCount()):
+                    parent_item = self._tree.topLevelItem(ci)
+                    if parent_item.childCount() > 0:
+                        self._tree.setCurrentItem(parent_item.child(0))
+                        break
+            else:
+                self._tree.setCurrentItem(self._tree.topLevelItem(0))
 
         row.addSpacing(20)
         row.addWidget(QLabel("Scale ×:", self))
@@ -122,20 +173,84 @@ class ModalResultsDialog(QDialog):
         # Push the initial selection out.
         self._push_view()
 
+    # ── grouped-tree builder ──
+
+    def _build_grouped_tree(self, result: ModalResult) -> None:
+        """Populate the tree with one parent item per component."""
+        bold = QFont()
+        bold.setBold(True)
+        for comp in result.components:
+            if comp.skip_reason:
+                label = (
+                    f"Component {comp.component_id} — "
+                    f"{len(comp.node_ids)} node{'s' if len(comp.node_ids) != 1 else ''}, "
+                    f"{len(comp.element_ids)} element{'s' if len(comp.element_ids) != 1 else ''} "
+                    f"[skipped: {comp.skip_reason}]"
+                )
+            else:
+                label = (
+                    f"Component {comp.component_id} — "
+                    f"{len(comp.node_ids)} nodes, "
+                    f"{len(comp.element_ids)} elements, "
+                    f"{comp.n_modes} modes"
+                )
+            parent_item = QTreeWidgetItem(self._tree, [label, "", "", ""])
+            parent_item.setFont(0, bold)
+            parent_item.setFlags(
+                parent_item.flags() & ~Qt.ItemFlag.ItemIsSelectable
+            )
+
+            for local_k in range(comp.n_modes):
+                global_k = comp.global_mode_offset + local_k
+                child = QTreeWidgetItem(parent_item, [
+                    str(global_k + 1),
+                    f"{float(result.frequencies[global_k]):.6g}",
+                    f"{float(result.periods[global_k]):.6g}",
+                    f"{float(result.omegas[global_k]):.6g}",
+                ])
+                child.setData(0, Qt.ItemDataRole.UserRole, global_k)
+
+            parent_item.setExpanded(True)
+
     # ── slot helpers ──
 
     def _on_row_changed(self, current, _previous) -> None:
         if current is None:
             return
-        idx = self._tree.indexOfTopLevelItem(current) + 1
-        if idx != self._mode_spin.value():
-            self._mode_spin.setValue(idx)
+        if self._is_grouped:
+            # Parent (component header) items are non-selectable; child
+            # items store their global mode index in UserRole.
+            if current.parent() is None:
+                return
+            global_idx = current.data(0, Qt.ItemDataRole.UserRole)
+            if global_idx is not None and global_idx + 1 != self._mode_spin.value():
+                self._mode_spin.setValue(global_idx + 1)
+        else:
+            idx = self._tree.indexOfTopLevelItem(current) + 1
+            if idx != self._mode_spin.value():
+                self._mode_spin.setValue(idx)
 
     def _on_mode_spun(self, value: int) -> None:
-        # Keep tree selection in sync with the spinner.
-        item = self._tree.topLevelItem(value - 1)
-        if item is not None and self._tree.currentItem() is not item:
-            self._tree.setCurrentItem(item)
+        if self._is_grouped:
+            # Find and select the child item whose UserRole == value - 1.
+            global_idx = value - 1
+            found = False
+            for ci in range(self._tree.topLevelItemCount()):
+                parent_item = self._tree.topLevelItem(ci)
+                for mi in range(parent_item.childCount()):
+                    child = parent_item.child(mi)
+                    if child.data(0, Qt.ItemDataRole.UserRole) == global_idx:
+                        if self._tree.currentItem() is not child:
+                            self._tree.setCurrentItem(child)
+                        found = True
+                        break
+                if found:
+                    break
+        else:
+            # Keep tree selection in sync with the spinner.
+            item = self._tree.topLevelItem(value - 1)
+            if item is not None and self._tree.currentItem() is not item:
+                self._tree.setCurrentItem(item)
         self._push_view()
 
     def _on_scale_changed(self, value: int) -> None:
