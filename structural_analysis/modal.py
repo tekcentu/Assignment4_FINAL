@@ -85,7 +85,11 @@ class ModalResult:
         warnings: Validation warnings carried over from the assembler.
         n_modes: Number of returned modes (may be less than requested
             when there are fewer free DOFs).
-        frequencies: 1-D array of natural frequencies in Hz, ascending.
+        frequencies: 1-D array of natural frequencies in Hz. Ascending
+            for single-component models. For multi-component models the
+            array is grouped by component (C1 modes, then C2 modes, …)
+            and is ascending WITHIN each component but NOT globally —
+            use ``min(result.frequencies)`` for the true fundamental.
         periods: 1-D array of natural periods in s (∞ where f = 0).
         omegas: 1-D array of natural angular frequencies in rad/s.
         modes: ``n_total × n_modes`` array. Each column is a mode shape
@@ -278,12 +282,6 @@ def _solve_components(
     n_total = dofs.n_total
     free_set = set(dofs.free_indices)
     supported_nodes = set(model.supports.keys())
-
-    # Build element lookup: node_id → set of element IDs
-    elem_by_node: dict[int, list[int]] = {nid: [] for nid in model.nodes}
-    for elem in model.elements:
-        elem_by_node.setdefault(elem.node_i, []).append(elem.id)
-        elem_by_node.setdefault(elem.node_j, []).append(elem.id)
 
     components: list[ComponentModalResult] = []
     all_freqs: list[np.ndarray] = []
@@ -582,11 +580,9 @@ def solve_modal(
         _orphan_nids: set[int] = set()
         _unsupported_nids: set[int] = set()
         for _comp_nodes in raw_comps:
-            _is_orphan = not any(
-                e.node_i in _comp_nodes and e.node_j in _comp_nodes
-                for e in model.elements
-            )
-            if _is_orphan:
+            # _connectivity_components partitions by element connectivity,
+            # so any singleton component is an orphan node by construction.
+            if len(_comp_nodes) == 1:
                 _orphan_nids |= _comp_nodes
             elif not any(n in _real_supported for n in _comp_nodes):
                 _unsupported_nids |= _comp_nodes
