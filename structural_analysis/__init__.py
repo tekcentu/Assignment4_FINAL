@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.30.4"
+__version__ = "0.30.5"
 __what_is_new__ = (
-    "Fix frame V/M diagram sign under distributed loads · "
-    "Shear now crosses zero correctly under UDL · "
-    "dM/dx = V preserved (solver math unchanged)"
+    "Moment diagram drawn below member (sagging-down convention) on canvas · "
+    "V and M diagrams coloured by sign (blue +, red −) with zero-crossing split · "
+    "Display-only: V(x), M(x), and solver math unchanged"
 )
 
 from .model import (

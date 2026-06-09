@@ -49,6 +49,8 @@ from .snap import SnapCandidate, SnapEngine
 from .element_graphics import (
     sample_internal_force as _diagram_ordinates,
     internal_force_at as _diagram_value,
+    _split_segments_by_sign as _diagram_sign_split,
+    sign_fill_color as _diagram_sign_color,
 )
 
 
@@ -1879,8 +1881,19 @@ class ModelCanvas(QWidget):
         if max_ord <= 0 or not per_elem:
             return
         scale = self.diagram_scale * 0.12 * span / max_ord
-        color = {"moment": "#17becf", "shear": "#bcbd22", "axial": "#8c564b"}[self.diagram_kind]
+        # Axial diagram keeps a single legacy fill colour; V and M are
+        # split by sign and filled blue (positive) / red (negative).
+        axial_color = "#8c564b"
         unit = _DIAGRAM_UNITS[self.diagram_kind]
+        # Conventional structural orientation: positive sagging moment
+        # plots BELOW the member centerline; positive shear / axial
+        # plot on the +normal side as before. The flip is display-only
+        # — sampled ys, max_ord, scale, critical-point picks, and the
+        # hover read-out (_diagram_value) all use the un-flipped ys.
+        if self.diagram_kind == "moment":
+            ord_sign = -1.0
+        else:
+            ord_sign = +1.0
 
         for elem, ni, nj, xs, ys in per_elem:
             L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
@@ -1888,17 +1901,63 @@ class ModelCanvas(QWidget):
                 continue
             cx, cy = (nj.x - ni.x) / L, (nj.y - ni.y) / L
             nx, ny = -cy, cx
-            poly_x = [ni.x]
-            poly_y = [ni.y]
-            for xx, yy in zip(xs, ys):
-                px = ni.x + xx * cx + scale * yy * nx
-                py = ni.y + xx * cy + scale * yy * ny
-                poly_x.append(px)
-                poly_y.append(py)
-            poly_x.append(nj.x)
-            poly_y.append(nj.y)
-            self.ax.fill(poly_x, poly_y, color=color, alpha=0.25, zorder=1)
-            self.ax.plot(poly_x, poly_y, color=color, linewidth=1.0, zorder=2)
+
+            def offset_point(xx, yy):
+                yy_disp = yy * ord_sign
+                return (
+                    ni.x + xx * cx + scale * yy_disp * nx,
+                    ni.y + xx * cy + scale * yy_disp * ny,
+                )
+
+            if self.diagram_kind in ("shear", "moment"):
+                # Split the sampled curve at interpolated zero crossings
+                # and fill each single-sign segment with the sign colour.
+                # Each closed polygon goes from the i-end of the segment
+                # along the curve to the j-end, then back along the
+                # member centerline so the fill sits between the curve
+                # and the member (just like the legacy single-fill).
+                segments = _diagram_sign_split(list(xs), list(ys))
+                for seg_xs, seg_ys, sign in segments:
+                    if len(seg_xs) < 2:
+                        continue
+                    color = _diagram_sign_color(sign)
+                    poly_x = []
+                    poly_y = []
+                    # Outgoing along the diagram curve.
+                    for xx, yy in zip(seg_xs, seg_ys):
+                        px, py = offset_point(xx, yy)
+                        poly_x.append(px)
+                        poly_y.append(py)
+                    # Outline the curve portion before appending the
+                    # centerline closure (avoids recomputing offset_point).
+                    self.ax.plot(
+                        poly_x, poly_y, color=color, linewidth=1.0, zorder=2,
+                    )
+                    # Close the polygon back along the member centerline.
+                    poly_x.append(ni.x + seg_xs[-1] * cx)
+                    poly_y.append(ni.y + seg_xs[-1] * cy)
+                    poly_x.append(ni.x + seg_xs[0] * cx)
+                    poly_y.append(ni.y + seg_xs[0] * cy)
+                    self.ax.fill(
+                        poly_x, poly_y, color=color, alpha=0.25, zorder=1,
+                    )
+            else:
+                # Axial — single colour, no sign split.
+                color = axial_color
+                poly_x = [ni.x]
+                poly_y = [ni.y]
+                for xx, yy in zip(xs, ys):
+                    px, py = offset_point(xx, yy)
+                    poly_x.append(px)
+                    poly_y.append(py)
+                poly_x.append(nj.x)
+                poly_y.append(nj.y)
+                self.ax.fill(
+                    poly_x, poly_y, color=color, alpha=0.25, zorder=1,
+                )
+                self.ax.plot(
+                    poly_x, poly_y, color=color, linewidth=1.0, zorder=2,
+                )
 
             # Per-element critical points: argmax(ys) and argmin(ys).
             # If the diagram is constant (axial), max == min — label
@@ -1918,9 +1977,11 @@ class ModelCanvas(QWidget):
             for i in picks:
                 xx = xs[i]
                 yy = ys[i]
-                # World-coords on the diagram polyline at this sample.
-                world_x = ni.x + xx * cx + scale * yy * nx
-                world_y = ni.y + xx * cy + scale * yy * ny
+                yy_disp = yy * ord_sign
+                # World-coords on the diagram polyline at this sample,
+                # using the same display flip applied to the fill.
+                world_x = ni.x + xx * cx + scale * yy_disp * nx
+                world_y = ni.y + xx * cy + scale * yy_disp * ny
                 # World-coords of the matching point on the element
                 # axis itself — that's what the snap engine should
                 # snap to (so a left-click in modelling tools still
@@ -1928,8 +1989,14 @@ class ModelCanvas(QWidget):
                 # diagram polyline).
                 axis_x = ni.x + xx * cx
                 axis_y = ni.y + xx * cy
-                # Marker on the diagram outline + annotation.
-                self.ax.plot(world_x, world_y, marker="o", color=color,
+                # Marker colour follows the sign convention used for the
+                # fill (blue positive / red negative for V & M; legacy
+                # brown for axial).
+                if self.diagram_kind in ("shear", "moment"):
+                    marker_color = _diagram_sign_color(1 if yy >= 0 else -1)
+                else:
+                    marker_color = axial_color
+                self.ax.plot(world_x, world_y, marker="o", color=marker_color,
                              markersize=6, markeredgecolor="#222",
                              markeredgewidth=0.8, zorder=4)
                 self.ax.annotate(
@@ -1938,7 +2005,7 @@ class ModelCanvas(QWidget):
                     xytext=(5, 5), textcoords="offset points",
                     fontsize=8, color="#222", zorder=6,
                     bbox=dict(boxstyle="round,pad=0.2",
-                              fc="#ffffffaa", ec=color, lw=0.5),
+                              fc="#ffffffaa", ec=marker_color, lw=0.5),
                 )
                 # Record a snap target at the element-axis position
                 # (not the offset polyline) so cursor snap places a
