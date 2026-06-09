@@ -211,6 +211,90 @@ _DIAGRAM_COLOR = {
     "shear":  "#0f9d58",
     "moment": "#d24c4c",
 }
+# Sign-coded fill colours used by V and M diagrams (display-only).
+# Positive regions blue, negative regions red — applied after splitting
+# the sampled curve at interpolated zero crossings so adjacent fills
+# touch cleanly.
+_SIGN_POS_COLOR = "#1f77b4"
+_SIGN_NEG_COLOR = "#d24c4c"
+
+
+def _split_segments_by_sign(
+    xs, ys, *, rel_tol: float = 1e-9,
+) -> list[tuple[list[float], list[float], int]]:
+    """Split a sampled diagram into single-sign segments.
+
+    Walks adjacent samples pairwise. Where two neighbours have opposite
+    signs, inserts the linearly-interpolated zero crossing
+    ``x* = x_i + (x_{i+1}-x_i) * y_i / (y_i - y_{i+1})`` as the closing
+    point of the outgoing segment AND the opening point of the incoming
+    one, so the resulting filled regions touch without a visible gap.
+
+    Samples with ``abs(y) <= rel_tol * max(abs(ys))`` are treated as
+    exactly zero so floating-point noise at pinned supports (where M=0
+    exactly in theory) does not spawn a microscopic spurious segment.
+
+    Returns a list of ``(xs_seg, ys_seg, sign)`` tuples with
+    ``sign ∈ {+1, -1}``. Exactly-zero samples are absorbed into whichever
+    neighbour has a definite sign; if every sample is zero the result is
+    a single segment with ``sign = +1``. The returned segments preserve
+    the curve geometry exactly — concatenating them reproduces the
+    polyline that the renderer would otherwise draw with a single fill.
+    """
+    if not xs or not ys or len(xs) != len(ys):
+        return []
+    n = len(xs)
+    peak = max((abs(y) for y in ys), default=0.0)
+    eps = rel_tol * peak if peak > 0.0 else 0.0
+    if n == 1:
+        s = 1 if ys[0] >= 0 else -1
+        return [([xs[0]], [ys[0]], s)]
+
+    def sign_of(y: float) -> int:
+        if y > eps:
+            return +1
+        if y < -eps:
+            return -1
+        return 0
+
+    segments: list[tuple[list[float], list[float], int]] = []
+    cur_xs: list[float] = [xs[0]]
+    cur_ys: list[float] = [ys[0]]
+    cur_sign = sign_of(ys[0])
+    for i in range(1, n):
+        x0, y0 = xs[i - 1], ys[i - 1]
+        x1, y1 = xs[i], ys[i]
+        s1 = sign_of(y1)
+        if cur_sign == 0:
+            cur_sign = s1
+        if s1 == 0 or s1 == cur_sign:
+            cur_xs.append(x1)
+            cur_ys.append(y1)
+            continue
+        # True sign change: insert the linearly-interpolated zero.
+        denom = (y0 - y1)
+        t = y0 / denom if denom != 0.0 else 0.5
+        xz = x0 + (x1 - x0) * t
+        cur_xs.append(xz)
+        cur_ys.append(0.0)
+        segments.append((cur_xs, cur_ys, cur_sign))
+        cur_xs = [xz, x1]
+        cur_ys = [0.0, y1]
+        cur_sign = s1
+
+    if cur_sign == 0:
+        cur_sign = +1
+    segments.append((cur_xs, cur_ys, cur_sign))
+    return segments
+
+
+def sign_fill_color(sign: int) -> str:
+    """Public accessor: blue for positive, red for negative.
+
+    Used by both the detail-dialog diagram helper and the main-canvas
+    diagram overlay so the colour palette is single-sourced.
+    """
+    return _SIGN_POS_COLOR if sign >= 0 else _SIGN_NEG_COLOR
 
 
 # ── Local-frame helpers ──────────────────────────────────────────
@@ -424,12 +508,20 @@ def _end_force_arrows(ax, x_node: float, L: float, h_ref: float,
 
 
 def _draw_single_nvm_diagram(ax, xs, ys, label: str, unit: str,
-                             color: str, *, invert: bool = False) -> None:
+                             color: str, *, invert: bool = False,
+                             sign_split: bool = False) -> None:
     """Render one of the N / V / M diagrams onto ``ax``.
 
     ``xs`` / ``ys`` are the sampled arrays (or ``None`` for inapplicable
     kinds on truss elements).  ``invert=True`` applies the structural
     BMD tension-fibre convention (moment drawn downward).
+
+    When ``sign_split=True`` the curve is split at interpolated zero
+    crossings and each single-sign region is filled blue (positive) or
+    red (negative). The polyline outline is drawn segment-wise in the
+    same colours so the diagram stays visually continuous at the
+    crossing. When ``sign_split=False`` the legacy single-colour fill
+    is used (current behaviour for axial diagrams).
     """
     _spine_clean(ax)
     ax.set_xlabel("x (m)", fontsize=7)
@@ -444,8 +536,14 @@ def _draw_single_nvm_diagram(ax, xs, ys, label: str, unit: str,
                 color="#555", fontsize=7, style="italic")
         return
 
-    ax.fill_between(xs, ys, 0, color=color, alpha=0.18)
-    ax.plot(xs, ys, color=color, linewidth=1.5)
+    if sign_split:
+        for seg_xs, seg_ys, sign in _split_segments_by_sign(xs, ys):
+            col = sign_fill_color(sign)
+            ax.fill_between(seg_xs, seg_ys, 0, color=col, alpha=0.20)
+            ax.plot(seg_xs, seg_ys, color=col, linewidth=1.5)
+    else:
+        ax.fill_between(xs, ys, 0, color=color, alpha=0.18)
+        ax.plot(xs, ys, color=color, linewidth=1.5)
     ax.axhline(0, color="#888", linewidth=0.5, linestyle="-", zorder=1)
 
     if invert:
@@ -700,10 +798,11 @@ def draw_element_detail(
             _draw_single_nvm_diagram(ax_n, xs_n, ys_n, "N", "kN",
                                      color=_DIAGRAM_COLOR["axial"])
             _draw_single_nvm_diagram(ax_v, xs_v, ys_v, "V", "kN",
-                                     color=_DIAGRAM_COLOR["shear"])
+                                     color=_DIAGRAM_COLOR["shear"],
+                                     sign_split=True)
             _draw_single_nvm_diagram(ax_m, xs_m, ys_m, "M", "kN·m",
                                      color=_DIAGRAM_COLOR["moment"],
-                                     invert=True)
+                                     invert=True, sign_split=True)
 
     axes = ElementDetailAxes(
         sketch=ax_sketch, fbd=ax_fbd, diagrams=ax_n, section=ax_section,
