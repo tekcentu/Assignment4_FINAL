@@ -86,55 +86,228 @@ def _make_l_frame_model():
     return m
 
 
-def test_joint_overlap_nodes_shared_node_detected():
-    """Node 2 has 2 frames meeting → it appears in the overlap list."""
-    from structural_analysis.gui_common.geometry import joint_overlap_nodes
-    m = _make_l_frame_model()
-    joints = joint_overlap_nodes(m, default_depth=0.2)
-    assert len(joints) == 1
-    x, y, side = joints[0]
-    assert x == pytest.approx(0.0)
-    assert y == pytest.approx(3.0)
-    # side = max(0.4, 0.3) = 0.4
-    assert side == pytest.approx(0.4)
+def _build_polys_for_model(m):
+    """Helper: build the {elem_id: body_polygon} dict the canvas would build."""
+    from structural_analysis.gui_common.geometry import (
+        physical_display_thickness, physical_member_polygon,
+        resolved_default_depth,
+    )
+    from structural_analysis.element import FrameElement2D
+    default_d = resolved_default_depth(m)
+    polys = {}
+    for elem in m.elements:
+        if not isinstance(elem, FrameElement2D):
+            continue
+        ni = m.nodes[elem.node_i]
+        nj = m.nodes[elem.node_j]
+        d = physical_display_thickness(elem, m.sections)
+        if d <= 0.0:
+            d = default_d
+        poly = physical_member_polygon(ni.x, ni.y, nj.x, nj.y, d)
+        if poly is not None:
+            polys[elem.id] = poly
+    return polys
 
 
-def test_joint_overlap_nodes_single_frame_no_marker():
-    """A node touched by only one frame element must NOT get a joint marker."""
+def test_joint_overlap_region_rectangular_when_sections_differ():
+    """Beam (depth 0.3) framing into column (depth 0.4) at a corner joint.
+
+    Both body rectangles end at the shared centerline node and extend AWAY
+    from it (column goes south, beam goes east).  Their geometric overlap
+    is therefore the *quadrant* near the corner:
+
+      column body:  x ∈ [-0.2, 0.2]   (half-width 0.2)
+      beam body:    y ∈ [2.85, 3.15]  (half-depth 0.15)
+      intersection: x ∈ [0, 0.2], y ∈ [2.85, 3]  → 0.2 × 0.15
+
+    Acceptance: the overlap is *geometry-derived* (not a fixed square)
+    and reflects the differing section depths (0.2 ≠ 0.15).
+    """
+    from structural_analysis.gui_common.geometry import joint_overlap_regions
+    m = _make_l_frame_model()       # column depth=0.4, beam depth=0.3
+    polys = _build_polys_for_model(m)
+    regions = joint_overlap_regions(m, polys)
+    assert len(regions) == 1
+    _poly, (cx, cy), (w, h), pair = regions[0]
+    assert w == pytest.approx(0.2, abs=1e-6)
+    assert h == pytest.approx(0.15, abs=1e-6)
+    # Centroid (mean of vertices of the corner quadrant).
+    assert cx == pytest.approx(0.1, abs=1e-6)
+    assert cy == pytest.approx(2.925, abs=1e-6)
+    assert pair == (1, 2)
+
+
+def test_joint_overlap_region_square_when_sections_match():
+    """Equal section depths → square intersection (still derived from real
+    geometry, not a fixed proxy)."""
     from structural_analysis.model import StructuralModel, Node, Support
     from structural_analysis.element import FrameElement2D
-    from structural_analysis.gui_common.geometry import joint_overlap_nodes
+    from structural_analysis.gui_common.geometry import joint_overlap_regions
     m = StructuralModel()
     m.nodes[1] = Node(1, 0.0, 0.0)
     m.nodes[2] = Node(2, 0.0, 3.0)
-    m.elements.append(
-        FrameElement2D(id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4,
-                       depth=0.4, rho=7850.0)
-    )
+    m.nodes[3] = Node(3, 4.0, 3.0)
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4,
+        depth=0.5, rho=7850.0,
+    ))
+    m.elements.append(FrameElement2D(
+        id=2, node_i=2, node_j=3, E=2.1e8, A=0.01, I=1e-4,
+        depth=0.5, rho=7850.0,
+    ))
     m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
-    joints = joint_overlap_nodes(m, default_depth=0.2)
-    assert joints == []
+    polys = _build_polys_for_model(m)
+    regions = joint_overlap_regions(m, polys)
+    assert len(regions) == 1
+    _poly, _c, (w, h), _pair = regions[0]
+    # Both half-widths are 0.25 → square 0.25 × 0.25 corner quadrant.
+    assert w == pytest.approx(0.25, abs=1e-6)
+    assert h == pytest.approx(0.25, abs=1e-6)
 
 
-def test_joint_overlap_nodes_truss_only_no_marker():
-    """Truss-only joints must not produce overlap markers."""
+def test_joint_overlap_regions_single_frame_no_region():
+    """A node touched by only one frame element must NOT get a region."""
+    from structural_analysis.model import StructuralModel, Node, Support
+    from structural_analysis.element import FrameElement2D
+    from structural_analysis.gui_common.geometry import joint_overlap_regions
+    m = StructuralModel()
+    m.nodes[1] = Node(1, 0.0, 0.0)
+    m.nodes[2] = Node(2, 0.0, 3.0)
+    m.elements.append(FrameElement2D(
+        id=1, node_i=1, node_j=2, E=2.1e8, A=0.01, I=1e-4,
+        depth=0.4, rho=7850.0,
+    ))
+    m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
+    polys = _build_polys_for_model(m)
+    assert joint_overlap_regions(m, polys) == []
+
+
+def test_joint_overlap_regions_truss_only_no_region():
+    """Truss-only joints must not produce overlap regions."""
     from structural_analysis.model import StructuralModel, Node, Support
     from structural_analysis.element import TrussElement2D
-    from structural_analysis.gui_common.geometry import joint_overlap_nodes
+    from structural_analysis.gui_common.geometry import joint_overlap_regions
     m = StructuralModel()
     m.nodes[1] = Node(1, 0.0, 0.0)
     m.nodes[2] = Node(2, 1.0, 0.0)
     m.nodes[3] = Node(3, 0.5, 1.0)
-    m.elements.append(
-        TrussElement2D(id=1, node_i=1, node_j=3, E=2.1e8, A=0.01)
-    )
-    m.elements.append(
-        TrussElement2D(id=2, node_i=2, node_j=3, E=2.1e8, A=0.01)
-    )
+    m.elements.append(TrussElement2D(
+        id=1, node_i=1, node_j=3, E=2.1e8, A=0.01,
+    ))
+    m.elements.append(TrussElement2D(
+        id=2, node_i=2, node_j=3, E=2.1e8, A=0.01,
+    ))
     m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
     m.supports[2] = Support(node_id=2, ux=True, uy=True, rz=True)
-    joints = joint_overlap_nodes(m, default_depth=0.2)
-    assert joints == []
+    # Trusses are excluded entirely — no polygons → no regions.
+    assert joint_overlap_regions(m, {}) == []
+
+
+# ── polygon_intersection helper ───────────────────────────────────────────────
+
+
+def test_polygon_intersection_two_unit_squares():
+    """Two overlapping axis-aligned unit squares → 0.5×0.5 intersection."""
+    from structural_analysis.gui_common.geometry import polygon_intersection
+    a = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    b = [(0.5, 0.5), (1.5, 0.5), (1.5, 1.5), (0.5, 1.5)]
+    out = polygon_intersection(a, b)
+    assert len(out) == 4
+    xs = sorted(p[0] for p in out)
+    ys = sorted(p[1] for p in out)
+    assert xs == pytest.approx([0.5, 0.5, 1.0, 1.0])
+    assert ys == pytest.approx([0.5, 0.5, 1.0, 1.0])
+
+
+def test_polygon_intersection_disjoint_returns_empty():
+    from structural_analysis.gui_common.geometry import polygon_intersection
+    a = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    b = [(2, 2), (3, 2), (3, 3), (2, 3)]
+    assert polygon_intersection(a, b) == []
+
+
+def test_polygon_intersection_winding_agnostic():
+    """CW and CCW inputs must yield identical bounding boxes."""
+    from structural_analysis.gui_common.geometry import polygon_intersection
+    a_ccw = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    b_cw = [(0.5, 1.5), (1.5, 1.5), (1.5, 0.5), (0.5, 0.5)]
+    out = polygon_intersection(a_ccw, b_cw)
+    assert len(out) == 4
+    xs = [p[0] for p in out]
+    ys = [p[1] for p in out]
+    assert max(xs) - min(xs) == pytest.approx(0.5)
+    assert max(ys) - min(ys) == pytest.approx(0.5)
+
+
+# ── physical_display_thickness rule ───────────────────────────────────────────
+
+
+def test_display_thickness_i_section_uses_outer_envelope():
+    """I-section: use max(depth, width) — never web thickness."""
+    from structural_analysis.model import Section
+    from structural_analysis.gui_common.geometry import physical_display_thickness
+    sec = Section(
+        id=1, material_id=1, A=0.005, I=1e-4,
+        depth=0.20, width=0.30,      # b=300, h=200 — flange wider than depth
+        shape_type="i_section",
+        b=0.30, h=0.20, tf=0.012, tw=0.008,
+    )
+
+    class _E:
+        section_id = 1
+        depth = 0.20
+    sections = {1: sec}
+    # max(0.20, 0.30) = 0.30; we must NOT pick tw (0.008) or tf (0.012).
+    assert physical_display_thickness(_E(), sections) == pytest.approx(0.30)
+
+
+def test_display_thickness_rectangle_uses_depth():
+    from structural_analysis.model import Section
+    from structural_analysis.gui_common.geometry import physical_display_thickness
+    sec = Section(
+        id=1, material_id=1, A=0.06, I=1e-4,
+        depth=0.50, width=0.30, shape_type="rectangle",
+        b=0.30, h=0.50,
+    )
+
+    class _E:
+        section_id = 1
+        depth = 0.50
+    assert physical_display_thickness(_E(), {1: sec}) == pytest.approx(0.50)
+
+
+def test_display_thickness_manual_falls_back_to_depth():
+    from structural_analysis.model import Section
+    from structural_analysis.gui_common.geometry import physical_display_thickness
+    sec = Section(
+        id=1, material_id=1, A=0.01, I=1e-4,
+        depth=0.35, width=0.0,         # manual: no width recorded
+        shape_type="manual",
+    )
+
+    class _E:
+        section_id = 1
+        depth = 0.35
+    assert physical_display_thickness(_E(), {1: sec}) == pytest.approx(0.35)
+
+
+def test_display_thickness_no_section_uses_elem_depth():
+    from structural_analysis.gui_common.geometry import physical_display_thickness
+
+    class _E:
+        section_id = None
+        depth = 0.22
+    assert physical_display_thickness(_E(), {}) == pytest.approx(0.22)
+
+
+def test_display_thickness_missing_all_returns_zero():
+    """No section and elem.depth==0 → 0.0; caller applies adaptive default."""
+    from structural_analysis.gui_common.geometry import physical_display_thickness
+
+    class _E:
+        section_id = None
+        depth = 0.0
+    assert physical_display_thickness(_E(), {}) == 0.0
 
 
 def test_resolved_default_depth_adaptive():
@@ -220,14 +393,28 @@ def test_physical_view_off_no_poly_collection(qt_app):
     assert len(artists) == 0
 
 
-def test_joint_hatch_rectangle_present_when_physical_on(qt_app):
-    """Hatched Rectangle marker must appear at the shared L-frame node."""
-    from matplotlib.patches import Rectangle
+def test_joint_overlap_polygon_present_when_physical_on(qt_app):
+    """Hatched polygon (the geometry-derived joint overlap) must appear at the
+    shared L-frame node when physical view is on."""
+    from matplotlib.patches import Polygon as MplPolygon
     w = _make_l_frame_window(qt_app)
     w._cb_physical.setChecked(True)
     hatched = [p for p in w.canvas.ax.patches
-               if isinstance(p, Rectangle) and p.get_hatch() == "///"]
-    assert len(hatched) >= 1, "Expected at least one hatched joint marker"
+               if isinstance(p, MplPolygon) and p.get_hatch() == "///"]
+    assert len(hatched) >= 1, "Expected at least one hatched joint overlap polygon"
+    # Verify it's a real intersection polygon (≥3 vertices), not a fixed square.
+    verts = hatched[0].get_xy()
+    assert len(verts) >= 3
+    w.close()
+
+
+def test_joint_overlap_debug_label_present_when_physical_on(qt_app):
+    """Temporary debug label (w×h @ (cx,cy)) must appear on overlap patch."""
+    w = _make_l_frame_window(qt_app)
+    w._cb_physical.setChecked(True)
+    texts = [t.get_text() for t in w.canvas.ax.texts]
+    matches = [t for t in texts if "×" in t and "@" in t]
+    assert matches, f"Expected debug label like '0.40×0.30 m @ (...)', got texts={texts}"
     w.close()
 
 

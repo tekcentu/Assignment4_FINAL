@@ -14,7 +14,7 @@ from typing import Callable, Optional
 import matplotlib
 matplotlib.use("QtAgg")  # noqa: E402  must precede pyplot import
 import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon as _MplPolygon, Rectangle as _MplRectangle
+from matplotlib.patches import Polygon as _MplPolygon
 from matplotlib.collections import PolyCollection as _PolyCollection
 from matplotlib import patheffects as _path_effects
 from matplotlib.backends.backend_qtagg import (
@@ -37,7 +37,8 @@ from ..model import (
 )
 from ..gui_common.geometry import (
     physical_member_polygon as _physical_member_polygon,
-    joint_overlap_nodes as _joint_overlap_nodes,
+    physical_display_thickness as _physical_display_thickness,
+    joint_overlap_regions as _joint_overlap_regions,
     resolved_default_depth as _resolved_default_depth,
     PHYSICAL_DEPTH_FRACTION as _DEFAULT_VISUAL_DEPTH_FRACTION,
     PHYSICAL_DEPTH_MIN as _DEFAULT_VISUAL_DEPTH_MIN,
@@ -1335,18 +1336,29 @@ class ModelCanvas(QWidget):
     # Qt/matplotlib stack.
 
     def _draw_physical_members(self, model: StructuralModel) -> None:
-        """Translucent body rectangles for every element + joint markers.
+        """Translucent body rectangles per element + true joint overlaps.
 
         Frame bodies are drawn in blue at alpha=0.25 (zorder=1.2).
         Truss bodies are drawn in red at alpha=0.18 (zorder=1.2).
-        Joint-zone markers (hatched squares) are drawn at zorder=1.3.
-        Both sit below validation (1.4) and selection (1.5) overlays so
-        error/warning glows and selection highlights remain clearly visible.
+        Joint overlap regions (geometry-derived convex intersections of
+        the two meeting bodies) are drawn as hatched polygons at
+        zorder=1.3.  All sit below validation (1.4) and selection (1.5)
+        overlays so error/warning glows and selection highlights remain
+        clearly visible.
+
+        Section depth source: ``physical_display_thickness`` resolves
+        the in-plane envelope per section (I-sections get
+        ``max(depth, width)`` — never web thickness).  When no real
+        thickness is available the adaptive ``resolved_default_depth``
+        kicks in and the fallback element count is reported on the
+        status bar.
         """
         default_depth = _resolved_default_depth(model)
         missing = 0
         frame_polys: list[list[tuple[float, float]]] = []
         truss_polys: list[list[tuple[float, float]]] = []
+        # Keyed by elem.id so joint_overlap_regions can pair them up.
+        element_polygons: dict[int, list[tuple[float, float]]] = {}
 
         for elem in model.elements:
             ni = model.nodes.get(elem.node_i)
@@ -1354,9 +1366,8 @@ class ModelCanvas(QWidget):
             if ni is None or nj is None:
                 continue
             is_frame = isinstance(elem, FrameElement2D)
-            if elem.depth > 0:
-                d = elem.depth
-            else:
+            d = _physical_display_thickness(elem, model.sections)
+            if d <= 0.0:
                 d = default_depth if is_frame else 0.5 * default_depth
                 missing += 1
             poly = _physical_member_polygon(ni.x, ni.y, nj.x, nj.y, d)
@@ -1364,6 +1375,7 @@ class ModelCanvas(QWidget):
                 continue
             if is_frame:
                 frame_polys.append(poly)
+                element_polygons[elem.id] = poly
             else:
                 truss_polys.append(poly)
 
@@ -1378,12 +1390,31 @@ class ModelCanvas(QWidget):
                 edgecolor="#d62728", linewidth=0.5, zorder=1.2,
             ))
 
-        for x, y, side in _joint_overlap_nodes(model, default_depth):
-            self.ax.add_patch(_MplRectangle(
-                (x - side / 2, y - side / 2), side, side,
+        # Geometry-derived joint overlap shading (replaces the old
+        # fixed-square proxy).  Pair-wise convex intersection of the
+        # body rectangles — naturally rectangular when sections differ.
+        for poly, (cx, cy), (w, h), _pair in _joint_overlap_regions(
+            model, element_polygons,
+        ):
+            self.ax.add_patch(_MplPolygon(
+                poly, closed=True,
                 hatch="///", facecolor="#f0c060", edgecolor="#806000",
                 alpha=0.30, linewidth=0.8, zorder=1.3,
             ))
+            # TEMPORARY debug aid: small label showing the overlap bbox
+            # size and centroid so reviewers can verify the geometry
+            # comes from real member extents.  Remove after sign-off.
+            self.ax.text(
+                cx, cy,
+                f"{w:.2f}×{h:.2f} m\n@ ({cx:.2f}, {cy:.2f})",
+                fontsize=6, color="#604000",
+                ha="center", va="center", zorder=1.35,
+                bbox=dict(
+                    boxstyle="round,pad=0.18",
+                    facecolor="white", edgecolor="#806000",
+                    alpha=0.75, linewidth=0.4,
+                ),
+            )
 
         self._physical_members_missing_depth = missing
 
