@@ -1963,6 +1963,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot edit element",
                                 f"Element {elem_id} does not exist.")
             return
+        ni = self._model.nodes.get(elem.node_i)
+        nj = self._model.nodes.get(elem.node_j)
+        member_len = None
+        if ni is not None and nj is not None:
+            member_len = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
         d = ElementDialog(
             self, model=self._model,
             existing_kind=getattr(elem, "kind", None),
@@ -1971,6 +1976,9 @@ class MainWindow(QMainWindow):
             existing_release_j=getattr(elem, "release_j", False),
             existing_material_override_id=getattr(
                 elem, "material_id_override", None),
+            existing_offset_i=getattr(elem, "offset_i", 0.0),
+            existing_offset_j=getattr(elem, "offset_j", 0.0),
+            member_length=member_len,
             remember_default=False,
         )
         if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
@@ -1983,8 +1991,11 @@ class MainWindow(QMainWindow):
             release_i=rv["release_i"],
             release_j=rv["release_j"],
             material_override_id=rv.get("material_override_id"),
+            offset_i=rv.get("offset_i", 0.0),
+            offset_j=rv.get("offset_j", 0.0),
         ))
         self.select_element(elem_id)
+        self._notify_rigid_offsets_if_any()
 
     def _show_element_results(self, elem_id: int) -> None:
         elem = next((e for e in self._model.elements if e.id == elem_id), None)
@@ -3423,17 +3434,37 @@ class MainWindow(QMainWindow):
             self.set_status("No cases were solved.")
         else:
             active_r = new_multi.get(self._active_case)
+            offsets_note = (
+                " · Rigid offsets active: diagrams on flexible span"
+                if self._model_has_rigid_offsets() else ""
+            )
             if active_r is not None and getattr(active_r, "residual", None) is not None:
                 self.set_status(
                     f"Solved {n_solved} case(s) · active = "
                     f"{self._active_case} · "
-                    f"residual = {active_r.residual:.2e}{skipped_suffix}"
+                    f"residual = {active_r.residual:.2e}"
+                    f"{skipped_suffix}{offsets_note}"
                 )
             else:
                 self.set_status(
                     f"Solved {n_solved} case(s) · active = "
-                    f"{self._active_case}{skipped_suffix}"
+                    f"{self._active_case}{skipped_suffix}{offsets_note}"
                 )
+
+    def _model_has_rigid_offsets(self) -> bool:
+        """True when any frame element carries a nonzero rigid offset."""
+        return any(
+            (getattr(e, "offset_i", 0.0) or getattr(e, "offset_j", 0.0))
+            for e in self._model.elements
+        )
+
+    def _notify_rigid_offsets_if_any(self) -> None:
+        """Status note after an offset edit — visual + analysis meaning."""
+        if self._model_has_rigid_offsets():
+            self.set_status(
+                "Rigid offsets are active for analysis. Internal force "
+                "diagrams are shown on the flexible span."
+            )
 
     # ── PR-A: active case + multi-result plumbing ──────────────────
 

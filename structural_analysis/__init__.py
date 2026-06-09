@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.30.5"
+__version__ = "0.31.0"
 __what_is_new__ = (
-    "Moment diagram drawn below member (sagging-down convention) on canvas · "
-    "V and M diagrams coloured by sign (blue +, red −) with zero-crossing split · "
-    "Display-only: V(x), M(x), and solver math unchanged"
+    "Optional rigid end offsets on frame elements (Tᵀ·k_flex·T) · "
+    "Member loads & diagrams on the flexible span, rigid zones marked on canvas · "
+    "Zero-offset models and results unchanged"
 )
 
 from .model import (

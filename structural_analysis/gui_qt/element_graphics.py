@@ -77,6 +77,16 @@ def evaluate_internal_force(
         return 0.0, None
     N_i, V_i, M_i, _N_j, _V_j, _M_j = (float(v) for v in f_local)
 
+    # Rigid end offsets (v0.31.0): member loads act on the flexible
+    # span [e_i, L − e_j], so the distributed-load terms accumulate
+    # from x = e_i, not x = 0. ``f_local`` is at the analytical joints;
+    # the rigid zones carry no member load, so the joint values carry
+    # linearly across them (M(e_i) = −M_i + V_i·e_i). Samplers restrict
+    # the plotted domain to the flexible span — see
+    # :func:`diagram_domain`. Zero offsets reduce every formula to the
+    # legacy form exactly.
+    e_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+
     # Project each mechanical load onto the element's local axes so the
     # diagram math sees the same (wx_l, wy_l) / (px_l, py_l) the FEM
     # math used (see element._project_load_to_local). For local loads
@@ -105,11 +115,11 @@ def evaluate_internal_force(
 
     if kind == "axial":
         # N(x) tension-positive, derived from left-FBD equilibrium:
-        #   N(x) = -N_i - wx_local * x - Σ px_local for a < x
+        #   N(x) = -N_i - wx_local * (x - e_i) - Σ px_local for a < x
         # When there are no axial member loads this collapses to the
         # constant -N_i used by every existing test.
         def axial(x):
-            n = -N_i - udl_wx_total * x
+            n = -N_i - udl_wx_total * max(0.0, x - e_i)
             for a, px in axial_points:
                 if x > a:
                     n -= px
@@ -121,7 +131,7 @@ def evaluate_internal_force(
 
     if kind == "shear":
         def shear(x):
-            v = V_i + udl_wy_total * x
+            v = V_i + udl_wy_total * max(0.0, x - e_i)
             for a, py in transverse_points:
                 if x > a:
                     v += py
@@ -130,7 +140,8 @@ def evaluate_internal_force(
 
     if kind == "moment":
         def moment(x):
-            m = -M_i + V_i * x + 0.5 * udl_wy_total * x * x
+            xw = max(0.0, x - e_i)
+            m = -M_i + V_i * x + 0.5 * udl_wy_total * xw * xw
             for a, py in transverse_points:
                 if x > a:
                     m += py * (x - a)
@@ -138,6 +149,22 @@ def evaluate_internal_force(
         return L, moment
 
     return L, None
+
+
+def diagram_domain(elem, ni: Node, nj: Node) -> tuple[float, float]:
+    """Arc-length interval ``(x_start, x_end)`` the diagrams cover.
+
+    The flexible span ``[offset_i, L − offset_j]`` for frames with
+    rigid end offsets; the full ``[0, L]`` otherwise. The rigid zones
+    are rigid transfer zones — they are drawn as such on the canvas
+    but never sampled as flexible bending diagrams.
+    """
+    L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+    e_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+    e_j = float(getattr(elem, "offset_j", 0.0) or 0.0)
+    x_start = min(max(e_i, 0.0), L)
+    x_end = max(x_start, L - max(e_j, 0.0))
+    return x_start, x_end
 
 
 def sample_internal_force(
@@ -159,7 +186,12 @@ def sample_internal_force(
     L, fn = evaluate_internal_force(elem, ni, nj, f_local, kind)
     if fn is None:
         return None, None
-    xs = [i * L / (n_samples - 1) for i in range(n_samples)]
+    # Stations cover the flexible span only (== [0, L] without rigid
+    # offsets); x remains absolute arc-length from node i so canvas
+    # world-space projection is unchanged.
+    x_start, x_end = diagram_domain(elem, ni, nj)
+    span = x_end - x_start
+    xs = [x_start + i * span / (n_samples - 1) for i in range(n_samples)]
     ys = [fn(x) for x in xs]
     return xs, ys
 
@@ -174,7 +206,8 @@ def internal_force_at(
     L, fn = evaluate_internal_force(elem, ni, nj, f_local, kind)
     if fn is None:
         return None
-    x = max(0.0, min(L, float(x_loc)))
+    x_start, x_end = diagram_domain(elem, ni, nj)
+    x = max(x_start, min(x_end, float(x_loc)))
     return float(fn(x))
 
 
@@ -206,6 +239,9 @@ class ElementDetailAxes(dict):
 _MEMBER_COLOR = "#1f3a5f"
 _SELECTED_COLOR = "#d24c4c"
 _LOAD_COLOR = "#1a7f37"
+# Rigid end-offset zones: dark, thick strokes so the rigid transfer
+# zones read as "not flexible" in both the canvas and the detail sketch.
+_RIGID_ZONE_COLOR = "#4d4d4d"
 _DIAGRAM_COLOR = {
     "axial":  "#5c7aff",
     "shear":  "#0f9d58",
@@ -342,6 +378,25 @@ def _draw_member_sketch(ax, elem, ni: Node, nj: Node,
     ax.plot([0, L], [0, 0], color=_SELECTED_COLOR, linewidth=2.4, zorder=3)
     ax.plot([0, L], [0, 0], marker="o", linestyle="none",
             color=_MEMBER_COLOR, markersize=5, zorder=4)
+
+    # Rigid end zones — thick dark stubs over [0, e_i] / [L−e_j, L]
+    # with a note that diagrams cover the flexible span only.
+    e_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+    e_j = float(getattr(elem, "offset_j", 0.0) or 0.0)
+    if e_i > 0.0 or e_j > 0.0:
+        if e_i > 0.0:
+            ax.plot([0, e_i], [0, 0], color=_RIGID_ZONE_COLOR,
+                    linewidth=5.5, solid_capstyle="butt", zorder=3.5)
+        if e_j > 0.0:
+            ax.plot([L - e_j, L], [0, 0], color=_RIGID_ZONE_COLOR,
+                    linewidth=5.5, solid_capstyle="butt", zorder=3.5)
+        ax.text(
+            0.5 * L, -0.42 * h_ref,
+            f"rigid offsets: i={e_i:g} m, j={e_j:g} m — "
+            "diagrams shown on the flexible span",
+            fontsize=6.5, color=_RIGID_ZONE_COLOR,
+            ha="center", va="top", style="italic",
+        )
 
     # Node labels
     ax.annotate(f"i ({ni.id})", (0, 0), textcoords="offset points",

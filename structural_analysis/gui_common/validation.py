@@ -570,7 +570,75 @@ def validate_model(model: "StructuralModel") -> ModelValidationResult:
     issues.extend(_find_unsupported_components(model))
     issues.extend(_find_truss_mechanisms(model))
     issues.extend(_find_single_release_mechanisms(model))
+    issues.extend(_find_invalid_rigid_offsets(model))
     return ModelValidationResult(issues=issues)
+
+
+def _find_invalid_rigid_offsets(
+    model: "StructuralModel",
+) -> list[ValidationIssue]:
+    """Errors for rigid end offsets invalidated by later edits.
+
+    Offsets are validated when entered (command / file load), but a
+    node move can shrink the member below ``offset_i + offset_j``, and
+    a member load edit can place a point load inside a rigid zone.
+    Catch both pre-solve with friendly messages so the solver never
+    raises mid-assembly.
+    """
+    from ..model import PointLoad
+
+    issues: list[ValidationIssue] = []
+    for elem in model.elements:
+        off_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+        off_j = float(getattr(elem, "offset_j", 0.0) or 0.0)
+        if off_i == 0.0 and off_j == 0.0:
+            continue
+        ni = model.nodes.get(elem.node_i)
+        nj = model.nodes.get(elem.node_j)
+        if ni is None or nj is None:
+            continue  # basic-sanity check reports the missing node
+        L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+        if off_i < 0.0 or off_j < 0.0:
+            issues.append(ValidationIssue(
+                severity="error",
+                message=(
+                    f"Element {elem.id}: rigid end offsets must be >= 0 "
+                    f"(offset_i={off_i:g}, offset_j={off_j:g})."
+                ),
+                element_ids=[elem.id],
+                code="negative_rigid_offset",
+            ))
+            continue
+        if off_i + off_j >= L:
+            issues.append(ValidationIssue(
+                severity="error",
+                message=(
+                    f"Element {elem.id}: rigid offsets "
+                    f"({off_i:g} + {off_j:g} m) consume the whole member "
+                    f"length ({L:g} m) — was a node moved? Reduce the "
+                    "offsets so the flexible span has positive length."
+                ),
+                element_ids=[elem.id],
+                code="rigid_offsets_exceed_length",
+            ))
+            continue
+        for ml in getattr(elem, "member_loads", []) or []:
+            if isinstance(ml, PointLoad):
+                a = float(ml.a)
+                if not (off_i - 1e-10 <= a <= L - off_j + 1e-10):
+                    issues.append(ValidationIssue(
+                        severity="error",
+                        message=(
+                            f"Element {elem.id}: point load at a={a:g} m "
+                            "falls inside a rigid end zone (flexible span "
+                            f"is [{off_i:g}, {L - off_j:g}] m). Move the "
+                            "load or reduce the offsets — loads are not "
+                            "silently relocated."
+                        ),
+                        element_ids=[elem.id],
+                        code="point_load_in_rigid_zone",
+                    ))
+    return issues
 
 
 # ── active-load-case filtering ───────────────────────────────────────

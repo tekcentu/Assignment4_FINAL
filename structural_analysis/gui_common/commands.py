@@ -580,6 +580,18 @@ class SplitElementCmd(Command):
                 "node instead."
             )
 
+        # Rigid end offsets cannot be meaningfully distributed across a
+        # split (the offsets describe the joint zones at the ORIGINAL
+        # ends; an interior split point has no rigid zone). Block with
+        # a clear message rather than silently guessing.
+        if (getattr(parent, "offset_i", 0.0) or
+                getattr(parent, "offset_j", 0.0)):
+            raise ValueError(
+                f"Element {self.element_id} has rigid end offsets — "
+                "remove the offsets before splitting, then re-apply them "
+                "to the children as needed."
+            )
+
         # Remap member_loads BEFORE any model mutation. If any load
         # type is unsupported this raises and the model is untouched.
         import math as _math
@@ -894,6 +906,8 @@ class UpdateElementCmd(Command):
     release_i: bool = False
     release_j: bool = False
     material_override_id: int | None = None
+    offset_i: float = 0.0
+    offset_j: float = 0.0
     _saved: object | None = None
     _saved_index: int = -1
     description: str = "edit element"
@@ -908,6 +922,28 @@ class UpdateElementCmd(Command):
             raise ValueError(f"Element {self.elem_id} does not exist.")
         if self.section_id not in model.sections:
             raise ValueError(f"Section {self.section_id} does not exist.")
+        # Rigid end offsets: frames only, non-negative, and the flexible
+        # span between the offset faces must keep positive length.
+        if self.offset_i < 0.0 or self.offset_j < 0.0:
+            raise ValueError(
+                "Rigid end offsets must be >= 0 "
+                f"(got offset_i={self.offset_i}, offset_j={self.offset_j})."
+            )
+        if (self.offset_i or self.offset_j):
+            if self.kind.lower() == "truss":
+                raise ValueError(
+                    "Rigid end offsets are only supported on frame elements."
+                )
+            n_i = model.nodes.get(self._saved.node_i)
+            n_j = model.nodes.get(self._saved.node_j)
+            if n_i is not None and n_j is not None:
+                L_tot = ((n_j.x - n_i.x) ** 2 + (n_j.y - n_i.y) ** 2) ** 0.5
+                if self.offset_i + self.offset_j >= L_tot:
+                    raise ValueError(
+                        f"offset_i + offset_j = "
+                        f"{self.offset_i + self.offset_j:g} m must be less "
+                        f"than the member length {L_tot:g} m."
+                    )
         section = model.sections[self.section_id]
         if section.material_id not in model.materials:
             raise ValueError(
@@ -950,6 +986,7 @@ class UpdateElementCmd(Command):
                 section_id=section.id,
                 material_id_override=self.material_override_id,
                 release_i=self.release_i, release_j=self.release_j,
+                offset_i=self.offset_i, offset_j=self.offset_j,
             )
         elem.member_loads = list(getattr(old, "member_loads", []))
         model.elements[self._saved_index] = elem
@@ -1051,6 +1088,10 @@ class BatchUpdateElementsCmd(Command):
                     release_i=bool(getattr(elem, "release_i", False)),
                     release_j=bool(getattr(elem, "release_j", False)),
                     material_override_id=new_override,
+                    # Preserve rigid end offsets — a batch section/material
+                    # change must not silently strip them.
+                    offset_i=float(getattr(elem, "offset_i", 0.0) or 0.0),
+                    offset_j=float(getattr(elem, "offset_j", 0.0) or 0.0),
                 )
                 sub.do(model)
                 self._sub_cmds.append(sub)

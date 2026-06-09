@@ -895,6 +895,9 @@ class ElementDialog(_ModalDialog):
                  existing_release_i: bool = False,
                  existing_release_j: bool = False,
                  existing_material_override_id: int | None = None,
+                 existing_offset_i: float = 0.0,
+                 existing_offset_j: float = 0.0,
+                 member_length: float | None = None,
                  remember_default: bool = True):
         self._model = model
         if not model.sections:
@@ -904,6 +907,9 @@ class ElementDialog(_ModalDialog):
         self._existing_ri = existing_release_i
         self._existing_rj = existing_release_j
         self._existing_mat_override = existing_material_override_id
+        self._existing_offset_i = float(existing_offset_i or 0.0)
+        self._existing_offset_j = float(existing_offset_j or 0.0)
+        self._member_length = member_length
         self._remember_default = bool(remember_default)
         super().__init__(parent, "Element properties")
 
@@ -963,6 +969,28 @@ class ElementDialog(_ModalDialog):
         form.addRow(self._cb_ri)
         form.addRow(self._cb_rj)
 
+        # Rigid end offsets (frames only). Optional — default 0 keeps
+        # the legacy fully-flexible behaviour. The analytical nodes
+        # stay at the joints; the flexible span starts/ends at the
+        # offset faces.
+        self._sb_off_i = QDoubleSpinBox(body)
+        self._sb_off_j = QDoubleSpinBox(body)
+        for sb in (self._sb_off_i, self._sb_off_j):
+            sb.setDecimals(4)
+            sb.setMinimum(0.0)
+            sb.setMaximum(1e6)
+            sb.setSingleStep(0.05)
+            sb.setSuffix(" m")
+            sb.setToolTip(
+                "Rigid end-zone length from the analytical node toward "
+                "the element interior.\nAnalysis uses the flexible span "
+                "between the offset faces; 0 = fully flexible."
+            )
+        self._sb_off_i.setValue(self._existing_offset_i)
+        self._sb_off_j.setValue(self._existing_offset_j)
+        form.addRow("Rigid offset at i:", self._sb_off_i)
+        form.addRow("Rigid offset at j:", self._sb_off_j)
+
         self._cb_remember = QCheckBox(
             "Remember and reuse these settings for subsequent elements",
             body,
@@ -976,6 +1004,8 @@ class ElementDialog(_ModalDialog):
         is_frame = self._rb_frame.isChecked()
         self._cb_ri.setEnabled(is_frame)
         self._cb_rj.setEnabled(is_frame)
+        self._sb_off_i.setEnabled(is_frame)
+        self._sb_off_j.setEnabled(is_frame)
 
     def _accept(self) -> dict:
         kind = "frame" if self._rb_frame.isChecked() else "truss"
@@ -983,6 +1013,15 @@ class ElementDialog(_ModalDialog):
         if section_id not in self._model.sections:
             raise ValueError(f"Section {section_id} does not exist.")
         mat_override = self._mat_combo.currentData()
+        off_i = self._sb_off_i.value() if kind == "frame" else 0.0
+        off_j = self._sb_off_j.value() if kind == "frame" else 0.0
+        if (off_i or off_j) and self._member_length is not None:
+            if off_i + off_j >= self._member_length:
+                raise ValueError(
+                    f"Rigid offsets ({off_i:g} + {off_j:g} m) must total "
+                    f"less than the member length "
+                    f"({self._member_length:g} m)."
+                )
         return {
             "kind": kind,
             "section_id": int(section_id),
@@ -990,6 +1029,8 @@ class ElementDialog(_ModalDialog):
             "release_j": self._cb_rj.isChecked() if kind == "frame" else False,
             "material_override_id": (int(mat_override)
                                       if mat_override is not None else None),
+            "offset_i": float(off_i),
+            "offset_j": float(off_j),
             "remember": self._cb_remember.isChecked(),
         }
 

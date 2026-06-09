@@ -51,6 +51,7 @@ from .element_graphics import (
     internal_force_at as _diagram_value,
     _split_segments_by_sign as _diagram_sign_split,
     sign_fill_color as _diagram_sign_color,
+    _RIGID_ZONE_COLOR,
 )
 
 
@@ -1139,6 +1140,8 @@ class ModelCanvas(QWidget):
         frame_ys: list[float | None] = []
         truss_xs: list[float | None] = []
         truss_ys: list[float | None] = []
+        rigid_xs: list[float | None] = []
+        rigid_ys: list[float | None] = []
         release_xs: list[float] = []
         release_ys: list[float] = []
         release_edges: list[str] = []
@@ -1152,6 +1155,26 @@ class ModelCanvas(QWidget):
             if is_frame:
                 frame_xs.extend([ni.x, nj.x, None])
                 frame_ys.extend([ni.y, nj.y, None])
+                # Rigid end offsets: collect the joint→face stubs so a
+                # later pass overdraws them in a distinct colour and a
+                # thicker stroke (flexible span keeps the normal line).
+                e_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+                e_j = float(getattr(elem, "offset_j", 0.0) or 0.0)
+                if e_i > 0.0 or e_j > 0.0:
+                    Lx, Ly = nj.x - ni.x, nj.y - ni.y
+                    L_e = math.hypot(Lx, Ly)
+                    if L_e > 1e-12:
+                        tx, ty = Lx / L_e, Ly / L_e
+                        if e_i > 0.0:
+                            rigid_xs.extend(
+                                [ni.x, ni.x + e_i * tx, None])
+                            rigid_ys.extend(
+                                [ni.y, ni.y + e_i * ty, None])
+                        if e_j > 0.0:
+                            rigid_xs.extend(
+                                [nj.x - e_j * tx, nj.x, None])
+                            rigid_ys.extend(
+                                [nj.y - e_j * ty, nj.y, None])
             else:
                 truss_xs.extend([ni.x, nj.x, None])
                 truss_ys.extend([ni.y, nj.y, None])
@@ -1205,6 +1228,15 @@ class ModelCanvas(QWidget):
             self.ax.plot(truss_xs, truss_ys, color="#d62728",
                          linestyle=":" if _phys else "--",
                          linewidth=1.0 if _phys else 2.0, zorder=2)
+        if rigid_xs:
+            # Rigid end-offset zones: distinct dark colour + thicker
+            # stroke over the joint→face stubs, drawn in EVERY view mode
+            # (the physical-view hatching is additional, not a
+            # replacement). zorder above the member centerline so the
+            # rigid zones are visually obvious at both ends.
+            self.ax.plot(rigid_xs, rigid_ys, color=_RIGID_ZONE_COLOR,
+                         linestyle="-", linewidth=4.6,
+                         solid_capstyle="butt", zorder=2.1)
         for rx, ry, edge in zip(release_xs, release_ys, release_edges):
             self.ax.plot(rx, ry, marker="o", color="white", markersize=7,
                          markeredgecolor=edge, zorder=5)
@@ -1361,6 +1393,7 @@ class ModelCanvas(QWidget):
         truss_polys: list[list[tuple[float, float]]] = []
         # Keyed by elem.id so joint_overlap_regions can pair them up.
         element_polygons: dict[int, list[tuple[float, float]]] = {}
+        rigid_zone_polys: list[list[tuple[float, float]]] = []
 
         for elem in model.elements:
             ni = model.nodes.get(elem.node_i)
@@ -1379,6 +1412,33 @@ class ModelCanvas(QWidget):
             if is_frame:
                 frame_polys.append(poly)
                 element_polygons[elem.id] = poly
+                # Rigid end-offset zones: hatched body sub-rectangles
+                # over [node, face] so the rigid transfer zones stay
+                # distinguishable from the flexible body. The thick
+                # centerline marking is drawn separately and persists
+                # in every view mode.
+                e_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+                e_j = float(getattr(elem, "offset_j", 0.0) or 0.0)
+                if e_i > 0.0 or e_j > 0.0:
+                    L_e = math.hypot(nj.x - ni.x, nj.y - ni.y)
+                    if L_e > 1e-12:
+                        tx = (nj.x - ni.x) / L_e
+                        ty = (nj.y - ni.y) / L_e
+                        zones = []
+                        if e_i > 0.0:
+                            zones.append(((ni.x, ni.y),
+                                          (ni.x + e_i * tx,
+                                           ni.y + e_i * ty)))
+                        if e_j > 0.0:
+                            zones.append(((nj.x - e_j * tx,
+                                           nj.y - e_j * ty),
+                                          (nj.x, nj.y)))
+                        for (ax_, ay_), (bx_, by_) in zones:
+                            zpoly = _physical_member_polygon(
+                                ax_, ay_, bx_, by_, d,
+                            )
+                            if zpoly is not None:
+                                rigid_zone_polys.append(zpoly)
             else:
                 truss_polys.append(poly)
 
@@ -1391,6 +1451,12 @@ class ModelCanvas(QWidget):
             self.ax.add_collection(_PolyCollection(
                 truss_polys, facecolor="#d62728", alpha=0.18,
                 edgecolor="#d62728", linewidth=0.5, zorder=1.2,
+            ))
+        if rigid_zone_polys:
+            self.ax.add_collection(_PolyCollection(
+                rigid_zone_polys, facecolor=_RIGID_ZONE_COLOR,
+                alpha=0.35, edgecolor=_RIGID_ZONE_COLOR,
+                hatch="xx", linewidth=0.6, zorder=1.25,
             ))
 
         # Geometry-derived joint overlap shading (replaces the old

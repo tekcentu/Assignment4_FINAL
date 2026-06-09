@@ -297,14 +297,17 @@ def read_input_file(filepath: str) -> StructuralModel:
                         release_i = True
                         release_j = True
 
-                # Trailing key=value kwargs. Currently only
-                # ``material_override_id`` is recognised; other unknown
-                # keys are rejected so typos surface immediately rather
-                # than silently being ignored. Positional tokens are only
+                # Trailing key=value kwargs. Recognised keys:
+                # ``material_override_id``, ``offset_i``, ``offset_j``
+                # (rigid end offsets, v0.31.0); other unknown keys are
+                # rejected so typos surface immediately rather than
+                # silently being ignored. Positional tokens are only
                 # permitted at idx 4 (kind) and idx 5 (release) — any
                 # later non-``key=value`` token is an error so typos like
                 # ``material_override_id 2`` don't slip through silently.
                 material_override_id: int | None = None
+                offset_i = 0.0
+                offset_j = 0.0
                 for idx, tok in enumerate(parts[4:], start=4):
                     if "=" not in tok:
                         positional_slot = (
@@ -336,11 +339,48 @@ def read_input_file(filepath: str) -> StructuralModel:
                                 "has no MATERIALS entry."
                             )
                         material_override_id = mid
+                    elif key in ("offset_i", "offset_j"):
+                        try:
+                            off = float(value)
+                        except ValueError:
+                            raise ValueError(
+                                f"Element {eid}: {key} must be a number, "
+                                f"got {value!r}."
+                            )
+                        if off < 0.0:
+                            raise ValueError(
+                                f"Element {eid}: {key}={off:g} — rigid end "
+                                "offsets must be >= 0."
+                            )
+                        if key == "offset_i":
+                            offset_i = off
+                        else:
+                            offset_j = off
                     else:
                         raise ValueError(
                             f"Element {eid}: unknown element option "
-                            f"{tok!r}; expected material_override_id=<id>."
+                            f"{tok!r}; expected material_override_id=<id>, "
+                            "offset_i=<m> or offset_j=<m>."
                         )
+
+                if (offset_i or offset_j) and etype == "TRUSS":
+                    raise ValueError(
+                        f"Element {eid}: rigid end offsets are only "
+                        "supported on FRAME elements."
+                    )
+                if offset_i or offset_j:
+                    n_i = model.nodes.get(sn)
+                    n_j = model.nodes.get(en)
+                    if n_i is not None and n_j is not None:
+                        L_tot = ((n_j.x - n_i.x) ** 2
+                                 + (n_j.y - n_i.y) ** 2) ** 0.5
+                        if offset_i + offset_j >= L_tot:
+                            raise ValueError(
+                                f"Element {eid}: offset_i + offset_j = "
+                                f"{offset_i + offset_j:g} m >= member length "
+                                f"{L_tot:g} m — the flexible span must have "
+                                "positive length."
+                            )
 
                 # Resolve the *effective* material for E / α / ρ. Geometry
                 # (A, I, depth) always comes from the section.
@@ -367,6 +407,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                         section_id=section.id,
                         material_id_override=material_override_id,
                         release_i=release_i, release_j=release_j,
+                        offset_i=offset_i, offset_j=offset_j,
                     )
                 model.elements.append(elem)
 

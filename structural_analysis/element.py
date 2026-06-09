@@ -21,6 +21,7 @@ import numpy as np
 from .model import (
     MemberLoad, PointLoad, UniformDistributedLoad,
     TrussTemperatureLoad, FrameTemperatureLoad,
+    STANDARD_GRAVITY,
 )
 
 
@@ -326,11 +327,32 @@ class FrameElement2D(Element2D):
         I: Moment of inertia (m⁴).
         release_i: If True, hinge at node i (local DOF 2).
         release_j: If True, hinge at node j (local DOF 5).
+        offset_i: Rigid end-zone length (m) from node i toward the
+            element interior. Default 0 — fully flexible (legacy).
+        offset_j: Rigid end-zone length (m) from node j toward the
+            element interior. Default 0.
+
+    Rigid end offsets (v0.31.0). When ``offset_i``/``offset_j`` are
+    nonzero, the analytical nodes stay at the joint centerlines but the
+    flexible (deformable) span runs from ``x = offset_i`` to
+    ``x = L − offset_j``. The local stiffness seen by the joint DOFs is
+    ``k_joint = Tᵀ · k_flex(L_flex) · T`` where ``T`` encodes the rigid-
+    arm kinematics (``v_face = v_joint + e·θ_joint``). Transformation
+    order: build k_flex on L_flex → apply T (still local) → apply
+    release condensation on k_joint → rotate local→global. Nodal loads
+    stay at the analytical joints; the lever-arm transfer to the
+    flexible face is captured by ``Tᵀ`` (master–slave rigid link), not
+    by moving loads. Member loads act on the flexible span only; their
+    fixed-end vectors are built on ``L_flex`` at the faces and mapped
+    to joint coordinates via ``Tᵀ``. With both offsets zero every path
+    short-circuits to the legacy formulas — results are bit-identical.
     """
 
     I: float = 0.0
     release_i: bool = False
     release_j: bool = False
+    offset_i: float = 0.0
+    offset_j: float = 0.0
 
     @property
     def kind(self) -> str:
@@ -341,17 +363,54 @@ class FrameElement2D(Element2D):
         """
         return "frame"
 
-    def raw_local_stiffness(self, nodes: dict) -> np.ndarray:
-        """Compute the 6×6 local stiffness for an unreleased frame element.
+    @property
+    def has_offsets(self) -> bool:
+        """True when either rigid end offset is nonzero."""
+        return self.offset_i != 0.0 or self.offset_j != 0.0
 
-        Args:
-            nodes: Dict mapping node IDs to Node objects.
+    def flexible_length(self, nodes: dict) -> float:
+        """Length of the deformable span: ``L_total − offset_i − offset_j``.
 
-        Returns:
-            6×6 numpy array — unreleased local stiffness using EA/L
-            and 12EI/L³, 6EI/L², 4EI/L, 2EI/L terms.
+        Raises:
+            ValueError: If offsets are negative or consume the whole
+                member (``offset_i + offset_j >= L_total``) — e.g. after
+                a node was moved closer; pre-solve validation surfaces
+                the same condition with a friendlier message.
         """
         L, _, _ = self.length_cos_sin(nodes)
+        if self.offset_i < 0.0 or self.offset_j < 0.0:
+            raise ValueError(
+                f"Element {self.id}: rigid end offsets must be >= 0 "
+                f"(got offset_i={self.offset_i}, offset_j={self.offset_j})."
+            )
+        L_flex = L - self.offset_i - self.offset_j
+        if L_flex <= 0.0:
+            raise ValueError(
+                f"Element {self.id}: rigid offsets ({self.offset_i} + "
+                f"{self.offset_j}) consume the whole member length "
+                f"{L:.6g} m — flexible span must be > 0."
+            )
+        return L_flex
+
+    def _offset_transform(self) -> np.ndarray:
+        """6×6 rigid-arm transform T mapping joint DOFs → face DOFs.
+
+        Small-rotation kinematics of the two rigid end zones::
+
+            u_a = u_i              u_b = u_j
+            v_a = v_i + e_i·θ_i    v_b = v_j − e_j·θ_j
+            θ_a = θ_i              θ_b = θ_j
+
+        ``k_joint = Tᵀ·k_flex·T`` is symmetric by construction and
+        equals ``k_flex`` exactly when both offsets are zero (T = I).
+        """
+        T = np.eye(6)
+        T[1, 2] = self.offset_i
+        T[4, 5] = -self.offset_j
+        return T
+
+    def _stiffness_for_length(self, L: float) -> np.ndarray:
+        """Textbook 6×6 local frame stiffness for a span of length ``L``."""
         EA_L = self.E * self.A / L
         EI = self.E * self.I
         L2, L3 = L * L, L * L * L
@@ -363,6 +422,37 @@ class FrameElement2D(Element2D):
             [    0,-12*EI/L3, -6*EI/L2,        0,  12*EI/L3, -6*EI/L2],
             [    0,  6*EI/L2,  2*EI/L,         0,  -6*EI/L2,  4*EI/L ],
         ])
+
+    def raw_local_stiffness(self, nodes: dict) -> np.ndarray:
+        """Compute the 6×6 local stiffness for an unreleased frame element.
+
+        Full node-to-node length, NO rigid-offset transform — the legacy
+        primitive. Assembly and force recovery go through
+        :meth:`joint_local_stiffness`, which adds the offset transform
+        when offsets are present.
+
+        Args:
+            nodes: Dict mapping node IDs to Node objects.
+
+        Returns:
+            6×6 numpy array — unreleased local stiffness using EA/L
+            and 12EI/L³, 6EI/L², 4EI/L, 2EI/L terms.
+        """
+        L, _, _ = self.length_cos_sin(nodes)
+        return self._stiffness_for_length(L)
+
+    def joint_local_stiffness(self, nodes: dict) -> np.ndarray:
+        """Local stiffness in JOINT coordinates, rigid offsets included.
+
+        ``k_joint = Tᵀ · k_flex(L_flex) · T``. With zero offsets this
+        short-circuits to :meth:`raw_local_stiffness` (bit-identical —
+        the backward-compatibility guarantee).
+        """
+        if not self.has_offsets:
+            return self.raw_local_stiffness(nodes)
+        k_flex = self._stiffness_for_length(self.flexible_length(nodes))
+        T = self._offset_transform()
+        return T.T @ k_flex @ T
 
     def consistent_mass_local(self, nodes: dict) -> np.ndarray:
         """Hermitian (energy-consistent) mass matrix for a 2D beam-column.
@@ -435,6 +525,13 @@ class FrameElement2D(Element2D):
                 (use FrameTemperatureLoad with equal t_top/t_bottom instead).
         """
         L, c, s = self.length_cos_sin(nodes)
+        # Rigid offsets: member loads act on the FLEXIBLE span only.
+        # Fixed-end vectors are built on L_eff at the offset faces; the
+        # Tᵀ map at the end of this method carries them to the joints
+        # (face shear × rigid arm becomes a joint moment). Zero offsets
+        # ⇒ L_eff == L, x0 == 0, no transform — legacy math unchanged.
+        x0 = self.offset_i
+        L_eff = self.flexible_length(nodes) if self.has_offsets else L
         p = np.zeros(6)
         for load in self.member_loads:
             if isinstance(load, UniformDistributedLoad):
@@ -443,34 +540,47 @@ class FrameElement2D(Element2D):
                 )
                 # Axial (linear shape functions): half to each end.
                 if wx_l != 0.0:
-                    p += np.array([wx_l*L/2, 0, 0, wx_l*L/2, 0, 0])
+                    p += np.array([wx_l*L_eff/2, 0, 0, wx_l*L_eff/2, 0, 0])
                 # Transverse (Hermite cubics): wL/2 and ±wL²/12.
                 if wy_l != 0.0:
                     p += np.array([
-                        0, wy_l*L/2, wy_l*L**2/12,
-                        0, wy_l*L/2, -wy_l*L**2/12,
+                        0, wy_l*L_eff/2, wy_l*L_eff**2/12,
+                        0, wy_l*L_eff/2, -wy_l*L_eff**2/12,
                     ])
             elif isinstance(load, PointLoad):
                 a = float(load.a)
                 if not (0 <= a <= L + 1e-10):
                     raise ValueError(f"Element {self.id}: point load a={a:.3f} outside L={L:.3f}.")
+                if self.has_offsets and not (
+                    self.offset_i - 1e-10 <= a <= L - self.offset_j + 1e-10
+                ):
+                    raise ValueError(
+                        f"Element {self.id}: point load at a={a:.3f} m falls "
+                        f"inside a rigid end zone (flexible span is "
+                        f"[{self.offset_i:.3f}, {L - self.offset_j:.3f}] m). "
+                        "Move the load onto the flexible span or reduce the "
+                        "rigid offsets — loads are not silently relocated."
+                    )
                 px_l, py_l = _project_load_to_local(
                     load.px, load.py, load.coord_system, c, s,
                 )
                 if L > 0:
+                    # Station measured from analytical node i (file/dialog
+                    # convention); rebase onto the flexible span.
+                    a_f = a - x0
                     # Axial linear shape functions: load splits by lever rule.
                     if px_l != 0.0:
                         p += np.array([
-                            px_l*(L - a)/L, 0, 0,
-                            px_l*a/L,       0, 0,
+                            px_l*(L_eff - a_f)/L_eff, 0, 0,
+                            px_l*a_f/L_eff,           0, 0,
                         ])
                     # Transverse: cubic Hermite shape functions.
                     if py_l != 0.0:
-                        xi = a / L
+                        xi = a_f / L_eff
                         n1 = 1 - 3*xi**2 + 2*xi**3
-                        n2 = L*(xi - 2*xi**2 + xi**3)
+                        n2 = L_eff*(xi - 2*xi**2 + xi**3)
                         n3 = 3*xi**2 - 2*xi**3
-                        n4 = L*(-xi**2 + xi**3)
+                        n4 = L_eff*(-xi**2 + xi**3)
                         p += np.array([
                             0, py_l*n1, py_l*n2,
                             0, py_l*n3, py_l*n4,
@@ -499,6 +609,47 @@ class FrameElement2D(Element2D):
                 )
             else:
                 raise TypeError(f"Unsupported load on element {self.id}: {type(load)}")
+        if self.has_offsets:
+            # Map face fixed-end forces to joint coordinates. Thermal
+            # axial/moment pairs pass through unchanged (zero face
+            # shear); UDL/point face shears pick up the rigid-arm
+            # moment at the joints.
+            return self._offset_transform().T @ p
+        return p
+
+    def self_weight_fixed_end_local(self, nodes: dict) -> np.ndarray:
+        """RAW (uncondensed) fixed-end vector for self-weight, joint coords.
+
+        Gravity acts in global −Y at ``STANDARD_GRAVITY``; the caller
+        (assembler) decides whether self-weight is enabled. Built on the
+        FLEXIBLE span when rigid offsets are present (the rigid zones
+        are idealised joint material and carry no distributed weight in
+        V1 — documented limitation), then mapped to joint coordinates
+        via ``Tᵀ``. Zero offsets reproduce the legacy full-length
+        wL/2, ±wL²/12 vector exactly.
+
+        Returns a zero vector when ``ρ·A == 0``.
+        """
+        rho = float(getattr(self, "rho", 0.0))
+        if rho == 0.0 or self.A == 0.0:
+            return np.zeros(6)
+        L, c, s = self.length_cos_sin(nodes)
+        if L <= 0.0:
+            return np.zeros(6)
+        L_eff = self.flexible_length(nodes) if self.has_offsets else L
+        w = rho * self.A * STANDARD_GRAVITY / 1000.0  # kN/m, in global −Y
+        w_local_x = -w * s
+        w_local_y = -w * c
+        p = np.array([
+            w_local_x * L_eff / 2.0,
+            w_local_y * L_eff / 2.0,
+            w_local_y * L_eff ** 2 / 12.0,
+            w_local_x * L_eff / 2.0,
+            w_local_y * L_eff / 2.0,
+            -w_local_y * L_eff ** 2 / 12.0,
+        ])
+        if self.has_offsets:
+            return self._offset_transform().T @ p
         return p
 
     def _released_dofs(self) -> list[int]:
@@ -543,7 +694,11 @@ class FrameElement2D(Element2D):
         if not released:
             return p_arr.copy()
         retained = [i for i in range(6) if i not in released]
-        k = self.raw_local_stiffness(nodes)
+        # Joint-coordinate stiffness: releases are hinges at the
+        # analytical joints, so with rigid offsets the condensation
+        # operates on k_joint = Tᵀ·k_flex·T (identical to the raw
+        # stiffness when offsets are zero).
+        k = self.joint_local_stiffness(nodes)
         kab = k[np.ix_(retained, released)]
         kbb = k[np.ix_(released, released)]
         p_out = np.zeros(6, dtype=float)
@@ -563,8 +718,14 @@ class FrameElement2D(Element2D):
         Returns:
             Tuple (k_condensed, p_condensed) — 6×6 and 6-element arrays
             with zeros at released DOF positions.
+
+        Transformation order with rigid offsets: k_flex(L_flex) →
+        offset transform Tᵀ·k·T (inside ``joint_local_stiffness``) →
+        release condensation here → local-to-global rotation by the
+        caller. ``p`` from ``local_consistent_load`` is already in
+        joint coordinates.
         """
-        k = self.raw_local_stiffness(nodes)
+        k = self.joint_local_stiffness(nodes)
         p = self.local_consistent_load(nodes)
         released = self._released_dofs()
         if not released:
@@ -606,7 +767,10 @@ class FrameElement2D(Element2D):
         """
         R = self.transformation_matrix(nodes)
         d_from_global = R @ u_global_elem
-        k_full = self.raw_local_stiffness(nodes)
+        # Joint-coordinate stiffness so q is the end-force at the
+        # analytical joints (consistent with assembly + equilibrium
+        # check); identical to raw stiffness when offsets are zero.
+        k_full = self.joint_local_stiffness(nodes)
         p_full = self.local_consistent_load(nodes)
         if p_extra_local is not None:
             p_full = p_full + np.asarray(p_extra_local, dtype=float)

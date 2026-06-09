@@ -531,16 +531,11 @@ def _apply_self_weight(
         w = rho * A * g / 1000.0  # kN/m, magnitude in global -Y
 
         if isinstance(elem, FrameElement2D):
-            w_local_x = -w * s
-            w_local_y = -w * c
-            p_local_raw = np.array([
-                w_local_x * L / 2.0,
-                w_local_y * L / 2.0,
-                w_local_y * L ** 2 / 12.0,
-                w_local_x * L / 2.0,
-                w_local_y * L / 2.0,
-                -w_local_y * L ** 2 / 12.0,
-            ])
+            # Built by the element so rigid end offsets are honoured
+            # (flexible-span weight, mapped to joint coordinates via
+            # Tᵀ); identical to the legacy inline wL/2, ±wL²/12 vector
+            # when offsets are zero.
+            p_local_raw = elem.self_weight_fixed_end_local(model.nodes)
             # Stash the RAW (uncondensed) fixed-end vector so the
             # postprocessor can include it in q = K·d − p recovery. The
             # back-substitution path needs p_b at released DOFs, so the
