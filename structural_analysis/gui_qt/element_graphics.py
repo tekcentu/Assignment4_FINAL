@@ -63,10 +63,14 @@ def evaluate_internal_force(
     shear / moment at the i-end (``q_local = K·d − p_local`` entries
     from :meth:`FrameElement2D.local_displacement_and_end_forces`).
     ``w`` is the summed UDL intensity in +y_local. ``points`` are
-    in-span point loads with ``py`` in +y_local. The point-load terms
-    in ``shear`` and ``moment`` carry the **same** sign of ``py`` so
-    ``dM/dx = V`` holds across the discontinuity (regression in
-    ``tests/test_diagram_signs.py``).
+    in-span point loads with ``py`` in +y_local. Derivation: take a
+    left-FBD cut at ``x``; internal shear ``S = −V_i − w·x`` is the
+    force the right part exerts on the left part. The plotted
+    ``V(x) = −S = V_i + w·x`` so the relation ``dM/dx = V`` holds. The
+    point-load terms in ``shear`` and ``moment`` carry the **same**
+    sign of ``py`` (regression in ``tests/test_diagram_signs.py``) and
+    the UDL terms in ``shear`` and ``moment`` are likewise consistent
+    (regression in ``tests/test_diagram_udl_signs.py``).
     """
     L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
     if L < 1e-12:
@@ -117,7 +121,7 @@ def evaluate_internal_force(
 
     if kind == "shear":
         def shear(x):
-            v = V_i - udl_wy_total * x
+            v = V_i + udl_wy_total * x
             for a, py in transverse_points:
                 if x > a:
                     v += py
@@ -126,7 +130,7 @@ def evaluate_internal_force(
 
     if kind == "moment":
         def moment(x):
-            m = -M_i + V_i * x - 0.5 * udl_wy_total * x * x
+            m = -M_i + V_i * x + 0.5 * udl_wy_total * x * x
             for a, py in transverse_points:
                 if x > a:
                     m += py * (x - a)
