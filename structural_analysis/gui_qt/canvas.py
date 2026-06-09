@@ -7,13 +7,16 @@ toolbar are Qt-specific.
 
 from __future__ import annotations
 
+import math
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 import matplotlib
 matplotlib.use("QtAgg")  # noqa: E402  must precede pyplot import
 import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon as _MplPolygon
+from matplotlib.patches import Polygon as _MplPolygon, Rectangle as _MplRectangle
+from matplotlib.collections import PolyCollection as _PolyCollection
 from matplotlib import patheffects as _path_effects
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT,
@@ -42,6 +45,12 @@ from .element_graphics import (
 
 
 _TOOLBAR_REMOVE = {"Subplots", "Customize"}
+
+# Physical-member overlay: adaptive fallback depth when section.depth == 0.
+# 2 % of the model bounding-box diagonal, clamped to [0.05, 1.0] m.
+_DEFAULT_VISUAL_DEPTH_FRACTION: float = 0.02
+_DEFAULT_VISUAL_DEPTH_MIN: float = 0.05   # metres
+_DEFAULT_VISUAL_DEPTH_MAX: float = 1.0    # metres
 
 
 class AppNavigationToolbar(NavigationToolbar2QT):
@@ -105,6 +114,10 @@ class ModelCanvas(QWidget):
         # i/j end labels on each element so users can see element
         # orientation at a glance. Off by default — advanced view.
         self.show_local_axes: bool = False
+        self.show_physical_members: bool = False
+        # Post-draw counter: how many elements fell back to default depth
+        # because section.depth == 0.  Read by the status-bar note in app.py.
+        self._physical_members_missing_depth: int = 0
         self.diagram_kind: str = "moment"
         self.deformed_scale: float = 1.0
         self.diagram_scale: float = 1.0
@@ -1174,12 +1187,19 @@ class ModelCanvas(QWidget):
                     release_edges.append(color)
             self._draw_member_loads(elem, ni, nj, load_scales)
 
+        if self.show_physical_members:
+            self._draw_physical_members(model)
+        # Physical view: switch centerlines to thin dashed so the translucent
+        # body shows through and the analytical line is still clearly marked.
+        _phys = self.show_physical_members
         if frame_xs:
-            self.ax.plot(frame_xs, frame_ys, color="#1f77b4", linestyle="-",
-                         linewidth=2.0, zorder=2)
+            self.ax.plot(frame_xs, frame_ys, color="#1f77b4",
+                         linestyle="--" if _phys else "-",
+                         linewidth=1.0 if _phys else 2.0, zorder=2)
         if truss_xs:
-            self.ax.plot(truss_xs, truss_ys, color="#d62728", linestyle="--",
-                         linewidth=2.0, zorder=2)
+            self.ax.plot(truss_xs, truss_ys, color="#d62728",
+                         linestyle=":" if _phys else "--",
+                         linewidth=1.0 if _phys else 2.0, zorder=2)
         for rx, ry, edge in zip(release_xs, release_ys, release_edges):
             self.ax.plot(rx, ry, marker="o", color="white", markersize=7,
                          markeredgecolor=edge, zorder=5)
@@ -1304,6 +1324,128 @@ class ModelCanvas(QWidget):
                 t.set_path_effects([
                     _path_effects.withStroke(linewidth=1.6, foreground="white"),
                 ])
+
+    # ── Physical-member overlay helpers ──────────────────────────────────────
+
+    @staticmethod
+    def _resolved_default_depth(model: StructuralModel) -> float:
+        """Adaptive fallback when section depth is unavailable.
+
+        Returns 2 % of the model bounding-box diagonal, clamped to
+        [``_DEFAULT_VISUAL_DEPTH_MIN``, ``_DEFAULT_VISUAL_DEPTH_MAX``] m.
+        Falls back to ``_DEFAULT_VISUAL_DEPTH_MIN`` for degenerate models
+        (fewer than 2 nodes or zero spatial extent).
+        """
+        xs = [n.x for n in model.nodes.values()]
+        ys = [n.y for n in model.nodes.values()]
+        if len(xs) < 2:
+            return _DEFAULT_VISUAL_DEPTH_MIN
+        diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        if diag <= 0.0:
+            return _DEFAULT_VISUAL_DEPTH_MIN
+        raw = _DEFAULT_VISUAL_DEPTH_FRACTION * diag
+        return max(_DEFAULT_VISUAL_DEPTH_MIN, min(_DEFAULT_VISUAL_DEPTH_MAX, raw))
+
+    @staticmethod
+    def _physical_member_polygon(
+        xi: float, yi: float, xj: float, yj: float, depth: float
+    ) -> list[tuple[float, float]] | None:
+        """4-corner rectangle centred on the centerline (xi,yi)→(xj,yj).
+
+        The perpendicular half-width is ``depth / 2``.  Returns ``None``
+        for degenerate zero-length members so callers can skip safely.
+        """
+        dx, dy = xj - xi, yj - yi
+        L = math.hypot(dx, dy)
+        if L == 0.0:
+            return None
+        nx, ny = -dy / L, dx / L   # unit normal, 90° CCW from tangent
+        h = 0.5 * depth
+        return [
+            (xi + h * nx, yi + h * ny),
+            (xj + h * nx, yj + h * ny),
+            (xj - h * nx, yj - h * ny),
+            (xi - h * nx, yi - h * ny),
+        ]
+
+    @staticmethod
+    def _joint_overlap_nodes(
+        model: StructuralModel, default_depth: float
+    ) -> list[tuple[float, float, float]]:
+        """Nodes where ≥ 2 frame elements meet, each as (x, y, side).
+
+        ``side`` is the maximum section depth of the meeting members
+        (or ``default_depth`` when none carry a non-zero depth).  Used to
+        draw a diagnostic hatched square centred on the joint.  Nodes
+        where only one frame element meets, or where only trusses meet,
+        are not included.
+        """
+        meet: dict[int, list[float]] = defaultdict(list)
+        for elem in model.elements:
+            if not isinstance(elem, FrameElement2D):
+                continue
+            d = elem.depth if elem.depth > 0 else default_depth
+            meet[elem.node_i].append(d)
+            meet[elem.node_j].append(d)
+        result = []
+        for nid, depths in meet.items():
+            if len(depths) >= 2 and nid in model.nodes:
+                n = model.nodes[nid]
+                result.append((n.x, n.y, max(depths)))
+        return result
+
+    def _draw_physical_members(self, model: StructuralModel) -> None:
+        """Translucent body rectangles for every element + joint markers.
+
+        Frame bodies are drawn in blue at alpha=0.25 (zorder=1.2).
+        Truss bodies are drawn in red at alpha=0.18 (zorder=1.2).
+        Joint-zone markers (hatched squares) are drawn at zorder=1.3.
+        Both sit below validation (1.4) and selection (1.5) overlays so
+        error/warning glows and selection highlights remain clearly visible.
+        """
+        default_depth = self._resolved_default_depth(model)
+        missing = 0
+        frame_polys: list[list[tuple[float, float]]] = []
+        truss_polys: list[list[tuple[float, float]]] = []
+
+        for elem in model.elements:
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            is_frame = isinstance(elem, FrameElement2D)
+            if elem.depth > 0:
+                d = elem.depth
+            else:
+                d = default_depth if is_frame else 0.5 * default_depth
+                missing += 1
+            poly = self._physical_member_polygon(ni.x, ni.y, nj.x, nj.y, d)
+            if poly is None:
+                continue
+            if is_frame:
+                frame_polys.append(poly)
+            else:
+                truss_polys.append(poly)
+
+        if frame_polys:
+            self.ax.add_collection(_PolyCollection(
+                frame_polys, facecolor="#1f77b4", alpha=0.25,
+                edgecolor="#1f77b4", linewidth=0.5, zorder=1.2,
+            ))
+        if truss_polys:
+            self.ax.add_collection(_PolyCollection(
+                truss_polys, facecolor="#d62728", alpha=0.18,
+                edgecolor="#d62728", linewidth=0.5, zorder=1.2,
+            ))
+
+        for x, y, side in self._joint_overlap_nodes(model, default_depth):
+            self.ax.add_patch(_MplRectangle(
+                (x - side / 2, y - side / 2), side, side,
+                hatch="///", facecolor="#f0c060", edgecolor="#806000",
+                alpha=0.30, linewidth=0.8, zorder=1.3,
+            ))
+
+        self._physical_members_missing_depth = missing
 
     def _draw_support(self, sup: Support, x: float, y: float) -> None:
         if sup.ux and sup.uy and sup.rz:
