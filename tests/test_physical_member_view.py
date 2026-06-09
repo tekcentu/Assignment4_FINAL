@@ -19,12 +19,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ── Pure-Python geometry helpers ──────────────────────────────────────────────
 
 
-class _FakeNode:
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
-
-
 def test_physical_member_polygon_horizontal():
     """Horizontal member (0,0)→(4,0), depth=0.4 → rectangle ±0.2 in y."""
     from structural_analysis.gui_common.geometry import physical_member_polygon

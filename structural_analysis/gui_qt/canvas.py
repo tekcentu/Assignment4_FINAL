@@ -1369,7 +1369,8 @@ class ModelCanvas(QWidget):
             d = _physical_display_thickness(elem, model.sections)
             if d <= 0.0:
                 d = default_depth if is_frame else 0.5 * default_depth
-                missing += 1
+                if is_frame:
+                    missing += 1
             poly = _physical_member_polygon(ni.x, ni.y, nj.x, nj.y, d)
             if poly is None:
                 continue

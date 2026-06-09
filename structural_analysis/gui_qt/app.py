@@ -2210,6 +2210,7 @@ class MainWindow(QMainWindow):
 
     def _on_physical_members_note(self, on: bool) -> None:
         if not on:
+            self._update_selection_status()
             return
         msg = (
             "Physical view is visual only. "

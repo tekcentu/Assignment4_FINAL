@@ -244,6 +244,8 @@ def joint_overlap_regions(
             continue
         if elem.id not in element_polygons:
             continue
+        if elem.node_i not in model.nodes or elem.node_j not in model.nodes:
+            continue
         by_node[elem.node_i].append(elem.id)
         by_node[elem.node_j].append(elem.id)
 
