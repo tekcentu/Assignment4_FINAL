@@ -1928,7 +1928,12 @@ class ModelCanvas(QWidget):
                         px, py = offset_point(xx, yy)
                         poly_x.append(px)
                         poly_y.append(py)
-                    # Return along the centerline back to the start.
+                    # Outline the curve portion before appending the
+                    # centerline closure (avoids recomputing offset_point).
+                    self.ax.plot(
+                        poly_x, poly_y, color=color, linewidth=1.0, zorder=2,
+                    )
+                    # Close the polygon back along the member centerline.
                     poly_x.append(ni.x + seg_xs[-1] * cx)
                     poly_y.append(ni.y + seg_xs[-1] * cy)
                     poly_x.append(ni.x + seg_xs[0] * cx)
@@ -1936,18 +1941,9 @@ class ModelCanvas(QWidget):
                     self.ax.fill(
                         poly_x, poly_y, color=color, alpha=0.25, zorder=1,
                     )
-                    # Outline only the curve portion, not the closure leg.
-                    line_x = [px for px, _ in (
-                        offset_point(xx, yy) for xx, yy in zip(seg_xs, seg_ys)
-                    )]
-                    line_y = [py for _, py in (
-                        offset_point(xx, yy) for xx, yy in zip(seg_xs, seg_ys)
-                    )]
-                    self.ax.plot(
-                        line_x, line_y, color=color, linewidth=1.0, zorder=2,
-                    )
             else:
                 # Axial — single colour, no sign split.
+                color = axial_color
                 poly_x = [ni.x]
                 poly_y = [ni.y]
                 for xx, yy in zip(xs, ys):
@@ -1957,10 +1953,10 @@ class ModelCanvas(QWidget):
                 poly_x.append(nj.x)
                 poly_y.append(nj.y)
                 self.ax.fill(
-                    poly_x, poly_y, color=axial_color, alpha=0.25, zorder=1,
+                    poly_x, poly_y, color=color, alpha=0.25, zorder=1,
                 )
                 self.ax.plot(
-                    poly_x, poly_y, color=axial_color, linewidth=1.0, zorder=2,
+                    poly_x, poly_y, color=color, linewidth=1.0, zorder=2,
                 )
 
             # Per-element critical points: argmax(ys) and argmin(ys).
