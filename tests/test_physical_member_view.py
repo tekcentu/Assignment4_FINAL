@@ -27,8 +27,8 @@ class _FakeNode:
 
 def test_physical_member_polygon_horizontal():
     """Horizontal member (0,0)→(4,0), depth=0.4 → rectangle ±0.2 in y."""
-    from structural_analysis.gui_qt.canvas import ModelCanvas
-    poly = ModelCanvas._physical_member_polygon(0.0, 0.0, 4.0, 0.0, 0.4)
+    from structural_analysis.gui_common.geometry import physical_member_polygon
+    poly = physical_member_polygon(0.0, 0.0, 4.0, 0.0, 0.4)
     assert poly is not None
     assert len(poly) == 4
     ys = [p[1] for p in poly]
@@ -40,8 +40,8 @@ def test_physical_member_polygon_horizontal():
 
 def test_physical_member_polygon_vertical():
     """Vertical member (0,0)→(0,3), depth=0.6 → rectangle ±0.3 in x."""
-    from structural_analysis.gui_qt.canvas import ModelCanvas
-    poly = ModelCanvas._physical_member_polygon(0.0, 0.0, 0.0, 3.0, 0.6)
+    from structural_analysis.gui_common.geometry import physical_member_polygon
+    poly = physical_member_polygon(0.0, 0.0, 0.0, 3.0, 0.6)
     assert poly is not None
     xs = [p[0] for p in poly]
     assert sorted(xs) == pytest.approx([-0.3, -0.3, 0.3, 0.3])
@@ -49,9 +49,9 @@ def test_physical_member_polygon_vertical():
 
 def test_physical_member_polygon_midpoint_on_centerline():
     """Centre of the 4-corner rectangle lies on the input segment midpoint."""
-    from structural_analysis.gui_qt.canvas import ModelCanvas
+    from structural_analysis.gui_common.geometry import physical_member_polygon
     xi, yi, xj, yj = 1.0, 2.0, 5.0, 4.0
-    poly = ModelCanvas._physical_member_polygon(xi, yi, xj, yj, 0.5)
+    poly = physical_member_polygon(xi, yi, xj, yj, 0.5)
     assert poly is not None
     cx = sum(p[0] for p in poly) / 4
     cy = sum(p[1] for p in poly) / 4
@@ -61,8 +61,8 @@ def test_physical_member_polygon_midpoint_on_centerline():
 
 def test_physical_member_polygon_zero_length_returns_none():
     """Degenerate zero-length member must return None, not raise."""
-    from structural_analysis.gui_qt.canvas import ModelCanvas
-    result = ModelCanvas._physical_member_polygon(1.0, 1.0, 1.0, 1.0, 0.3)
+    from structural_analysis.gui_common.geometry import physical_member_polygon
+    result = physical_member_polygon(1.0, 1.0, 1.0, 1.0, 0.3)
     assert result is None
 
 
@@ -88,9 +88,9 @@ def _make_l_frame_model():
 
 def test_joint_overlap_nodes_shared_node_detected():
     """Node 2 has 2 frames meeting → it appears in the overlap list."""
-    from structural_analysis.gui_qt.canvas import ModelCanvas
+    from structural_analysis.gui_common.geometry import joint_overlap_nodes
     m = _make_l_frame_model()
-    joints = ModelCanvas._joint_overlap_nodes(m, default_depth=0.2)
+    joints = joint_overlap_nodes(m, default_depth=0.2)
     assert len(joints) == 1
     x, y, side = joints[0]
     assert x == pytest.approx(0.0)
@@ -103,7 +103,7 @@ def test_joint_overlap_nodes_single_frame_no_marker():
     """A node touched by only one frame element must NOT get a joint marker."""
     from structural_analysis.model import StructuralModel, Node, Support
     from structural_analysis.element import FrameElement2D
-    from structural_analysis.gui_qt.canvas import ModelCanvas
+    from structural_analysis.gui_common.geometry import joint_overlap_nodes
     m = StructuralModel()
     m.nodes[1] = Node(1, 0.0, 0.0)
     m.nodes[2] = Node(2, 0.0, 3.0)
@@ -112,7 +112,7 @@ def test_joint_overlap_nodes_single_frame_no_marker():
                        depth=0.4, rho=7850.0)
     )
     m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
-    joints = ModelCanvas._joint_overlap_nodes(m, default_depth=0.2)
+    joints = joint_overlap_nodes(m, default_depth=0.2)
     assert joints == []
 
 
@@ -120,7 +120,7 @@ def test_joint_overlap_nodes_truss_only_no_marker():
     """Truss-only joints must not produce overlap markers."""
     from structural_analysis.model import StructuralModel, Node, Support
     from structural_analysis.element import TrussElement2D
-    from structural_analysis.gui_qt.canvas import ModelCanvas
+    from structural_analysis.gui_common.geometry import joint_overlap_nodes
     m = StructuralModel()
     m.nodes[1] = Node(1, 0.0, 0.0)
     m.nodes[2] = Node(2, 1.0, 0.0)
@@ -133,22 +133,23 @@ def test_joint_overlap_nodes_truss_only_no_marker():
     )
     m.supports[1] = Support(node_id=1, ux=True, uy=True, rz=True)
     m.supports[2] = Support(node_id=2, ux=True, uy=True, rz=True)
-    joints = ModelCanvas._joint_overlap_nodes(m, default_depth=0.2)
+    joints = joint_overlap_nodes(m, default_depth=0.2)
     assert joints == []
 
 
 def test_resolved_default_depth_adaptive():
     """Default depth is ~2% of bbox diagonal, clamped to [0.05, 1.0] m."""
     from structural_analysis.model import StructuralModel, Node
-    from structural_analysis.gui_qt.canvas import ModelCanvas, _DEFAULT_VISUAL_DEPTH_FRACTION
-
+    from structural_analysis.gui_common.geometry import (
+        resolved_default_depth, PHYSICAL_DEPTH_FRACTION,
+    )
     m = StructuralModel()
     m.nodes[1] = Node(1, 0.0, 0.0)
     m.nodes[2] = Node(2, 10.0, 0.0)
     m.nodes[3] = Node(3, 0.0, 10.0)
     # diag = sqrt(100+100) ≈ 14.14 m  →  0.02 * 14.14 ≈ 0.283 m
-    expected = _DEFAULT_VISUAL_DEPTH_FRACTION * math.hypot(10.0, 10.0)
-    result = ModelCanvas._resolved_default_depth(m)   # @staticmethod
+    expected = PHYSICAL_DEPTH_FRACTION * math.hypot(10.0, 10.0)
+    result = resolved_default_depth(m)
     assert result == pytest.approx(expected, rel=1e-3)
 
 

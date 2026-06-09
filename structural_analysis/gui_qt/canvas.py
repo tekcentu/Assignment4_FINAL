@@ -8,7 +8,6 @@ toolbar are Qt-specific.
 from __future__ import annotations
 
 import math
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -36,6 +35,14 @@ from ..model import (
     TrussTemperatureLoad,
     UniformDistributedLoad,
 )
+from ..gui_common.geometry import (
+    physical_member_polygon as _physical_member_polygon,
+    joint_overlap_nodes as _joint_overlap_nodes,
+    resolved_default_depth as _resolved_default_depth,
+    PHYSICAL_DEPTH_FRACTION as _DEFAULT_VISUAL_DEPTH_FRACTION,
+    PHYSICAL_DEPTH_MIN as _DEFAULT_VISUAL_DEPTH_MIN,
+    PHYSICAL_DEPTH_MAX as _DEFAULT_VISUAL_DEPTH_MAX,
+)
 from .grid import GridSystem
 from .snap import SnapCandidate, SnapEngine
 from .element_graphics import (
@@ -45,12 +52,7 @@ from .element_graphics import (
 
 
 _TOOLBAR_REMOVE = {"Subplots", "Customize"}
-
-# Physical-member overlay: adaptive fallback depth when section.depth == 0.
-# 2 % of the model bounding-box diagonal, clamped to [0.05, 1.0] m.
-_DEFAULT_VISUAL_DEPTH_FRACTION: float = 0.02
-_DEFAULT_VISUAL_DEPTH_MIN: float = 0.05   # metres
-_DEFAULT_VISUAL_DEPTH_MAX: float = 1.0    # metres
+# _DEFAULT_VISUAL_DEPTH_* constants are imported from gui_common.geometry above.
 
 
 class AppNavigationToolbar(NavigationToolbar2QT):
@@ -1325,74 +1327,12 @@ class ModelCanvas(QWidget):
                     _path_effects.withStroke(linewidth=1.6, foreground="white"),
                 ])
 
-    # ── Physical-member overlay helpers ──────────────────────────────────────
-
-    @staticmethod
-    def _resolved_default_depth(model: StructuralModel) -> float:
-        """Adaptive fallback when section depth is unavailable.
-
-        Returns 2 % of the model bounding-box diagonal, clamped to
-        [``_DEFAULT_VISUAL_DEPTH_MIN``, ``_DEFAULT_VISUAL_DEPTH_MAX``] m.
-        Falls back to ``_DEFAULT_VISUAL_DEPTH_MIN`` for degenerate models
-        (fewer than 2 nodes or zero spatial extent).
-        """
-        xs = [n.x for n in model.nodes.values()]
-        ys = [n.y for n in model.nodes.values()]
-        if len(xs) < 2:
-            return _DEFAULT_VISUAL_DEPTH_MIN
-        diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
-        if diag <= 0.0:
-            return _DEFAULT_VISUAL_DEPTH_MIN
-        raw = _DEFAULT_VISUAL_DEPTH_FRACTION * diag
-        return max(_DEFAULT_VISUAL_DEPTH_MIN, min(_DEFAULT_VISUAL_DEPTH_MAX, raw))
-
-    @staticmethod
-    def _physical_member_polygon(
-        xi: float, yi: float, xj: float, yj: float, depth: float
-    ) -> list[tuple[float, float]] | None:
-        """4-corner rectangle centred on the centerline (xi,yi)→(xj,yj).
-
-        The perpendicular half-width is ``depth / 2``.  Returns ``None``
-        for degenerate zero-length members so callers can skip safely.
-        """
-        dx, dy = xj - xi, yj - yi
-        L = math.hypot(dx, dy)
-        if L == 0.0:
-            return None
-        nx, ny = -dy / L, dx / L   # unit normal, 90° CCW from tangent
-        h = 0.5 * depth
-        return [
-            (xi + h * nx, yi + h * ny),
-            (xj + h * nx, yj + h * ny),
-            (xj - h * nx, yj - h * ny),
-            (xi - h * nx, yi - h * ny),
-        ]
-
-    @staticmethod
-    def _joint_overlap_nodes(
-        model: StructuralModel, default_depth: float
-    ) -> list[tuple[float, float, float]]:
-        """Nodes where ≥ 2 frame elements meet, each as (x, y, side).
-
-        ``side`` is the maximum section depth of the meeting members
-        (or ``default_depth`` when none carry a non-zero depth).  Used to
-        draw a diagnostic hatched square centred on the joint.  Nodes
-        where only one frame element meets, or where only trusses meet,
-        are not included.
-        """
-        meet: dict[int, list[float]] = defaultdict(list)
-        for elem in model.elements:
-            if not isinstance(elem, FrameElement2D):
-                continue
-            d = elem.depth if elem.depth > 0 else default_depth
-            meet[elem.node_i].append(d)
-            meet[elem.node_j].append(d)
-        result = []
-        for nid, depths in meet.items():
-            if len(depths) >= 2 and nid in model.nodes:
-                n = model.nodes[nid]
-                result.append((n.x, n.y, max(depths)))
-        return result
+    # ── Physical-member overlay ───────────────────────────────────────────────
+    # Pure-geometry helpers (physical_member_polygon, joint_overlap_nodes,
+    # resolved_default_depth) live in gui_common/geometry.py — imported at
+    # the top of this file as _physical_member_polygon, _joint_overlap_nodes,
+    # _resolved_default_depth — so they can be tested without importing the
+    # Qt/matplotlib stack.
 
     def _draw_physical_members(self, model: StructuralModel) -> None:
         """Translucent body rectangles for every element + joint markers.
@@ -1403,7 +1343,7 @@ class ModelCanvas(QWidget):
         Both sit below validation (1.4) and selection (1.5) overlays so
         error/warning glows and selection highlights remain clearly visible.
         """
-        default_depth = self._resolved_default_depth(model)
+        default_depth = _resolved_default_depth(model)
         missing = 0
         frame_polys: list[list[tuple[float, float]]] = []
         truss_polys: list[list[tuple[float, float]]] = []
@@ -1419,7 +1359,7 @@ class ModelCanvas(QWidget):
             else:
                 d = default_depth if is_frame else 0.5 * default_depth
                 missing += 1
-            poly = self._physical_member_polygon(ni.x, ni.y, nj.x, nj.y, d)
+            poly = _physical_member_polygon(ni.x, ni.y, nj.x, nj.y, d)
             if poly is None:
                 continue
             if is_frame:
@@ -1438,7 +1378,7 @@ class ModelCanvas(QWidget):
                 edgecolor="#d62728", linewidth=0.5, zorder=1.2,
             ))
 
-        for x, y, side in self._joint_overlap_nodes(model, default_depth):
+        for x, y, side in _joint_overlap_nodes(model, default_depth):
             self.ax.add_patch(_MplRectangle(
                 (x - side / 2, y - side / 2), side, side,
                 hatch="///", facecolor="#f0c060", edgecolor="#806000",
