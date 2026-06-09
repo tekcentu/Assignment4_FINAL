@@ -75,6 +75,7 @@ from ..gui_common.file_writer import write_input_file
 from ..gui_common.results_view import (
     case_combo_entries,
     format_result,
+    relabel_component_to_structure,
     resolve_view,
 )
 from ..gui_common.validation import (
@@ -3661,7 +3662,7 @@ class MainWindow(QMainWindow):
         )
         self._modal_results_dialog.show()
         _comp_note = (
-            f" · {modal_result.component_summary}"
+            f" · {relabel_component_to_structure(modal_result.component_summary)}"
             if getattr(modal_result, "component_summary", "")
             else ""
         )
