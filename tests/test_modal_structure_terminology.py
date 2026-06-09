@@ -20,7 +20,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ── relabel helper (pure-Python) ──────────────────────────────────────────────
 
 
-def test_relabel_maps_all_four_surface_forms():
+def test_relabel_maps_all_surface_forms():
     from structural_analysis.gui_common.results_view import (
         relabel_component_to_structure as relabel,
     )
@@ -28,6 +28,8 @@ def test_relabel_maps_all_four_surface_forms():
     assert relabel("component") == "structure"
     assert relabel("Components") == "Structures"
     assert relabel("components") == "structures"
+    assert relabel("COMPONENT") == "STRUCTURE"
+    assert relabel("COMPONENTS") == "STRUCTURES"
 
 
 def test_relabel_in_sentence_preserves_surrounding_text():
@@ -132,19 +134,18 @@ def _single_column_model():
     return m
 
 
-try:
-    from PyQt6.QtWidgets import QApplication, QLabel
-except Exception as exc:  # noqa: BLE001
-    pytest.skip(f"PyQt6 unavailable: {exc}", allow_module_level=True)
-
-
 @pytest.fixture(scope="module")
 def qt_app():
+    try:
+        from PyQt6.QtWidgets import QApplication
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"PyQt6 unavailable: {exc}")
     return QApplication.instance() or QApplication([])
 
 
 def _all_visible_text(dialog) -> str:
     """Concatenate every tree item label + QLabel text in the dialog."""
+    from PyQt6.QtWidgets import QLabel
     parts: list[str] = []
     tree = dialog._tree
     for i in range(tree.topLevelItemCount()):

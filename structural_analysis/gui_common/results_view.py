@@ -21,9 +21,11 @@ _COMPONENT_WORD_RE = re.compile(r"\bcomponents?\b", re.IGNORECASE)
 
 def _component_to_structure_word(match: re.Match) -> str:
     """Map one ``component``/``components`` match to ``structure``/``structures``
-    while preserving the matched casing (Title or lower)."""
+    while preserving the matched casing (UPPER, Title, or lower)."""
     word = match.group(0)
     plural = word[-1] in ("s", "S")
+    if word.isupper():
+        return "STRUCTURES" if plural else "STRUCTURE"
     base = "Structure" if word[:1].isupper() else "structure"
     return base + ("s" if plural else "")
 
@@ -37,8 +39,9 @@ def relabel_component_to_structure(text: str) -> str:
     engineering language. This helper does a whole-word, case-aware swap so
     solver-sourced prose (e.g. ``ModalResult.component_summary``) can be shown
     in user terms WITHOUT touching the solver. Only the surface forms
-    ``Component`` / ``component`` / ``Components`` / ``components`` are mapped;
-    substrings like ``componentry`` are left untouched by the ``\\b`` guards.
+    ``Component`` / ``component`` / ``COMPONENT`` / ``Components`` /
+    ``components`` / ``COMPONENTS`` are mapped; substrings like ``componentry``
+    are left untouched by the ``\\b`` guards.
     """
     if not text:
         return text
