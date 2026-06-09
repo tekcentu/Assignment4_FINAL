@@ -7,6 +7,7 @@ toolbar are Qt-specific.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -14,6 +15,7 @@ import matplotlib
 matplotlib.use("QtAgg")  # noqa: E402  must precede pyplot import
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as _MplPolygon
+from matplotlib.collections import PolyCollection as _PolyCollection
 from matplotlib import patheffects as _path_effects
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT,
@@ -33,6 +35,15 @@ from ..model import (
     TrussTemperatureLoad,
     UniformDistributedLoad,
 )
+from ..gui_common.geometry import (
+    physical_member_polygon as _physical_member_polygon,
+    physical_display_thickness as _physical_display_thickness,
+    joint_overlap_regions as _joint_overlap_regions,
+    resolved_default_depth as _resolved_default_depth,
+    PHYSICAL_DEPTH_FRACTION as _DEFAULT_VISUAL_DEPTH_FRACTION,
+    PHYSICAL_DEPTH_MIN as _DEFAULT_VISUAL_DEPTH_MIN,
+    PHYSICAL_DEPTH_MAX as _DEFAULT_VISUAL_DEPTH_MAX,
+)
 from .grid import GridSystem
 from .snap import SnapCandidate, SnapEngine
 from .element_graphics import (
@@ -42,6 +53,7 @@ from .element_graphics import (
 
 
 _TOOLBAR_REMOVE = {"Subplots", "Customize"}
+# _DEFAULT_VISUAL_DEPTH_* constants are imported from gui_common.geometry above.
 
 
 class AppNavigationToolbar(NavigationToolbar2QT):
@@ -105,6 +117,10 @@ class ModelCanvas(QWidget):
         # i/j end labels on each element so users can see element
         # orientation at a glance. Off by default — advanced view.
         self.show_local_axes: bool = False
+        self.show_physical_members: bool = False
+        # Post-draw counter: how many elements fell back to default depth
+        # because section.depth == 0.  Read by the status-bar note in app.py.
+        self._physical_members_missing_depth: int = 0
         self.diagram_kind: str = "moment"
         self.deformed_scale: float = 1.0
         self.diagram_scale: float = 1.0
@@ -1174,12 +1190,19 @@ class ModelCanvas(QWidget):
                     release_edges.append(color)
             self._draw_member_loads(elem, ni, nj, load_scales)
 
+        if self.show_physical_members:
+            self._draw_physical_members(model)
+        # Physical view: switch centerlines to thin dashed so the translucent
+        # body shows through and the analytical line is still clearly marked.
+        _phys = self.show_physical_members
         if frame_xs:
-            self.ax.plot(frame_xs, frame_ys, color="#1f77b4", linestyle="-",
-                         linewidth=2.0, zorder=2)
+            self.ax.plot(frame_xs, frame_ys, color="#1f77b4",
+                         linestyle="--" if _phys else "-",
+                         linewidth=1.0 if _phys else 2.0, zorder=2)
         if truss_xs:
-            self.ax.plot(truss_xs, truss_ys, color="#d62728", linestyle="--",
-                         linewidth=2.0, zorder=2)
+            self.ax.plot(truss_xs, truss_ys, color="#d62728",
+                         linestyle=":" if _phys else "--",
+                         linewidth=1.0 if _phys else 2.0, zorder=2)
         for rx, ry, edge in zip(release_xs, release_ys, release_edges):
             self.ax.plot(rx, ry, marker="o", color="white", markersize=7,
                          markeredgecolor=edge, zorder=5)
@@ -1304,6 +1327,97 @@ class ModelCanvas(QWidget):
                 t.set_path_effects([
                     _path_effects.withStroke(linewidth=1.6, foreground="white"),
                 ])
+
+    # ── Physical-member overlay ───────────────────────────────────────────────
+    # Pure-geometry helpers (physical_member_polygon, joint_overlap_nodes,
+    # resolved_default_depth) live in gui_common/geometry.py — imported at
+    # the top of this file as _physical_member_polygon, _joint_overlap_nodes,
+    # _resolved_default_depth — so they can be tested without importing the
+    # Qt/matplotlib stack.
+
+    def _draw_physical_members(self, model: StructuralModel) -> None:
+        """Translucent body rectangles per element + true joint overlaps.
+
+        Frame bodies are drawn in blue at alpha=0.25 (zorder=1.2).
+        Truss bodies are drawn in red at alpha=0.18 (zorder=1.2).
+        Joint overlap regions (geometry-derived convex intersections of
+        the two meeting bodies) are drawn as hatched polygons at
+        zorder=1.3.  All sit below validation (1.4) and selection (1.5)
+        overlays so error/warning glows and selection highlights remain
+        clearly visible.
+
+        Section depth source: ``physical_display_thickness`` resolves
+        the in-plane envelope per section (I-sections get
+        ``max(depth, width)`` — never web thickness).  When no real
+        thickness is available the adaptive ``resolved_default_depth``
+        kicks in and the fallback element count is reported on the
+        status bar.
+        """
+        default_depth = _resolved_default_depth(model)
+        missing = 0
+        frame_polys: list[list[tuple[float, float]]] = []
+        truss_polys: list[list[tuple[float, float]]] = []
+        # Keyed by elem.id so joint_overlap_regions can pair them up.
+        element_polygons: dict[int, list[tuple[float, float]]] = {}
+
+        for elem in model.elements:
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            is_frame = isinstance(elem, FrameElement2D)
+            d = _physical_display_thickness(elem, model.sections)
+            if d <= 0.0:
+                d = default_depth if is_frame else 0.5 * default_depth
+                if is_frame:
+                    missing += 1
+            poly = _physical_member_polygon(ni.x, ni.y, nj.x, nj.y, d)
+            if poly is None:
+                continue
+            if is_frame:
+                frame_polys.append(poly)
+                element_polygons[elem.id] = poly
+            else:
+                truss_polys.append(poly)
+
+        if frame_polys:
+            self.ax.add_collection(_PolyCollection(
+                frame_polys, facecolor="#1f77b4", alpha=0.25,
+                edgecolor="#1f77b4", linewidth=0.5, zorder=1.2,
+            ))
+        if truss_polys:
+            self.ax.add_collection(_PolyCollection(
+                truss_polys, facecolor="#d62728", alpha=0.18,
+                edgecolor="#d62728", linewidth=0.5, zorder=1.2,
+            ))
+
+        # Geometry-derived joint overlap shading (replaces the old
+        # fixed-square proxy).  Pair-wise convex intersection of the
+        # body rectangles — naturally rectangular when sections differ.
+        for poly, (cx, cy), (w, h), _pair in _joint_overlap_regions(
+            model, element_polygons,
+        ):
+            self.ax.add_patch(_MplPolygon(
+                poly, closed=True,
+                hatch="///", facecolor="#f0c060", edgecolor="#806000",
+                alpha=0.30, linewidth=0.8, zorder=1.3,
+            ))
+            # TEMPORARY debug aid: small label showing the overlap bbox
+            # size and centroid so reviewers can verify the geometry
+            # comes from real member extents.  Remove after sign-off.
+            self.ax.text(
+                cx, cy,
+                f"{w:.2f}×{h:.2f} m\n@ ({cx:.2f}, {cy:.2f})",
+                fontsize=6, color="#604000",
+                ha="center", va="center", zorder=1.35,
+                bbox=dict(
+                    boxstyle="round,pad=0.18",
+                    facecolor="white", edgecolor="#806000",
+                    alpha=0.75, linewidth=0.4,
+                ),
+            )
+
+        self._physical_members_missing_depth = missing
 
     def _draw_support(self, sup: Support, x: float, y: float) -> None:
         if sup.ux and sup.uy and sup.rz:

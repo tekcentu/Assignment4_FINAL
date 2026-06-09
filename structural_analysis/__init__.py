@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.30.2"
+__version__ = "0.30.3"
 __what_is_new__ = (
-    "Modal results say 'Structure' not 'Component' · "
-    "Per-structure explanatory note in modal dialog · "
-    "Internal code names unchanged"
+    "Physical Members overlay shows section-aware body around centerlines · "
+    "Joint overlap shaded at shared nodes · "
+    "Analysis still uses centerline elements (visual only)"
 )
 
 from .model import (

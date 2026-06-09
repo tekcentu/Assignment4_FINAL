@@ -845,10 +845,18 @@ class MainWindow(QMainWindow):
         self._cb_diagrams.toggled.connect(self._refresh_overlays)
         self._cb_section_labels = QCheckBox("Section/material names", self._overlay_panel)
         self._cb_section_labels.toggled.connect(self._refresh_overlays)
+        self._cb_physical = QCheckBox("Physical members", self._overlay_panel)
+        self._cb_physical.setToolTip(
+            "Physical view is visual only.\n"
+            "Analysis still uses centerline elements."
+        )
+        self._cb_physical.toggled.connect(self._refresh_overlays)
+        self._cb_physical.toggled.connect(self._on_physical_members_note)
         v.addWidget(self._cb_deformed)
         v.addWidget(self._cb_reactions)
         v.addWidget(self._cb_diagrams)
         v.addWidget(self._cb_section_labels)
+        v.addWidget(self._cb_physical)
 
         self._dia_group = QButtonGroup(self._overlay_panel)
         for label, val in [("M (moment)", "moment"),
@@ -2193,11 +2201,28 @@ class MainWindow(QMainWindow):
         self.canvas.show_reactions = self._cb_reactions.isChecked()
         self.canvas.show_diagrams = self._cb_diagrams.isChecked()
         self.canvas.show_section_labels = self._cb_section_labels.isChecked()
+        self.canvas.show_physical_members = self._cb_physical.isChecked()
         for btn in self._dia_group.buttons():
             if btn.isChecked():
                 self.canvas.diagram_kind = btn.property("diagram_kind")
                 break
         self.canvas.redraw()
+
+    def _on_physical_members_note(self, on: bool) -> None:
+        if not on:
+            self._update_selection_status()
+            return
+        msg = (
+            "Physical view is visual only. "
+            "Analysis still uses centerline elements."
+        )
+        n = getattr(self.canvas, "_physical_members_missing_depth", 0)
+        if n:
+            msg += (
+                f" ({n} element(s) had no section depth — "
+                "using adaptive default thickness.)"
+            )
+        self._status_label.setText(msg)
 
     # ── grid / snap ──
 
