@@ -529,6 +529,14 @@ def solve_modal(
             cannot be condensed (no mass-bearing free DOFs / singular
             massless-DOF stiffness block).
     """
+    from .assembler import model_is_3d
+    if model_is_3d(model):
+        raise ValueError(
+            "Modal analysis is not yet supported for 3D models — the "
+            "mass assembler is 2D-only in this version. Keep the model "
+            "planar (all z = 0, no 3D supports/loads) to run a modal "
+            "study."
+        )
     if normalisation not in ("mass", "max"):
         raise ValueError(
             f"Unknown normalisation {normalisation!r}; expected 'mass' or 'max'."
