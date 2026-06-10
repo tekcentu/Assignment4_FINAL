@@ -898,6 +898,7 @@ class ElementDialog(_ModalDialog):
                  existing_offset_i: float = 0.0,
                  existing_offset_j: float = 0.0,
                  member_length: float | None = None,
+                 show_offsets: bool = True,
                  remember_default: bool = True):
         self._model = model
         if not model.sections:
@@ -910,6 +911,16 @@ class ElementDialog(_ModalDialog):
         self._existing_offset_i = float(existing_offset_i or 0.0)
         self._existing_offset_j = float(existing_offset_j or 0.0)
         self._member_length = member_length
+        # Offsets are an edit-only concern. Creation flows pass
+        # show_offsets=False so the new-frame dialog stays one decision
+        # short of the wizard it used to be; rigid offsets are then
+        # assigned post-creation via the menu / right-click command, or
+        # by re-opening this dialog through Element Details.
+        self._show_offsets = bool(show_offsets)
+        self._sb_off_i = None
+        self._sb_off_j = None
+        self._lbl_l_total = None
+        self._lbl_l_flex = None
         self._remember_default = bool(remember_default)
         super().__init__(parent, "Element properties")
 
@@ -972,24 +983,47 @@ class ElementDialog(_ModalDialog):
         # Rigid end offsets (frames only). Optional — default 0 keeps
         # the legacy fully-flexible behaviour. The analytical nodes
         # stay at the joints; the flexible span starts/ends at the
-        # offset faces.
-        self._sb_off_i = QDoubleSpinBox(body)
-        self._sb_off_j = QDoubleSpinBox(body)
-        for sb in (self._sb_off_i, self._sb_off_j):
-            sb.setDecimals(4)
-            sb.setMinimum(0.0)
-            sb.setMaximum(1e6)
-            sb.setSingleStep(0.05)
-            sb.setSuffix(" m")
-            sb.setToolTip(
-                "Rigid end-zone length from the analytical node toward "
-                "the element interior.\nAnalysis uses the flexible span "
-                "between the offset faces; 0 = fully flexible."
-            )
-        self._sb_off_i.setValue(self._existing_offset_i)
-        self._sb_off_j.setValue(self._existing_offset_j)
-        form.addRow("Rigid offset at i:", self._sb_off_i)
-        form.addRow("Rigid offset at j:", self._sb_off_j)
+        # offset faces. Hidden in creation mode (show_offsets=False)
+        # so the new-frame flow stays a 3-decision dialog; offsets are
+        # set after the fact via the Assign / Clear commands or Element
+        # Details.
+        if self._show_offsets:
+            self._sb_off_i = QDoubleSpinBox(body)
+            self._sb_off_j = QDoubleSpinBox(body)
+            for sb in (self._sb_off_i, self._sb_off_j):
+                sb.setDecimals(4)
+                sb.setMinimum(0.0)
+                sb.setMaximum(1e6)
+                sb.setSingleStep(0.05)
+                sb.setSuffix(" m")
+                sb.setToolTip(
+                    "Rigid end-zone length from the analytical node "
+                    "toward the element interior.\nAnalysis uses the "
+                    "flexible span between the offset faces; 0 = fully "
+                    "flexible."
+                )
+            self._sb_off_i.setValue(self._existing_offset_i)
+            self._sb_off_j.setValue(self._existing_offset_j)
+            form.addRow("Rigid offset at i:", self._sb_off_i)
+            form.addRow("Rigid offset at j:", self._sb_off_j)
+            if self._member_length is not None:
+                # Live-updating L_total / L_flex labels so the user sees
+                # how their offsets eat into the deformable span as they
+                # spin the numbers (mirrors the solver's flex_length
+                # arithmetic exactly; no need to launch a re-validation).
+                self._lbl_l_total = QLabel(
+                    f"L_total = {self._member_length:.4g} m", body,
+                )
+                self._lbl_l_flex = QLabel("", body)
+                self._refresh_l_flex_label()
+                self._sb_off_i.valueChanged.connect(
+                    lambda _v: self._refresh_l_flex_label()
+                )
+                self._sb_off_j.valueChanged.connect(
+                    lambda _v: self._refresh_l_flex_label()
+                )
+                form.addRow("Total length:", self._lbl_l_total)
+                form.addRow("Flexible span:", self._lbl_l_flex)
 
         self._cb_remember = QCheckBox(
             "Remember and reuse these settings for subsequent elements",
@@ -1004,8 +1038,31 @@ class ElementDialog(_ModalDialog):
         is_frame = self._rb_frame.isChecked()
         self._cb_ri.setEnabled(is_frame)
         self._cb_rj.setEnabled(is_frame)
-        self._sb_off_i.setEnabled(is_frame)
-        self._sb_off_j.setEnabled(is_frame)
+        if self._sb_off_i is not None:
+            self._sb_off_i.setEnabled(is_frame)
+        if self._sb_off_j is not None:
+            self._sb_off_j.setEnabled(is_frame)
+        if self._lbl_l_flex is not None:
+            self._refresh_l_flex_label()
+
+    def _refresh_l_flex_label(self) -> None:
+        if (self._lbl_l_flex is None
+                or self._sb_off_i is None
+                or self._sb_off_j is None
+                or self._member_length is None):
+            return
+        is_frame = self._rb_frame.isChecked()
+        off_i = self._sb_off_i.value() if is_frame else 0.0
+        off_j = self._sb_off_j.value() if is_frame else 0.0
+        L_flex = self._member_length - off_i - off_j
+        if L_flex <= 0.0:
+            self._lbl_l_flex.setText(
+                f"L_flex = {L_flex:.4g} m  (offsets consume the member)"
+            )
+            self._lbl_l_flex.setStyleSheet("color: #c0392b;")
+        else:
+            self._lbl_l_flex.setText(f"L_flex = {L_flex:.4g} m")
+            self._lbl_l_flex.setStyleSheet("")
 
     def _accept(self) -> dict:
         kind = "frame" if self._rb_frame.isChecked() else "truss"
@@ -1013,8 +1070,12 @@ class ElementDialog(_ModalDialog):
         if section_id not in self._model.sections:
             raise ValueError(f"Section {section_id} does not exist.")
         mat_override = self._mat_combo.currentData()
-        off_i = self._sb_off_i.value() if kind == "frame" else 0.0
-        off_j = self._sb_off_j.value() if kind == "frame" else 0.0
+        if kind == "frame" and self._sb_off_i is not None:
+            off_i = self._sb_off_i.value()
+            off_j = self._sb_off_j.value()
+        else:
+            off_i = 0.0
+            off_j = 0.0
         if (off_i or off_j) and self._member_length is not None:
             if off_i + off_j >= self._member_length:
                 raise ValueError(

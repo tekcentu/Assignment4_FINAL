@@ -177,3 +177,154 @@ def test_element_dialog_truss_returns_zero_offsets(qt_app):
     rv = d._accept()
     assert rv["offset_i"] == 0.0
     assert rv["offset_j"] == 0.0
+
+
+# ── creation-mode dialog (show_offsets=False) + L_total / L_flex ─────────
+
+
+def _dlg_model():
+    from structural_analysis.model import Material, Section
+    m = StructuralModel(title="dlg")
+    m.materials = {1: Material(1, E=E, alpha=1e-5)}
+    m.sections = {1: Section(1, material_id=1, A=A, I=I, depth=0.3)}
+    return m
+
+
+def test_element_dialog_hides_offset_fields_in_creation_mode(qt_app):
+    from structural_analysis.gui_qt.dialogs import ElementDialog
+    m = _dlg_model()
+    d = ElementDialog(
+        None, model=m, existing_kind="frame", existing_section_id=1,
+        show_offsets=False,
+    )
+    assert d._sb_off_i is None
+    assert d._sb_off_j is None
+    assert d._lbl_l_total is None
+    assert d._lbl_l_flex is None
+    rv = d._accept()
+    # No offset spinboxes ⇒ creation result is always zero offsets.
+    assert rv["offset_i"] == 0.0
+    assert rv["offset_j"] == 0.0
+
+
+def test_element_dialog_shows_l_total_and_l_flex_labels(qt_app):
+    from structural_analysis.gui_qt.dialogs import ElementDialog
+    m = _dlg_model()
+    d = ElementDialog(
+        None, model=m, existing_kind="frame", existing_section_id=1,
+        existing_offset_i=0.5, existing_offset_j=0.25, member_length=6.0,
+    )
+    assert d._lbl_l_total is not None
+    assert d._lbl_l_flex is not None
+    assert "6" in d._lbl_l_total.text()
+    # 6.0 - 0.5 - 0.25 = 5.25
+    assert "5.25" in d._lbl_l_flex.text()
+
+
+def test_element_dialog_l_flex_updates_live(qt_app):
+    from structural_analysis.gui_qt.dialogs import ElementDialog
+    m = _dlg_model()
+    d = ElementDialog(
+        None, model=m, existing_kind="frame", existing_section_id=1,
+        existing_offset_i=0.0, existing_offset_j=0.0, member_length=6.0,
+    )
+    assert "6" in d._lbl_l_flex.text()
+    d._sb_off_i.setValue(1.0)
+    d._sb_off_j.setValue(0.5)
+    assert "4.5" in d._lbl_l_flex.text()
+
+
+# ── batch offset commands wired through MainWindow ───────────────────────
+
+
+def _multi_frame_model_for_app():
+    """L-frame: columns 1 & 3, beam id 2 between top nodes."""
+    from structural_analysis.model import Material, Section
+    m = StructuralModel(title="gui auto offsets")
+    m.materials = {1: Material(1, E=E, alpha=1e-5, density=7850.0)}
+    m.sections = {1: Section(1, material_id=1, A=A, I=I, depth=0.4)}
+    m.nodes = {
+        1: Node(1, 0.0, 0.0),
+        2: Node(2, 0.0, 3.0),
+        3: Node(3, 6.0, 3.0),
+        4: Node(4, 6.0, 0.0),
+    }
+    m.elements = [
+        FrameElement2D(1, 1, 2, E=E, A=A, I=I, depth=0.4, section_id=1),
+        FrameElement2D(2, 2, 3, E=E, A=A, I=I, depth=0.4, section_id=1),
+        FrameElement2D(3, 4, 3, E=E, A=A, I=I, depth=0.4, section_id=1),
+    ]
+    m.supports = {
+        1: Support(1, ux=True, uy=True, rz=True),
+        4: Support(4, ux=True, uy=True, rz=True),
+    }
+    return m
+
+
+def _make_window(qt_app, model):
+    from structural_analysis.gui_qt.app import MainWindow
+    w = MainWindow()
+    w._model = model
+    return w
+
+
+def test_app_assign_auto_offsets_applies_to_selection(qt_app):
+    m = _multi_frame_model_for_app()
+    w = _make_window(qt_app, m)
+    w.canvas.add_element_to_selection(2)
+    w._do_assign_auto_rigid_offsets(prompt_on_empty=False)
+    beam = w._model.elements[1]
+    assert beam.offset_i == pytest.approx(0.2, rel=1e-6)
+    assert beam.offset_j == pytest.approx(0.2, rel=1e-6)
+
+
+def test_app_assign_auto_offsets_no_selection_no_prompt_does_nothing(qt_app):
+    m = _multi_frame_model_for_app()
+    w = _make_window(qt_app, m)
+    w.canvas.clear_selection()
+    w._do_assign_auto_rigid_offsets(prompt_on_empty=False)
+    assert all(
+        e.offset_i == 0.0 and e.offset_j == 0.0
+        for e in w._model.elements
+    )
+    # Status bar tells the user what to do.
+    assert "select" in w._status_label.text().lower()
+
+
+def test_app_clear_rigid_offsets_zeros_selection(qt_app):
+    m = _multi_frame_model_for_app()
+    m.elements[1].offset_i = 0.2
+    m.elements[1].offset_j = 0.2
+    w = _make_window(qt_app, m)
+    w.canvas.add_element_to_selection(2)
+    w._do_clear_rigid_offsets(prompt_on_empty=False)
+    beam = w._model.elements[1]
+    assert beam.offset_i == 0.0 and beam.offset_j == 0.0
+    assert "1 element(s) cleared" in w._status_label.text()
+
+
+def test_app_assign_auto_offsets_undo_redo_via_main_window(qt_app):
+    m = _multi_frame_model_for_app()
+    w = _make_window(qt_app, m)
+    w.canvas.add_element_to_selection(2)
+    w._do_assign_auto_rigid_offsets(prompt_on_empty=False)
+    assert w._model.elements[1].offset_i == pytest.approx(0.2, rel=1e-6)
+    w.act_undo.trigger()
+    assert w._model.elements[1].offset_i == 0.0
+    w.act_redo.trigger()
+    assert w._model.elements[1].offset_i == pytest.approx(0.2, rel=1e-6)
+
+
+def test_app_status_reports_assigned_and_skipped_counts(qt_app):
+    """Status bar message reflects assigned + truss-skipped counts."""
+    from structural_analysis.element import TrussElement2D
+    m = _multi_frame_model_for_app()
+    # Replace column 1 with a truss so it lands in the skipped bucket.
+    m.elements[0] = TrussElement2D(1, 1, 2, E=E, A=A)
+    w = _make_window(qt_app, m)
+    w.canvas.add_element_to_selection(1)
+    w.canvas.add_element_to_selection(2)
+    w._do_assign_auto_rigid_offsets(prompt_on_empty=False)
+    status = w._status_label.text()
+    assert "1 element(s) assigned" in status
+    assert "truss" in status

@@ -996,6 +996,243 @@ class UpdateElementCmd(Command):
             model.elements[self._saved_index] = self._saved
 
 
+# ── rigid end offsets (v0.31.1) ──────────────────────────────────────────
+#
+# Two batch commands assign / clear ``offset_i`` / ``offset_j`` on a set of
+# frame elements directly (without going through ``UpdateElementCmd`` so the
+# element identity, section, releases, member loads, and material override
+# are preserved untouched). Both snapshot the prior offsets so undo is
+# pointwise — never reaches outside the listed elements.
+#
+# AssignAutoRigidOffsetsCmd derives the offsets from the geometric joint
+# overlap (the same physical-member polygons the canvas paints). Safety
+# guards: a frame is *skipped* with a recorded reason if the computed pair
+# would leave a tiny / zero / negative flexible span. Skipped frames keep
+# their pre-existing offsets — there is no silent overwrite.
+
+# Minimum flexible-span guard for the auto-assign command. The flex span
+# must stay above ``max(_MIN_FLEX_FRACTION × L_total, _MIN_FLEX_ABS_M)`` or
+# the offset assignment is rejected for that element (no clamp — clamping a
+# real geometric overlap silently would hide a degenerate model).
+_MIN_FLEX_FRACTION: float = 0.10
+_MIN_FLEX_ABS_M: float = 0.05
+
+
+def _resolve_depth_for_element(model: StructuralModel, elem) -> float:
+    """Visual thickness used for joint-overlap geometry.
+
+    Mirrors the canvas resolution so the computed offsets match what the
+    user sees in the physical-member view: section depth/envelope first,
+    adaptive ``resolved_default_depth(model)`` fallback when missing.
+    """
+    from .geometry import physical_display_thickness, resolved_default_depth
+    d = physical_display_thickness(elem, model.sections)
+    if d > 0.0:
+        return d
+    return resolved_default_depth(model)
+
+
+def _compute_auto_offsets_for_element(
+    model: StructuralModel, elem,
+) -> tuple[float, float]:
+    """Return the (offset_i, offset_j) implied by physical joint overlap.
+
+    Pairs ``elem``'s body polygon against every other frame sharing one of
+    its analytical nodes, clips the polygons, and projects the clip onto
+    ``elem``'s axis inward from the shared end. The deepest inward
+    penetration wins, separately at each end. An end with no qualifying
+    neighbor contributes 0.0. Truss neighbors are ignored — joint zones
+    only make engineering sense between frames.
+    """
+    from .geometry import physical_member_polygon, polygon_intersection
+    ni = model.nodes.get(elem.node_i)
+    nj = model.nodes.get(elem.node_j)
+    if ni is None or nj is None:
+        return 0.0, 0.0
+    import math as _math
+    L = _math.hypot(nj.x - ni.x, nj.y - ni.y)
+    if L < 1e-12:
+        return 0.0, 0.0
+    tx = (nj.x - ni.x) / L
+    ty = (nj.y - ni.y) / L
+    d_e = _resolve_depth_for_element(model, elem)
+    poly_e = physical_member_polygon(ni.x, ni.y, nj.x, nj.y, d_e)
+    if poly_e is None:
+        return 0.0, 0.0
+
+    off_i = 0.0
+    off_j = 0.0
+    for other in model.elements:
+        if other.id == elem.id:
+            continue
+        if not isinstance(other, FrameElement2D):
+            continue
+        shared = {other.node_i, other.node_j} & {elem.node_i, elem.node_j}
+        if not shared:
+            continue
+        on_i = model.nodes.get(other.node_i)
+        on_j = model.nodes.get(other.node_j)
+        if on_i is None or on_j is None:
+            continue
+        d_o = _resolve_depth_for_element(model, other)
+        poly_o = physical_member_polygon(on_i.x, on_i.y, on_j.x, on_j.y, d_o)
+        if poly_o is None:
+            continue
+        clipped = polygon_intersection(poly_e, poly_o)
+        if len(clipped) < 3:
+            continue
+        if elem.node_i in shared:
+            depth_in = 0.0
+            for vx, vy in clipped:
+                s = (vx - ni.x) * tx + (vy - ni.y) * ty
+                if s > depth_in:
+                    depth_in = s
+            if depth_in > off_i:
+                off_i = depth_in
+        if elem.node_j in shared:
+            depth_in = 0.0
+            for vx, vy in clipped:
+                s = -((vx - nj.x) * tx + (vy - nj.y) * ty)
+                if s > depth_in:
+                    depth_in = s
+            if depth_in > off_j:
+                off_j = depth_in
+    return off_i, off_j
+
+
+@dataclass
+class ClearRigidOffsetsCmd(Command):
+    """Zero out ``offset_i`` / ``offset_j`` on each listed element.
+
+    Trusses and frames whose offsets are already zero are reported as
+    skipped (no mutation, no snapshot entry) so undo never resurrects
+    spurious zero-to-zero edits. ``description`` is filled in by the GUI
+    based on the run report so the undo stack reads naturally.
+    """
+
+    element_ids: list[int] = field(default_factory=list)
+    _snapshot: dict[int, tuple[float, float]] = field(
+        default_factory=dict, init=False,
+    )
+    n_cleared: int = field(default=0, init=False)
+    n_skipped_truss: int = field(default=0, init=False)
+    n_skipped_already_zero: int = field(default=0, init=False)
+    description: str = "clear rigid offsets"
+
+    def do(self, model: StructuralModel) -> None:
+        self._snapshot = {}
+        self.n_cleared = 0
+        self.n_skipped_truss = 0
+        self.n_skipped_already_zero = 0
+        for eid in self.element_ids:
+            elem = next((e for e in model.elements if e.id == eid), None)
+            if elem is None:
+                continue
+            if not isinstance(elem, FrameElement2D):
+                self.n_skipped_truss += 1
+                continue
+            ei = float(getattr(elem, "offset_i", 0.0) or 0.0)
+            ej = float(getattr(elem, "offset_j", 0.0) or 0.0)
+            if ei == 0.0 and ej == 0.0:
+                self.n_skipped_already_zero += 1
+                continue
+            self._snapshot[eid] = (ei, ej)
+            elem.offset_i = 0.0
+            elem.offset_j = 0.0
+            self.n_cleared += 1
+
+    def undo(self, model: StructuralModel) -> None:
+        for eid, (ei, ej) in self._snapshot.items():
+            elem = next((e for e in model.elements if e.id == eid), None)
+            if elem is None:
+                continue
+            elem.offset_i = ei
+            elem.offset_j = ej
+
+
+@dataclass
+class AssignAutoRigidOffsetsCmd(Command):
+    """Set rigid end offsets from physical joint-overlap geometry.
+
+    For every listed frame element, the offset at each end is the deepest
+    inward penetration of the joint-overlap polygon at that end's node.
+    Trusses are skipped silently and counted. A frame is **skipped, not
+    clamped** when the computed pair would leave a flexible span below
+    ``max(_MIN_FLEX_FRACTION × L_total, _MIN_FLEX_ABS_M)`` — silent
+    clamping a real geometric overlap to "almost the whole member" would
+    hide a degenerate joint setup. A frame whose computed offsets are
+    both zero is recorded as ``n_no_overlap`` so the host can tell the
+    user "nothing to assign at this end".
+
+    Undo restores the prior offsets exactly (including any pre-existing
+    nonzero offsets the command overwrote).
+    """
+
+    element_ids: list[int] = field(default_factory=list)
+    _snapshot: dict[int, tuple[float, float]] = field(
+        default_factory=dict, init=False,
+    )
+    n_assigned: int = field(default=0, init=False)
+    n_skipped_truss: int = field(default=0, init=False)
+    n_no_overlap: int = field(default=0, init=False)
+    n_skipped_too_short: int = field(default=0, init=False)
+    skipped_too_short_ids: list[int] = field(
+        default_factory=list, init=False,
+    )
+    description: str = "assign rigid offsets"
+
+    def do(self, model: StructuralModel) -> None:
+        self._snapshot = {}
+        self.n_assigned = 0
+        self.n_skipped_truss = 0
+        self.n_no_overlap = 0
+        self.n_skipped_too_short = 0
+        self.skipped_too_short_ids = []
+        for eid in self.element_ids:
+            elem = next((e for e in model.elements if e.id == eid), None)
+            if elem is None:
+                continue
+            if not isinstance(elem, FrameElement2D):
+                self.n_skipped_truss += 1
+                continue
+            ni = model.nodes.get(elem.node_i)
+            nj = model.nodes.get(elem.node_j)
+            if ni is None or nj is None:
+                continue
+            L_tot = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+            if L_tot < 1e-12:
+                continue
+            off_i, off_j = _compute_auto_offsets_for_element(model, elem)
+            # Safety: non-negative (geometric overlap can't be negative,
+            # but defensive against future projection edge cases).
+            if off_i < 0.0 or off_j < 0.0:
+                continue
+            if off_i == 0.0 and off_j == 0.0:
+                self.n_no_overlap += 1
+                continue
+            min_flex = max(_MIN_FLEX_FRACTION * L_tot, _MIN_FLEX_ABS_M)
+            if off_i + off_j >= L_tot - min_flex:
+                # The computed overlap would leave an unrealistically tiny
+                # flexible span. Skip rather than silently clamp.
+                self.n_skipped_too_short += 1
+                self.skipped_too_short_ids.append(eid)
+                continue
+            old_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+            old_j = float(getattr(elem, "offset_j", 0.0) or 0.0)
+            self._snapshot[eid] = (old_i, old_j)
+            elem.offset_i = float(off_i)
+            elem.offset_j = float(off_j)
+            self.n_assigned += 1
+
+    def undo(self, model: StructuralModel) -> None:
+        for eid, (ei, ej) in self._snapshot.items():
+            elem = next((e for e in model.elements if e.id == eid), None)
+            if elem is None:
+                continue
+            elem.offset_i = ei
+            elem.offset_j = ej
+
+
 # ── batch element ops (v0.13.0) ──────────────────────────────────────────
 
 

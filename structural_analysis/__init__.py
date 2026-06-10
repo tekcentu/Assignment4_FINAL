@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.31.0"
+__version__ = "0.31.1"
 __what_is_new__ = (
-    "Optional rigid end offsets on frame elements (Tᵀ·k_flex·T) · "
-    "Member loads & diagrams on the flexible span, rigid zones marked on canvas · "
-    "Zero-offset models and results unchanged"
+    "Assign / Clear rigid offsets commands (selection or all frames) · "
+    "Auto-offsets from physical joint overlap with safe-span guard · "
+    "Creation dialog stays simple; L_total / L_flex live in Element Details"
 )
 
 from .model import (
