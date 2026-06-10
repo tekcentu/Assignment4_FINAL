@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.31.1"
+__version__ = "0.31.2"
 __what_is_new__ = (
-    "Assign / Clear rigid offsets commands (selection or all frames) · "
-    "Auto-offsets from physical joint overlap with safe-span guard · "
-    "Creation dialog stays simple; L_total / L_flex live in Element Details"
+    "Rigid-offset review fixes: face-displacement deformed shapes · "
+    "minimum flexible-span guard · add-command offset propagation · "
+    "capped right-rigid-zone diagram load terms"
 )
 
 from .model import (

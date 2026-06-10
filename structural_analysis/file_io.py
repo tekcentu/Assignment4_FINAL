@@ -16,7 +16,7 @@ from .model import (
     LoadCase, LoadCombination,
     JointMass, ModalMassSource,
 )
-from .element import FrameElement2D, TrussElement2D
+from .element import FrameElement2D, MIN_FLEXIBLE_LENGTH, TrussElement2D
 
 
 # Whitelisted trailing key=value tokens on MATERIALS / SECTIONS rows.
@@ -374,12 +374,12 @@ def read_input_file(filepath: str) -> StructuralModel:
                     if n_i is not None and n_j is not None:
                         L_tot = ((n_j.x - n_i.x) ** 2
                                  + (n_j.y - n_i.y) ** 2) ** 0.5
-                        if offset_i + offset_j >= L_tot:
+                        if offset_i + offset_j > L_tot - MIN_FLEXIBLE_LENGTH:
                             raise ValueError(
                                 f"Element {eid}: offset_i + offset_j = "
                                 f"{offset_i + offset_j:g} m >= member length "
-                                f"{L_tot:g} m — the flexible span must have "
-                                "positive length."
+                                f"{L_tot:g} m — the flexible span must be "
+                                f"at least {MIN_FLEXIBLE_LENGTH:g} m."
                             )
 
                 # Resolve the *effective* material for E / α / ρ. Geometry

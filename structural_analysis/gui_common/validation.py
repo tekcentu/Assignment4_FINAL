@@ -585,6 +585,7 @@ def _find_invalid_rigid_offsets(
     Catch both pre-solve with friendly messages so the solver never
     raises mid-assembly.
     """
+    from ..element import MIN_FLEXIBLE_LENGTH
     from ..model import PointLoad
 
     issues: list[ValidationIssue] = []
@@ -609,14 +610,14 @@ def _find_invalid_rigid_offsets(
                 code="negative_rigid_offset",
             ))
             continue
-        if off_i + off_j >= L:
+        if off_i + off_j > L - MIN_FLEXIBLE_LENGTH:
             issues.append(ValidationIssue(
                 severity="error",
                 message=(
                     f"Element {elem.id}: rigid offsets "
                     f"({off_i:g} + {off_j:g} m) consume the whole member "
                     f"length ({L:g} m) — was a node moved? Reduce the "
-                    "offsets so the flexible span has positive length."
+                    f"offsets so the flexible span is at least {MIN_FLEXIBLE_LENGTH:g} m."
                 ),
                 element_ids=[elem.id],
                 code="rigid_offsets_exceed_length",
