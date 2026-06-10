@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..element import FrameElement2D
 from ..file_io import read_input_file
 from ..main import run_analysis, run_multi_case_analysis
 from ..model import AnalysisResult, Material, Section, StructuralModel
@@ -50,12 +51,14 @@ from ..gui_common.commands import (
     AddNodeCmd,
     AddOrUpdateMaterialCmd,
     AddOrUpdateSectionCmd,
+    AssignAutoRigidOffsetsCmd,
     BatchAddMemberLoadsCmd,
     BatchAddNodalLoadsCmd,
     BatchDeleteCmd,
     BatchUpdateElementsCmd,
     check_merge_preconditions,
     ClearMemberLoadsCmd,
+    ClearRigidOffsetsCmd,
     Command,
     DeleteElementCmd,
     DeleteMaterialCmd,
@@ -433,6 +436,36 @@ class MainWindow(QMainWindow):
             "Undoable; member loads stay attached to their physical "
             "element; analysis results are invalidated."
         )
+        # v0.31.1 — Rigid end-offset batch commands. Both work on the
+        # current selection; the auto-assign action falls back to
+        # "every frame element" after confirmation when nothing is
+        # selected, so the user can apply the geometric overlap rule
+        # to a whole frame in one click.
+        # QAction's triggered signal passes a bool (the checked state);
+        # wrap so the bool doesn't land in element_ids.
+        self.act_assign_auto_offsets = QAction(
+            "&Assign automatic rigid offsets…", self,
+            triggered=lambda _checked=False:
+                self._do_assign_auto_rigid_offsets(),
+        )
+        self.act_assign_auto_offsets.setToolTip(
+            "Compute rigid end-zone lengths from the physical joint "
+            "overlap (member depths at the shared analytical node) and "
+            "apply them to selected frame elements. Trusses are skipped; "
+            "frames whose computed offsets would leave a very short "
+            "flexible span are reported and skipped, not silently "
+            "clamped."
+        )
+        self.act_clear_offsets = QAction(
+            "Clear rigid offsets", self,
+            triggered=lambda _checked=False:
+                self._do_clear_rigid_offsets(),
+        )
+        self.act_clear_offsets.setToolTip(
+            "Zero out the rigid end offsets on every selected frame "
+            "element (or every frame element when nothing is selected, "
+            "after confirmation). Undoable."
+        )
         self.act_snap = QAction("Snap to grid", self, checkable=True, checked=True,
                                   triggered=self._toggle_snap)
         # Snap-kind toggles
@@ -619,6 +652,7 @@ class MainWindow(QMainWindow):
         self._lockable_actions = [
             self.act_building_wizard, self.act_add_node_coords,
             self.act_materials, self.act_forget_elem_defaults,
+            self.act_assign_auto_offsets, self.act_clear_offsets,
         ]
 
     def _build_menus(self) -> None:
@@ -643,6 +677,9 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_batch_nodal_load)
         m_edit.addAction(self.act_materials)
         m_edit.addAction(self.act_forget_elem_defaults)
+        m_edit.addSeparator()
+        m_edit.addAction(self.act_assign_auto_offsets)
+        m_edit.addAction(self.act_clear_offsets)
         m_edit.addSeparator()
         m_edit.addAction(self.act_renumber_elements)
 
@@ -1696,6 +1733,11 @@ class MainWindow(QMainWindow):
                 existing_section_id=(sticky or {}).get("section_id"),
                 existing_material_override_id=(
                     sticky or {}).get("material_override_id"),
+                # Creation flow stays minimal: rigid offsets are set
+                # post-creation through the Rigid offsets menu / right-
+                # click command, or by re-opening this dialog via
+                # "Element Details…" → "edit section/material…".
+                show_offsets=False,
             )
         except ValueError as e:
             QMessageBox.warning(self, "Cannot add element", str(e))
@@ -1861,6 +1903,36 @@ class MainWindow(QMainWindow):
         a_clear_loads = menu.addAction(
             f"Element {elem_id}: clear member loads"
         )
+        # Rigid-offset shortcuts on the right-click menu: they target the
+        # full selection if the clicked element is in it (so a multi-
+        # select right-click applies to all), otherwise just this element.
+        elem_obj = next(
+            (e for e in self._model.elements if e.id == elem_id), None,
+        )
+        is_frame = isinstance(elem_obj, FrameElement2D)
+        sel_for_offset = (
+            sorted(sel_elems) if elem_id in sel_elems else [elem_id]
+        )
+        n_targets = len(sel_for_offset)
+        a_auto_off = None
+        a_clear_off = None
+        if is_frame:
+            menu.addSeparator()
+            auto_label = (
+                f"Element {elem_id}: assign automatic rigid offsets"
+                if n_targets == 1
+                else f"Assign automatic rigid offsets to "
+                     f"{n_targets} elements"
+            )
+            clear_label = (
+                f"Element {elem_id}: clear rigid offsets"
+                if n_targets == 1
+                else f"Clear rigid offsets on {n_targets} elements"
+            )
+            a_auto_off = menu.addAction(auto_label)
+            a_clear_off = menu.addAction(clear_label)
+            a_auto_off.setEnabled(not edits_locked)
+            a_clear_off.setEnabled(not edits_locked)
         a_delete = menu.addAction(f"Element {elem_id}: delete")
         for act in (a_edit, a_clear_loads, a_delete):
             act.setEnabled(not edits_locked)
@@ -1885,6 +1957,14 @@ class MainWindow(QMainWindow):
             self._edit_element(elem_id)
         elif chosen is a_clear_loads:
             self.execute(ClearMemberLoadsCmd(elem_id=elem_id))
+        elif a_auto_off is not None and chosen is a_auto_off:
+            self._do_assign_auto_rigid_offsets(
+                element_ids=sel_for_offset, prompt_on_empty=False,
+            )
+        elif a_clear_off is not None and chosen is a_clear_off:
+            self._do_clear_rigid_offsets(
+                element_ids=sel_for_offset, prompt_on_empty=False,
+            )
         elif chosen is a_delete:
             self.execute(DeleteElementCmd(elem_id=elem_id))
 
@@ -1963,6 +2043,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot edit element",
                                 f"Element {elem_id} does not exist.")
             return
+        ni = self._model.nodes.get(elem.node_i)
+        nj = self._model.nodes.get(elem.node_j)
+        member_len = None
+        if ni is not None and nj is not None:
+            member_len = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
         d = ElementDialog(
             self, model=self._model,
             existing_kind=getattr(elem, "kind", None),
@@ -1971,6 +2056,9 @@ class MainWindow(QMainWindow):
             existing_release_j=getattr(elem, "release_j", False),
             existing_material_override_id=getattr(
                 elem, "material_id_override", None),
+            existing_offset_i=getattr(elem, "offset_i", 0.0),
+            existing_offset_j=getattr(elem, "offset_j", 0.0),
+            member_length=member_len,
             remember_default=False,
         )
         if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
@@ -1983,8 +2071,11 @@ class MainWindow(QMainWindow):
             release_i=rv["release_i"],
             release_j=rv["release_j"],
             material_override_id=rv.get("material_override_id"),
+            offset_i=rv.get("offset_i", 0.0),
+            offset_j=rv.get("offset_j", 0.0),
         ))
         self.select_element(elem_id)
+        self._notify_rigid_offsets_if_any()
 
     def _show_element_results(self, elem_id: int) -> None:
         elem = next((e for e in self._model.elements if e.id == elem_id), None)
@@ -3423,17 +3514,181 @@ class MainWindow(QMainWindow):
             self.set_status("No cases were solved.")
         else:
             active_r = new_multi.get(self._active_case)
+            offsets_note = (
+                " · Rigid offsets active: diagrams on flexible span"
+                if self._model_has_rigid_offsets() else ""
+            )
             if active_r is not None and getattr(active_r, "residual", None) is not None:
                 self.set_status(
                     f"Solved {n_solved} case(s) · active = "
                     f"{self._active_case} · "
-                    f"residual = {active_r.residual:.2e}{skipped_suffix}"
+                    f"residual = {active_r.residual:.2e}"
+                    f"{skipped_suffix}{offsets_note}"
                 )
             else:
                 self.set_status(
                     f"Solved {n_solved} case(s) · active = "
-                    f"{self._active_case}{skipped_suffix}"
+                    f"{self._active_case}{skipped_suffix}{offsets_note}"
                 )
+
+    def _model_has_rigid_offsets(self) -> bool:
+        """True when any frame element carries a nonzero rigid offset."""
+        return any(
+            (getattr(e, "offset_i", 0.0) or getattr(e, "offset_j", 0.0))
+            for e in self._model.elements
+        )
+
+    def _notify_rigid_offsets_if_any(self) -> None:
+        """Status note after an offset edit — visual + analysis meaning."""
+        if self._model_has_rigid_offsets():
+            self.set_status(
+                "Rigid offsets are active for analysis. Internal force "
+                "diagrams are shown on the flexible span."
+            )
+
+    def _frame_element_ids(self) -> list[int]:
+        """Sorted ids of every frame element in the model."""
+        return sorted(
+            e.id for e in self._model.elements
+            if isinstance(e, FrameElement2D)
+        )
+
+    def _resolve_offset_targets(
+        self,
+        element_ids: list[int] | None,
+        action_label: str,
+        prompt_on_empty: bool,
+    ) -> list[int] | None:
+        """Pick the element ids the offset command should act on.
+
+        Priority: explicit ``element_ids`` → canvas selection (filtered to
+        frames) → fall back to *every* frame element after a confirm
+        dialog (only when ``prompt_on_empty`` is True; otherwise just
+        emit a status message and return ``None``). Returns ``None`` when
+        nothing is targetable, so the caller exits cleanly.
+        """
+        if element_ids is not None:
+            ids = [eid for eid in element_ids
+                   if any(e.id == eid for e in self._model.elements)]
+            if not ids:
+                self.set_status(
+                    f"{action_label}: no matching elements in the model."
+                )
+                return None
+            return ids
+        sel = sorted(self.canvas.get_selected_elements())
+        # Keep trusses in the target list when the selection touches at
+        # least one frame — the command needs them so it can report
+        # "N truss(es) skipped". A pure-truss selection falls back to
+        # the no-frame-selected path so the user sees the prompt /
+        # status message rather than a silent no-op.
+        sel_has_frame = any(
+            isinstance(
+                next((e for e in self._model.elements if e.id == eid), None),
+                FrameElement2D,
+            )
+            for eid in sel
+        )
+        if sel_has_frame:
+            return list(sel)
+        all_frames = self._frame_element_ids()
+        if not all_frames:
+            self.set_status(
+                f"{action_label}: no frame elements in the model."
+            )
+            return None
+        if not prompt_on_empty:
+            self.set_status(
+                f"{action_label}: select one or more frame elements first."
+            )
+            return None
+        reply = QMessageBox.question(
+            self, action_label,
+            f"No frame elements are selected. Apply to every frame "
+            f"element ({len(all_frames)} in the model)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return None
+        return all_frames
+
+    def _do_assign_auto_rigid_offsets(
+        self,
+        element_ids: list[int] | None = None,
+        prompt_on_empty: bool = True,
+    ) -> None:
+        """Compute and apply rigid offsets from physical joint overlap."""
+        targets = self._resolve_offset_targets(
+            element_ids, "Assign automatic rigid offsets", prompt_on_empty,
+        )
+        if targets is None:
+            return
+        cmd = AssignAutoRigidOffsetsCmd(element_ids=list(targets))
+        try:
+            self.execute(cmd)
+        except ValueError as e:
+            QMessageBox.warning(
+                self, "Assign automatic rigid offsets", str(e),
+            )
+            return
+        parts: list[str] = []
+        if cmd.n_assigned:
+            parts.append(f"{cmd.n_assigned} element(s) assigned")
+        if cmd.n_no_overlap:
+            parts.append(f"{cmd.n_no_overlap} with no joint overlap")
+        if cmd.n_skipped_truss:
+            parts.append(f"{cmd.n_skipped_truss} truss(es) skipped")
+        if cmd.n_skipped_too_short:
+            ids_text = ", ".join(str(i) for i in cmd.skipped_too_short_ids)
+            parts.append(
+                f"{cmd.n_skipped_too_short} skipped (would leave a too-"
+                f"short flexible span: {ids_text})"
+            )
+        if not parts:
+            parts.append("no changes")
+        self.set_status("Rigid offsets: " + " · ".join(parts))
+        if cmd.n_skipped_too_short:
+            QMessageBox.information(
+                self, "Assign automatic rigid offsets",
+                "Some elements were skipped because the computed offsets "
+                "would leave a very short flexible span (< "
+                f"{int(100 * 0.10)}% of the member length or 5 cm). "
+                "Skipped element ids: "
+                + ", ".join(str(i) for i in cmd.skipped_too_short_ids)
+                + ". Edit them manually via Element Details if those "
+                "offsets are physically intended.",
+            )
+
+    def _do_clear_rigid_offsets(
+        self,
+        element_ids: list[int] | None = None,
+        prompt_on_empty: bool = True,
+    ) -> None:
+        """Zero out rigid offsets on selected / chosen frame elements."""
+        targets = self._resolve_offset_targets(
+            element_ids, "Clear rigid offsets", prompt_on_empty,
+        )
+        if targets is None:
+            return
+        cmd = ClearRigidOffsetsCmd(element_ids=list(targets))
+        try:
+            self.execute(cmd)
+        except ValueError as e:
+            QMessageBox.warning(self, "Clear rigid offsets", str(e))
+            return
+        parts: list[str] = []
+        if cmd.n_cleared:
+            parts.append(f"{cmd.n_cleared} element(s) cleared")
+        if cmd.n_skipped_already_zero:
+            parts.append(
+                f"{cmd.n_skipped_already_zero} already had zero offsets"
+            )
+        if cmd.n_skipped_truss:
+            parts.append(f"{cmd.n_skipped_truss} truss(es) skipped")
+        if not parts:
+            parts.append("no changes")
+        self.set_status("Rigid offsets: " + " · ".join(parts))
 
     # ── PR-A: active case + multi-result plumbing ──────────────────
 

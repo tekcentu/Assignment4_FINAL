@@ -173,6 +173,15 @@ def write_input_file(model: StructuralModel, path: str) -> None:
                     "Cannot serialise."
                 )
             line += f"  material_override_id={override_id}"
+        # Rigid end offsets (frames only) — additive kwargs, omitted
+        # when zero so legacy zero-offset files serialise byte-identically.
+        if isinstance(elem, FrameElement2D):
+            off_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+            off_j = float(getattr(elem, "offset_j", 0.0) or 0.0)
+            if off_i:
+                line += f"  offset_i={_fmt(off_i)}"
+            if off_j:
+                line += f"  offset_j={_fmt(off_j)}"
         out.append(line)
     out.append("")
 
