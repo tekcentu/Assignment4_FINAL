@@ -52,11 +52,18 @@ radius (10 px) for visual targeting — that's a different concern
 
 @dataclass(frozen=True)
 class Node:
-    """A node in the structural model."""
+    """A node in the structural model.
+
+    ``z`` defaults to 0.0 so every pre-3D construction site
+    (``Node(id, x, y)``) keeps working; a model whose nodes all carry
+    z = 0 is solved with the legacy 2D pipeline (see
+    :func:`structural_analysis.assembler.model_is_3d`).
+    """
 
     id: int
     x: float
     y: float
+    z: float = 0.0
 
 
 # ── Material / Section ─────────────────────────────────────────
@@ -179,6 +186,12 @@ class Support:
         settle_ux, settle_uy, settle_rz: Prescribed displacement at a restrained
             DOF. None means the standard zero displacement. Non-zero values are
             used to model support settlement.
+        uz, rx, ry: 3D-only restraint flags (out-of-plane translation and
+            the two extra rotations). Default False so every legacy 2D
+            construction site keeps its meaning. They are declared AFTER
+            the settlement fields purely for positional backward
+            compatibility — ``Support(nid, ux, uy, rz)`` predates 3D.
+        settle_uz, settle_rx, settle_ry: 3D settlement counterparts.
     """
 
     node_id: int
@@ -188,17 +201,37 @@ class Support:
     settle_ux: float | None = None
     settle_uy: float | None = None
     settle_rz: float | None = None
+    uz: bool = False
+    rx: bool = False
+    ry: bool = False
+    settle_uz: float | None = None
+    settle_rx: float | None = None
+    settle_ry: float | None = None
 
     def prescribed(self, dof: str) -> float:
-        """Return the prescribed displacement for a DOF ('ux', 'uy', 'rz').
+        """Return the prescribed displacement for a DOF name.
 
         Args:
-            dof: DOF name ('ux', 'uy', or 'rz').
+            dof: DOF name ('ux', 'uy', 'uz', 'rx', 'ry', or 'rz').
 
         Returns:
             Prescribed displacement value, or 0.0 if no settlement defined.
         """
         return getattr(self, f"settle_{dof}") or 0.0
+
+    @property
+    def any_restrained(self) -> bool:
+        """True if any of the six DOFs is restrained."""
+        return (self.ux or self.uy or self.rz
+                or self.uz or self.rx or self.ry)
+
+    @property
+    def has_3d_content(self) -> bool:
+        """True when this support uses any 3D-only DOF or settlement."""
+        return bool(
+            self.uz or self.rx or self.ry
+            or self.settle_uz or self.settle_rx or self.settle_ry
+        )
 
 
 # ── Loads ──────────────────────────────────────────────────────
@@ -206,13 +239,26 @@ class Support:
 
 @dataclass(frozen=True)
 class NodalLoad:
-    """Applied load at a node (global coordinates)."""
+    """Applied load at a node (global coordinates).
+
+    The 3D components (``fz``, ``mx``, ``my``) default to 0 and are
+    declared after ``load_case`` so the legacy positional construction
+    ``NodalLoad(nid, fx, fy, mz)`` keeps its meaning.
+    """
 
     node_id: int
     fx: float = 0.0   # force in x (kN)
     fy: float = 0.0   # force in y (kN)
     mz: float = 0.0   # moment about z (kN·m)
     load_case: str = "DEFAULT"
+    fz: float = 0.0   # force in z (kN) — 3D only
+    mx: float = 0.0   # moment about x (kN·m) — 3D only
+    my: float = 0.0   # moment about y (kN·m) — 3D only
+
+    @property
+    def has_3d_content(self) -> bool:
+        """True when any 3D-only component is non-zero."""
+        return bool(self.fz or self.mx or self.my)
 
 
 @dataclass(frozen=True)
@@ -244,6 +290,10 @@ class UniformDistributedLoad:
     wx: float = 0.0
     coord_system: str = "local"
     load_case: str = "DEFAULT"
+    # 3D-only component: local +z_local ("local") or global +Z
+    # ("global"). Declared after load_case for positional
+    # backward-compatibility; always 0 on 2D models.
+    wz: float = 0.0
 
     def __post_init__(self):
         if self.coord_system not in ("local", "global", "gravity"):
@@ -251,11 +301,12 @@ class UniformDistributedLoad:
                 f"UniformDistributedLoad.coord_system must be 'local', "
                 f"'global', or 'gravity' (got {self.coord_system!r})."
             )
-        if self.coord_system == "gravity" and self.wx != 0.0:
+        if self.coord_system == "gravity" and (self.wx != 0.0
+                                               or self.wz != 0.0):
             raise ValueError(
                 "UniformDistributedLoad with coord_system='gravity' has a "
-                "single magnitude in wy; wx must be 0 because gravity is "
-                "a 1-D direction (global -Y) by definition."
+                "single magnitude in wy; wx and wz must be 0 because "
+                "gravity is a 1-D direction (global -Y) by definition."
             )
 
 
@@ -282,6 +333,8 @@ class PointLoad:
     px: float = 0.0
     coord_system: str = "local"
     load_case: str = "DEFAULT"
+    # 3D-only component (see UniformDistributedLoad.wz).
+    pz: float = 0.0
 
     def __post_init__(self):
         if self.coord_system not in ("local", "global", "gravity"):
@@ -289,11 +342,12 @@ class PointLoad:
                 f"PointLoad.coord_system must be 'local', 'global', or "
                 f"'gravity' (got {self.coord_system!r})."
             )
-        if self.coord_system == "gravity" and self.px != 0.0:
+        if self.coord_system == "gravity" and (self.px != 0.0
+                                               or self.pz != 0.0):
             raise ValueError(
                 "PointLoad with coord_system='gravity' has a single "
-                "magnitude in py; px must be 0 because gravity is a "
-                "1-D direction (global -Y) by definition."
+                "magnitude in py; px and pz must be 0 because gravity is "
+                "a 1-D direction (global -Y) by definition."
             )
 
 
@@ -557,6 +611,12 @@ class StructuralModel:
     nodal_loads: list[NodalLoad] = field(default_factory=list)
 
     # ── analysis settings ──
+    # When True, the solve always uses the 3D (6-DOF-per-node) pipeline
+    # even if every node lies in the XY plane. Out-of-plane content
+    # (node z ≠ 0, 3D supports/loads, Element3D instances) switches the
+    # pipeline automatically — see ``assembler.model_is_3d``.
+    force_3d: bool = False
+
     # When True, the static assembler injects gravity loads on every
     # element (frame: full local fixed-end forces; truss: half-weight
     # lumped at each endpoint in global -Y). Gravity direction is
