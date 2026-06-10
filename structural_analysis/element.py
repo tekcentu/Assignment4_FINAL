@@ -25,6 +25,9 @@ from .model import (
 )
 
 
+MIN_FLEXIBLE_LENGTH: float = 1e-12
+
+
 def _length_cos_sin(ni, nj) -> tuple[float, float, float]:
     """Compute element length and direction cosines.
 
@@ -41,7 +44,7 @@ def _length_cos_sin(ni, nj) -> tuple[float, float, float]:
     dx = nj.x - ni.x
     dy = nj.y - ni.y
     L = float(np.hypot(dx, dy))
-    if L < 1e-12:
+    if L < MIN_FLEXIBLE_LENGTH:
         raise ValueError(f"Zero-length element between ({ni.x},{ni.y}) and ({nj.x},{nj.y}).")
     return L, dx / L, dy / L
 
@@ -384,11 +387,12 @@ class FrameElement2D(Element2D):
                 f"(got offset_i={self.offset_i}, offset_j={self.offset_j})."
             )
         L_flex = L - self.offset_i - self.offset_j
-        if L_flex <= 0.0:
+        if L_flex < MIN_FLEXIBLE_LENGTH:
             raise ValueError(
                 f"Element {self.id}: rigid offsets ({self.offset_i} + "
-                f"{self.offset_j}) consume the whole member length "
-                f"{L:.6g} m — flexible span must be > 0."
+                f"{self.offset_j}) leave flexible span {L_flex:.6g} m "
+                f"on member length {L:.6g} m — flexible span must be "
+                f">= {MIN_FLEXIBLE_LENGTH:g} m."
             )
         return L_flex
 
@@ -408,6 +412,23 @@ class FrameElement2D(Element2D):
         T[1, 2] = self.offset_i
         T[4, 5] = -self.offset_j
         return T
+
+    def face_local_displacements(self, d_joint_local: np.ndarray) -> np.ndarray:
+        """Map joint-coordinate local DOFs to flexible-face local DOFs.
+
+        ``d_joint_local`` is the analytical-node vector used for assembly
+        and force recovery.  For offset frames, the deformable beam span
+        starts/ends at the offset faces, whose transverse displacements
+        include the rigid-arm terms ``v_i + e_i·θ_i`` and
+        ``v_j − e_j·θ_j``.  Returning this vector separately lets renderers
+        draw the flexible span with the same kinematics solved by
+        ``k_joint = Tᵀ·k_flex·T`` while preserving ``d_local`` as the
+        joint-coordinate result used by legacy consumers.
+        """
+        d = np.asarray(d_joint_local, dtype=float)
+        if not self.has_offsets:
+            return np.array(d, copy=True)
+        return self._offset_transform() @ d
 
     def _stiffness_for_length(self, L: float) -> np.ndarray:
         """Textbook 6×6 local frame stiffness for a span of length ``L``."""

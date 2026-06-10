@@ -29,7 +29,7 @@ import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from ..element import FrameElement2D, TrussElement2D
+from ..element import FrameElement2D, MIN_FLEXIBLE_LENGTH, TrussElement2D
 from ..model import (
     NODE_COINCIDENCE_TOL,
     FrameTemperatureLoad,
@@ -215,6 +215,8 @@ class AddElementCmd(Command):
     release_j: bool = False
     elem_id: int | None = None
     material_override_id: int | None = None
+    offset_i: float = 0.0
+    offset_j: float = 0.0
     description: str = "add element"
 
     def do(self, model: StructuralModel) -> None:
@@ -255,6 +257,25 @@ class AddElementCmd(Command):
         kind = self.kind.lower()
         if kind not in ("frame", "truss"):
             raise ValueError(f"Element kind must be 'frame' or 'truss', got {self.kind!r}.")
+        if self.offset_i < 0.0 or self.offset_j < 0.0:
+            raise ValueError(
+                "Rigid end offsets must be >= 0 "
+                f"(got offset_i={self.offset_i}, offset_j={self.offset_j})."
+            )
+        if self.offset_i or self.offset_j:
+            if kind == "truss":
+                raise ValueError(
+                    "Rigid end offsets are only supported on frame elements."
+                )
+            L_tot = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
+            if self.offset_i + self.offset_j > L_tot - MIN_FLEXIBLE_LENGTH:
+                raise ValueError(
+                    f"offset_i + offset_j = "
+                    f"{self.offset_i + self.offset_j:g} m must be less "
+                    "than the member length minus the minimum "
+                    f"flexible span ({L_tot:g} - "
+                    f"{MIN_FLEXIBLE_LENGTH:g} m)."
+                )
 
         if self.elem_id is None:
             ids = [e.id for e in model.elements]
@@ -279,6 +300,7 @@ class AddElementCmd(Command):
                 section_id=section.id,
                 material_id_override=self.material_override_id,
                 release_i=self.release_i, release_j=self.release_j,
+                offset_i=self.offset_i, offset_j=self.offset_j,
             )
         model.elements.append(elem)
 
@@ -319,6 +341,8 @@ class AddMemberCmd(Command):
     release_i: bool = False
     release_j: bool = False
     material_override_id: int | None = None
+    offset_i: float = 0.0
+    offset_j: float = 0.0
     node_i: int | None = None  # if set, reuse this node id
     node_j: int | None = None
     elem_id: int | None = None
@@ -366,6 +390,8 @@ class AddMemberCmd(Command):
                 release_i=self.release_i,
                 release_j=self.release_j,
                 material_override_id=self.material_override_id,
+                offset_i=self.offset_i,
+                offset_j=self.offset_j,
                 elem_id=self.elem_id,
             )
             inner.do(model)
@@ -938,11 +964,13 @@ class UpdateElementCmd(Command):
             n_j = model.nodes.get(self._saved.node_j)
             if n_i is not None and n_j is not None:
                 L_tot = ((n_j.x - n_i.x) ** 2 + (n_j.y - n_i.y) ** 2) ** 0.5
-                if self.offset_i + self.offset_j >= L_tot:
+                if self.offset_i + self.offset_j > L_tot - MIN_FLEXIBLE_LENGTH:
                     raise ValueError(
                         f"offset_i + offset_j = "
                         f"{self.offset_i + self.offset_j:g} m must be less "
-                        f"than the member length {L_tot:g} m."
+                        f"than the member length minus the minimum "
+                        f"flexible span ({L_tot:g} - "
+                        f"{MIN_FLEXIBLE_LENGTH:g} m)."
                     )
         section = model.sections[self.section_id]
         if section.material_id not in model.materials:

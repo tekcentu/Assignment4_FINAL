@@ -23,7 +23,7 @@ from structural_analysis.model import (
 from structural_analysis.element import FrameElement2D
 from structural_analysis.main import run_analysis
 from structural_analysis.gui_qt.element_graphics import (
-    sample_internal_force, internal_force_at, diagram_domain,
+    evaluate_internal_force, sample_internal_force, internal_force_at, diagram_domain,
 )
 
 E, A, I = 200_000.0, 0.02, 0.08
@@ -229,6 +229,30 @@ def test_face_moment_carries_linearly_from_joint():
         elem, m.nodes[1], m.nodes[2], f_local, "moment", ei,
     )
     assert m_face == pytest.approx(-M_i + V_i * ei, abs=1e-9)
+
+
+
+
+def test_udl_terms_stop_accumulating_in_right_rigid_zone():
+    L, ei, ej, w = 6.0, 1.0, 1.0, 10.0
+    m = _ss_beam(L, offset_i=ei, offset_j=ej)
+    m.elements[0].member_loads.append(UniformDistributedLoad(wy=-w))
+    r = run_analysis(m, verbose=False)
+    elem = m.elements[0]
+    f_local = r.member_results[1]["f_local"]
+    _, shear = evaluate_internal_force(
+        elem, m.nodes[1], m.nodes[2], f_local, "shear",
+    )
+    _, moment = evaluate_internal_force(
+        elem, m.nodes[1], m.nodes[2], f_local, "moment",
+    )
+    x_face_j = L - ej
+    assert shear(L) == pytest.approx(shear(x_face_j), abs=1e-9)
+    # No UDL exists in the right rigid zone, so moment advances only by
+    # the constant shear carried from the flexible face.
+    assert moment(L) == pytest.approx(
+        moment(x_face_j) + shear(x_face_j) * ej, abs=1e-9,
+    )
 
 
 def test_zero_offset_diagrams_unchanged():
