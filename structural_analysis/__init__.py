@@ -1,10 +1,9 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.31.2"
+__version__ = "0.32.0"
 __what_is_new__ = (
-    "Rigid-offset review fixes: face-displacement deformed shapes · "
-    "minimum flexible-span guard · add-command offset propagation · "
-    "capped right-rigid-zone diagram load terms"
+    "Result export tables: member station N/V/M and node displacement/reaction "
+    "CSV/TSV exports for spreadsheet validation"
 )
 
 from .model import (
