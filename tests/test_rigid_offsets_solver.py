@@ -147,6 +147,20 @@ def test_offsets_stiffen_structure():
     assert abs(_disp(r_off, 2, "uy")) < abs(_disp(r_plain, 2, "uy"))
 
 
+def test_member_results_include_face_displacements_for_offsets():
+    e_off = 1.0
+    m = _cantilever(L=6.0, offset_j=e_off, P=10.0)
+    r = run_analysis(m, verbose=False)
+    assert r.status == "ok"
+    mr = r.member_results[1]
+    d_joint = mr["d_local"]
+    d_face = mr["d_local_face"]
+    expected = m.elements[0]._offset_transform() @ d_joint
+    assert np.allclose(d_face, expected)
+    assert d_face[4] == pytest.approx(d_joint[4] - e_off * d_joint[5])
+    assert not np.allclose(d_face, d_joint)
+
+
 # ── reference comparison: near-rigid stub model ──────────────────────────
 
 

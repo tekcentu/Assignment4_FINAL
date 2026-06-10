@@ -20,8 +20,9 @@ from structural_analysis.element import FrameElement2D, TrussElement2D
 from structural_analysis.file_io import read_input_file
 from structural_analysis.gui_common.file_writer import write_input_file
 from structural_analysis.gui_common.commands import (
-    AssignAutoRigidOffsetsCmd, BatchUpdateElementsCmd, ClearRigidOffsetsCmd,
-    SplitElementCmd, UpdateElementCmd,
+    AddElementCmd, AddMemberCmd, AssignAutoRigidOffsetsCmd,
+    BatchUpdateElementsCmd, ClearRigidOffsetsCmd, SplitElementCmd,
+    UpdateElementCmd,
 )
 from structural_analysis.gui_common.validation import validate_model
 
@@ -97,6 +98,47 @@ def test_flexible_length_rejects_consuming_offsets():
                        offset_i=0.6, offset_j=0.6)
     with pytest.raises(ValueError, match="flexible span"):
         e.flexible_length(nodes)
+
+
+def _command_model():
+    m = StructuralModel(title="cmd offsets")
+    m.materials = {1: Material(1, E=210000.0, alpha=1.2e-5)}
+    m.sections = {1: Section(1, material_id=1, A=0.01, I=0.001)}
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    return m
+
+
+def test_add_element_cmd_preserves_frame_offsets():
+    m = _command_model()
+    AddElementCmd(
+        node_i=1, node_j=2, section_id=1, kind="frame",
+        offset_i=0.4, offset_j=0.3,
+    ).do(m)
+    e = m.elements[0]
+    assert isinstance(e, FrameElement2D)
+    assert e.offset_i == pytest.approx(0.4)
+    assert e.offset_j == pytest.approx(0.3)
+
+
+def test_add_member_cmd_forwards_frame_offsets():
+    m = _command_model()
+    m.nodes = {}
+    AddMemberCmd(
+        x_i=0.0, y_i=0.0, x_j=6.0, y_j=0.0,
+        section_id=1, kind="frame", offset_i=0.4, offset_j=0.3,
+    ).do(m)
+    e = m.elements[0]
+    assert e.offset_i == pytest.approx(0.4)
+    assert e.offset_j == pytest.approx(0.3)
+
+
+def test_add_element_cmd_rejects_tiny_flexible_span():
+    m = _command_model()
+    with pytest.raises(ValueError, match="minimum flexible span"):
+        AddElementCmd(
+            node_i=1, node_j=2, section_id=1, kind="frame",
+            offset_i=6.0 - 5e-13,
+        ).do(m)
 
 
 # ── file parsing ─────────────────────────────────────────────────────────

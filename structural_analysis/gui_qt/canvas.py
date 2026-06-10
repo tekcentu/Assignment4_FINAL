@@ -1731,20 +1731,42 @@ class ModelCanvas(QWidget):
         mr = result.member_results.get(elem.id) if result else None
         if mr is None or "d_local" not in mr:
             return [ni.x, nj.x], [ni.y, nj.y]
-        d = mr["d_local"]
-        ui_loc, vi_loc, thi = float(d[0]), float(d[1]), float(d[2])
-        uj_loc, vj_loc, thj = float(d[3]), float(d[4]), float(d[5])
-        n = max(2, int(self.deformed_stations))
-        Xs: list[float] = []
-        Ys: list[float] = []
-        for k in range(n):
-            r = k / (n - 1)
-            u_loc = (1.0 - r) * ui_loc + r * uj_loc
-            v_loc = self._hermite_v(r, L, vi_loc, thi, vj_loc, thj)
-            x_def = r * L + scale * u_loc
+        d_joint = mr["d_local"]
+        d_face = mr.get("d_local_face", d_joint)
+        ui_joint, vi_joint = float(d_joint[0]), float(d_joint[1])
+        uj_joint, vj_joint = float(d_joint[3]), float(d_joint[4])
+        ui_face, vi_face, thi_face = (
+            float(d_face[0]), float(d_face[1]), float(d_face[2])
+        )
+        uj_face, vj_face, thj_face = (
+            float(d_face[3]), float(d_face[4]), float(d_face[5])
+        )
+        e_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+        e_j = float(getattr(elem, "offset_j", 0.0) or 0.0)
+        x_face_i = min(max(e_i, 0.0), L)
+        x_face_j = max(x_face_i, L - max(e_j, 0.0))
+        L_flex = max(x_face_j - x_face_i, 0.0)
+
+        def _append_point(x_base: float, u_loc: float, v_loc: float) -> None:
+            x_def = x_base + scale * u_loc
             y_def = scale * v_loc
             Xs.append(ni.x + c * x_def - s * y_def)
             Ys.append(ni.y + s * x_def + c * y_def)
+
+        n = max(2, int(self.deformed_stations))
+        Xs: list[float] = []
+        Ys: list[float] = []
+        if x_face_i > 0.0:
+            _append_point(0.0, ui_joint, vi_joint)
+        for k in range(n):
+            r = k / (n - 1)
+            u_loc = (1.0 - r) * ui_face + r * uj_face
+            v_loc = self._hermite_v(
+                r, L_flex, vi_face, thi_face, vj_face, thj_face,
+            )
+            _append_point(x_face_i + r * L_flex, u_loc, v_loc)
+        if x_face_j < L:
+            _append_point(L, uj_joint, vj_joint)
         return Xs, Ys
 
     def _draw_deformed(self) -> None:
@@ -1770,11 +1792,14 @@ class ModelCanvas(QWidget):
             mr = result.member_results.get(elem.id)
             if mr is None or "d_local" not in mr:
                 continue
-            d = mr["d_local"]
+            d = mr.get("d_local_face", mr["d_local"])
             try:
-                L, _c, _s = elem.length_cos_sin(model.nodes)
+                L = elem.flexible_length(model.nodes)
             except (ValueError, ZeroDivisionError):
-                continue
+                try:
+                    L, _c, _s = elem.length_cos_sin(model.nodes)
+                except (ValueError, ZeroDivisionError):
+                    continue
             vi, thi, vj, thj = float(d[1]), float(d[2]), float(d[4]), float(d[5])
             for rk in (0.25, 0.5, 0.75):
                 max_disp = max(max_disp, abs(self._hermite_v(rk, L, vi, thi, vj, thj)))

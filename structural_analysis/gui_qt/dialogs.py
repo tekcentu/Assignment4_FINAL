@@ -40,7 +40,7 @@ from PyQt6.QtWidgets import (
 
 from PyQt6.QtWidgets import QTabWidget
 
-from ..element import FrameElement2D, TrussElement2D
+from ..element import FrameElement2D, MIN_FLEXIBLE_LENGTH, TrussElement2D
 from ..model import (
     FrameTemperatureLoad,
     LoadCase,
@@ -1055,9 +1055,9 @@ class ElementDialog(_ModalDialog):
         off_i = self._sb_off_i.value() if is_frame else 0.0
         off_j = self._sb_off_j.value() if is_frame else 0.0
         L_flex = self._member_length - off_i - off_j
-        if L_flex <= 0.0:
+        if L_flex < MIN_FLEXIBLE_LENGTH:
             self._lbl_l_flex.setText(
-                f"L_flex = {L_flex:.4g} m  (offsets consume the member)"
+                f"L_flex = {L_flex:.4g} m  (minimum is {MIN_FLEXIBLE_LENGTH:g} m)"
             )
             self._lbl_l_flex.setStyleSheet("color: #c0392b;")
         else:
@@ -1077,11 +1077,12 @@ class ElementDialog(_ModalDialog):
             off_i = 0.0
             off_j = 0.0
         if (off_i or off_j) and self._member_length is not None:
-            if off_i + off_j >= self._member_length:
+            if off_i + off_j > self._member_length - MIN_FLEXIBLE_LENGTH:
                 raise ValueError(
                     f"Rigid offsets ({off_i:g} + {off_j:g} m) must total "
-                    f"less than the member length "
-                    f"({self._member_length:g} m)."
+                    f"less than the member length minus the minimum "
+                    f"flexible span ({self._member_length:g} - "
+                    f"{MIN_FLEXIBLE_LENGTH:g} m)."
                 )
         return {
             "kind": kind,

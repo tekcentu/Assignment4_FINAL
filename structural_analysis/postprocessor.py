@@ -7,6 +7,7 @@ from __future__ import annotations
 import numpy as np
 
 from .assembler import DofManager
+from .element import FrameElement2D
 from .model import StructuralModel
 
 
@@ -63,11 +64,14 @@ def compute_member_forces(
             model.nodes, u_global_elem, p_extra_local=p_extra,
         )
 
-        results[elem.id] = {
+        entry = {
             "f_local": q_local,
             "d_local": d_local,
             "d_global": u_global_elem,
         }
+        if isinstance(elem, FrameElement2D):
+            entry["d_local_face"] = elem.face_local_displacements(d_local)
+        results[elem.id] = entry
 
     return results
 

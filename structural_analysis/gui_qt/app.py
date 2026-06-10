@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 
 from ..element import FrameElement2D
 from ..file_io import read_input_file
-from ..main import run_analysis, run_multi_case_analysis
+from ..main import run_multi_case_analysis
 from ..model import AnalysisResult, Material, Section, StructuralModel
 from ..multi_case_result import (
     SUM_ALL_KEY,
@@ -45,7 +45,6 @@ from ..multi_case_result import (
 )
 from .. import __version__, __what_is_new__
 from ..gui_common.commands import (
-    AddElementCmd,
     AddMemberCmd,
     AddMemberLoadCmd,
     AddNodeCmd,
@@ -112,7 +111,6 @@ from .dialogs import (
     FineNodeDialog,
     GridDialog,
     GridSpacingDialog,
-    GroupManagerDialog,
     MaterialListDialog,
     MemberLoadDialog,
     NodalLoadManagerDialog,
@@ -121,6 +119,10 @@ from .dialogs import (
     SupportDialog,
 )
 from .grid import GridSystem
+from .result_export_tables import (
+    MemberStationForceTableDialog,
+    NodeResultTableDialog,
+)
 
 
 def _make_building_icon() -> QIcon:
@@ -560,6 +562,15 @@ class MainWindow(QMainWindow):
         )
         self.act_clear_result = QAction("&Clear results", self,
                                           triggered=self._clear_result)
+        self.act_node_result_table = QAction(
+            "Node result &table…", self,
+            triggered=self._show_node_result_table,
+        )
+        self.act_node_result_table.setToolTip(
+            "Open a read-only table of nodal displacements and reactions "
+            "for the selected solved case/combination. Copy as TSV or "
+            "export as CSV for spreadsheet comparison."
+        )
 
         # ── v0.27.0 Selection menu actions ──
         self.act_sel_frames = QAction(
@@ -825,6 +836,7 @@ class MainWindow(QMainWindow):
         m_run.addAction(self.act_joint_masses)
         m_run.addAction(self.act_matrix_inspector)
         m_run.addSeparator()
+        m_run.addAction(self.act_node_result_table)
         m_run.addAction(self.act_clear_result)
 
     def _build_toolbar(self) -> None:
@@ -1864,6 +1876,9 @@ class MainWindow(QMainWindow):
         if action == "loads":
             self._open_element_inspector(elem_id, tab="loads")
             return
+        if action == "station_forces":
+            self._show_member_station_force_table([elem_id])
+            return
         # While the element-detail inspector is open the host has the
         # rest of the editing surface locked (see _set_editing_locked).
         # The right-click context menu's edit items are built fresh
@@ -1914,9 +1929,24 @@ class MainWindow(QMainWindow):
             sorted(sel_elems) if elem_id in sel_elems else [elem_id]
         )
         n_targets = len(sel_for_offset)
+        a_station_forces = None
         a_auto_off = None
         a_clear_off = None
         if is_frame:
+            station_targets = [
+                eid for eid in sel_for_offset
+                if isinstance(
+                    next((e for e in self._model.elements if e.id == eid), None),
+                    FrameElement2D,
+                )
+            ]
+            station_label = (
+                f"Element {elem_id}: Station Force Table…"
+                if len(station_targets) <= 1
+                else f"Station Force Table for {len(station_targets)} frame elements…"
+            )
+            a_station_forces = menu.addAction(station_label)
+            a_station_forces.setEnabled(bool(station_targets))
             menu.addSeparator()
             auto_label = (
                 f"Element {elem_id}: assign automatic rigid offsets"
@@ -1943,6 +1973,8 @@ class MainWindow(QMainWindow):
             self._open_element_inspector(elem_id, tab="loads")
         elif a_batch is not None and chosen is a_batch:
             self._do_batch_member_load()
+        elif a_station_forces is not None and chosen is a_station_forces:
+            self._show_member_station_force_table(station_targets)
         elif chosen is a_sim_type:
             self._select_similar_type(elem_id)
         elif chosen is a_sim_sec:
@@ -2122,6 +2154,55 @@ class MainWindow(QMainWindow):
         )
         box.setDetailedText("\n".join(lines))
         box.exec()
+
+
+    def _show_member_station_force_table(self, element_ids: list[int]) -> None:
+        """Open a read-only N/V/M station table for frame element(s)."""
+        frame_ids = [
+            eid for eid in element_ids
+            if isinstance(
+                next((e for e in self._model.elements if e.id == eid), None),
+                FrameElement2D,
+            )
+        ]
+        if not frame_ids:
+            QMessageBox.information(
+                self, "Station Force Table",
+                "Station Force Table is available for frame elements only.",
+            )
+            return
+        if self._multi_result is None:
+            QMessageBox.information(
+                self, "Station Force Table",
+                "Run static analysis first (F5), then open station forces.",
+            )
+            return
+        d = MemberStationForceTableDialog(
+            self, model=self._model, element_ids=frame_ids,
+            multi_result=self._multi_result, active_case=self._active_case,
+            n_stations=self.canvas.diagram_stations,
+        )
+        self._member_station_force_dialog = d
+        d.show()
+        d.raise_()
+        d.activateWindow()
+
+    def _show_node_result_table(self) -> None:
+        """Open a read-only nodal displacement/reaction export table."""
+        if self._multi_result is None:
+            QMessageBox.information(
+                self, "Node Result Table",
+                "Run static analysis first (F5), then open node results.",
+            )
+            return
+        d = NodeResultTableDialog(
+            self, model=self._model, multi_result=self._multi_result,
+            active_case=self._active_case,
+        )
+        self._node_result_table_dialog = d
+        d.show()
+        d.raise_()
+        d.activateWindow()
 
     def _open_material_list(self) -> None:
         d = MaterialListDialog(
