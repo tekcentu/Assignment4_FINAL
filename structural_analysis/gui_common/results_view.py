@@ -154,9 +154,17 @@ def resolve_view(
 def format_result(model: StructuralModel, result: AnalysisResult | None) -> str:
     if result is None:
         return "(no analysis run yet)"
+    # 3D results carry the full six-key DOF map per node; 2D results
+    # keep the legacy ux/uy/rz triple (and the legacy report layout).
+    is_3d = any("uz" in em for em in result.E_map.values())
+    dof_names = (
+        ("ux", "uy", "uz", "rx", "ry", "rz") if is_3d
+        else ("ux", "uy", "rz")
+    )
     lines: list[str] = []
     lines.append("=" * 70)
-    lines.append(f"  2D Structural Analysis — {result.title or model.title}")
+    lines.append(f"  {'3D' if is_3d else '2D'} Structural Analysis — "
+                 f"{result.title or model.title}")
     lines.append("=" * 70)
     if result.warnings:
         lines.append("\n  Warnings:")
@@ -173,14 +181,17 @@ def format_result(model: StructuralModel, result: AnalysisResult | None) -> str:
     max_disp = 0.0
     max_disp_node: int | None = None
     has_disp_dofs = False
+    trans_dofs = [d for d in dof_names if d.startswith("u")]
     if result.D is not None:
         for nid, em in result.E_map.items():
-            if em["ux"] is None and em["uy"] is None:
+            if all(em.get(d) is None for d in trans_dofs):
                 continue
             has_disp_dofs = True
-            ux = float(result.D[em["ux"]]) if em["ux"] is not None else 0.0
-            uy = float(result.D[em["uy"]]) if em["uy"] is not None else 0.0
-            mag = (ux * ux + uy * uy) ** 0.5
+            mag = sum(
+                (float(result.D[em[d]]) if em.get(d) is not None else 0.0)
+                ** 2
+                for d in trans_dofs
+            ) ** 0.5
             if mag >= max_disp:
                 max_disp = mag
                 max_disp_node = nid
@@ -208,11 +219,14 @@ def format_result(model: StructuralModel, result: AnalysisResult | None) -> str:
     # A value of None means the DOF is either restrained at a support ("fix")
     # or inactive (e.g. the rotational DOF of a node connected only to
     # truss elements — labelled "—").
+    dof_headers = {"ux": "Tx", "uy": "Ty", "uz": "Tz",
+                   "rx": "Rx", "ry": "Ry", "rz": "Rz"}
     lines.append("\n── Step B: Global DOF Indices ──")
     lines.append(f"  Active DOFs: {sum(1 for em in result.E_map.values() for v in em.values() if v is not None)}, "
                  f"Free DOFs (NumEq): {result.num_eq}")
-    lines.append(f"  {'Node':>6}  {'Tx':>6}  {'Ty':>6}  {'Rz':>6}"
-                 f"   (index = global DOF #; fix = restrained; — = inactive)")
+    lines.append("  " + f"{'Node':>6}"
+                 + "".join(f"  {dof_headers[d]:>6}" for d in dof_names)
+                 + "   (index = global DOF #; fix = restrained; — = inactive)")
     for nid in sorted(result.E_map):
         em = result.E_map[nid]
         sup = model.support_for(nid)
@@ -220,43 +234,68 @@ def format_result(model: StructuralModel, result: AnalysisResult | None) -> str:
             if v is not None:
                 return str(v)
             return "fix" if getattr(sup, dof) else "—"
-        lines.append(f"  {nid:>6}  {f(em['ux'],'ux'):>6}  "
-                     f"{f(em['uy'],'uy'):>6}  {f(em['rz'],'rz'):>6}")
+        lines.append(f"  {nid:>6}" + "".join(
+            f"  {f(em.get(d), d):>6}" for d in dof_names))
 
     # Step D
+    disp_units = {"ux": "m", "uy": "m", "uz": "m",
+                  "rx": "rad", "ry": "rad", "rz": "rad"}
     lines.append("\n── Step D: Solve K·D = F ──")
     lines.append(f"  Residual ||K_ff·D_f − F_f|| = {result.residual:.4e}")
     lines.append(f"\n  Nodal displacements:")
-    lines.append(f"  {'Node':>6}  {'ux (m)':>14}  {'uy (m)':>14}  {'rz (rad)':>14}")
+    lines.append("  " + f"{'Node':>6}" + "".join(
+        f"  {f'{d} ({disp_units[d]})':>14}" for d in dof_names))
     D = result.D
     for nid in sorted(result.E_map):
         em = result.E_map[nid]
-        ux = float(D[em["ux"]]) if em["ux"] is not None else 0.0
-        uy = float(D[em["uy"]]) if em["uy"] is not None else 0.0
-        rz = float(D[em["rz"]]) if em["rz"] is not None else 0.0
-        lines.append(f"  {nid:>6}  {ux:>14.6e}  {uy:>14.6e}  {rz:>14.6e}")
+        vals = [float(D[em[d]]) if em.get(d) is not None else 0.0
+                for d in dof_names]
+        lines.append(f"  {nid:>6}" + "".join(f"  {v:>14.6e}" for v in vals))
 
     # Step E
     lines.append("\n── Step E: Member End Forces ──")
-    lines.append(f"  {'Elem':>6} {'Type':>6}  "
-                 f"{'N_i':>10}  {'V_i':>10}  {'M_i':>10}  "
-                 f"{'N_j':>10}  {'V_j':>10}  {'M_j':>10}")
-    for elem in model.elements:
-        mr = result.member_results.get(elem.id)
-        if mr is None:
-            continue
-        f_local = mr["f_local"]
-        kind = "frame" if isinstance(elem, FrameElement2D) else "truss"
-        lines.append(f"  {elem.id:>6} {kind:>6}  " +
-                     "  ".join(f"{float(f_local[j]):>10.4f}" for j in range(6)))
+    if is_3d:
+        cols = ["N", "Vy", "Vz", "T", "My", "Mz"]
+        lines.append(f"  {'Elem':>6} {'Type':>7} {'End':>4}  " +
+                     "  ".join(f"{c:>10}" for c in cols))
+        for elem in model.elements:
+            mr = result.member_results.get(elem.id)
+            if mr is None:
+                continue
+            f_local = mr["f_local"]
+            kind = ("frame" if isinstance(elem, FrameElement2D)
+                    else getattr(elem, "kind", "truss"))
+            half = len(f_local) // 2
+            for end, sl in (("i", f_local[:half]), ("j", f_local[half:])):
+                padded = list(sl) + [0.0] * (6 - len(sl))
+                lines.append(f"  {elem.id:>6} {kind:>7} {end:>4}  " +
+                             "  ".join(f"{float(v):>10.4f}"
+                                       for v in padded))
+    else:
+        lines.append(f"  {'Elem':>6} {'Type':>6}  "
+                     f"{'N_i':>10}  {'V_i':>10}  {'M_i':>10}  "
+                     f"{'N_j':>10}  {'V_j':>10}  {'M_j':>10}")
+        for elem in model.elements:
+            mr = result.member_results.get(elem.id)
+            if mr is None:
+                continue
+            f_local = mr["f_local"]
+            kind = "frame" if isinstance(elem, FrameElement2D) else "truss"
+            lines.append(f"  {elem.id:>6} {kind:>6}  " +
+                         "  ".join(f"{float(f_local[j]):>10.4f}" for j in range(6)))
 
     # Step F
+    reaction_headers = {
+        "ux": "Rx (kN)", "uy": "Ry (kN)", "uz": "Rz (kN)",
+        "rx": "Mx (kN·m)", "ry": "My (kN·m)", "rz": "Mz (kN·m)",
+    }
     lines.append("\n── Step F: Support Reactions ──")
-    lines.append(f"  {'Node':>6}  {'Rx (kN)':>12}  {'Ry (kN)':>12}  {'Mz (kN·m)':>12}")
+    lines.append("  " + f"{'Node':>6}" + "".join(
+        f"  {reaction_headers[d]:>12}" for d in dof_names))
     for nid in sorted(result.reactions):
         r = result.reactions[nid]
-        lines.append(f"  {nid:>6}  {r.get('ux', 0):>12.4f}  "
-                     f"{r.get('uy', 0):>12.4f}  {r.get('rz', 0):>12.4f}")
+        lines.append(f"  {nid:>6}" + "".join(
+            f"  {r.get(d, 0):>12.4f}" for d in dof_names))
     lines.append(f"  Max equilibrium residual at free nodes: {result.eq_residual:.4e}")
 
     lines.append("\n" + "=" * 70)

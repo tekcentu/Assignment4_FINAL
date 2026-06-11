@@ -1,4 +1,14 @@
-# CE4011 Assignment 4 - 2D Structural Analysis Program
+# CE4011 Assignment 4 - 2D/3D Structural Analysis Program
+
+> **3D FEM (v0.32):** models with out-of-plane content (node `z ≠ 0`,
+> 3D supports/loads, or `force_3d`) solve through a 6-DOF-per-node
+> space pipeline — 12-DOF frame elements (axial + torsion + biaxial
+> bending), 3D trusses, settlements and thermal loads included. 2D
+> elements are promoted automatically at solve time; planar models
+> keep the legacy 2D pipeline bit-identically. The GUI gains work-plane
+> projection views (XY/XZ/ZY/isometric), a working-depth control, node
+> Z coordinates, 6-DOF supports, and a native-z 3D viewer. See
+> `inputs/example_3d_grillage.txt` for the extended file format.
 
 ```mermaid
 flowchart LR

@@ -72,23 +72,28 @@ def _find_or_create_node(
     x: float,
     y: float,
     hinted_id: int | None,
+    z: float = 0.0,
 ) -> tuple[int, bool]:
     """Return ``(node_id, was_created)`` for the given coordinate.
 
     Priority: explicit ``hinted_id`` (e.g. from the snap engine) → an
-    existing node within :data:`NODE_COINCIDENCE_TOL` of ``(x, y)`` →
-    allocate a new id and add the node. Composite commands
+    existing node within :data:`NODE_COINCIDENCE_TOL` of ``(x, y, z)``
+    → allocate a new id and add the node. Composite commands
     (``AddMemberCmd``, ``SplitElementCmd``) share this so the two
-    paths cannot drift.
+    paths cannot drift. A snapped ``hinted_id`` deliberately wins over
+    ``z`` — clicking an existing node connects to it even when the
+    working depth differs (that is how cross-storey members are drawn
+    from a plan/elevation work plane).
     """
     if hinted_id is not None and hinted_id in model.nodes:
         return hinted_id, False
     for n in model.nodes.values():
         if (abs(n.x - x) < NODE_COINCIDENCE_TOL
-                and abs(n.y - y) < NODE_COINCIDENCE_TOL):
+                and abs(n.y - y) < NODE_COINCIDENCE_TOL
+                and abs(getattr(n, "z", 0.0) - z) < NODE_COINCIDENCE_TOL):
             return n.id, False
     new_id = _next_id(model.nodes)
-    model.nodes[new_id] = Node(new_id, float(x), float(y))
+    model.nodes[new_id] = Node(new_id, float(x), float(y), float(z))
     return new_id, True
 
 
@@ -118,6 +123,9 @@ class AddNodeCmd(Command):
     y: float
     node_id: int | None = None
     description: str = "add node"
+    # 3D: out-of-plane coordinate (declared after the legacy fields so
+    # existing keyword construction sites are untouched).
+    z: float = 0.0
 
     def do(self, model: StructuralModel) -> None:
         if self.node_id is None:
@@ -126,12 +134,16 @@ class AddNodeCmd(Command):
             raise ValueError(f"Node id {self.node_id} already exists.")
         for n in model.nodes.values():
             if (abs(n.x - self.x) < NODE_COINCIDENCE_TOL
-                    and abs(n.y - self.y) < NODE_COINCIDENCE_TOL):
+                    and abs(n.y - self.y) < NODE_COINCIDENCE_TOL
+                    and abs(getattr(n, "z", 0.0) - self.z)
+                    < NODE_COINCIDENCE_TOL):
                 raise ValueError(
                     f"A node already exists at ({self.x}, {self.y}) "
                     f"(id {n.id})."
                 )
-        model.nodes[self.node_id] = Node(self.node_id, float(self.x), float(self.y))
+        model.nodes[self.node_id] = Node(
+            self.node_id, float(self.x), float(self.y), float(self.z),
+        )
 
     def undo(self, model: StructuralModel) -> None:
         model.nodes.pop(self.node_id, None)
@@ -142,15 +154,22 @@ class MoveNodeCmd(Command):
     node_id: int
     new_x: float
     new_y: float
-    _old: tuple[float, float] | None = None
+    _old: tuple[float, float, float] | None = None
     description: str = "move node"
+    # 3D: ``None`` preserves the node's current z (the common case for
+    # in-plane drags); a float sets it.
+    new_z: float | None = None
 
     def do(self, model: StructuralModel) -> None:
         if self.node_id not in model.nodes:
             raise ValueError(f"Node {self.node_id} does not exist.")
         old = model.nodes[self.node_id]
-        self._old = (old.x, old.y)
-        model.nodes[self.node_id] = Node(self.node_id, float(self.new_x), float(self.new_y))
+        old_z = getattr(old, "z", 0.0)
+        self._old = (old.x, old.y, old_z)
+        z = old_z if self.new_z is None else float(self.new_z)
+        model.nodes[self.node_id] = Node(
+            self.node_id, float(self.new_x), float(self.new_y), z,
+        )
 
     def undo(self, model: StructuralModel) -> None:
         if self._old is None:
@@ -244,7 +263,9 @@ class AddElementCmd(Command):
             mat = model.materials[section.material_id]
         ni = model.nodes[self.node_i]
         nj = model.nodes[self.node_j]
-        if abs(ni.x - nj.x) < 1e-12 and abs(ni.y - nj.y) < 1e-12:
+        if (abs(ni.x - nj.x) < 1e-12 and abs(ni.y - nj.y) < 1e-12
+                and abs(getattr(ni, "z", 0.0) - getattr(nj, "z", 0.0))
+                < 1e-12):
             raise ValueError("Element has zero length (coincident nodes).")
         for elem in model.elements:
             if {elem.node_i, elem.node_j} == {self.node_i, self.node_j}:
@@ -322,6 +343,10 @@ class AddMemberCmd(Command):
     node_i: int | None = None  # if set, reuse this node id
     node_j: int | None = None
     elem_id: int | None = None
+    # 3D: out-of-plane coordinates for endpoints created in free space
+    # (the GUI's working depth). Ignored when a node id hint resolves.
+    z_i: float = 0.0
+    z_j: float = 0.0
 
     _created_node_i: int | None = field(default=None, init=False)
     _created_node_j: int | None = field(default=None, init=False)
@@ -349,12 +374,12 @@ class AddMemberCmd(Command):
         self._inner = None
         try:
             resolved_i, created_i = _find_or_create_node(
-                model, self.x_i, self.y_i, self.node_i,
+                model, self.x_i, self.y_i, self.node_i, self.z_i,
             )
             if created_i:
                 self._created_node_i = resolved_i
             resolved_j, created_j = _find_or_create_node(
-                model, self.x_j, self.y_j, self.node_j,
+                model, self.x_j, self.y_j, self.node_j, self.z_j,
             )
             if created_j:
                 self._created_node_j = resolved_j
@@ -573,6 +598,12 @@ class SplitElementCmd(Command):
         proj_x, proj_y, t = project_point_on_segment(
             self.x, self.y, ni.x, ni.y, nj.x, nj.y,
         )
+        # 3D: the click projects in the XY work plane; the split
+        # node's z follows the same parametric position along the
+        # member so node C stays ON the (possibly z-varying) element.
+        zi = getattr(ni, "z", 0.0)
+        zj = getattr(nj, "z", 0.0)
+        proj_z = zi + t * (zj - zi)
         if t <= ELEMENT_SPLIT_TOL or t >= 1.0 - ELEMENT_SPLIT_TOL:
             raise ValueError(
                 f"Split point is too close to an endpoint of element "
@@ -595,10 +626,10 @@ class SplitElementCmd(Command):
         # Remap member_loads BEFORE any model mutation. If any load
         # type is unsupported this raises and the model is untouched.
         import math as _math
-        L_parent = _math.hypot(nj.x - ni.x, nj.y - ni.y)
+        L_parent = _math.hypot(nj.x - ni.x, nj.y - ni.y, zj - zi)
         L1 = t * L_parent
-        L_child_a = _math.hypot(proj_x - ni.x, proj_y - ni.y)
-        L_child_b = _math.hypot(nj.x - proj_x, nj.y - proj_y)
+        L_child_a = _math.hypot(proj_x - ni.x, proj_y - ni.y, proj_z - zi)
+        L_child_b = _math.hypot(nj.x - proj_x, nj.y - proj_y, zj - proj_z)
         parent_member_loads = list(getattr(parent, "member_loads", None) or [])
         a_loads, b_loads = _remap_member_loads(
             parent_member_loads, L1, L_parent, L_child_a, L_child_b,
@@ -619,7 +650,9 @@ class SplitElementCmd(Command):
         if self.node_id is not None and self.node_id in model.nodes:
             hinted = model.nodes[self.node_id]
             if (abs(hinted.x - proj_x) >= NODE_COINCIDENCE_TOL
-                    or abs(hinted.y - proj_y) >= NODE_COINCIDENCE_TOL):
+                    or abs(hinted.y - proj_y) >= NODE_COINCIDENCE_TOL
+                    or abs(getattr(hinted, "z", 0.0) - proj_z)
+                    >= NODE_COINCIDENCE_TOL):
                 raise ValueError(
                     f"Hinted node_id={self.node_id} at "
                     f"({hinted.x}, {hinted.y}) does not lie on element "
@@ -627,7 +660,7 @@ class SplitElementCmd(Command):
                     f"({proj_x}, {proj_y}); refusing to split."
                 )
         resolved_c, created_c = _find_or_create_node(
-            model, proj_x, proj_y, self.node_id,
+            model, proj_x, proj_y, self.node_id, proj_z,
         )
         if created_c:
             self._created_node_c = resolved_c
@@ -821,6 +854,10 @@ class DrawMemberWithSplitsCmd(Command):
     release_i: bool = False
     release_j: bool = False
     material_override_id: int | None = None
+    # 3D: working-depth z for endpoints created in free space (split
+    # targets and node hints carry their own z).
+    z_i: float = 0.0
+    z_j: float = 0.0
 
     _splits: list[SplitElementCmd] = field(default_factory=list, init=False)
     _inner: "AddMemberCmd | None" = field(default=None, init=False)
@@ -850,6 +887,7 @@ class DrawMemberWithSplitsCmd(Command):
             inner = AddMemberCmd(
                 x_i=self.x_i, y_i=self.y_i, node_i=resolved_i,
                 x_j=self.x_j, y_j=self.y_j, node_j=resolved_j,
+                z_i=self.z_i, z_j=self.z_j,
                 kind=self.kind, section_id=self.section_id,
                 release_i=self.release_i, release_j=self.release_j,
                 material_override_id=self.material_override_id,

@@ -2,9 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-CE4011 Assignment 4 — a 2D structural-analysis solver (frames + trusses, thermal
-loads, support settlements, modal analysis) with a PyQt6 GUI on top of a pure
-NumPy/SciPy core. Python ≥ 3.11.
+CE4011 Assignment 4 — a 2D/3D structural-analysis solver (frames + trusses,
+thermal loads, support settlements, modal analysis [2D-only]) with a PyQt6 GUI
+on top of a pure NumPy/SciPy core. Python ≥ 3.11.
+
+3D (v0.32): a model with out-of-plane content (node z ≠ 0, 3D supports/loads,
+native `Element3D` instances, or `model.force_3d`) solves through a
+6-DOF-per-node pipeline. `element3d.py` owns the 12-DOF space frame / space
+truss and the 2D→3D promotion applied at assembly time
+(`assembler.model_is_3d` / `prepare_solve_elements`); planar models keep the
+legacy 2D pipeline bit-identical. The GUI canvas shows 3D models via
+work-plane projection (View → Work plane: XY/XZ/ZY/isometric); geometry
+creation happens on the XY plane at the View → Working depth z level.
 
 ## Commands
 
@@ -116,3 +125,15 @@ Plain-text sections parsed by `file_io.read_input_file`. Key Assignment-4 additi
 - `SUPPORTS`: `<node_id> <ux> <uy> <rz> [settle_ux settle_uy settle_rz]`.
 - `FRAME_TEMPERATURE`: `<element_id> <t_top> <t_bottom>` (mean → axial, difference → bending gradient).
 - `TRUSS_TEMPERATURE`: `<element_id> <delta_T>` (uniform ΔT along the bar).
+
+3D additions (v0.32 — see `inputs/example_3d_grillage.txt`):
+
+- `NODES` rows accept an optional 4th column: `<id> <x> <y> [z]`.
+- `SUPPORTS3D`: `<node_id> <ux> <uy> <uz> <rx> <ry> <rz> [6 settlements]`
+  (separate keyword — a widened SUPPORTS row would be ambiguous with the
+  legacy 3-flags + 3-settlements form).
+- `LOADS3D`: `<node_id> <fx> <fy> <fz> <mx> <my> <mz> [case=NAME]`.
+- `MEMBER_UDL` / `MEMBER_POINT_LOADS` accept an optional third numeric
+  component (`wz` / `pz`).
+- `ANALYSIS_OPTIONS`: `force_3d=<bool>` forces the 6-DOF pipeline on a
+  planar model.

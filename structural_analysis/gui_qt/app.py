@@ -260,6 +260,9 @@ class MainWindow(QMainWindow):
         # when False, draw all loads at full intensity. Wired to the
         # View → "Active case loads only" toggle.
         self._active_case_loads_only: bool = True
+        # 3D work plane (v0.32): out-of-plane coordinate assigned to
+        # geometry created by canvas clicks in the current view.
+        self._working_depth: float = 0.0
         self._modal_result = None
         self._modal_results_dialog = None
         self._view3d_window = None
@@ -407,6 +410,15 @@ class MainWindow(QMainWindow):
             shortcut="Shift+N",
             triggered=self._do_add_node_at_coords,
         )
+        self.act_connect_nodes = QAction(
+            "Co&nnect selected nodes…", self,
+            triggered=self._connect_selected_nodes,
+        )
+        self.act_connect_nodes.setToolTip(
+            "Create a frame/truss member between the two currently "
+            "selected nodes — works across z levels, where a canvas "
+            "click cannot distinguish coincident projections."
+        )
         self.act_grid_spacing = QAction("&Grid spacing…", self,
                                           triggered=self._set_grid_spacing)
         self.act_grid_system = QAction("Grid s&ystem…", self,
@@ -418,6 +430,41 @@ class MainWindow(QMainWindow):
             statusTip="Open a separate 3D window with each element "
                        "extruded along its section profile.",
             triggered=self._open_view3d,
+        )
+        # ── 3D work planes (v0.32) ──
+        # Radio group selecting the canvas projection: the legacy XY
+        # front view (editable), the XZ plan / ZY side elevations
+        # (editable at the working depth), and a display-only
+        # isometric mode.
+        self._view_plane_actions: dict[str, QAction] = {}
+        from .canvas import VIEW_PLANES as _VIEW_PLANES
+        _plane_labels = {
+            "XY": "&XY (front — default)",
+            "XZ": "X&Z (plan)",
+            "ZY": "Z&Y (side)",
+            "ISO": "&Isometric (display only)",
+        }
+        view_plane_group = QActionGroup(self)
+        view_plane_group.setExclusive(True)
+        for plane in _VIEW_PLANES:
+            a = QAction(
+                _plane_labels[plane], self, checkable=True,
+                checked=(plane == "XY"),
+            )
+            a.triggered.connect(
+                lambda _=False, p=plane: self._set_view_plane(p)
+            )
+            view_plane_group.addAction(a)
+            self._view_plane_actions[plane] = a
+        self.act_working_depth = QAction(
+            "Working &depth…", self,
+            triggered=self._set_working_depth,
+        )
+        self.act_working_depth.setToolTip(
+            "Out-of-plane coordinate given to nodes created by canvas "
+            "clicks (z in the XY view, y in XZ, x in ZY). Snapped "
+            "clicks on existing nodes always connect to those nodes "
+            "regardless of depth."
         )
         self.act_forget_elem_defaults = QAction(
             "Forget element defaults", self,
@@ -742,6 +789,16 @@ class MainWindow(QMainWindow):
         m_view.addAction(self.act_fit_view)
         m_view.addAction(self.act_open_view3d)
         m_view.addSeparator()
+        plane_menu = m_view.addMenu("Work &plane")
+        plane_menu.setStatusTip(
+            "Projection used by the canvas — XY front (editable), "
+            "XZ plan / ZY side (editable at working depth), or a "
+            "display-only isometric view."
+        )
+        for a in self._view_plane_actions.values():
+            plane_menu.addAction(a)
+        m_view.addAction(self.act_working_depth)
+        m_view.addSeparator()
         m_view.addAction(self.act_grid_system)
         m_view.addAction(self.act_grid_spacing)
         m_view.addAction(self.act_snap)
@@ -811,6 +868,8 @@ class MainWindow(QMainWindow):
             "computed from solved case results."
         )
         m_model = self.menuBar().addMenu("&Model")
+        m_model.addAction(self.act_connect_nodes)
+        m_model.addSeparator()
         m_model.addAction(self.act_load_cases)
         m_model.addAction(self.act_load_combinations)
 
@@ -1029,12 +1088,16 @@ class MainWindow(QMainWindow):
         if not shift:
             self.canvas.clear_selection()
         rx0, ry0, rx1, ry1 = rect
-        for nid, node in self._model.nodes.items():
+        # The drag rect lives in view-plane coordinates — test against
+        # the projected node positions so box-select works in every
+        # work plane (identity in the legacy XY view).
+        proj = self.canvas.projected_model()
+        for nid, node in proj.nodes.items():
             if _point_in_world_rect(node.x, node.y, rx0, ry0, rx1, ry1):
                 self.canvas.add_node_to_selection(nid)
-        for elem in self._model.elements:
-            ni = self._model.nodes.get(elem.node_i)
-            nj = self._model.nodes.get(elem.node_j)
+        for elem in proj.elements:
+            ni = proj.nodes.get(elem.node_i)
+            nj = proj.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
             i_in = _point_in_world_rect(ni.x, ni.y, rx0, ry0, rx1, ry1)
@@ -1053,6 +1116,46 @@ class MainWindow(QMainWindow):
     def select_to_neutral_mode(self) -> None:
         """Switch the active tool back to Select. Used after ESC."""
         self._select_tool("select")
+
+    # ── 3D work plane (v0.32) ────────────────────────────────────────
+
+    def working_z(self) -> float:
+        """Out-of-plane coordinate for geometry created by canvas
+        clicks (host hook consumed by the Node / Frame / Truss tools)."""
+        return self._working_depth
+
+    def can_edit_geometry(self) -> bool:
+        """True when the active canvas view supports creation clicks."""
+        return self.canvas.is_editable_view
+
+    def _set_view_plane(self, plane: str) -> None:
+        self.canvas.set_view_plane(plane)
+        if plane == "ISO":
+            self.set_status(
+                "Isometric view — display only. Selection and "
+                "inspection work; switch to XY/XZ/ZY to edit geometry."
+            )
+        elif plane == "XY":
+            self.set_status("XY work plane (front view).")
+        else:
+            axis = {"XZ": "y", "ZY": "x"}[plane]
+            self.set_status(
+                f"{plane} work plane — new geometry is placed at "
+                f"{axis} = {self._working_depth:g} m "
+                "(View → Working depth…)."
+            )
+
+    def _set_working_depth(self) -> None:
+        from PyQt6.QtWidgets import QInputDialog
+        value, ok = QInputDialog.getDouble(
+            self, "Working depth",
+            "Out-of-plane coordinate for new geometry (m):",
+            self._working_depth, -1e9, 1e9, 6,
+        )
+        if not ok:
+            return
+        self._working_depth = float(value)
+        self.set_status(f"Working depth set to {value:g} m.")
 
     def _update_selection_status(self) -> None:
         nn = len(self.canvas.get_selected_nodes())
@@ -1678,6 +1781,7 @@ class MainWindow(QMainWindow):
                 self.execute(AddMemberCmd(
                     x_i=first_x, y_i=first_y, node_i=first_node_id,
                     x_j=second_x, y_j=second_y, node_j=second_node_id,
+                    z_i=self._working_depth, z_j=self._working_depth,
                     section_id=section_id,
                     kind=effective_kind,
                     release_i=release_i,
@@ -1690,6 +1794,7 @@ class MainWindow(QMainWindow):
                 split_target_j=second_split_target,
                 x_i=first_x, y_i=first_y, node_i_hint=first_node_id,
                 x_j=second_x, y_j=second_y, node_j_hint=second_node_id,
+                z_i=self._working_depth, z_j=self._working_depth,
                 kind=effective_kind, section_id=section_id,
                 release_i=release_i, release_j=release_j,
                 material_override_id=material_override_id,
@@ -2705,12 +2810,24 @@ class MainWindow(QMainWindow):
             except ValueError as e:
                 QMessageBox.warning(self, "Invalid input", str(e))
 
+    def _connect_selected_nodes(self) -> None:
+        """Create a member between the two selected nodes (any z)."""
+        sel = sorted(self.canvas.get_selected_nodes())
+        if len(sel) != 2:
+            QMessageBox.information(
+                self, "Connect selected nodes",
+                "Select exactly two nodes first (Select tool; "
+                "Shift-click adds to the selection).",
+            )
+            return
+        self.open_element_dialog_for_pair(sel[0], sel[1])
+
     def _do_add_node_at_coords(self) -> None:
         d = FineNodeDialog(self, model=self._model)
         if d.exec() != QDialog.DialogCode.Accepted or d.result_value is None:
             return
-        x, y = d.result_value
-        self.execute(AddNodeCmd(x=x, y=y))
+        x, y, z = d.result_value
+        self.execute(AddNodeCmd(x=x, y=y, z=z))
 
     def _do_renumber_elements(self) -> None:
         """Open the RenumberElementsDialog, then execute the command and
