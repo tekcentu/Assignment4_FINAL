@@ -210,6 +210,14 @@ class ModelCanvas(QWidget):
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
+        # Persistent matplotlib Line2D artists for the hover/snap markers.
+        # We re-use them across hover-only repaints (which avoid a full
+        # ax.clear()) so the markers can be moved by updating xdata/ydata
+        # + draw_idle() instead of rebuilding the whole scene. ax.clear()
+        # in redraw() detaches them; _draw_snap_marker rebuilds them
+        # lazily on the next paint.
+        self._snap_marker_artist = None     # solid snap-target marker
+        self._hover_marker_artist = None    # faint "+" ghost crosshair
         # Either anchored at an existing node id (legacy) or a free
         # start point (v0.10.0 — first click landed on empty space and
         # no node has been created yet). Exactly one is non-None at a
@@ -534,6 +542,10 @@ class ModelCanvas(QWidget):
         self._setting_axes_limits = True
         try:
             self.ax.clear()
+            # ax.clear() destroys all artists; drop our cached references
+            # so _draw_snap_marker rebuilds them on the next paint.
+            self._snap_marker_artist = None
+            self._hover_marker_artist = None
             self.ax.set_aspect("equal", adjustable="box")
 
             if saved_xlim is not None:
@@ -669,7 +681,8 @@ class ModelCanvas(QWidget):
             # Cursor left the axes — drop the hover marker.
             if self._hover_xy is not None:
                 self._hover_xy = None
-                self._mpl_canvas.draw_idle()
+                self._snap_marker = None
+                self.repaint_hover_marker()
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -823,6 +836,12 @@ class ModelCanvas(QWidget):
             AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
         self.ax.yaxis.set_major_locator(
             AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
+        # Show absolute metre values on the spine — never the confusing
+        # "+1e3" offset-notation corner label matplotlib adds when the
+        # coordinates are large. ax.clear() re-enables it, so set this
+        # every redraw alongside the locator.
+        self.ax.ticklabel_format(
+            style="plain", useOffset=False, axis="both")
 
         grid = self._grid_provider()
         if grid.is_empty():
@@ -900,30 +919,70 @@ class ModelCanvas(QWidget):
                          textcoords="offset points", fontsize=8,
                          color="#222222", zorder=9)
 
+    _SNAP_MARKER_STYLES = {
+        "node":     ("o", "#ff7f0e"),  # filled circle, orange
+        "diagram":  ("*", "#d62728"),  # star, red — post mode
+        "grid":     ("s", "#1f77b4"),  # square, blue
+        "endpoint": ("^", "#9467bd"),  # triangle, purple
+        "midpoint": ("D", "#17becf"),  # diamond, cyan
+        "project":  ("x", "#2ca02c"),  # x, green
+    }
+
     def _draw_snap_marker(self) -> None:
+        """Update the persistent hover/snap-marker artists in place.
+
+        Called both from ``redraw()`` (after ax.clear, when the cached
+        artist refs are None) and from ``repaint_hover_marker()`` between
+        redraws. Updating xdata/ydata + visibility on a persistent Line2D
+        is orders of magnitude cheaper than ``ax.plot()`` + a full scene
+        rebuild, which is what makes mouse-move hover feel snappy on
+        large models.
+        """
         c = self._snap_marker
         if c is not None:
-            marker_styles = {
-                "node":     ("o", "#ff7f0e"),  # filled circle, orange
-                "diagram":  ("*", "#d62728"),  # star, red — post mode
-                "grid":     ("s", "#1f77b4"),  # square, blue
-                "endpoint": ("^", "#9467bd"),  # triangle, purple
-                "midpoint": ("D", "#17becf"),  # diamond, cyan
-                "project":  ("x", "#2ca02c"),  # x, green
-            }
-            marker, color = marker_styles.get(c.kind, ("o", "#888"))
-            self.ax.plot(c.x, c.y, marker=marker, color=color, markersize=12,
-                         markerfacecolor="none", markeredgewidth=2,
-                         zorder=10)
+            marker, color = self._SNAP_MARKER_STYLES.get(c.kind, ("o", "#888"))
+            if self._snap_marker_artist is None:
+                (self._snap_marker_artist,) = self.ax.plot(
+                    [c.x], [c.y], marker=marker, color=color, markersize=12,
+                    markerfacecolor="none", markeredgewidth=2,
+                    linestyle="None", zorder=10,
+                )
+            else:
+                self._snap_marker_artist.set_data([c.x], [c.y])
+                self._snap_marker_artist.set_marker(marker)
+                self._snap_marker_artist.set_color(color)
+                self._snap_marker_artist.set_visible(True)
+            if self._hover_marker_artist is not None:
+                self._hover_marker_artist.set_visible(False)
             return
         # No real snap candidate → draw a faint "ghost" crosshair at
         # the rectangular-grid-snapped cursor so the user always knows
         # where a left-click would land.
+        if self._snap_marker_artist is not None:
+            self._snap_marker_artist.set_visible(False)
         if self._hover_xy is None:
+            if self._hover_marker_artist is not None:
+                self._hover_marker_artist.set_visible(False)
             return
         x, y = self._hover_xy
-        self.ax.plot(x, y, marker="+", color="#888888", markersize=14,
-                     markeredgewidth=1.5, alpha=0.7, zorder=10)
+        if self._hover_marker_artist is None:
+            (self._hover_marker_artist,) = self.ax.plot(
+                [x], [y], marker="+", color="#888888", markersize=14,
+                markeredgewidth=1.5, alpha=0.7, linestyle="None", zorder=10,
+            )
+        else:
+            self._hover_marker_artist.set_data([x], [y])
+            self._hover_marker_artist.set_visible(True)
+
+    def repaint_hover_marker(self) -> None:
+        """Update only the hover/snap marker and schedule a paint.
+
+        Used by ``_on_canvas_motion`` so mouse motion does not trigger a
+        full ``redraw()`` (which would clear and rebuild every artist —
+        grid, all elements, labels, diagrams — on every move).
+        """
+        self._draw_snap_marker()
+        self._mpl_canvas.draw_idle()
 
     def _draw_element_preview(self) -> None:
         if self._element_preview is not None:

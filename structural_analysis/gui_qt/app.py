@@ -2152,8 +2152,10 @@ class MainWindow(QMainWindow):
             if value_text:
                 parts.append(value_text)
         self._coord_label.setText("  |  ".join(parts))
-        # Repaint canvas if the snap marker changed.
-        self.canvas.redraw()
+        # Repaint only the hover/snap marker — a full canvas.redraw()
+        # here would clear and rebuild every artist on every mouse move,
+        # which is the dominant cost on large models.
+        self.canvas.repaint_hover_marker()
         try:
             self._active_tool.on_motion(hit, cursor_px=cursor_px)
         except Exception:
