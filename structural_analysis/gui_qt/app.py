@@ -411,6 +411,31 @@ class MainWindow(QMainWindow):
                                           triggered=self._set_grid_spacing)
         self.act_grid_system = QAction("Grid s&ystem…", self,
                                          triggered=self._edit_grid_system)
+        # The default reference grid and the generated structural grid are
+        # independent visual layers. Toggling either does NOT change
+        # snap behavior (grid_spacing still snaps clicks; GridSystem
+        # intersections still snap when populated). The tooltips state
+        # this so users don't expect a hidden snap-side effect.
+        _grid_tip = ("Display only — snap behavior is unchanged. "
+                     "Click position still snaps to the spacing grid.")
+        self.act_show_default_grid = QAction(
+            "Show &default grid", self, checkable=True, checked=True,
+            triggered=self._toggle_show_default_grid,
+        )
+        self.act_show_default_grid.setToolTip(_grid_tip)
+        self.act_show_generated_grid = QAction(
+            "Show &generated grid", self, checkable=True, checked=True,
+            triggered=self._toggle_show_generated_grid,
+        )
+        self.act_show_generated_grid.setToolTip(_grid_tip)
+        self.act_generate_grid_from_nodes = QAction(
+            "Generate grid &from nodes", self,
+            triggered=lambda _checked=False: self._do_generate_grid_from_nodes(),
+        )
+        self.act_clear_generated_grid = QAction(
+            "&Clear generated grid", self,
+            triggered=lambda _checked=False: self._do_clear_generated_grid(),
+        )
         self.act_fit_view = QAction("&Fit to view", self, shortcut="Home",
                                       triggered=self._do_fit_view)
         self.act_open_view3d = QAction(
@@ -742,8 +767,20 @@ class MainWindow(QMainWindow):
         m_view.addAction(self.act_fit_view)
         m_view.addAction(self.act_open_view3d)
         m_view.addSeparator()
-        m_view.addAction(self.act_grid_system)
-        m_view.addAction(self.act_grid_spacing)
+        # Grid submenu — the default reference grid and the generated
+        # structural grid are independent visual layers. (PR #56 follow-up:
+        # populating a GridSystem used to silently hide the default grid.)
+        m_grid = m_view.addMenu("&Grid")
+        m_grid.addAction(self.act_show_default_grid)
+        m_grid.addAction(self.act_show_generated_grid)
+        m_grid.addSeparator()
+        m_grid.addAction(self.act_generate_grid_from_nodes)
+        m_grid.addAction(self.act_clear_generated_grid)
+        m_grid.addSeparator()
+        m_grid.addAction(self.act_grid_system)
+        m_grid.addAction(self.act_grid_spacing)
+        self._m_grid = m_grid  # keep reference for tests
+        self._refresh_grid_actions_enabled()
         m_view.addAction(self.act_snap)
         m_view.addSeparator()
         for a in self._snap_actions.values():
@@ -2243,8 +2280,10 @@ class MainWindow(QMainWindow):
             if value_text:
                 parts.append(value_text)
         self._coord_label.setText("  |  ".join(parts))
-        # Repaint canvas if the snap marker changed.
-        self.canvas.redraw()
+        # Repaint only the hover/snap marker — a full canvas.redraw()
+        # here would clear and rebuild every artist on every mouse move,
+        # which is the dominant cost on large models.
+        self.canvas.repaint_hover_marker()
         try:
             self._active_tool.on_motion(hit, cursor_px=cursor_px)
         except Exception:
@@ -2317,6 +2356,13 @@ class MainWindow(QMainWindow):
 
     # ── grid / snap ──
 
+    def _set_grid(self, g) -> None:
+        """Setter passed to SetGridSystemCmd: assigns the grid and keeps
+        the grid-action enable state in sync (so undo/redo flip the
+        Show generated / Clear generated actions automatically)."""
+        self._grid = g
+        self._refresh_grid_actions_enabled()
+
     def _edit_grid_system(self) -> None:
         d = GridDialog(
             self,
@@ -2329,8 +2375,70 @@ class MainWindow(QMainWindow):
             self.execute(SetGridSystemCmd(
                 new_grid=new_grid,
                 getter=lambda: self._grid,
-                setter=lambda g: setattr(self, "_grid", g),
+                setter=self._set_grid,
             ))
+
+    def _toggle_show_default_grid(self) -> None:
+        self.canvas.show_default_grid = self.act_show_default_grid.isChecked()
+        self.canvas.redraw()
+
+    def _toggle_show_generated_grid(self) -> None:
+        self.canvas.show_generated_grid = (
+            self.act_show_generated_grid.isChecked()
+        )
+        self.canvas.redraw()
+
+    def _refresh_grid_actions_enabled(self) -> None:
+        """Disable generated-grid actions when no GridSystem is present."""
+        has_grid = not self._grid.is_empty()
+        self.act_show_generated_grid.setEnabled(has_grid)
+        self.act_clear_generated_grid.setEnabled(has_grid)
+
+    def _do_generate_grid_from_nodes(self) -> None:
+        """Build a GridSystem from unique node X/Y coordinates and apply
+        it through SetGridSystemCmd (so undo/redo works).
+
+        Visual layer only — does not change snap behavior. The new grid
+        gains snap-target status as a SIDE EFFECT of populating the
+        GridSystem (it does today already, via the snap engine's "grid"
+        kind); this action does not disable the existing rectangular
+        snap_spacing fallback.
+        """
+        if not self._model.nodes:
+            self._status_label.setText(
+                "Generate grid from nodes: model has no nodes."
+            )
+            return
+        from .grid import GridLine, GridSystem, _label
+        xs = sorted({float(n.x) for n in self._model.nodes.values()})
+        ys = sorted({float(n.y) for n in self._model.nodes.values()})
+        x_lines = [GridLine(_label(i, "alpha"), x) for i, x in enumerate(xs)]
+        y_lines = [GridLine(_label(i, "numeric"), y) for i, y in enumerate(ys)]
+        new_grid = GridSystem(x_lines=x_lines, y_lines=y_lines)
+        self.execute(SetGridSystemCmd(
+            new_grid=new_grid,
+            getter=lambda: self._grid,
+            setter=self._set_grid,
+        ))
+        self.canvas.show_generated_grid = True
+        self.act_show_generated_grid.setChecked(True)
+        self._refresh_grid_actions_enabled()
+        self._status_label.setText(
+            f"Generated structural grid: {len(x_lines)} × {len(y_lines)} "
+            f"line(s) from {len(self._model.nodes)} node(s)."
+        )
+
+    def _do_clear_generated_grid(self) -> None:
+        from .grid import GridSystem
+        if self._grid.is_empty():
+            return
+        self.execute(SetGridSystemCmd(
+            new_grid=GridSystem(),
+            getter=lambda: self._grid,
+            setter=self._set_grid,
+        ))
+        self._refresh_grid_actions_enabled()
+        self._status_label.setText("Generated structural grid cleared.")
 
     def _toggle_snap_kind(self, kind: str) -> None:
         if self._snap_actions[kind].isChecked():
@@ -3133,6 +3241,7 @@ class MainWindow(QMainWindow):
             return
         self._model = _build_starter_model()
         self._grid = GridSystem()
+        self._refresh_grid_actions_enabled()
         self._groups = {}
         self._undo.clear()
         self._redo.clear()
@@ -3184,6 +3293,7 @@ class MainWindow(QMainWindow):
             return
         self._model = new_model
         self._grid = new_grid
+        self._refresh_grid_actions_enabled()
         self._groups = new_groups
         self._undo.clear()
         self._redo.clear()

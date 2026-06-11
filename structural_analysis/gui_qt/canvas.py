@@ -20,7 +20,7 @@ from matplotlib import patheffects as _path_effects
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT,
 )
-from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import Locator
 
 from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
@@ -93,6 +93,59 @@ class HitResult:
     snap_label: str = ""   # human-readable target description
 
 
+class AdaptiveGridLocator(Locator):
+    """Coordinate-axis tick locator that stays readable at any zoom.
+
+    Ticks land on multiples of a *base* spacing (the snap grid), but the
+    spacing is coarsened in a 1-2-5 progression (base × 1, 2, 5, 10, 20,
+    50, …) so that no more than ``max_ticks`` labels fall inside the
+    current view. A fixed ``MultipleLocator`` instead emits one tick per
+    base step regardless of zoom, so the numbers collide as soon as the
+    user zooms out.
+
+    matplotlib re-invokes the locator on *every* draw using the live view
+    interval, so this self-adjusts during scroll-zoom — which only calls
+    ``draw_idle`` and never rebuilds the grid — as well as on full redraws.
+    Ticks are never made finer than ``base``, so zooming in still reveals
+    the true snap grid rather than inventing sub-grid coordinates.
+    """
+
+    def __init__(self, base: float, max_ticks: int) -> None:
+        self._base = float(base)
+        self._max_ticks = max(1, int(max_ticks))
+
+    def __call__(self):
+        vmin, vmax = self.axis.get_view_interval()
+        return self.tick_values(vmin, vmax)
+
+    def step_for_span(self, span: float) -> float:
+        """Smallest base×{1,2,5,10,…} step keeping ≤ max_ticks in ``span``."""
+        step = self._base
+        if step <= 0.0 or span <= 0.0:
+            return max(step, 0.0)
+        seq = (1, 2, 5)
+        i = 0
+        while span / step > self._max_ticks:
+            i += 1
+            step = self._base * seq[i % 3] * (10 ** (i // 3))
+        return step
+
+    def tick_values(self, vmin, vmax):
+        if vmax < vmin:
+            vmin, vmax = vmax, vmin
+        step = self.step_for_span(vmax - vmin)
+        if step <= 0.0:
+            return []
+        first = math.ceil(vmin / step) * step
+        ticks = []
+        x = first
+        # +0.5·step guards the final tick against floating-point drift.
+        while x <= vmax + step * 0.5:
+            ticks.append(x)
+            x += step
+        return self.raise_if_exceeds(ticks)
+
+
 class ModelCanvas(QWidget):
     """A QWidget containing the matplotlib figure + its navigation toolbar."""
 
@@ -101,6 +154,9 @@ class ModelCanvas(QWidget):
     MAX_AUTO_NODE_LABELS = 300
     MAX_AUTO_ELEMENT_LABELS = 250
     MAX_LABELED_GRID_LINES = 240
+    # Max coordinate numbers per axis before AdaptiveGridLocator coarsens
+    # the spacing — keeps the spine labels from colliding when zoomed out.
+    MAX_AXIS_LABELS = 12
 
     def __init__(self, parent: QWidget | None,
                  model_provider: Callable[[], StructuralModel],
@@ -111,6 +167,16 @@ class ModelCanvas(QWidget):
         self.grid_spacing: float = 0.5
         self.snap_enabled: bool = True
         self.snap_engine = SnapEngine(tolerance_px=10.0)
+        # Two independent grid display layers (snap is unaffected by either):
+        #   show_default_grid    — the dotted ``grid_spacing`` reference grid
+        #   show_generated_grid  — the labeled GridSystem from _grid_provider
+        # Either can be toggled on/off without affecting snap. ``_snap()``
+        # always rounds to ``grid_spacing`` when no snap-engine candidate
+        # wins, and the snap engine always emits GridSystem-intersection
+        # candidates when the system is non-empty — regardless of these
+        # display flags.
+        self.show_default_grid: bool = True
+        self.show_generated_grid: bool = True
 
         self.show_deformed: bool = True
         self.show_reactions: bool = True
@@ -155,6 +221,14 @@ class ModelCanvas(QWidget):
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
+        # Persistent matplotlib Line2D artists for the hover/snap markers.
+        # We re-use them across hover-only repaints (which avoid a full
+        # ax.clear()) so the markers can be moved by updating xdata/ydata
+        # + draw_idle() instead of rebuilding the whole scene. ax.clear()
+        # in redraw() detaches them; _draw_snap_marker rebuilds them
+        # lazily on the next paint.
+        self._snap_marker_artist = None     # solid snap-target marker
+        self._hover_marker_artist = None    # faint "+" ghost crosshair
         # Either anchored at an existing node id (legacy) or a free
         # start point (v0.10.0 — first click landed on empty space and
         # no node has been created yet). Exactly one is non-None at a
@@ -479,6 +553,10 @@ class ModelCanvas(QWidget):
         self._setting_axes_limits = True
         try:
             self.ax.clear()
+            # ax.clear() destroys all artists; drop our cached references
+            # so _draw_snap_marker rebuilds them on the next paint.
+            self._snap_marker_artist = None
+            self._hover_marker_artist = None
             self.ax.set_aspect("equal", adjustable="box")
 
             if saved_xlim is not None:
@@ -614,7 +692,8 @@ class ModelCanvas(QWidget):
             # Cursor left the axes — drop the hover marker.
             if self._hover_xy is not None:
                 self._hover_xy = None
-                self._mpl_canvas.draw_idle()
+                self._snap_marker = None
+                self.repaint_hover_marker()
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -759,19 +838,43 @@ class ModelCanvas(QWidget):
     # ── drawing ──
 
     def _draw_grid(self) -> None:
+        # Spine coordinate numbers use an adaptive locator so they never
+        # collide as the user zooms — a fixed step would pile up on
+        # zoom-out. ax.clear() (in redraw) resets the locator, so it is
+        # re-installed here every redraw; between redraws matplotlib keeps
+        # re-invoking it, which is what makes scroll-zoom stay readable.
+        self.ax.xaxis.set_major_locator(
+            AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
+        self.ax.yaxis.set_major_locator(
+            AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
+        # Show absolute metre values on the spine — never the confusing
+        # "+1e3" offset-notation corner label matplotlib adds when the
+        # coordinates are large. ax.clear() re-enables it, so set this
+        # every redraw alongside the locator.
+        self.ax.ticklabel_format(
+            style="plain", useOffset=False, axis="both")
+
         grid = self._grid_provider()
-        if grid.is_empty():
-            # Fall back to a uniform-spacing grid.
-            self.ax.xaxis.set_major_locator(MultipleLocator(self.grid_spacing))
-            self.ax.yaxis.set_major_locator(MultipleLocator(self.grid_spacing))
+        # The two layers are drawn independently — populating a GridSystem
+        # no longer hides the default reference grid. When both are on,
+        # the default grid is faded so the named structural grid stays
+        # visually dominant; when only the default is on, it uses its
+        # full weight as the user expects.
+        gen_visible = self.show_generated_grid and not grid.is_empty()
+        if self.show_default_grid:
+            alpha = 0.4 if gen_visible else 1.0
             self.ax.grid(True, which="major", linestyle=":", linewidth=0.5,
-                         color="#cccccc")
+                         color="#cccccc", alpha=alpha)
+        else:
+            self.ax.grid(False)
+        if not gen_visible:
             return
-        # Draw the labeled grid manually. Don't enable matplotlib's auto-grid.
-        # Only draw lines that can be seen in the current viewport; this keeps
-        # pan/zoom responsive on large building grids and avoids edge labels
-        # piling up far outside the user's view.
-        self.ax.grid(False)
+        # Draw the labeled grid manually as Line2D + text overlays. The
+        # default-grid enable above is NOT undone here — both layers can
+        # render simultaneously when both flags are on (the default is
+        # already drawn lighter so the labeled grid stays prominent).
+        # Only draw lines visible in the current viewport so pan/zoom
+        # stay responsive on large building grids.
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
         x_pad = max(abs(x1 - x0) * 0.02, 1e-9)
@@ -835,30 +938,70 @@ class ModelCanvas(QWidget):
                          textcoords="offset points", fontsize=8,
                          color="#222222", zorder=9)
 
+    _SNAP_MARKER_STYLES = {
+        "node":     ("o", "#ff7f0e"),  # filled circle, orange
+        "diagram":  ("*", "#d62728"),  # star, red — post mode
+        "grid":     ("s", "#1f77b4"),  # square, blue
+        "endpoint": ("^", "#9467bd"),  # triangle, purple
+        "midpoint": ("D", "#17becf"),  # diamond, cyan
+        "project":  ("x", "#2ca02c"),  # x, green
+    }
+
     def _draw_snap_marker(self) -> None:
+        """Update the persistent hover/snap-marker artists in place.
+
+        Called both from ``redraw()`` (after ax.clear, when the cached
+        artist refs are None) and from ``repaint_hover_marker()`` between
+        redraws. Updating xdata/ydata + visibility on a persistent Line2D
+        is orders of magnitude cheaper than ``ax.plot()`` + a full scene
+        rebuild, which is what makes mouse-move hover feel snappy on
+        large models.
+        """
         c = self._snap_marker
         if c is not None:
-            marker_styles = {
-                "node":     ("o", "#ff7f0e"),  # filled circle, orange
-                "diagram":  ("*", "#d62728"),  # star, red — post mode
-                "grid":     ("s", "#1f77b4"),  # square, blue
-                "endpoint": ("^", "#9467bd"),  # triangle, purple
-                "midpoint": ("D", "#17becf"),  # diamond, cyan
-                "project":  ("x", "#2ca02c"),  # x, green
-            }
-            marker, color = marker_styles.get(c.kind, ("o", "#888"))
-            self.ax.plot(c.x, c.y, marker=marker, color=color, markersize=12,
-                         markerfacecolor="none", markeredgewidth=2,
-                         zorder=10)
+            marker, color = self._SNAP_MARKER_STYLES.get(c.kind, ("o", "#888"))
+            if self._snap_marker_artist is None:
+                (self._snap_marker_artist,) = self.ax.plot(
+                    [c.x], [c.y], marker=marker, color=color, markersize=12,
+                    markerfacecolor="none", markeredgewidth=2,
+                    linestyle="None", zorder=10,
+                )
+            else:
+                self._snap_marker_artist.set_data([c.x], [c.y])
+                self._snap_marker_artist.set_marker(marker)
+                self._snap_marker_artist.set_color(color)
+                self._snap_marker_artist.set_visible(True)
+            if self._hover_marker_artist is not None:
+                self._hover_marker_artist.set_visible(False)
             return
         # No real snap candidate → draw a faint "ghost" crosshair at
         # the rectangular-grid-snapped cursor so the user always knows
         # where a left-click would land.
+        if self._snap_marker_artist is not None:
+            self._snap_marker_artist.set_visible(False)
         if self._hover_xy is None:
+            if self._hover_marker_artist is not None:
+                self._hover_marker_artist.set_visible(False)
             return
         x, y = self._hover_xy
-        self.ax.plot(x, y, marker="+", color="#888888", markersize=14,
-                     markeredgewidth=1.5, alpha=0.7, zorder=10)
+        if self._hover_marker_artist is None:
+            (self._hover_marker_artist,) = self.ax.plot(
+                [x], [y], marker="+", color="#888888", markersize=14,
+                markeredgewidth=1.5, alpha=0.7, linestyle="None", zorder=10,
+            )
+        else:
+            self._hover_marker_artist.set_data([x], [y])
+            self._hover_marker_artist.set_visible(True)
+
+    def repaint_hover_marker(self) -> None:
+        """Update only the hover/snap marker and schedule a paint.
+
+        Used by ``_on_canvas_motion`` so mouse motion does not trigger a
+        full ``redraw()`` (which would clear and rebuild every artist —
+        grid, all elements, labels, diagrams — on every move).
+        """
+        self._draw_snap_marker()
+        self._mpl_canvas.draw_idle()
 
     def _draw_element_preview(self) -> None:
         if self._element_preview is not None:

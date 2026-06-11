@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.31.1"
+__version__ = "0.30.8"
 __what_is_new__ = (
-    "Assign / Clear rigid offsets commands (selection or all frames) · "
-    "Auto-offsets from physical joint overlap with safe-span guard · "
-    "Creation dialog stays simple; L_total / L_flex live in Element Details"
+    "Default and generated grids are independent visual layers (toggle each) · "
+    "View → Grid: Generate from nodes, Clear generated grid (undoable) · "
+    "Snap behavior unchanged — display toggles never silently affect clicks"
 )
 
 from .model import (
