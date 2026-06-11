@@ -7,11 +7,13 @@ through a ray cast onto a selectable axis-aligned construction plane
 (the 3D generalisation of the 2D canvas's work-plane + working-depth
 pair).
 
-Dependency policy: ``pyqtgraph`` + ``PyOpenGL`` are OPTIONAL (the
-``gl`` extra in pyproject). When they are missing — or the platform
-cannot create a GL context — the host shows a friendly message and
-every other feature keeps working; nothing else imports this module
-eagerly.
+Dependency policy: ``pyqtgraph`` + ``PyOpenGL`` ship as standard
+dependencies since v0.33.1 (originally an optional extra — "dependency
+not installed" was the first thing users hit). The import stays
+guarded: on an environment that predates the dependency bump, or when
+the platform cannot create a GL context, the host shows an actionable
+message with the exact install command and every other feature keeps
+working; nothing else imports this module eagerly.
 
 All click-interpretation math (projection, picking, rays) lives in
 :mod:`structural_analysis.gui_common.spatial` so it stays unit-
@@ -48,9 +50,16 @@ except Exception as exc:  # noqa: BLE001 — any import failure disables GL
 def gl_available() -> tuple[bool, str]:
     """Whether the OpenGL stack imported. ``(ok, reason_if_not)``."""
     if gl is None:
+        import sys
         return False, (
-            "The 3D viewport needs the optional 'pyqtgraph' + 'PyOpenGL' "
-            f"packages (pip install pyqtgraph PyOpenGL). {_GL_IMPORT_ERROR}"
+            "The 3D viewport needs the 'pyqtgraph' and 'PyOpenGL' "
+            "packages, which are not installed in this Python "
+            "environment.\n\nInstall them with:\n\n"
+            f"    {sys.executable} -m pip install pyqtgraph PyOpenGL\n\n"
+            "then restart the application. (They are part of the "
+            "standard dependencies as of v0.33.1 — `pip install .` in "
+            "the project folder also picks them up.)\n\n"
+            f"Details: {_GL_IMPORT_ERROR}"
         )
     return True, ""
 

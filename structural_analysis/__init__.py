@@ -1,10 +1,10 @@
 """2D/3D Structural Analysis Package — CE 4011 Assignment 4."""
 
-__version__ = "0.33.0"
+__version__ = "0.33.1"
 __what_is_new__ = (
-    "OpenGL 3D viewport (beta): orbit, pick, draw in space · "
-    "3D load dialogs + projected arrows, Tab cycles stacked nodes · "
-    "3D rigid offsets, Section Iy/roll, storeys, all-view diagrams"
+    "Fast canvas: cursor repaints via blitting (no per-move rebuild) · "
+    "OpenGL 3D viewport (beta) with deps now installed by default · "
+    "3D loads/offsets/Iy/roll, Tab cycles stacks, storeys"
 )
 
 from .model import (

@@ -400,3 +400,46 @@ def test_storeys_persist_in_project_viewstate(qt_app, tmp_path):
     # Legacy dicts (no storeys key) stay loadable.
     legacy = {k: v for k, v in data.items() if k != "storeys"}
     assert ViewState.from_dict(legacy).storeys == []
+
+
+# ── v0.33.1: blitted hover overlay (canvas performance) ────────
+
+
+def test_mouse_motion_never_triggers_full_redraw(qt_app, monkeypatch):
+    """Per-move full scene rebuilds were the canvas lag — pin the fix:
+    the motion handler must use the blit overlay, not canvas.redraw."""
+    w = MainWindow(initial_path="inputs/example_3d_table_frame.txt")
+    qt_app.processEvents()
+    w.canvas._mpl_canvas.draw()  # establish the blit background
+
+    full_redraws: list[int] = []
+    overlay_updates: list[int] = []
+    monkeypatch.setattr(w.canvas, "redraw",
+                        lambda: full_redraws.append(1))
+    monkeypatch.setattr(w.canvas, "update_hover_overlay",
+                        lambda: overlay_updates.append(1))
+    w._on_canvas_motion(HitResult(x=1.0, y=1.0), (100.0, 100.0))
+    assert full_redraws == []
+    assert overlay_updates == [1]
+
+
+def test_update_hover_overlay_paths(qt_app):
+    w = MainWindow(initial_path="inputs/example_3d_table_frame.txt")
+    qt_app.processEvents()
+    w.canvas._mpl_canvas.draw()
+    assert w.canvas._overlay_bg is not None  # captured via draw_event
+
+    # Hover ghost, member rubber-band, and box-select rect all repaint
+    # through the blit path without touching the scene artists.
+    w.canvas._hover_xy = (1.0, 1.0)
+    w.canvas.update_hover_overlay()
+    w.canvas.set_element_preview_free(0.0, 0.0, 2.0, 1.0, "frame")
+    w.canvas.update_hover_overlay()
+    assert list(w.canvas._overlay_preview_line.get_xdata()) == [0.0, 2.0]
+    w.canvas.set_drag_rect(0.0, 0.0, 1.0, 1.0, True)
+    w.canvas.update_hover_overlay()
+    assert w.canvas._overlay_rect.get_visible()
+    w.canvas.clear_drag_rect()
+    w.canvas.clear_element_preview()
+    w.canvas.update_hover_overlay()
+    assert not w.canvas._overlay_rect.get_visible()

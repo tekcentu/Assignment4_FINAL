@@ -330,6 +330,21 @@ class ModelCanvas(QWidget):
         self._mpl_canvas.mpl_connect("motion_notify_event", self._handle_motion)
         self._mpl_canvas.mpl_connect("scroll_event", self._handle_scroll)
 
+        # ── blitted hover overlay (v0.33.1 — performance) ──
+        # Mouse motion used to trigger a FULL scene rebuild per event
+        # (ax.clear + every artist recreated — tens of ms even on small
+        # models). The cursor-following decorations (snap marker, hover
+        # ghost, member rubber-band, box-select rectangle) now live on
+        # dedicated animated artists composited over a cached background
+        # with canvas blitting; a real redraw only happens when the
+        # scene itself changes.
+        self._overlay_bg = None
+        self._overlay_marker = None
+        self._overlay_preview_line = None
+        self._overlay_preview_ends = None
+        self._overlay_rect = None
+        self._mpl_canvas.mpl_connect("draw_event", self._capture_overlay_bg)
+
     # ── public API ──
 
     # ── 3D view plane (v0.32) ──
@@ -748,10 +763,11 @@ class ModelCanvas(QWidget):
             self._mpl_canvas.draw_idle()
             return
         if self.on_motion is None or event.inaxes is not self.ax:
-            # Cursor left the axes — drop the hover marker.
-            if self._hover_xy is not None:
+            # Cursor left the axes — drop the hover marker (cheap blit).
+            if self._hover_xy is not None or self._snap_marker is not None:
                 self._hover_xy = None
-                self._mpl_canvas.draw_idle()
+                self._snap_marker = None
+                self.update_hover_overlay()
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -1065,6 +1081,141 @@ class ModelCanvas(QWidget):
             self.ax.annotate(name, (ex, ey), xytext=(4, 2),
                              textcoords="offset points", fontsize=8,
                              color="#222222", zorder=9)
+
+    # ── blitted hover overlay (v0.33.1) ───────────────────────────
+
+    def _capture_overlay_bg(self, _event) -> None:
+        """Cache the freshly rendered scene as the blit background.
+
+        Fires on every real matplotlib draw (full redraw, resize, pan,
+        zoom), so the cache can never go stale relative to the scene.
+        """
+        try:
+            self._overlay_bg = self._mpl_canvas.copy_from_bbox(
+                self.fig.bbox,
+            )
+        except Exception:  # pragma: no cover — backend without blitting
+            self._overlay_bg = None
+
+    def _ensure_overlay_artists(self) -> None:
+        """(Re)create the animated overlay artists after an ax.clear."""
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Rectangle
+
+        if (self._overlay_marker is not None
+                and self._overlay_marker.axes is self.ax):
+            return
+        self._overlay_marker = Line2D(
+            [], [], linestyle="None", marker="o", markersize=12,
+            markerfacecolor="none", markeredgewidth=2, zorder=10,
+            animated=True,
+        )
+        self.ax.add_line(self._overlay_marker)
+        self._overlay_preview_line = Line2D(
+            [], [], linewidth=2.4, alpha=0.55, zorder=3, animated=True,
+        )
+        self.ax.add_line(self._overlay_preview_line)
+        self._overlay_preview_ends = Line2D(
+            [], [], linestyle="None", marker="o", markersize=5,
+            markerfacecolor="white", alpha=0.85, zorder=9,
+            animated=True,
+        )
+        self.ax.add_line(self._overlay_preview_ends)
+        self._overlay_rect = Rectangle(
+            (0, 0), 0, 0, linewidth=1.4, alpha=0.10, fill=True,
+            zorder=12, animated=True, visible=False,
+        )
+        self.ax.add_patch(self._overlay_rect)
+
+    def _style_overlay_marker(self) -> None:
+        m = self._overlay_marker
+        c = self._snap_marker
+        if c is not None:
+            marker_styles = {
+                "node":     ("o", "#ff7f0e"),
+                "diagram":  ("*", "#d62728"),
+                "grid":     ("s", "#1f77b4"),
+                "endpoint": ("^", "#9467bd"),
+                "midpoint": ("D", "#17becf"),
+                "project":  ("x", "#2ca02c"),
+            }
+            marker, color = marker_styles.get(c.kind, ("o", "#888"))
+            m.set_data([c.x], [c.y])
+            m.set_marker(marker)
+            m.set_markersize(12)
+            m.set_markeredgewidth(2)
+            m.set_color(color)
+            m.set_alpha(1.0)
+        elif self._hover_xy is not None:
+            x, y = self._hover_xy
+            m.set_data([x], [y])
+            m.set_marker("+")
+            m.set_markersize(14)
+            m.set_markeredgewidth(1.5)
+            m.set_color("#888888")
+            m.set_alpha(0.7)
+        else:
+            m.set_data([], [])
+
+    def _style_overlay_preview(self) -> None:
+        line = self._overlay_preview_line
+        ends = self._overlay_preview_ends
+        if self._element_preview is not None:
+            start_node_id, end_x, end_y, kind = self._element_preview
+            start = self.projected_model().nodes.get(start_node_id)
+            if start is None:
+                line.set_data([], [])
+                ends.set_data([], [])
+                return
+            sx, sy = start.x, start.y
+            end_pts = ([end_x], [end_y])
+        elif self._element_preview_free is not None:
+            sx, sy, end_x, end_y, kind = self._element_preview_free
+            end_pts = ([sx, end_x], [sy, end_y])
+        else:
+            line.set_data([], [])
+            ends.set_data([], [])
+            return
+        color = "#1f77b4" if kind == "frame" else "#d62728"
+        line.set_data([sx, end_x], [sy, end_y])
+        line.set_color(color)
+        line.set_linestyle("-" if kind == "frame" else "--")
+        ends.set_data(*end_pts)
+        ends.set_markeredgecolor(color)
+
+    def _style_overlay_rect(self) -> None:
+        rect = self._overlay_rect
+        if self._drag_rect is None:
+            rect.set_visible(False)
+            return
+        x0, y0, x1, y1, is_crossing = self._drag_rect
+        color = "#2da44e" if is_crossing else "#1f6feb"
+        rect.set_bounds(min(x0, x1), min(y0, y1),
+                        abs(x1 - x0), abs(y1 - y0))
+        rect.set_edgecolor(color)
+        rect.set_facecolor(color)
+        rect.set_linestyle("--" if is_crossing else "-")
+        rect.set_visible(True)
+
+    def update_hover_overlay(self) -> None:
+        """Cheap per-mouse-move repaint: blit the cursor decorations
+        over the cached scene instead of rebuilding the scene."""
+        if self._overlay_bg is None:
+            # No background yet (first paint still pending) — fall back
+            # to a real draw, which captures one via the draw_event.
+            self._mpl_canvas.draw_idle()
+            return
+        self._ensure_overlay_artists()
+        self._style_overlay_marker()
+        self._style_overlay_preview()
+        self._style_overlay_rect()
+        canvas = self._mpl_canvas
+        canvas.restore_region(self._overlay_bg)
+        self.ax.draw_artist(self._overlay_marker)
+        self.ax.draw_artist(self._overlay_preview_line)
+        self.ax.draw_artist(self._overlay_preview_ends)
+        self.ax.draw_artist(self._overlay_rect)
+        canvas.blit(self.fig.bbox)
 
     def _draw_snap_marker(self) -> None:
         c = self._snap_marker

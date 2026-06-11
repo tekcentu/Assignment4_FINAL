@@ -2406,12 +2406,16 @@ class MainWindow(QMainWindow):
             if value_text:
                 parts.append(value_text)
         self._coord_label.setText("  |  ".join(parts))
-        # Repaint canvas if the snap marker changed.
-        self.canvas.redraw()
         try:
             self._active_tool.on_motion(hit, cursor_px=cursor_px)
         except Exception:
             pass
+        # v0.33.1 — cursor decorations (snap marker, rubber-band
+        # preview, box-select rect) repaint via a cached-background
+        # blit instead of the old full-scene rebuild per mouse move,
+        # which made the canvas visibly lag on real models. Runs AFTER
+        # the tool hook so preview state is already fresh.
+        self.canvas.update_hover_overlay()
 
     def _diagram_value_text_for_hit(self, hit: HitResult) -> str | None:
         """Return a "Moment: +12.3 kN·m @ x=4.5 m" tail for the status

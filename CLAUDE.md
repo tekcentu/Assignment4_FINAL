@@ -15,8 +15,9 @@ legacy 2D pipeline bit-identical. The GUI canvas shows 3D models via
 work-plane projection (View → Work plane: XY/XZ/ZY/isometric); geometry
 creation happens on the XY plane at the View → Working depth z level.
 
-v0.33 additions: an optional OpenGL viewport (`gui_qt/viewport3d.py`,
-pyqtgraph + PyOpenGL via the `gl` extra; click math in the Qt-free
+v0.33 additions: an OpenGL viewport (`gui_qt/viewport3d.py`,
+pyqtgraph + PyOpenGL — standard deps since v0.33.1, import still
+guarded; click math in the Qt-free
 `gui_common/spatial.py`); 3D components in the load dialogs with
 projected canvas arrows; Tab cycles coincident node projections; 3D
 rigid end offsets (12-DOF rigid-arm transform in `element3d.py`);
@@ -24,6 +25,14 @@ rigid end offsets (12-DOF rigid-arm transform in `element3d.py`);
 curved 3D deformed shapes and in-plane N/V/M diagrams in every view;
 a storey manager (named z-levels, persisted in `.spa.json`); 3D mass
 matrices on the space elements (modal stays 2D-gated).
+
+Canvas performance (v0.33.1): mouse motion repaints cursor decorations
+(snap marker, hover ghost, rubber-band preview, box-select rect) by
+blitting animated artists over a cached background
+(`canvas.update_hover_overlay`); a full `canvas.redraw()` runs only
+when the scene actually changes. Never reintroduce a per-motion
+`redraw()` — it rebuilds every matplotlib artist and lags on real
+models.
 
 ## Commands
 
