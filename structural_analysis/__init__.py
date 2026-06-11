@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.30.7"
+__version__ = "0.30.8"
 __what_is_new__ = (
-    "Canvas coordinate numbers stay readable at any zoom (adaptive 1-2-5 ticks) · "
-    "Axis labels show plain metre values — no '+1e3' offset notation · "
-    "Hover snap-marker updates skip the full scene rebuild (smoother on big models)"
+    "Default and generated grids are independent visual layers (toggle each) · "
+    "View → Grid: Generate from nodes, Clear generated grid (undoable) · "
+    "Snap behavior unchanged — display toggles never silently affect clicks"
 )
 
 from .model import (

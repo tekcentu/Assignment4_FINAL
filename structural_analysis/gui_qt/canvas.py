@@ -166,6 +166,16 @@ class ModelCanvas(QWidget):
         self.grid_spacing: float = 0.5
         self.snap_enabled: bool = True
         self.snap_engine = SnapEngine(tolerance_px=10.0)
+        # Two independent grid display layers (snap is unaffected by either):
+        #   show_default_grid    — the dotted ``grid_spacing`` reference grid
+        #   show_generated_grid  — the labeled GridSystem from _grid_provider
+        # Either can be toggled on/off without affecting snap. ``_snap()``
+        # always rounds to ``grid_spacing`` when no snap-engine candidate
+        # wins, and the snap engine always emits GridSystem-intersection
+        # candidates when the system is non-empty — regardless of these
+        # display flags.
+        self.show_default_grid: bool = True
+        self.show_generated_grid: bool = True
 
         self.show_deformed: bool = True
         self.show_reactions: bool = True
@@ -844,18 +854,26 @@ class ModelCanvas(QWidget):
             style="plain", useOffset=False, axis="both")
 
         grid = self._grid_provider()
-        if grid.is_empty():
-            # Fall back to a uniform reference grid drawn at the same
-            # adaptive ticks, so the dotted lines coarsen with the labels
-            # instead of smearing into a solid block when zoomed out.
+        # The two layers are drawn independently — populating a GridSystem
+        # no longer hides the default reference grid. When both are on,
+        # the default grid is faded so the named structural grid stays
+        # visually dominant; when only the default is on, it uses its
+        # full weight as the user expects.
+        gen_visible = self.show_generated_grid and not grid.is_empty()
+        if self.show_default_grid:
+            alpha = 0.4 if gen_visible else 1.0
             self.ax.grid(True, which="major", linestyle=":", linewidth=0.5,
-                         color="#cccccc")
+                         color="#cccccc", alpha=alpha)
+        else:
+            self.ax.grid(False)
+        if not gen_visible:
             return
-        # Draw the labeled grid manually. Don't enable matplotlib's auto-grid.
-        # Only draw lines that can be seen in the current viewport; this keeps
-        # pan/zoom responsive on large building grids and avoids edge labels
-        # piling up far outside the user's view.
-        self.ax.grid(False)
+        # Draw the labeled grid manually as Line2D + text overlays. The
+        # default-grid enable above is NOT undone here — both layers can
+        # render simultaneously when both flags are on (the default is
+        # already drawn lighter so the labeled grid stays prominent).
+        # Only draw lines visible in the current viewport so pan/zoom
+        # stay responsive on large building grids.
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
         x_pad = max(abs(x1 - x0) * 0.02, 1e-9)
