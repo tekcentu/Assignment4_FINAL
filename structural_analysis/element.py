@@ -365,6 +365,10 @@ class FrameElement2D(Element2D):
     release_j: bool = False
     offset_i: float = 0.0
     offset_j: float = 0.0
+    # 3D (v0.33): rotation of the section about the member axis (rad),
+    # consumed by the 2D→3D promotion's local-axes construction. Has
+    # no effect on the planar solve.
+    roll: float = 0.0
 
     @property
     def kind(self) -> str:

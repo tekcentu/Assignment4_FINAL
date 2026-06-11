@@ -2033,15 +2033,9 @@ class ModelCanvas(QWidget):
             return [ni.x, nj.x], [ni.y, nj.y]
         d = mr["d_local"]
         if len(d) != 6:
-            # 3D solve (12 local DOFs): fall back to a straight line
-            # between the projected displaced endpoints — the smooth
-            # Hermite interpolation is a planar formulation.
-            uxi, uyi = self._node_displacement(elem.node_i)
-            uxj, uyj = self._node_displacement(elem.node_j)
-            return (
-                [ni.x + scale * uxi, nj.x + scale * uxj],
-                [ni.y + scale * uyi, nj.y + scale * uyj],
-            )
+            # 3D solve (12 local DOFs): Hermite-interpolate the curve
+            # in BOTH local bending planes and project it (v0.33).
+            return self._frame_deformed_points_3d(elem, d, scale)
         ui_loc, vi_loc, thi = float(d[0]), float(d[1]), float(d[2])
         uj_loc, vj_loc, thj = float(d[3]), float(d[4]), float(d[5])
         n = max(2, int(self.deformed_stations))
@@ -2055,6 +2049,56 @@ class ModelCanvas(QWidget):
             y_def = scale * v_loc
             Xs.append(ni.x + c * x_def - s * y_def)
             Ys.append(ni.y + s * x_def + c * y_def)
+        return Xs, Ys
+
+    def _frame_deformed_points_3d(
+        self, elem, d, scale: float,
+    ) -> tuple[list[float], list[float]]:
+        """Projected deformed centreline for a 12-DOF (space) result.
+
+        The curve is built in the element's true local triad — axial
+        lerp plus cubic Hermite in local y (using θz) and local z
+        (using θy with the −dw/dx sign flip) — then mapped to world
+        coordinates and projected onto the active view plane. Falls
+        back to the straight displaced chord if the triad degenerates.
+        """
+        from ..element3d import local_axes as _local_axes_3d
+        real = self._model().nodes
+        rn_i = real.get(elem.node_i)
+        rn_j = real.get(elem.node_j)
+        if rn_i is None or rn_j is None:
+            return [], []
+        try:
+            L3, lam = _local_axes_3d(
+                rn_i, rn_j, roll=getattr(elem, "roll", 0.0),
+            )
+        except ValueError:
+            uxi, uyi = self._node_displacement(elem.node_i)
+            uxj, uyj = self._node_displacement(elem.node_j)
+            pni = self.project_xyz(rn_i.x, rn_i.y,
+                                   getattr(rn_i, "z", 0.0))
+            pnj = self.project_xyz(rn_j.x, rn_j.y,
+                                   getattr(rn_j, "z", 0.0))
+            return ([pni[0] + scale * uxi, pnj[0] + scale * uxj],
+                    [pni[1] + scale * uyi, pnj[1] + scale * uyj])
+        import numpy as _np
+        p0 = _np.array([rn_i.x, rn_i.y, getattr(rn_i, "z", 0.0)])
+        xhat, yhat, zhat = lam[0], lam[1], lam[2]
+        n = max(2, int(self.deformed_stations))
+        Xs: list[float] = []
+        Ys: list[float] = []
+        for k in range(n):
+            r = k / (n - 1)
+            u = (1.0 - r) * float(d[0]) + r * float(d[6])
+            v = self._hermite_v(r, L3, float(d[1]), float(d[5]),
+                                float(d[7]), float(d[11]))
+            w = self._hermite_v(r, L3, float(d[2]), -float(d[4]),
+                                float(d[8]), -float(d[10]))
+            world = (p0 + xhat * (r * L3 + scale * u)
+                     + yhat * (scale * v) + zhat * (scale * w))
+            px, py = self.project_xyz(world[0], world[1], world[2])
+            Xs.append(px)
+            Ys.append(py)
         return Xs, Ys
 
     def _draw_deformed(self) -> None:
@@ -2081,11 +2125,18 @@ class ModelCanvas(QWidget):
             if mr is None or "d_local" not in mr:
                 continue
             d = mr["d_local"]
-            if len(d) != 6:
-                continue  # 3D solve — endpoint displacements suffice
             try:
                 L, _c, _s = elem.length_cos_sin(model.nodes)
             except (ValueError, ZeroDivisionError):
+                continue
+            if len(d) != 6:
+                # Space result: scan both local bending planes.
+                for rk in (0.25, 0.5, 0.75):
+                    v = self._hermite_v(rk, L, float(d[1]), float(d[5]),
+                                        float(d[7]), float(d[11]))
+                    w = self._hermite_v(rk, L, float(d[2]), -float(d[4]),
+                                        float(d[8]), -float(d[10]))
+                    max_disp = max(max_disp, abs(v), abs(w))
                 continue
             vi, thi, vj, thj = float(d[1]), float(d[2]), float(d[4]), float(d[5])
             for rk in (0.25, 0.5, 0.75):
@@ -2098,10 +2149,13 @@ class ModelCanvas(QWidget):
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
-            if isinstance(elem, FrameElement2D):
+            if (isinstance(elem, FrameElement2D)
+                    or getattr(elem, "kind", "") == "frame3d"):
                 try:
                     Xs, Ys = self._frame_deformed_points(elem, scale)
                 except (ValueError, ZeroDivisionError):
+                    continue
+                if not Xs:
                     continue
             else:
                 # Truss bar stays straight between displaced endpoints —
@@ -2242,14 +2296,7 @@ class ModelCanvas(QWidget):
             len(mr.get("f_local", ())) == 12
             for mr in result.member_results.values()
         )
-        if result_is_3d and self._view_plane != "XY":
-            self.ax.annotate(
-                "N/V/M diagrams for 3D results are shown in the XY "
-                "view only",
-                (0.02, 0.94), xycoords="axes fraction",
-                fontsize=8, color="#8c564b", va="top",
-            )
-            return
+        real_nodes = self._model().nodes
         for elem in model.elements:
             mr = result.member_results.get(elem.id)
             if mr is None:
@@ -2260,6 +2307,14 @@ class ModelCanvas(QWidget):
             ni = model.nodes.get(elem.node_i)
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
+                continue
+            # Sample on the REAL geometry so the ordinates stay exact
+            # in every view (v0.33); the drawing loop below rescales
+            # station positions onto the (possibly foreshortened)
+            # projected member.
+            rn_i = real_nodes.get(elem.node_i)
+            rn_j = real_nodes.get(elem.node_j)
+            if rn_i is None or rn_j is None:
                 continue
             # Sample density is configurable via View → Diagram stations.
             # Lower counts give a coarser preview; the critical-point
@@ -2272,11 +2327,14 @@ class ModelCanvas(QWidget):
             # 2D sign convention.
             f_local = mr.get("f_local_inplane", mr["f_local"])
             xs, ys = _diagram_ordinates(
-                elem, ni, nj, f_local, self.diagram_kind, n_samples=n,
+                elem, rn_i, rn_j, f_local, self.diagram_kind, n_samples=n,
             )
             if xs is None:
                 continue
-            per_elem.append((elem, ni, nj, xs, ys))
+            L_real = ((rn_j.x - rn_i.x) ** 2 + (rn_j.y - rn_i.y) ** 2
+                      + (getattr(rn_j, "z", 0.0)
+                         - getattr(rn_i, "z", 0.0)) ** 2) ** 0.5
+            per_elem.append((elem, ni, nj, xs, ys, L_real))
             max_ord = max(max_ord, max(abs(v) for v in ys))
         if max_ord <= 0 or not per_elem:
             return
@@ -2295,18 +2353,22 @@ class ModelCanvas(QWidget):
         else:
             ord_sign = +1.0
 
-        for elem, ni, nj, xs, ys in per_elem:
+        for elem, ni, nj, xs, ys, L_real in per_elem:
             L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
             if L < 1e-12:
-                continue
+                continue  # member looks at the camera in this view
             cx, cy = (nj.x - ni.x) / L, (nj.y - ni.y) / L
             nx, ny = -cy, cx
+            # Stations were sampled on the real length; rescale onto
+            # the projected span (ratio = 1 in the XY view of planar
+            # geometry — legacy behaviour preserved exactly).
+            sta = (L / L_real) if L_real > 1e-12 else 1.0
 
             def offset_point(xx, yy):
                 yy_disp = yy * ord_sign
                 return (
-                    ni.x + xx * cx + scale * yy_disp * nx,
-                    ni.y + xx * cy + scale * yy_disp * ny,
+                    ni.x + xx * sta * cx + scale * yy_disp * nx,
+                    ni.y + xx * sta * cy + scale * yy_disp * ny,
                 )
 
             if self.diagram_kind in ("shear", "moment"):
@@ -2334,10 +2396,10 @@ class ModelCanvas(QWidget):
                         poly_x, poly_y, color=color, linewidth=1.0, zorder=2,
                     )
                     # Close the polygon back along the member centerline.
-                    poly_x.append(ni.x + seg_xs[-1] * cx)
-                    poly_y.append(ni.y + seg_xs[-1] * cy)
-                    poly_x.append(ni.x + seg_xs[0] * cx)
-                    poly_y.append(ni.y + seg_xs[0] * cy)
+                    poly_x.append(ni.x + seg_xs[-1] * sta * cx)
+                    poly_y.append(ni.y + seg_xs[-1] * sta * cy)
+                    poly_x.append(ni.x + seg_xs[0] * sta * cx)
+                    poly_y.append(ni.y + seg_xs[0] * sta * cy)
                     self.ax.fill(
                         poly_x, poly_y, color=color, alpha=0.25, zorder=1,
                     )
@@ -2380,15 +2442,15 @@ class ModelCanvas(QWidget):
                 yy_disp = yy * ord_sign
                 # World-coords on the diagram polyline at this sample,
                 # using the same display flip applied to the fill.
-                world_x = ni.x + xx * cx + scale * yy_disp * nx
-                world_y = ni.y + xx * cy + scale * yy_disp * ny
+                world_x = ni.x + xx * sta * cx + scale * yy_disp * nx
+                world_y = ni.y + xx * sta * cy + scale * yy_disp * ny
                 # World-coords of the matching point on the element
                 # axis itself — that's what the snap engine should
                 # snap to (so a left-click in modelling tools still
                 # lands on the member geometry, not on the offset
                 # diagram polyline).
-                axis_x = ni.x + xx * cx
-                axis_y = ni.y + xx * cy
+                axis_x = ni.x + xx * sta * cx
+                axis_y = ni.y + xx * sta * cy
                 # Marker colour follows the sign convention used for the
                 # fill (blue positive / red negative for V & M; legacy
                 # brown for axial).
@@ -2421,8 +2483,12 @@ class ModelCanvas(QWidget):
                     "L": L,
                 })
 
+        kind_note = (
+            f"{self.diagram_kind} (in-plane N/Vy/Mz)"
+            if result_is_3d else self.diagram_kind
+        )
         self.ax.annotate(
-            f"{self.diagram_kind} diagram × {scale:.2g}  ·  max |·| = {max_ord:.3g} {unit}",
+            f"{kind_note} diagram × {scale:.2g}  ·  max |·| = {max_ord:.3g} {unit}",
             (0.02, 0.94), xycoords="axes fraction",
             fontsize=8, color=color, va="top",
         )

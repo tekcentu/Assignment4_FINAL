@@ -224,3 +224,46 @@ def test_example_3d_grillage_input_solves():
     expected = (2 * F * L**3 / (3 * E * Iz)) + F * L**3 / (G * J)
     uy3 = result.D[result.E_map[3]["uy"]]
     assert uy3 == pytest.approx(expected, rel=1e-9)
+
+
+def test_section_iy_and_element_roll_roundtrip(tmp_path):
+    path = _write(tmp_path, """
+TITLE
+iy-roll
+NODES 2
+1  0.0  0.0
+2  4.0  0.0
+MATERIALS 1
+1  200000000.0  0.0  0.0  Steel
+SECTIONS 1
+1  1  0.01  4e-05  0.3  Sec  Iy=2e-05  J=3e-05
+ELEMENTS 1
+1  1  2  1  FRAME  roll=0.7853981633974483
+""")
+    m = read_input_file(path)
+    assert m.sections[1].Iy == 2e-05
+    assert m.elements[0].roll == pytest.approx(0.7853981633974483)
+
+    out = str(tmp_path / "rt.txt")
+    write_input_file(m, out)
+    m2 = read_input_file(out)
+    assert m2.sections[1].Iy == 2e-05
+    assert m2.elements[0].roll == pytest.approx(0.7853981633974483)
+
+
+def test_roll_rejected_on_truss(tmp_path):
+    path = _write(tmp_path, """
+TITLE
+bad
+NODES 2
+1  0.0  0.0
+2  4.0  0.0
+MATERIALS 1
+1  200000000.0  0.0  0.0  Steel
+SECTIONS 1
+1  1  0.01  4e-05  0.3
+ELEMENTS 1
+1  1  2  1  TRUSS  roll=0.5
+""")
+    with pytest.raises(ValueError, match="roll"):
+        read_input_file(path)

@@ -167,6 +167,10 @@ class Section:
     h: float = 0.0
     tf: float = 0.0
     tw: float = 0.0
+    # 3D (v0.33): second moment about the section's local y axis
+    # (out-of-plane bending). 0 means "not specified" — the 2D→3D
+    # promotion then falls back to Iy = I (the symmetric default).
+    Iy: float = 0.0
 
 
 # ── Supports ───────────────────────────────────────────────────

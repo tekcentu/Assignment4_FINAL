@@ -23,7 +23,7 @@ from .element import FrameElement2D, TrussElement2D
 # Anything outside these maps raises ValueError so typos surface.
 _MATERIAL_KWARG_TYPES: dict[str, type] = {"nu": float, "template": str}
 _SECTION_KWARG_TYPES: dict[str, type] = {
-    "width": float, "J": float,
+    "width": float, "J": float, "Iy": float,
     "shape": str,        # alias → shape_type
     "shape_type": str,
     "b": float, "h": float, "tf": float, "tw": float,
@@ -313,6 +313,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                 material_override_id: int | None = None
                 offset_i = 0.0
                 offset_j = 0.0
+                roll = 0.0
                 for idx, tok in enumerate(parts[4:], start=4):
                     if "=" not in tok:
                         positional_slot = (
@@ -344,6 +345,14 @@ def read_input_file(filepath: str) -> StructuralModel:
                                 "has no MATERIALS entry."
                             )
                         material_override_id = mid
+                    elif key == "roll":
+                        try:
+                            roll = float(value)
+                        except ValueError:
+                            raise ValueError(
+                                f"Element {eid}: roll must be a number "
+                                f"(radians), got {value!r}."
+                            )
                     elif key in ("offset_i", "offset_j"):
                         try:
                             off = float(value)
@@ -365,9 +374,14 @@ def read_input_file(filepath: str) -> StructuralModel:
                         raise ValueError(
                             f"Element {eid}: unknown element option "
                             f"{tok!r}; expected material_override_id=<id>, "
-                            "offset_i=<m> or offset_j=<m>."
+                            "offset_i=<m>, offset_j=<m> or roll=<rad>."
                         )
 
+                if roll and etype == "TRUSS":
+                    raise ValueError(
+                        f"Element {eid}: roll is only supported on "
+                        "FRAME elements."
+                    )
                 if (offset_i or offset_j) and etype == "TRUSS":
                     raise ValueError(
                         f"Element {eid}: rigid end offsets are only "
@@ -414,6 +428,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                         material_id_override=material_override_id,
                         release_i=release_i, release_j=release_j,
                         offset_i=offset_i, offset_j=offset_j,
+                        roll=roll,
                     )
                 model.elements.append(elem)
 

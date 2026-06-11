@@ -391,6 +391,9 @@ class SectionDialog(_ModalDialog):
             # Populate the relevant page
             self._a_entry.setText(repr(s.A))
             self._i_entry.setText(repr(s.I))
+            self._iy_entry.setText(
+                repr(s.Iy) if getattr(s, "Iy", 0.0) else "",
+            )
             self._d_entry.setText(repr(s.depth))
             self._w_entry.setText(repr(s.width))
             self._rect_b.setText(repr(s.b or 0.0))
@@ -415,10 +418,14 @@ class SectionDialog(_ModalDialog):
         form = QFormLayout(page)
         self._a_entry = QLineEdit(page)
         self._i_entry = QLineEdit(page)
+        self._iy_entry = QLineEdit(page)
         self._d_entry = QLineEdit(page)
         self._w_entry = QLineEdit(page)
         form.addRow("A (m²)", self._a_entry)
         form.addRow("I (m⁴)", self._i_entry)
+        # 3D (v0.33): out-of-plane bending inertia. Blank/0 keeps the
+        # symmetric Iy = I default used by the 2D→3D promotion.
+        form.addRow("Iy (m⁴ — 3D, blank = I)", self._iy_entry)
         form.addRow("depth (m)", self._d_entry)
         form.addRow("width (m)", self._w_entry)
         return page
@@ -846,14 +853,18 @@ class SectionDialog(_ModalDialog):
                                  allow_blank=True) or 0.0
             width = parse_float(self._w_entry.text(), "width",
                                  allow_blank=True) or 0.0
+            Iy = parse_float(self._iy_entry.text(), "Iy",
+                             allow_blank=True) or 0.0
             if A <= 0:
                 raise ValueError("A must be > 0.")
             if I < 0:
                 raise ValueError("I cannot be negative.")
+            if Iy < 0:
+                raise ValueError("Iy cannot be negative.")
             return Section(
                 id=sid, name=name, material_id=int(material_id),
                 A=A, I=I, depth=depth, width=width,
-                J=0.0, shape_type="manual",
+                J=0.0, shape_type="manual", Iy=Iy,
             )
 
         # Shape-driven path

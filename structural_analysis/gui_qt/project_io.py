@@ -34,12 +34,16 @@ class ViewState:
     snap_kinds: list[str] = field(default_factory=lambda: [
         "node", "grid", "endpoint", "midpoint", "project"
     ])
+    # v0.33 — named z-levels (storey manager). Each entry is
+    # ``(name, z)``; GUI metadata only, never passed to the solver.
+    storeys: list[tuple[str, float]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "xlim": list(self.xlim) if self.xlim is not None else None,
             "ylim": list(self.ylim) if self.ylim is not None else None,
             "snap_kinds": list(self.snap_kinds),
+            "storeys": [[str(n), float(z)] for n, z in self.storeys],
         }
 
     @classmethod
@@ -51,7 +55,13 @@ class ViewState:
         kinds = list(data.get("snap_kinds") or [
             "node", "grid", "endpoint", "midpoint", "project"
         ])
-        return cls(xlim=xlim, ylim=ylim, snap_kinds=kinds)
+        storeys = [
+            (str(row[0]), float(row[1]))
+            for row in (data.get("storeys") or [])
+            if isinstance(row, (list, tuple)) and len(row) == 2
+        ]
+        return cls(xlim=xlim, ylim=ylim, snap_kinds=kinds,
+                   storeys=storeys)
 
 
 @dataclass

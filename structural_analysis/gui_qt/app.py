@@ -263,6 +263,9 @@ class MainWindow(QMainWindow):
         # 3D work plane (v0.32): out-of-plane coordinate assigned to
         # geometry created by canvas clicks in the current view.
         self._working_depth: float = 0.0
+        # v0.33 — storey manager: named z-levels, persisted in the
+        # .spa.json view state. GUI metadata only.
+        self._storeys: list[tuple[str, float]] = []
         self._modal_result = None
         self._modal_results_dialog = None
         self._view3d_window = None
@@ -473,6 +476,14 @@ class MainWindow(QMainWindow):
         self.act_working_depth = QAction(
             "Working &depth…", self,
             triggered=self._set_working_depth,
+        )
+        self.act_storeys = QAction(
+            "S&toreys…", self,
+            triggered=self._manage_storeys,
+        )
+        self.act_storeys.setToolTip(
+            "Name the z-levels you build on (Level 1 = 0, Level 2 = 3 …) "
+            "and jump the working depth between them."
         )
         self.act_working_depth.setToolTip(
             "Out-of-plane coordinate given to nodes created by canvas "
@@ -813,6 +824,7 @@ class MainWindow(QMainWindow):
         for a in self._view_plane_actions.values():
             plane_menu.addAction(a)
         m_view.addAction(self.act_working_depth)
+        m_view.addAction(self.act_storeys)
         m_view.addSeparator()
         m_view.addAction(self.act_grid_system)
         m_view.addAction(self.act_grid_spacing)
@@ -1179,8 +1191,29 @@ class MainWindow(QMainWindow):
         )
         if not ok:
             return
+        self._apply_working_depth(float(value))
+
+    def _apply_working_depth(self, value: float) -> None:
+        from .storeys import storey_name_for_depth
         self._working_depth = float(value)
-        self.set_status(f"Working depth set to {value:g} m.")
+        storey = storey_name_for_depth(self._storeys, self._working_depth)
+        suffix = f" ({storey})" if storey else ""
+        self.set_status(f"Working depth set to {value:g} m{suffix}.")
+
+    def _manage_storeys(self) -> None:
+        from .storeys import StoreyManagerDialog
+        d = StoreyManagerDialog(
+            self, storeys=self._storeys,
+            current_depth=self._working_depth,
+        )
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        if d.result_storeys is not None:
+            self._storeys = d.result_storeys
+            self._modified = True
+            self._update_title()
+        if d.activated_depth is not None:
+            self._apply_working_depth(d.activated_depth)
 
     def _update_selection_status(self) -> None:
         nn = len(self.canvas.get_selected_nodes())
@@ -3354,6 +3387,8 @@ class MainWindow(QMainWindow):
         self.canvas.snap_engine.enabled_kinds = set(enabled)
         for kind, action in self._snap_actions.items():
             action.setChecked(kind in enabled)
+        # v0.33 — restore the project's storey list.
+        self._storeys = list(getattr(view, "storeys", []) or [])
         # Repaint so the new xlim/ylim and snap-toggle state show up.
         self.canvas.redraw()
 
@@ -3384,6 +3419,7 @@ class MainWindow(QMainWindow):
                     xlim=tuple(self.canvas.ax.get_xlim()),
                     ylim=tuple(self.canvas.ax.get_ylim()),
                     snap_kinds=sorted(self.canvas.snap_engine.enabled_kinds),
+                    storeys=list(self._storeys),
                 )
                 project = Project(
                     model=self._model, grid=self._grid,

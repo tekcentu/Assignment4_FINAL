@@ -347,3 +347,56 @@ def test_depth_stack_working_depth_wins_initial_pick(qt_app):
     w.canvas._apply_depth_stack(hit, w.canvas.projected_model())
     assert hit.node_id == 2  # the z = 4 twin matches the working depth
     assert "depth 4" in hit.snap_label
+
+
+# ── v0.33: storey manager ──────────────────────────────────────
+
+
+def test_storey_helpers():
+    from structural_analysis.gui_qt.storeys import (
+        normalized_storeys, storey_name_for_depth,
+    )
+
+    rows = [("Roof", 6.0), ("Level 1", 0.0), ("Level 2", 3.0)]
+    out = normalized_storeys(rows)
+    assert out == [("Level 1", 0.0), ("Level 2", 3.0), ("Roof", 6.0)]
+    assert storey_name_for_depth(out, 3.0) == "Level 2"
+    assert storey_name_for_depth(out, 1.5) is None
+
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="Duplicate"):
+        normalized_storeys([("A", 0.0), ("A", 1.0)])
+    with _pytest.raises(ValueError, match="share the level"):
+        normalized_storeys([("A", 0.0), ("B", 0.0)])
+
+
+def test_storey_dialog_roundtrip_and_activation(qt_app):
+    from structural_analysis.gui_qt.storeys import StoreyManagerDialog
+
+    w = MainWindow()
+    d = StoreyManagerDialog(w, storeys=[("Level 1", 0.0)],
+                            current_depth=0.0)
+    d._name_entry.setText("Level 2")
+    d._z_spin.setValue(3.0)
+    d._on_add()
+    d._table.setCurrentCell(1, 0)
+    d._on_activate()  # accepts + requests the depth jump
+    assert d.result_storeys == [("Level 1", 0.0), ("Level 2", 3.0)]
+    assert d.activated_depth == 3.0
+
+    # The host applies the jump and labels the status with the storey.
+    w._storeys = d.result_storeys
+    w._apply_working_depth(3.0)
+    assert w._working_depth == 3.0
+
+
+def test_storeys_persist_in_project_viewstate(qt_app, tmp_path):
+    from structural_analysis.gui_qt.project_io import ViewState
+
+    vs = ViewState(storeys=[("Level 1", 0.0), ("Roof", 6.0)])
+    data = vs.to_dict()
+    back = ViewState.from_dict(data)
+    assert back.storeys == [("Level 1", 0.0), ("Roof", 6.0)]
+    # Legacy dicts (no storeys key) stay loadable.
+    legacy = {k: v for k, v in data.items() if k != "storeys"}
+    assert ViewState.from_dict(legacy).storeys == []
