@@ -436,6 +436,15 @@ class MainWindow(QMainWindow):
                        "extruded along its section profile.",
             triggered=self._open_view3d,
         )
+        # v0.33 — interactive OpenGL viewport (orbit / pick / draw in
+        # space). Optional dependency: pyqtgraph + PyOpenGL.
+        self.act_open_viewport3d = QAction(
+            "3D viewport (&beta)…", self,
+            statusTip="Open the interactive OpenGL viewport: orbit with "
+                      "the mouse, pick nodes/elements, and place "
+                      "geometry on a construction plane in space.",
+            triggered=self._open_viewport3d,
+        )
         # ── 3D work planes (v0.32) ──
         # Radio group selecting the canvas projection: the legacy XY
         # front view (editable), the XZ plan / ZY side elevations
@@ -793,6 +802,7 @@ class MainWindow(QMainWindow):
         m_view = self.menuBar().addMenu("&View")
         m_view.addAction(self.act_fit_view)
         m_view.addAction(self.act_open_view3d)
+        m_view.addAction(self.act_open_viewport3d)
         m_view.addSeparator()
         plane_menu = m_view.addMenu("Work &plane")
         plane_menu.setStatusTip(
@@ -1149,6 +1159,16 @@ class MainWindow(QMainWindow):
                 f"{axis} = {self._working_depth:g} m "
                 "(View → Working depth…)."
             )
+
+    def _open_viewport3d(self) -> None:
+        """Open (or raise) the interactive OpenGL viewport (v0.33)."""
+        existing = getattr(self, "_viewport3d", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        from .viewport3d import open_viewport3d
+        self._viewport3d = open_viewport3d(self)
 
     def _set_working_depth(self) -> None:
         from PyQt6.QtWidgets import QInputDialog
