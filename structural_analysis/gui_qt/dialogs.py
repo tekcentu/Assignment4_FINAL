@@ -1500,10 +1500,17 @@ class NodalLoadDialog(_ModalDialog):
     def _build_body(self, body: QWidget) -> None:
         form = QFormLayout(body)
         self._entries: dict[str, QLineEdit] = {}
-        for label, key in [("Fx (kN)", "fx"), ("Fy (kN)", "fy"), ("Mz (kN·m)", "mz")]:
+        for label, key in [
+            ("Fx (kN)", "fx"), ("Fy (kN)", "fy"), ("Mz (kN·m)", "mz"),
+            # 3D components (v0.33): non-zero values switch the solve
+            # to the 6-DOF space pipeline automatically.
+            ("Fz (kN — 3D)", "fz"),
+            ("Mx (kN·m — 3D)", "mx"),
+            ("My (kN·m — 3D)", "my"),
+        ]:
             e = QLineEdit(body)
             if self._existing is not None:
-                e.setText(repr(getattr(self._existing, key)))
+                e.setText(repr(getattr(self._existing, key, 0.0)))
             else:
                 e.setText("0.0")
             form.addRow(label, e)
@@ -1517,12 +1524,23 @@ class NodalLoadDialog(_ModalDialog):
         )
         form.addRow("Load case:", self._case_combo)
 
-    def _accept(self) -> tuple[float, float, float, str]:
-        fx = parse_float(self._entries["fx"].text(), "Fx", allow_blank=True) or 0.0
-        fy = parse_float(self._entries["fy"].text(), "Fy", allow_blank=True) or 0.0
-        mz = parse_float(self._entries["mz"].text(), "Mz", allow_blank=True) or 0.0
+    def _accept(self) -> tuple[float, float, float, str, float, float, float]:
+        """Result tuple: ``(fx, fy, mz, load_case, fz, mx, my)``.
+
+        The 3D components are APPENDED (not interleaved) so the v0.17
+        ``(fx, fy, mz, load_case)`` prefix keeps its positions for
+        legacy consumers.
+        """
+        vals = {
+            key: parse_float(
+                self._entries[key].text(), key.capitalize(),
+                allow_blank=True,
+            ) or 0.0
+            for key in ("fx", "fy", "mz", "fz", "mx", "my")
+        }
         load_case = _normalize_load_case(self._case_combo.currentText())
-        return (fx, fy, mz, load_case)
+        return (vals["fx"], vals["fy"], vals["mz"], load_case,
+                vals["fz"], vals["mx"], vals["my"])
 
 
 # ── nodal-load manager (v0.20 — PR #30) ──
@@ -1682,11 +1700,11 @@ class NodalLoadManagerDialog(QDialog):
         values = self._open_form(existing=None)
         if values is None:
             return
-        fx, fy, mz, load_case = values
-        if fx == 0.0 and fy == 0.0 and mz == 0.0:
+        fx, fy, mz, load_case, fz, mx, my = values
+        if all(v == 0.0 for v in (fx, fy, mz, fz, mx, my)):
             QMessageBox.information(
                 self, "Empty load",
-                "Fx, Fy, Mz are all zero — nothing to add.",
+                "All six load components are zero — nothing to add.",
             )
             return
         # PR-A: ensure unknown load-case names appear in model.load_cases
@@ -1696,7 +1714,7 @@ class NodalLoadManagerDialog(QDialog):
             ensure(load_case)
         self._host.execute(AddNodalLoadCmd(
             node_id=self._node_id, fx=fx, fy=fy, mz=mz,
-            load_case=load_case,
+            load_case=load_case, fz=fz, mx=mx, my=my,
         ))
         self._rebuild_table()
 
@@ -1713,11 +1731,12 @@ class NodalLoadManagerDialog(QDialog):
         values = self._open_form(existing=existing)
         if values is None:
             return
-        fx, fy, mz, load_case = values
-        if fx == 0.0 and fy == 0.0 and mz == 0.0:
+        fx, fy, mz, load_case, fz, mx, my = values
+        if all(v == 0.0 for v in (fx, fy, mz, fz, mx, my)):
             QMessageBox.information(
                 self, "Empty load",
-                "Fx, Fy, Mz are all zero — use Delete to remove the row.",
+                "All six load components are zero — use Delete to "
+                "remove the row.",
             )
             return
         ensure = getattr(self._host, "_ensure_load_case_exists", None)
@@ -1725,7 +1744,7 @@ class NodalLoadManagerDialog(QDialog):
             ensure(load_case)
         self._host.execute(EditNodalLoadRowCmd(
             row_index=global_idx, fx=fx, fy=fy, mz=mz,
-            load_case=load_case,
+            load_case=load_case, fz=fz, mx=mx, my=my,
         ))
         self._rebuild_table()
 
@@ -2107,9 +2126,13 @@ class MemberLoadDialog(_ModalDialog):
                     self._add_field(
                         "wy (kN/m, local y / transverse / ⊥ member)", "wy",
                     )
+                    self._add_field(
+                        "wz (kN/m, local z — 3D out-of-plane)", "wz",
+                    )
                 elif cs == "global":
                     self._add_field("qX (kN/m, global X)", "wx")
                     self._add_field("qY (kN/m, global Y)", "wy")
+                    self._add_field("qZ (kN/m, global Z — 3D)", "wz")
                 else:  # gravity
                     self._add_field(
                         "qg (kN/m, +ve downward · global -Y)", "wy",
@@ -2122,9 +2145,13 @@ class MemberLoadDialog(_ModalDialog):
                     self._add_field(
                         "Py (kN, local y / transverse / ⊥ member)", "py",
                     )
+                    self._add_field(
+                        "Pz (kN, local z — 3D out-of-plane)", "pz",
+                    )
                 elif cs == "global":
                     self._add_field("PX (kN, global X)", "px")
                     self._add_field("PY (kN, global Y)", "py")
+                    self._add_field("PZ (kN, global Z — 3D)", "pz")
                 else:  # gravity
                     self._add_field(
                         "Pg (kN, +ve downward · global -Y)", "py",
@@ -2183,13 +2210,19 @@ class MemberLoadDialog(_ModalDialog):
                 # class __post_init__ accepts it. Local and global
                 # show wx.
                 wx = 0.0
+                wz = 0.0
                 if cs != "gravity":
                     x_name = "qX" if cs == "global" else "wx"
                     wx = parse_float(
                         self._fields["wx"].text(), x_name, allow_blank=True,
                     ) or 0.0
+                    z_name = "qZ" if cs == "global" else "wz"
+                    wz = parse_float(
+                        self._fields["wz"].text(), z_name, allow_blank=True,
+                    ) or 0.0
                 return UniformDistributedLoad(
-                    wy=wy, wx=wx, coord_system=cs, load_case=load_case,
+                    wy=wy, wx=wx, wz=wz, coord_system=cs,
+                    load_case=load_case,
                 )
             else:  # point
                 y_name = (
@@ -2198,10 +2231,15 @@ class MemberLoadDialog(_ModalDialog):
                 )
                 py = parse_float(self._fields["py"].text(), y_name)
                 px = 0.0
+                pz = 0.0
                 if cs != "gravity":
                     x_name = "PX" if cs == "global" else "Px"
                     px = parse_float(
                         self._fields["px"].text(), x_name, allow_blank=True,
+                    ) or 0.0
+                    z_name = "PZ" if cs == "global" else "Pz"
+                    pz = parse_float(
+                        self._fields["pz"].text(), z_name, allow_blank=True,
                     ) or 0.0
                 a = parse_float(self._fields["a"].text(), "a")
                 L, _, _ = self._elem.length_cos_sin(self._model.nodes)
@@ -2210,7 +2248,7 @@ class MemberLoadDialog(_ModalDialog):
                         f"a must lie within [0, {L:.3g}] (element length)."
                     )
                 return PointLoad(
-                    py=py, a=a, px=px, coord_system=cs,
+                    py=py, a=a, px=px, pz=pz, coord_system=cs,
                     load_case=load_case,
                 )
         # thermal

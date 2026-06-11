@@ -1232,16 +1232,22 @@ class ModelCanvas(QWidget):
         max_udl = 0.0
         max_point = 0.0
         for ld in model.nodal_loads:
-            max_force = max(max_force, (ld.fx ** 2 + ld.fy ** 2) ** 0.5)
+            max_force = max(
+                max_force,
+                (ld.fx ** 2 + ld.fy ** 2
+                 + getattr(ld, "fz", 0.0) ** 2) ** 0.5,
+            )
         for elem in model.elements:
             for ml in getattr(elem, "member_loads", []):
                 if isinstance(ml, UniformDistributedLoad):
                     max_udl = max(
                         max_udl, abs(ml.wy), abs(getattr(ml, "wx", 0.0)),
+                        abs(getattr(ml, "wz", 0.0)),
                     )
                 elif isinstance(ml, PointLoad):
                     max_point = max(
                         max_point, abs(ml.py), abs(getattr(ml, "px", 0.0)),
+                        abs(getattr(ml, "pz", 0.0)),
                     )
         span = self._model_span()
         # Map the largest load in each family to ~12% of the model
@@ -1651,37 +1657,40 @@ class ModelCanvas(QWidget):
         # ``case_alpha`` dims loads belonging to non-active load cases
         # when the host has the "active case only" overlay on (PR-A).
         case_alpha = self._load_case_alpha(ld)
+        unprojected: list[str] = []
         if force_scale > 0:
-            if ld.fx:
-                dx = ld.fx * force_scale
+            # One arrow per non-zero force component, drawn along the
+            # PROJECTION of its world axis onto the active view plane.
+            # In the XY view this reproduces the legacy Fx / Fy arrows
+            # exactly (Z projects to zero length there and falls back
+            # to the text tag).
+            label_offsets = {"Fx": (0, 5), "Fy": (5, 0), "Fz": (5, -5)}
+            for name, comp, vec in (
+                ("Fx", ld.fx, (1.0, 0.0, 0.0)),
+                ("Fy", ld.fy, (0.0, 1.0, 0.0)),
+                ("Fz", getattr(ld, "fz", 0.0), (0.0, 0.0, 1.0)),
+            ):
+                if not comp:
+                    continue
+                du, dv = self.project_xyz(*vec)
+                if math.hypot(du, dv) < 1e-9:
+                    unprojected.append(f"{name}={comp:+.3g}")
+                    continue
+                dx = comp * force_scale * du
+                dy = comp * force_scale * dv
                 self.ax.annotate(
                     "",
                     xy=(x, y),
-                    xytext=(x - dx, y),
+                    xytext=(x - dx, y - dy),
                     arrowprops=dict(
                         arrowstyle="->", color="#2ca02c", lw=2,
                         alpha=case_alpha,
                     ),
                     zorder=5,
                 )
-                self.ax.annotate(f"Fx={ld.fx:+.3g}", (x - dx, y),
-                                 xytext=(0, 5), textcoords="offset points",
-                                 fontsize=7, color="#2ca02c", zorder=6,
-                                 alpha=case_alpha)
-            if ld.fy:
-                dy = ld.fy * force_scale
-                self.ax.annotate(
-                    "",
-                    xy=(x, y),
-                    xytext=(x, y - dy),
-                    arrowprops=dict(
-                        arrowstyle="->", color="#2ca02c", lw=2,
-                        alpha=case_alpha,
-                    ),
-                    zorder=5,
-                )
-                self.ax.annotate(f"Fy={ld.fy:+.3g}", (x, y - dy),
-                                 xytext=(5, 0), textcoords="offset points",
+                self.ax.annotate(f"{name}={comp:+.3g}", (x - dx, y - dy),
+                                 xytext=label_offsets[name],
+                                 textcoords="offset points",
                                  fontsize=7, color="#2ca02c", zorder=6,
                                  alpha=case_alpha)
         if ld.mz:
@@ -1689,12 +1698,11 @@ class ModelCanvas(QWidget):
                              textcoords="offset points", fontsize=7,
                              color="#2ca02c", zorder=6,
                              alpha=case_alpha)
-        # 3D-only components: compact textual tag (the canvas draws
-        # in-plane arrows only; the 3D viewer shows true directions).
-        parts_3d = [
+        # Moments about in-plane axes (and any force component that
+        # looks straight at the camera) stay textual tags.
+        parts_3d = unprojected + [
             f"{name}={val:+.3g}"
-            for name, val in (("Fz", getattr(ld, "fz", 0.0)),
-                              ("Mx", getattr(ld, "mx", 0.0)),
+            for name, val in (("Mx", getattr(ld, "mx", 0.0)),
                               ("My", getattr(ld, "my", 0.0)))
             if val
         ]
@@ -1723,11 +1731,37 @@ class ModelCanvas(QWidget):
         local loads."""
         if not elem.member_loads:
             return
-        L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
-        if L < 1e-12:
+        # Arrow DIRECTIONS come from the element's true 3D local triad
+        # (built on the REAL nodes), projected onto the active view
+        # plane; arrow POSITIONS interpolate along the projected member
+        # (``ni`` / ``nj`` here are projected nodes). For a planar
+        # member in the XY view this reproduces the legacy tangent /
+        # normal arrows bit-for-bit, and out-of-plane (wz / pz)
+        # components become real arrows in plan / side / iso views.
+        from ..element3d import local_axes as _local_axes_3d
+        real_nodes = self._model().nodes
+        rn_i = real_nodes.get(elem.node_i)
+        rn_j = real_nodes.get(elem.node_j)
+        if rn_i is None or rn_j is None:
             return
-        tx, ty = (nj.x - ni.x) / L, (nj.y - ni.y) / L   # member tangent
-        nx, ny = -ty, tx                                # member +y_local
+        try:
+            L3, lam = _local_axes_3d(
+                rn_i, rn_j, roll=getattr(elem, "roll", 0.0),
+            )
+        except ValueError:
+            return
+
+        def _projected_dirs(components):
+            """[(du, dv, mag)] with zero-length projections dropped."""
+            out = []
+            for vec, mag in components:
+                if mag == 0.0:
+                    continue
+                du, dv = self.project_xyz(*vec)
+                if math.hypot(du, dv) < 1e-9:
+                    continue  # axis looks at the camera in this view
+                out.append((du, dv, mag))
+            return out
 
         labels: list[str] = []
         udl_scale = load_scales.get("udl", 0.0)
@@ -1740,11 +1774,12 @@ class ModelCanvas(QWidget):
             if isinstance(ml, UniformDistributedLoad):
                 labels.append(_label_for_udl(ml))
                 if udl_scale > 0:
-                    for dx, dy, mag in _udl_visual_components(
-                        ml, tx, ty, nx, ny,
-                    ):
-                        if mag == 0.0:
-                            continue
+                    comps = _mechanical_world_components(
+                        lam, getattr(ml, "wx", 0.0), ml.wy,
+                        getattr(ml, "wz", 0.0),
+                        getattr(ml, "coord_system", "local"),
+                    )
+                    for dx, dy, mag in _projected_dirs(comps):
                         self._draw_udl_arrow_strip(
                             ni, nj, dx, dy, mag, udl_scale,
                             case_alpha=case_alpha,
@@ -1752,14 +1787,15 @@ class ModelCanvas(QWidget):
             elif isinstance(ml, PointLoad):
                 labels.append(_label_for_pointload(ml))
                 if point_scale > 0:
-                    a = max(0.0, min(L, float(ml.a)))
-                    bx = ni.x + tx * a
-                    by = ni.y + ty * a
-                    for dx, dy, mag in _pointload_visual_components(
-                        ml, tx, ty, nx, ny,
-                    ):
-                        if mag == 0.0:
-                            continue
+                    frac = max(0.0, min(1.0, float(ml.a) / L3))
+                    bx = ni.x + (nj.x - ni.x) * frac
+                    by = ni.y + (nj.y - ni.y) * frac
+                    comps = _mechanical_world_components(
+                        lam, getattr(ml, "px", 0.0), ml.py,
+                        getattr(ml, "pz", 0.0),
+                        getattr(ml, "coord_system", "local"),
+                    )
+                    for dx, dy, mag in _projected_dirs(comps):
                         h = mag * point_scale
                         # Tail OPPOSITE to load direction so the
                         # arrowhead at xy=(bx,by) visually points along
@@ -2344,6 +2380,31 @@ class ModelCanvas(QWidget):
             self._user_view_dirty = True
 
 
+def _mechanical_world_components(
+    lam, cx: float, cy: float, cz: float, coord_system: str,
+) -> list[tuple[tuple[float, float, float], float]]:
+    """``[(world_direction, magnitude)]`` for a UDL / point load.
+
+    ``lam`` is the element's 3×3 local triad (rows x̂, ŷ, ẑ in world
+    coordinates, from :func:`structural_analysis.element3d.local_axes`).
+    The 3D successor of :func:`_udl_visual_components` /
+    :func:`_pointload_visual_components` (kept below for their pinned
+    2D contract): callers project the world directions onto the active
+    view plane. For an XY-plane member, x̂/ŷ project to the legacy
+    tangent / normal exactly.
+    """
+    if coord_system == "local":
+        return [(tuple(lam[0]), cx), (tuple(lam[1]), cy),
+                (tuple(lam[2]), cz)]
+    if coord_system == "global":
+        return [((1.0, 0.0, 0.0), cx), ((0.0, 1.0, 0.0), cy),
+                ((0.0, 0.0, 1.0), cz)]
+    if coord_system == "gravity":
+        return [((0.0, -1.0, 0.0), cy)]
+    # Defensive: unknown — legacy local-y rendering.
+    return [(tuple(lam[1]), cy)]
+
+
 def _udl_visual_components(
     ml: UniformDistributedLoad, tx: float, ty: float, nx: float, ny: float,
 ) -> list[tuple[float, float, float]]:
@@ -2398,6 +2459,9 @@ def _label_for_udl(ml: UniformDistributedLoad) -> str:
             return f"UDL qX={ml.wx:+.3g} glob"
         return f"UDL qY={ml.wy:+.3g} glob"
     # local
+    wz = getattr(ml, "wz", 0.0)
+    if wz != 0.0:
+        return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g},{wz:+.3g})"
     if ml.wx != 0.0 and ml.wy != 0.0:
         return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g})"
     if ml.wx != 0.0:
@@ -2412,6 +2476,10 @@ def _label_for_pointload(ml: PointLoad) -> str:
         return f"P {ml.py:+.3g}@{ml.a:.3g} grav"
     if cs == "global":
         suffix = " glob"
+    pz = getattr(ml, "pz", 0.0)
+    if pz != 0.0:
+        return (f"P ({ml.px:+.3g},{ml.py:+.3g},{pz:+.3g})"
+                f"@{ml.a:.3g}{suffix}")
     if ml.px != 0.0 and ml.py != 0.0:
         return f"P ({ml.px:+.3g},{ml.py:+.3g})@{ml.a:.3g}{suffix}"
     if ml.px != 0.0:

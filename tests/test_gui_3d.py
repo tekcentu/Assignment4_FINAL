@@ -203,3 +203,81 @@ def test_view3d_window_uses_native_z(qt_app):
     assert tuple(p) == (1.0, 2.0, 3.0)
     p = _node_world(1.0, 2.0, "z_up", 3.0)
     assert tuple(p) == (1.0, 3.0, 2.0)
+
+
+# ── v0.33: 3D load dialogs + projected arrows ──────────────────
+
+
+def test_mechanical_world_components_triad():
+    import numpy as np
+    from structural_analysis.element3d import local_axes
+    from structural_analysis.gui_qt.canvas import (
+        _mechanical_world_components,
+    )
+
+    ni, nj = Node(1, 0.0, 0.0, 0.0), Node(2, 4.0, 0.0, 0.0)
+    _, lam = local_axes(ni, nj)
+    comps = _mechanical_world_components(lam, 1.0, -2.0, 3.0, "local")
+    np.testing.assert_allclose(comps[0][0], (1.0, 0.0, 0.0), atol=1e-12)
+    np.testing.assert_allclose(comps[1][0], (0.0, 1.0, 0.0), atol=1e-12)
+    np.testing.assert_allclose(comps[2][0], (0.0, 0.0, 1.0), atol=1e-12)
+    assert [m for _, m in comps] == [1.0, -2.0, 3.0]
+
+    grav = _mechanical_world_components(lam, 0.0, 5.0, 0.0, "gravity")
+    assert grav == [((0.0, -1.0, 0.0), 5.0)]
+
+
+def test_nodal_load_dialog_3d_components_reach_model(qt_app):
+    from structural_analysis.gui_common.commands import AddNodalLoadCmd
+    from structural_analysis.assembler import model_is_3d
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0)}
+    w.execute(AddNodalLoadCmd(node_id=1, fz=-4.0, mx=1.0))
+    ld = w._model.nodal_loads[0]
+    assert (ld.fz, ld.mx, ld.my) == (-4.0, 1.0, 0.0)
+    assert model_is_3d(w._model)
+    # All-zero rows are still rejected.
+    import pytest as _pytest
+    cmd = AddNodalLoadCmd(node_id=1)
+    with _pytest.raises(ValueError, match="six components"):
+        cmd.do(w._model)
+
+
+def test_fz_arrow_drawn_in_plan_view(qt_app):
+    from structural_analysis.model import NodalLoad
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0, 0.0), 2: Node(2, 4.0, 0.0, 0.0)}
+    w._model.nodal_loads.append(NodalLoad(2, fz=-9.0))
+
+    # Front view: Fz looks at the camera -> text tag only.
+    w.canvas.set_view_plane("XY")
+    w.canvas.redraw()
+    labels_xy = [t.get_text() for t in w.canvas.ax.texts]
+    assert any("Fz=-9" in s for s in labels_xy)
+
+    # Plan view: Fz becomes a real projected arrow with its label.
+    w.canvas.set_view_plane("XZ")
+    w.canvas.redraw()
+    labels_xz = [t.get_text() for t in w.canvas.ax.texts]
+    assert any(s.startswith("Fz=") for s in labels_xz)
+
+
+def test_member_udl_wz_draws_in_plan_view(qt_app):
+    from structural_analysis.model import (
+        Material, Section, UniformDistributedLoad,
+    )
+    from structural_analysis.element import FrameElement2D
+
+    w = MainWindow()
+    w._model.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 4.0, 0.0)}
+    e = FrameElement2D(id=1, node_i=1, node_j=2, E=2.1e8, A=0.01,
+                       I=1e-4, section_id=1)
+    e.member_loads.append(UniformDistributedLoad(wy=0.0, wz=-3.0))
+    w._model.elements.append(e)
+    for plane in ("XY", "XZ", "ISO"):
+        w.canvas.set_view_plane(plane)
+        w.canvas.redraw()  # no crash; wz arrows render where projectable
+    labels = [t.get_text() for t in w.canvas.ax.texts]
+    assert any("UDL" in s and "-3" in s for s in labels)
