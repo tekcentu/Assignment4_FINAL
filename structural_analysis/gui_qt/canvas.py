@@ -20,7 +20,7 @@ from matplotlib import patheffects as _path_effects
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT,
 )
-from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import Locator
 
 from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
@@ -92,6 +92,59 @@ class HitResult:
     snap_label: str = ""   # human-readable target description
 
 
+class AdaptiveGridLocator(Locator):
+    """Coordinate-axis tick locator that stays readable at any zoom.
+
+    Ticks land on multiples of a *base* spacing (the snap grid), but the
+    spacing is coarsened in a 1-2-5 progression (base × 1, 2, 5, 10, 20,
+    50, …) so that no more than ``max_ticks`` labels fall inside the
+    current view. A fixed ``MultipleLocator`` instead emits one tick per
+    base step regardless of zoom, so the numbers collide as soon as the
+    user zooms out.
+
+    matplotlib re-invokes the locator on *every* draw using the live view
+    interval, so this self-adjusts during scroll-zoom — which only calls
+    ``draw_idle`` and never rebuilds the grid — as well as on full redraws.
+    Ticks are never made finer than ``base``, so zooming in still reveals
+    the true snap grid rather than inventing sub-grid coordinates.
+    """
+
+    def __init__(self, base: float, max_ticks: int) -> None:
+        self._base = float(base)
+        self._max_ticks = max(1, int(max_ticks))
+
+    def __call__(self):
+        vmin, vmax = self.axis.get_view_interval()
+        return self.tick_values(vmin, vmax)
+
+    def step_for_span(self, span: float) -> float:
+        """Smallest base×{1,2,5,10,…} step keeping ≤ max_ticks in ``span``."""
+        step = self._base
+        if step <= 0.0 or span <= 0.0:
+            return max(step, 0.0)
+        seq = (1, 2, 5)
+        i = 0
+        while span / step > self._max_ticks:
+            i += 1
+            step = self._base * seq[i % 3] * (10 ** (i // 3))
+        return step
+
+    def tick_values(self, vmin, vmax):
+        if vmax < vmin:
+            vmin, vmax = vmax, vmin
+        step = self.step_for_span(vmax - vmin)
+        if step <= 0.0:
+            return []
+        first = math.ceil(vmin / step) * step
+        ticks = []
+        x = first
+        # +0.5·step guards the final tick against floating-point drift.
+        while x <= vmax + step * 0.5:
+            ticks.append(x)
+            x += step
+        return self.raise_if_exceeds(ticks)
+
+
 class ModelCanvas(QWidget):
     """A QWidget containing the matplotlib figure + its navigation toolbar."""
 
@@ -100,6 +153,9 @@ class ModelCanvas(QWidget):
     MAX_AUTO_NODE_LABELS = 300
     MAX_AUTO_ELEMENT_LABELS = 250
     MAX_LABELED_GRID_LINES = 240
+    # Max coordinate numbers per axis before AdaptiveGridLocator coarsens
+    # the spacing — keeps the spine labels from colliding when zoomed out.
+    MAX_AXIS_LABELS = 12
 
     def __init__(self, parent: QWidget | None,
                  model_provider: Callable[[], StructuralModel],
@@ -758,11 +814,21 @@ class ModelCanvas(QWidget):
     # ── drawing ──
 
     def _draw_grid(self) -> None:
+        # Spine coordinate numbers use an adaptive locator so they never
+        # collide as the user zooms — a fixed step would pile up on
+        # zoom-out. ax.clear() (in redraw) resets the locator, so it is
+        # re-installed here every redraw; between redraws matplotlib keeps
+        # re-invoking it, which is what makes scroll-zoom stay readable.
+        self.ax.xaxis.set_major_locator(
+            AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
+        self.ax.yaxis.set_major_locator(
+            AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
+
         grid = self._grid_provider()
         if grid.is_empty():
-            # Fall back to a uniform-spacing grid.
-            self.ax.xaxis.set_major_locator(MultipleLocator(self.grid_spacing))
-            self.ax.yaxis.set_major_locator(MultipleLocator(self.grid_spacing))
+            # Fall back to a uniform reference grid drawn at the same
+            # adaptive ticks, so the dotted lines coarsen with the labels
+            # instead of smearing into a solid block when zoomed out.
             self.ax.grid(True, which="major", linestyle=":", linewidth=0.5,
                          color="#cccccc")
             return

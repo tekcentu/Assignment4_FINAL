@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.30.5"
+__version__ = "0.30.6"
 __what_is_new__ = (
-    "Moment diagram drawn below member (sagging-down convention) on canvas · "
-    "V and M diagrams coloured by sign (blue +, red −) with zero-crossing split · "
-    "Display-only: V(x), M(x), and solver math unchanged"
+    "Canvas coordinate numbers stay readable at any zoom (adaptive 1-2-5 ticks) · "
+    "Zoom-out no longer piles axis labels into an unreadable blur · "
+    "Reference grid coarsens with the labels instead of smearing solid"
 )
 
 from .model import (
