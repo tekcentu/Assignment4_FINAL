@@ -199,6 +199,15 @@ class ModelCanvas(QWidget):
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
+        # Depth-aware snapping (v0.33). When several nodes project onto
+        # the same view-plane position (storeys stacked behind each
+        # other in the XY view), the hovered "stack" is tracked here and
+        # the Tab key cycles which member of the stack a node hit
+        # resolves to. ``working_depth_provider`` (wired by the host)
+        # biases the initial pick toward the active working depth.
+        self._stack_ids: tuple[int, ...] = ()
+        self._stack_cycle: int = 0
+        self.working_depth_provider: Callable[[], float] | None = None
         # Either anchored at an existing node id (legacy) or a free
         # start point (v0.10.0 — first click landed on empty space and
         # no node has been created yet). Exactly one is non-None at a
@@ -677,6 +686,16 @@ class ModelCanvas(QWidget):
                     if top is not None and top is not self:
                         top.keyPressEvent(event)
                         return True
+                if event.key() == Qt.Key.Key_Tab and len(self._stack_ids) > 1:
+                    # Depth-aware snapping (v0.33): Tab cycles through
+                    # nodes whose projections coincide under the cursor.
+                    # Claim the ShortcutOverride too, otherwise Qt's
+                    # focus chain consumes Tab before we see KeyPress.
+                    if t == QEvent.Type.ShortcutOverride:
+                        event.accept()
+                        return True
+                    if self._cycle_depth_stack():
+                        return True
         return super().eventFilter(obj, event)
 
     # ── event forwarding ──
@@ -826,6 +845,7 @@ class ModelCanvas(QWidget):
                             snap_label=candidate.label)
             if candidate.kind == "node":
                 hit.node_id = candidate.object_id
+                self._apply_depth_stack(hit, model)
             elif candidate.kind in ("endpoint", "midpoint", "project",
                                      "diagram"):
                 hit.element_id = candidate.object_id
@@ -850,6 +870,96 @@ class ModelCanvas(QWidget):
             event.xdata, event.ydata, px_per_dx, px_per_dy, model,
         )
         return hit
+
+    # ── depth-aware node stacks (v0.33) ──
+
+    def _depth_of(self, node) -> float:
+        """The out-of-plane coordinate of a REAL node in this view."""
+        vp = self._view_plane
+        if vp == "XZ":
+            return node.y
+        if vp == "ZY":
+            return node.x
+        return getattr(node, "z", 0.0)  # XY (and nominal for ISO)
+
+    def _node_stack_for(self, model, node_id: int) -> tuple[int, ...]:
+        """Ids of every node sharing ``node_id``'s projected position,
+        sorted by their out-of-plane depth. ``model`` is the projected
+        model; depths are read from the real one."""
+        proj_nodes = model.nodes
+        base = proj_nodes.get(node_id)
+        if base is None:
+            return (node_id,)
+        tol = 1e-9
+        stack = [
+            nid for nid, n in proj_nodes.items()
+            if abs(n.x - base.x) < tol and abs(n.y - base.y) < tol
+        ]
+        if len(stack) <= 1:
+            return tuple(stack) or (node_id,)
+        real = self._model().nodes
+        stack.sort(key=lambda nid: self._depth_of(real[nid]))
+        return tuple(stack)
+
+    def _stack_order(self) -> list[int]:
+        """The hovered stack, rotated so a working-depth match (when
+        one exists) comes first — that is the click-through default."""
+        order = list(self._stack_ids)
+        if len(order) > 1 and self.working_depth_provider is not None:
+            try:
+                wd = float(self.working_depth_provider())
+            except Exception:
+                wd = None
+            if wd is not None:
+                real = self._model().nodes
+                for i, nid in enumerate(order):
+                    n = real.get(nid)
+                    if n is not None and abs(self._depth_of(n) - wd) < 1e-9:
+                        order = order[i:] + order[:i]
+                        break
+        return order
+
+    def _stack_hit_label(self, chosen: int, order: list[int]) -> str:
+        n = self._model().nodes.get(chosen)
+        depth = self._depth_of(n) if n is not None else 0.0
+        pos = order.index(chosen) % len(order) + 1
+        return (f"node {chosen} (depth {depth:g}) — "
+                f"{pos}/{len(order)} stacked, Tab cycles")
+
+    def _apply_depth_stack(self, hit: HitResult, model) -> None:
+        """Resolve a node hit through the coincident-projection stack."""
+        stack = self._node_stack_for(model, hit.node_id)
+        if stack != self._stack_ids:
+            self._stack_ids = stack
+            self._stack_cycle = 0
+        if len(stack) <= 1:
+            return
+        order = self._stack_order()
+        chosen = order[self._stack_cycle % len(order)]
+        hit.node_id = chosen
+        hit.snap_label = self._stack_hit_label(chosen, order)
+
+    def _cycle_depth_stack(self) -> bool:
+        """Advance the Tab cycle on the hovered stack. Returns True
+        when a stack was active and the hit was re-dispatched."""
+        if len(self._stack_ids) <= 1 or self._last_hit is None:
+            return False
+        self._stack_cycle += 1
+        order = self._stack_order()
+        chosen = order[self._stack_cycle % len(order)]
+        old = self._last_hit
+        hit = HitResult(
+            x=old.x, y=old.y, node_id=chosen,
+            snap_kind="node",
+            snap_label=self._stack_hit_label(chosen, order),
+        )
+        self._last_hit = hit
+        if self.on_motion is not None and self._last_event_px is not None:
+            try:
+                self.on_motion(hit, self._last_event_px)
+            except Exception:
+                pass
+        return True
 
     def _pick_nearest_element_px(
         self, x: float, y: float,

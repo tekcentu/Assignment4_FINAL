@@ -322,6 +322,11 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical, self)
         self.canvas = ModelCanvas(splitter, lambda: self._model,
                                     grid_provider=lambda: self._grid)
+        # Depth-aware snapping (v0.33): bias stacked-node picks
+        # toward the active working depth.
+        self.canvas.working_depth_provider = (
+            lambda: self._working_depth
+        )
         splitter.addWidget(self.canvas)
 
         result_frame = QFrame(splitter)

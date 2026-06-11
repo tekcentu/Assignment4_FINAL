@@ -281,3 +281,69 @@ def test_member_udl_wz_draws_in_plan_view(qt_app):
         w.canvas.redraw()  # no crash; wz arrows render where projectable
     labels = [t.get_text() for t in w.canvas.ax.texts]
     assert any("UDL" in s and "-3" in s for s in labels)
+
+
+# ── v0.33: depth-aware snapping (stacked-node Tab cycling) ─────
+
+
+def _stacked_window(qt_app):
+    w = MainWindow()
+    w._model.nodes = {
+        1: Node(1, 2.0, 1.0, 0.0),
+        2: Node(2, 2.0, 1.0, 4.0),   # same XY projection, z = 4
+        3: Node(3, 5.0, 1.0, 0.0),   # unrelated
+    }
+    return w
+
+
+def test_depth_stack_resolution_and_cycle(qt_app):
+    w = _stacked_window(qt_app)
+    c = w.canvas
+    stack = c._node_stack_for(c.projected_model(), 1)
+    assert stack == (1, 2)  # depth-sorted
+    assert c._node_stack_for(c.projected_model(), 3) == (3,)
+
+    # Working depth 4 biases the pick to node 2.
+    w._working_depth = 4.0
+    c._stack_ids = stack
+    assert c._stack_order() == [2, 1]
+    w._working_depth = 0.0
+    assert c._stack_order() == [1, 2]
+
+
+def test_depth_stack_applied_to_node_hits(qt_app):
+    from structural_analysis.gui_qt.canvas import HitResult
+
+    w = _stacked_window(qt_app)
+    c = w.canvas
+    hit = HitResult(x=2.0, y=1.0, node_id=1, snap_kind="node",
+                    snap_label="node 1")
+    c._apply_depth_stack(hit, c.projected_model())
+    assert hit.node_id == 1
+    assert "1/2 stacked" in hit.snap_label and "Tab" in hit.snap_label
+
+    # Cycle: next Tab resolves to the deeper node.
+    c._last_hit = hit
+    c._last_event_px = (10.0, 10.0)
+    seen: list[int] = []
+    c.on_motion = lambda h, px: seen.append(h.node_id)
+    assert c._cycle_depth_stack()
+    assert seen == [2]
+    assert c._last_hit.node_id == 2
+    assert "2/2 stacked" in c._last_hit.snap_label
+
+    # Cycling wraps around.
+    assert c._cycle_depth_stack()
+    assert c._last_hit.node_id == 1
+
+
+def test_depth_stack_working_depth_wins_initial_pick(qt_app):
+    from structural_analysis.gui_qt.canvas import HitResult
+
+    w = _stacked_window(qt_app)
+    w._working_depth = 4.0
+    hit = HitResult(x=2.0, y=1.0, node_id=1, snap_kind="node",
+                    snap_label="node 1")
+    w.canvas._apply_depth_stack(hit, w.canvas.projected_model())
+    assert hit.node_id == 2  # the z = 4 twin matches the working depth
+    assert "depth 4" in hit.snap_label
