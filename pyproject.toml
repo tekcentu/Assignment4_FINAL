@@ -13,11 +13,25 @@ dependencies = [
     "scipy>=1.10",
     "matplotlib>=3.7",
     "PyQt6>=6.6",
+    # 3D viewport (View -> 3D viewport (beta)). Pure-Python packages;
+    # the GUI still degrades gracefully if they are missing at runtime
+    # (e.g. a source checkout that predates this entry). >=0.14 is the
+    # shader-based GL renderer — older releases draw the grid/lines via
+    # legacy fixed-function GL, invisible on core-profile contexts.
+    "pyqtgraph>=0.14",
+    "PyOpenGL>=3.1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+]
+# Back-compat alias: the viewport packages moved into the core
+# dependencies in v0.33.1 ("dependency not installed" was the first
+# thing every user hit). `pip install .[gl]` keeps working.
+gl = [
+    "pyqtgraph>=0.14",
+    "PyOpenGL>=3.1",
 ]
 
 [project.scripts]

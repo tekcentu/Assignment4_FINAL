@@ -1697,19 +1697,27 @@ class AddNodalLoadCmd(Command):
     fy: float = 0.0
     mz: float = 0.0
     load_case: str = "DEFAULT"
+    # 3D components (v0.33): any non-zero value switches the solve to
+    # the 6-DOF space pipeline automatically.
+    fz: float = 0.0
+    mx: float = 0.0
+    my: float = 0.0
     _appended_load: NodalLoad | None = field(default=None, init=False)
     description: str = "add nodal load"
 
     def do(self, model: StructuralModel) -> None:
         if self.node_id not in model.nodes:
             raise ValueError(f"Node {self.node_id} does not exist.")
-        if self.fx == 0.0 and self.fy == 0.0 and self.mz == 0.0:
+        if (self.fx == 0.0 and self.fy == 0.0 and self.mz == 0.0
+                and self.fz == 0.0 and self.mx == 0.0
+                and self.my == 0.0):
             raise ValueError(
-                "Nodal load has Fx = Fy = Mz = 0 — nothing to add."
+                "Nodal load has all six components = 0 — nothing to add."
             )
         self._appended_load = NodalLoad(
             self.node_id, float(self.fx), float(self.fy),
             float(self.mz), load_case=self.load_case,
+            fz=float(self.fz), mx=float(self.mx), my=float(self.my),
         )
         model.nodal_loads.append(self._appended_load)
 
@@ -1742,6 +1750,10 @@ class EditNodalLoadRowCmd(Command):
     fy: float
     mz: float
     load_case: str = "DEFAULT"
+    # 3D components (v0.33).
+    fz: float = 0.0
+    mx: float = 0.0
+    my: float = 0.0
     _saved: NodalLoad | None = field(default=None, init=False)
     _new_load: NodalLoad | None = field(default=None, init=False)
     description: str = "edit nodal load row"
@@ -1753,14 +1765,18 @@ class EditNodalLoadRowCmd(Command):
                 f"(have {len(model.nodal_loads)} row"
                 f"{'s' if len(model.nodal_loads) != 1 else ''})."
             )
-        if self.fx == 0.0 and self.fy == 0.0 and self.mz == 0.0:
+        if (self.fx == 0.0 and self.fy == 0.0 and self.mz == 0.0
+                and self.fz == 0.0 and self.mx == 0.0
+                and self.my == 0.0):
             raise ValueError(
-                "Nodal load has Fx = Fy = Mz = 0 — use Delete to remove it."
+                "Nodal load has all six components = 0 — use Delete "
+                "to remove it."
             )
         self._saved = model.nodal_loads[self.row_index]
         self._new_load = NodalLoad(
             self._saved.node_id, float(self.fx), float(self.fy),
             float(self.mz), load_case=self.load_case,
+            fz=float(self.fz), mx=float(self.mx), my=float(self.my),
         )
         model.nodal_loads[self.row_index] = self._new_load
 

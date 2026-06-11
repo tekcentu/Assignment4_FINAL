@@ -165,6 +165,10 @@ def format_element_loads(
                 magnitude = _format_mechanical_magnitude(
                     wx, ld.wy, x_name, y_name, "kN/m",
                 )
+                wz = getattr(ld, "wz", 0.0)
+                if wz:
+                    z_name = "qZ" if cs == "global" else "wz"
+                    magnitude += f", {z_name} = {wz:+g} kN/m"
             local_eq = _local_equivalent_note(
                 model, elem, wx, ld.wy, cs, "kN/m", "udl",
             )
@@ -197,6 +201,10 @@ def format_element_loads(
                 magnitude = _format_mechanical_magnitude(
                     px, ld.py, x_name, y_name, "kN",
                 )
+                pz = getattr(ld, "pz", 0.0)
+                if pz:
+                    z_name = "PZ" if cs == "global" else "Pz"
+                    magnitude += f", {z_name} = {pz:+g} kN"
             local_eq = _local_equivalent_note(
                 model, elem, px, ld.py, cs, "kN", "point",
             )

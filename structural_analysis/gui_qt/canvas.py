@@ -199,6 +199,15 @@ class ModelCanvas(QWidget):
         self._modal_mode_idx: int = 0
         self._modal_scale: float = 1.0
         self._snap_marker = None  # current SnapCandidate
+        # Depth-aware snapping (v0.33). When several nodes project onto
+        # the same view-plane position (storeys stacked behind each
+        # other in the XY view), the hovered "stack" is tracked here and
+        # the Tab key cycles which member of the stack a node hit
+        # resolves to. ``working_depth_provider`` (wired by the host)
+        # biases the initial pick toward the active working depth.
+        self._stack_ids: tuple[int, ...] = ()
+        self._stack_cycle: int = 0
+        self.working_depth_provider: Callable[[], float] | None = None
         # Either anchored at an existing node id (legacy) or a free
         # start point (v0.10.0 — first click landed on empty space and
         # no node has been created yet). Exactly one is non-None at a
@@ -320,6 +329,21 @@ class ModelCanvas(QWidget):
         self._mpl_canvas.mpl_connect("button_release_event", self._handle_release)
         self._mpl_canvas.mpl_connect("motion_notify_event", self._handle_motion)
         self._mpl_canvas.mpl_connect("scroll_event", self._handle_scroll)
+
+        # ── blitted hover overlay (v0.33.1 — performance) ──
+        # Mouse motion used to trigger a FULL scene rebuild per event
+        # (ax.clear + every artist recreated — tens of ms even on small
+        # models). The cursor-following decorations (snap marker, hover
+        # ghost, member rubber-band, box-select rectangle) now live on
+        # dedicated animated artists composited over a cached background
+        # with canvas blitting; a real redraw only happens when the
+        # scene itself changes.
+        self._overlay_bg = None
+        self._overlay_marker = None
+        self._overlay_preview_line = None
+        self._overlay_preview_ends = None
+        self._overlay_rect = None
+        self._mpl_canvas.mpl_connect("draw_event", self._capture_overlay_bg)
 
     # ── public API ──
 
@@ -677,6 +701,16 @@ class ModelCanvas(QWidget):
                     if top is not None and top is not self:
                         top.keyPressEvent(event)
                         return True
+                if event.key() == Qt.Key.Key_Tab and len(self._stack_ids) > 1:
+                    # Depth-aware snapping (v0.33): Tab cycles through
+                    # nodes whose projections coincide under the cursor.
+                    # Claim the ShortcutOverride too, otherwise Qt's
+                    # focus chain consumes Tab before we see KeyPress.
+                    if t == QEvent.Type.ShortcutOverride:
+                        event.accept()
+                        return True
+                    if self._cycle_depth_stack():
+                        return True
         return super().eventFilter(obj, event)
 
     # ── event forwarding ──
@@ -729,10 +763,11 @@ class ModelCanvas(QWidget):
             self._mpl_canvas.draw_idle()
             return
         if self.on_motion is None or event.inaxes is not self.ax:
-            # Cursor left the axes — drop the hover marker.
-            if self._hover_xy is not None:
+            # Cursor left the axes — drop the hover marker (cheap blit).
+            if self._hover_xy is not None or self._snap_marker is not None:
                 self._hover_xy = None
-                self._mpl_canvas.draw_idle()
+                self._snap_marker = None
+                self.update_hover_overlay()
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -826,6 +861,7 @@ class ModelCanvas(QWidget):
                             snap_label=candidate.label)
             if candidate.kind == "node":
                 hit.node_id = candidate.object_id
+                self._apply_depth_stack(hit, model)
             elif candidate.kind in ("endpoint", "midpoint", "project",
                                      "diagram"):
                 hit.element_id = candidate.object_id
@@ -850,6 +886,96 @@ class ModelCanvas(QWidget):
             event.xdata, event.ydata, px_per_dx, px_per_dy, model,
         )
         return hit
+
+    # ── depth-aware node stacks (v0.33) ──
+
+    def _depth_of(self, node) -> float:
+        """The out-of-plane coordinate of a REAL node in this view."""
+        vp = self._view_plane
+        if vp == "XZ":
+            return node.y
+        if vp == "ZY":
+            return node.x
+        return getattr(node, "z", 0.0)  # XY (and nominal for ISO)
+
+    def _node_stack_for(self, model, node_id: int) -> tuple[int, ...]:
+        """Ids of every node sharing ``node_id``'s projected position,
+        sorted by their out-of-plane depth. ``model`` is the projected
+        model; depths are read from the real one."""
+        proj_nodes = model.nodes
+        base = proj_nodes.get(node_id)
+        if base is None:
+            return (node_id,)
+        tol = 1e-9
+        stack = [
+            nid for nid, n in proj_nodes.items()
+            if abs(n.x - base.x) < tol and abs(n.y - base.y) < tol
+        ]
+        if len(stack) <= 1:
+            return tuple(stack) or (node_id,)
+        real = self._model().nodes
+        stack.sort(key=lambda nid: self._depth_of(real[nid]))
+        return tuple(stack)
+
+    def _stack_order(self) -> list[int]:
+        """The hovered stack, rotated so a working-depth match (when
+        one exists) comes first — that is the click-through default."""
+        order = list(self._stack_ids)
+        if len(order) > 1 and self.working_depth_provider is not None:
+            try:
+                wd = float(self.working_depth_provider())
+            except Exception:
+                wd = None
+            if wd is not None:
+                real = self._model().nodes
+                for i, nid in enumerate(order):
+                    n = real.get(nid)
+                    if n is not None and abs(self._depth_of(n) - wd) < 1e-9:
+                        order = order[i:] + order[:i]
+                        break
+        return order
+
+    def _stack_hit_label(self, chosen: int, order: list[int]) -> str:
+        n = self._model().nodes.get(chosen)
+        depth = self._depth_of(n) if n is not None else 0.0
+        pos = order.index(chosen) % len(order) + 1
+        return (f"node {chosen} (depth {depth:g}) — "
+                f"{pos}/{len(order)} stacked, Tab cycles")
+
+    def _apply_depth_stack(self, hit: HitResult, model) -> None:
+        """Resolve a node hit through the coincident-projection stack."""
+        stack = self._node_stack_for(model, hit.node_id)
+        if stack != self._stack_ids:
+            self._stack_ids = stack
+            self._stack_cycle = 0
+        if len(stack) <= 1:
+            return
+        order = self._stack_order()
+        chosen = order[self._stack_cycle % len(order)]
+        hit.node_id = chosen
+        hit.snap_label = self._stack_hit_label(chosen, order)
+
+    def _cycle_depth_stack(self) -> bool:
+        """Advance the Tab cycle on the hovered stack. Returns True
+        when a stack was active and the hit was re-dispatched."""
+        if len(self._stack_ids) <= 1 or self._last_hit is None:
+            return False
+        self._stack_cycle += 1
+        order = self._stack_order()
+        chosen = order[self._stack_cycle % len(order)]
+        old = self._last_hit
+        hit = HitResult(
+            x=old.x, y=old.y, node_id=chosen,
+            snap_kind="node",
+            snap_label=self._stack_hit_label(chosen, order),
+        )
+        self._last_hit = hit
+        if self.on_motion is not None and self._last_event_px is not None:
+            try:
+                self.on_motion(hit, self._last_event_px)
+            except Exception:
+                pass
+        return True
 
     def _pick_nearest_element_px(
         self, x: float, y: float,
@@ -955,6 +1081,141 @@ class ModelCanvas(QWidget):
             self.ax.annotate(name, (ex, ey), xytext=(4, 2),
                              textcoords="offset points", fontsize=8,
                              color="#222222", zorder=9)
+
+    # ── blitted hover overlay (v0.33.1) ───────────────────────────
+
+    def _capture_overlay_bg(self, _event) -> None:
+        """Cache the freshly rendered scene as the blit background.
+
+        Fires on every real matplotlib draw (full redraw, resize, pan,
+        zoom), so the cache can never go stale relative to the scene.
+        """
+        try:
+            self._overlay_bg = self._mpl_canvas.copy_from_bbox(
+                self.fig.bbox,
+            )
+        except Exception:  # pragma: no cover — backend without blitting
+            self._overlay_bg = None
+
+    def _ensure_overlay_artists(self) -> None:
+        """(Re)create the animated overlay artists after an ax.clear."""
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Rectangle
+
+        if (self._overlay_marker is not None
+                and self._overlay_marker.axes is self.ax):
+            return
+        self._overlay_marker = Line2D(
+            [], [], linestyle="None", marker="o", markersize=12,
+            markerfacecolor="none", markeredgewidth=2, zorder=10,
+            animated=True,
+        )
+        self.ax.add_line(self._overlay_marker)
+        self._overlay_preview_line = Line2D(
+            [], [], linewidth=2.4, alpha=0.55, zorder=3, animated=True,
+        )
+        self.ax.add_line(self._overlay_preview_line)
+        self._overlay_preview_ends = Line2D(
+            [], [], linestyle="None", marker="o", markersize=5,
+            markerfacecolor="white", alpha=0.85, zorder=9,
+            animated=True,
+        )
+        self.ax.add_line(self._overlay_preview_ends)
+        self._overlay_rect = Rectangle(
+            (0, 0), 0, 0, linewidth=1.4, alpha=0.10, fill=True,
+            zorder=12, animated=True, visible=False,
+        )
+        self.ax.add_patch(self._overlay_rect)
+
+    def _style_overlay_marker(self) -> None:
+        m = self._overlay_marker
+        c = self._snap_marker
+        if c is not None:
+            marker_styles = {
+                "node":     ("o", "#ff7f0e"),
+                "diagram":  ("*", "#d62728"),
+                "grid":     ("s", "#1f77b4"),
+                "endpoint": ("^", "#9467bd"),
+                "midpoint": ("D", "#17becf"),
+                "project":  ("x", "#2ca02c"),
+            }
+            marker, color = marker_styles.get(c.kind, ("o", "#888"))
+            m.set_data([c.x], [c.y])
+            m.set_marker(marker)
+            m.set_markersize(12)
+            m.set_markeredgewidth(2)
+            m.set_color(color)
+            m.set_alpha(1.0)
+        elif self._hover_xy is not None:
+            x, y = self._hover_xy
+            m.set_data([x], [y])
+            m.set_marker("+")
+            m.set_markersize(14)
+            m.set_markeredgewidth(1.5)
+            m.set_color("#888888")
+            m.set_alpha(0.7)
+        else:
+            m.set_data([], [])
+
+    def _style_overlay_preview(self) -> None:
+        line = self._overlay_preview_line
+        ends = self._overlay_preview_ends
+        if self._element_preview is not None:
+            start_node_id, end_x, end_y, kind = self._element_preview
+            start = self.projected_model().nodes.get(start_node_id)
+            if start is None:
+                line.set_data([], [])
+                ends.set_data([], [])
+                return
+            sx, sy = start.x, start.y
+            end_pts = ([end_x], [end_y])
+        elif self._element_preview_free is not None:
+            sx, sy, end_x, end_y, kind = self._element_preview_free
+            end_pts = ([sx, end_x], [sy, end_y])
+        else:
+            line.set_data([], [])
+            ends.set_data([], [])
+            return
+        color = "#1f77b4" if kind == "frame" else "#d62728"
+        line.set_data([sx, end_x], [sy, end_y])
+        line.set_color(color)
+        line.set_linestyle("-" if kind == "frame" else "--")
+        ends.set_data(*end_pts)
+        ends.set_markeredgecolor(color)
+
+    def _style_overlay_rect(self) -> None:
+        rect = self._overlay_rect
+        if self._drag_rect is None:
+            rect.set_visible(False)
+            return
+        x0, y0, x1, y1, is_crossing = self._drag_rect
+        color = "#2da44e" if is_crossing else "#1f6feb"
+        rect.set_bounds(min(x0, x1), min(y0, y1),
+                        abs(x1 - x0), abs(y1 - y0))
+        rect.set_edgecolor(color)
+        rect.set_facecolor(color)
+        rect.set_linestyle("--" if is_crossing else "-")
+        rect.set_visible(True)
+
+    def update_hover_overlay(self) -> None:
+        """Cheap per-mouse-move repaint: blit the cursor decorations
+        over the cached scene instead of rebuilding the scene."""
+        if self._overlay_bg is None:
+            # No background yet (first paint still pending) — fall back
+            # to a real draw, which captures one via the draw_event.
+            self._mpl_canvas.draw_idle()
+            return
+        self._ensure_overlay_artists()
+        self._style_overlay_marker()
+        self._style_overlay_preview()
+        self._style_overlay_rect()
+        canvas = self._mpl_canvas
+        canvas.restore_region(self._overlay_bg)
+        self.ax.draw_artist(self._overlay_marker)
+        self.ax.draw_artist(self._overlay_preview_line)
+        self.ax.draw_artist(self._overlay_preview_ends)
+        self.ax.draw_artist(self._overlay_rect)
+        canvas.blit(self.fig.bbox)
 
     def _draw_snap_marker(self) -> None:
         c = self._snap_marker
@@ -1232,16 +1493,22 @@ class ModelCanvas(QWidget):
         max_udl = 0.0
         max_point = 0.0
         for ld in model.nodal_loads:
-            max_force = max(max_force, (ld.fx ** 2 + ld.fy ** 2) ** 0.5)
+            max_force = max(
+                max_force,
+                (ld.fx ** 2 + ld.fy ** 2
+                 + getattr(ld, "fz", 0.0) ** 2) ** 0.5,
+            )
         for elem in model.elements:
             for ml in getattr(elem, "member_loads", []):
                 if isinstance(ml, UniformDistributedLoad):
                     max_udl = max(
                         max_udl, abs(ml.wy), abs(getattr(ml, "wx", 0.0)),
+                        abs(getattr(ml, "wz", 0.0)),
                     )
                 elif isinstance(ml, PointLoad):
                     max_point = max(
                         max_point, abs(ml.py), abs(getattr(ml, "px", 0.0)),
+                        abs(getattr(ml, "pz", 0.0)),
                     )
         span = self._model_span()
         # Map the largest load in each family to ~12% of the model
@@ -1651,37 +1918,40 @@ class ModelCanvas(QWidget):
         # ``case_alpha`` dims loads belonging to non-active load cases
         # when the host has the "active case only" overlay on (PR-A).
         case_alpha = self._load_case_alpha(ld)
+        unprojected: list[str] = []
         if force_scale > 0:
-            if ld.fx:
-                dx = ld.fx * force_scale
+            # One arrow per non-zero force component, drawn along the
+            # PROJECTION of its world axis onto the active view plane.
+            # In the XY view this reproduces the legacy Fx / Fy arrows
+            # exactly (Z projects to zero length there and falls back
+            # to the text tag).
+            label_offsets = {"Fx": (0, 5), "Fy": (5, 0), "Fz": (5, -5)}
+            for name, comp, vec in (
+                ("Fx", ld.fx, (1.0, 0.0, 0.0)),
+                ("Fy", ld.fy, (0.0, 1.0, 0.0)),
+                ("Fz", getattr(ld, "fz", 0.0), (0.0, 0.0, 1.0)),
+            ):
+                if not comp:
+                    continue
+                du, dv = self.project_xyz(*vec)
+                if math.hypot(du, dv) < 1e-9:
+                    unprojected.append(f"{name}={comp:+.3g}")
+                    continue
+                dx = comp * force_scale * du
+                dy = comp * force_scale * dv
                 self.ax.annotate(
                     "",
                     xy=(x, y),
-                    xytext=(x - dx, y),
+                    xytext=(x - dx, y - dy),
                     arrowprops=dict(
                         arrowstyle="->", color="#2ca02c", lw=2,
                         alpha=case_alpha,
                     ),
                     zorder=5,
                 )
-                self.ax.annotate(f"Fx={ld.fx:+.3g}", (x - dx, y),
-                                 xytext=(0, 5), textcoords="offset points",
-                                 fontsize=7, color="#2ca02c", zorder=6,
-                                 alpha=case_alpha)
-            if ld.fy:
-                dy = ld.fy * force_scale
-                self.ax.annotate(
-                    "",
-                    xy=(x, y),
-                    xytext=(x, y - dy),
-                    arrowprops=dict(
-                        arrowstyle="->", color="#2ca02c", lw=2,
-                        alpha=case_alpha,
-                    ),
-                    zorder=5,
-                )
-                self.ax.annotate(f"Fy={ld.fy:+.3g}", (x, y - dy),
-                                 xytext=(5, 0), textcoords="offset points",
+                self.ax.annotate(f"{name}={comp:+.3g}", (x - dx, y - dy),
+                                 xytext=label_offsets[name],
+                                 textcoords="offset points",
                                  fontsize=7, color="#2ca02c", zorder=6,
                                  alpha=case_alpha)
         if ld.mz:
@@ -1689,12 +1959,11 @@ class ModelCanvas(QWidget):
                              textcoords="offset points", fontsize=7,
                              color="#2ca02c", zorder=6,
                              alpha=case_alpha)
-        # 3D-only components: compact textual tag (the canvas draws
-        # in-plane arrows only; the 3D viewer shows true directions).
-        parts_3d = [
+        # Moments about in-plane axes (and any force component that
+        # looks straight at the camera) stay textual tags.
+        parts_3d = unprojected + [
             f"{name}={val:+.3g}"
-            for name, val in (("Fz", getattr(ld, "fz", 0.0)),
-                              ("Mx", getattr(ld, "mx", 0.0)),
+            for name, val in (("Mx", getattr(ld, "mx", 0.0)),
                               ("My", getattr(ld, "my", 0.0)))
             if val
         ]
@@ -1723,11 +1992,37 @@ class ModelCanvas(QWidget):
         local loads."""
         if not elem.member_loads:
             return
-        L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
-        if L < 1e-12:
+        # Arrow DIRECTIONS come from the element's true 3D local triad
+        # (built on the REAL nodes), projected onto the active view
+        # plane; arrow POSITIONS interpolate along the projected member
+        # (``ni`` / ``nj`` here are projected nodes). For a planar
+        # member in the XY view this reproduces the legacy tangent /
+        # normal arrows bit-for-bit, and out-of-plane (wz / pz)
+        # components become real arrows in plan / side / iso views.
+        from ..element3d import local_axes as _local_axes_3d
+        real_nodes = self._model().nodes
+        rn_i = real_nodes.get(elem.node_i)
+        rn_j = real_nodes.get(elem.node_j)
+        if rn_i is None or rn_j is None:
             return
-        tx, ty = (nj.x - ni.x) / L, (nj.y - ni.y) / L   # member tangent
-        nx, ny = -ty, tx                                # member +y_local
+        try:
+            L3, lam = _local_axes_3d(
+                rn_i, rn_j, roll=getattr(elem, "roll", 0.0),
+            )
+        except ValueError:
+            return
+
+        def _projected_dirs(components):
+            """[(du, dv, mag)] with zero-length projections dropped."""
+            out = []
+            for vec, mag in components:
+                if mag == 0.0:
+                    continue
+                du, dv = self.project_xyz(*vec)
+                if math.hypot(du, dv) < 1e-9:
+                    continue  # axis looks at the camera in this view
+                out.append((du, dv, mag))
+            return out
 
         labels: list[str] = []
         udl_scale = load_scales.get("udl", 0.0)
@@ -1740,11 +2035,12 @@ class ModelCanvas(QWidget):
             if isinstance(ml, UniformDistributedLoad):
                 labels.append(_label_for_udl(ml))
                 if udl_scale > 0:
-                    for dx, dy, mag in _udl_visual_components(
-                        ml, tx, ty, nx, ny,
-                    ):
-                        if mag == 0.0:
-                            continue
+                    comps = _mechanical_world_components(
+                        lam, getattr(ml, "wx", 0.0), ml.wy,
+                        getattr(ml, "wz", 0.0),
+                        getattr(ml, "coord_system", "local"),
+                    )
+                    for dx, dy, mag in _projected_dirs(comps):
                         self._draw_udl_arrow_strip(
                             ni, nj, dx, dy, mag, udl_scale,
                             case_alpha=case_alpha,
@@ -1752,14 +2048,15 @@ class ModelCanvas(QWidget):
             elif isinstance(ml, PointLoad):
                 labels.append(_label_for_pointload(ml))
                 if point_scale > 0:
-                    a = max(0.0, min(L, float(ml.a)))
-                    bx = ni.x + tx * a
-                    by = ni.y + ty * a
-                    for dx, dy, mag in _pointload_visual_components(
-                        ml, tx, ty, nx, ny,
-                    ):
-                        if mag == 0.0:
-                            continue
+                    frac = max(0.0, min(1.0, float(ml.a) / L3))
+                    bx = ni.x + (nj.x - ni.x) * frac
+                    by = ni.y + (nj.y - ni.y) * frac
+                    comps = _mechanical_world_components(
+                        lam, getattr(ml, "px", 0.0), ml.py,
+                        getattr(ml, "pz", 0.0),
+                        getattr(ml, "coord_system", "local"),
+                    )
+                    for dx, dy, mag in _projected_dirs(comps):
                         h = mag * point_scale
                         # Tail OPPOSITE to load direction so the
                         # arrowhead at xy=(bx,by) visually points along
@@ -1887,15 +2184,9 @@ class ModelCanvas(QWidget):
             return [ni.x, nj.x], [ni.y, nj.y]
         d = mr["d_local"]
         if len(d) != 6:
-            # 3D solve (12 local DOFs): fall back to a straight line
-            # between the projected displaced endpoints — the smooth
-            # Hermite interpolation is a planar formulation.
-            uxi, uyi = self._node_displacement(elem.node_i)
-            uxj, uyj = self._node_displacement(elem.node_j)
-            return (
-                [ni.x + scale * uxi, nj.x + scale * uxj],
-                [ni.y + scale * uyi, nj.y + scale * uyj],
-            )
+            # 3D solve (12 local DOFs): Hermite-interpolate the curve
+            # in BOTH local bending planes and project it (v0.33).
+            return self._frame_deformed_points_3d(elem, d, scale)
         ui_loc, vi_loc, thi = float(d[0]), float(d[1]), float(d[2])
         uj_loc, vj_loc, thj = float(d[3]), float(d[4]), float(d[5])
         n = max(2, int(self.deformed_stations))
@@ -1909,6 +2200,56 @@ class ModelCanvas(QWidget):
             y_def = scale * v_loc
             Xs.append(ni.x + c * x_def - s * y_def)
             Ys.append(ni.y + s * x_def + c * y_def)
+        return Xs, Ys
+
+    def _frame_deformed_points_3d(
+        self, elem, d, scale: float,
+    ) -> tuple[list[float], list[float]]:
+        """Projected deformed centreline for a 12-DOF (space) result.
+
+        The curve is built in the element's true local triad — axial
+        lerp plus cubic Hermite in local y (using θz) and local z
+        (using θy with the −dw/dx sign flip) — then mapped to world
+        coordinates and projected onto the active view plane. Falls
+        back to the straight displaced chord if the triad degenerates.
+        """
+        from ..element3d import local_axes as _local_axes_3d
+        real = self._model().nodes
+        rn_i = real.get(elem.node_i)
+        rn_j = real.get(elem.node_j)
+        if rn_i is None or rn_j is None:
+            return [], []
+        try:
+            L3, lam = _local_axes_3d(
+                rn_i, rn_j, roll=getattr(elem, "roll", 0.0),
+            )
+        except ValueError:
+            uxi, uyi = self._node_displacement(elem.node_i)
+            uxj, uyj = self._node_displacement(elem.node_j)
+            pni = self.project_xyz(rn_i.x, rn_i.y,
+                                   getattr(rn_i, "z", 0.0))
+            pnj = self.project_xyz(rn_j.x, rn_j.y,
+                                   getattr(rn_j, "z", 0.0))
+            return ([pni[0] + scale * uxi, pnj[0] + scale * uxj],
+                    [pni[1] + scale * uyi, pnj[1] + scale * uyj])
+        import numpy as _np
+        p0 = _np.array([rn_i.x, rn_i.y, getattr(rn_i, "z", 0.0)])
+        xhat, yhat, zhat = lam[0], lam[1], lam[2]
+        n = max(2, int(self.deformed_stations))
+        Xs: list[float] = []
+        Ys: list[float] = []
+        for k in range(n):
+            r = k / (n - 1)
+            u = (1.0 - r) * float(d[0]) + r * float(d[6])
+            v = self._hermite_v(r, L3, float(d[1]), float(d[5]),
+                                float(d[7]), float(d[11]))
+            w = self._hermite_v(r, L3, float(d[2]), -float(d[4]),
+                                float(d[8]), -float(d[10]))
+            world = (p0 + xhat * (r * L3 + scale * u)
+                     + yhat * (scale * v) + zhat * (scale * w))
+            px, py = self.project_xyz(world[0], world[1], world[2])
+            Xs.append(px)
+            Ys.append(py)
         return Xs, Ys
 
     def _draw_deformed(self) -> None:
@@ -1935,11 +2276,18 @@ class ModelCanvas(QWidget):
             if mr is None or "d_local" not in mr:
                 continue
             d = mr["d_local"]
-            if len(d) != 6:
-                continue  # 3D solve — endpoint displacements suffice
             try:
                 L, _c, _s = elem.length_cos_sin(model.nodes)
             except (ValueError, ZeroDivisionError):
+                continue
+            if len(d) != 6:
+                # Space result: scan both local bending planes.
+                for rk in (0.25, 0.5, 0.75):
+                    v = self._hermite_v(rk, L, float(d[1]), float(d[5]),
+                                        float(d[7]), float(d[11]))
+                    w = self._hermite_v(rk, L, float(d[2]), -float(d[4]),
+                                        float(d[8]), -float(d[10]))
+                    max_disp = max(max_disp, abs(v), abs(w))
                 continue
             vi, thi, vj, thj = float(d[1]), float(d[2]), float(d[4]), float(d[5])
             for rk in (0.25, 0.5, 0.75):
@@ -1952,10 +2300,13 @@ class ModelCanvas(QWidget):
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
-            if isinstance(elem, FrameElement2D):
+            if (isinstance(elem, FrameElement2D)
+                    or getattr(elem, "kind", "") == "frame3d"):
                 try:
                     Xs, Ys = self._frame_deformed_points(elem, scale)
                 except (ValueError, ZeroDivisionError):
+                    continue
+                if not Xs:
                     continue
             else:
                 # Truss bar stays straight between displaced endpoints —
@@ -2096,14 +2447,7 @@ class ModelCanvas(QWidget):
             len(mr.get("f_local", ())) == 12
             for mr in result.member_results.values()
         )
-        if result_is_3d and self._view_plane != "XY":
-            self.ax.annotate(
-                "N/V/M diagrams for 3D results are shown in the XY "
-                "view only",
-                (0.02, 0.94), xycoords="axes fraction",
-                fontsize=8, color="#8c564b", va="top",
-            )
-            return
+        real_nodes = self._model().nodes
         for elem in model.elements:
             mr = result.member_results.get(elem.id)
             if mr is None:
@@ -2114,6 +2458,14 @@ class ModelCanvas(QWidget):
             ni = model.nodes.get(elem.node_i)
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
+                continue
+            # Sample on the REAL geometry so the ordinates stay exact
+            # in every view (v0.33); the drawing loop below rescales
+            # station positions onto the (possibly foreshortened)
+            # projected member.
+            rn_i = real_nodes.get(elem.node_i)
+            rn_j = real_nodes.get(elem.node_j)
+            if rn_i is None or rn_j is None:
                 continue
             # Sample density is configurable via View → Diagram stations.
             # Lower counts give a coarser preview; the critical-point
@@ -2126,11 +2478,14 @@ class ModelCanvas(QWidget):
             # 2D sign convention.
             f_local = mr.get("f_local_inplane", mr["f_local"])
             xs, ys = _diagram_ordinates(
-                elem, ni, nj, f_local, self.diagram_kind, n_samples=n,
+                elem, rn_i, rn_j, f_local, self.diagram_kind, n_samples=n,
             )
             if xs is None:
                 continue
-            per_elem.append((elem, ni, nj, xs, ys))
+            L_real = ((rn_j.x - rn_i.x) ** 2 + (rn_j.y - rn_i.y) ** 2
+                      + (getattr(rn_j, "z", 0.0)
+                         - getattr(rn_i, "z", 0.0)) ** 2) ** 0.5
+            per_elem.append((elem, ni, nj, xs, ys, L_real))
             max_ord = max(max_ord, max(abs(v) for v in ys))
         if max_ord <= 0 or not per_elem:
             return
@@ -2149,18 +2504,22 @@ class ModelCanvas(QWidget):
         else:
             ord_sign = +1.0
 
-        for elem, ni, nj, xs, ys in per_elem:
+        for elem, ni, nj, xs, ys, L_real in per_elem:
             L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
             if L < 1e-12:
-                continue
+                continue  # member looks at the camera in this view
             cx, cy = (nj.x - ni.x) / L, (nj.y - ni.y) / L
             nx, ny = -cy, cx
+            # Stations were sampled on the real length; rescale onto
+            # the projected span (ratio = 1 in the XY view of planar
+            # geometry — legacy behaviour preserved exactly).
+            sta = (L / L_real) if L_real > 1e-12 else 1.0
 
             def offset_point(xx, yy):
                 yy_disp = yy * ord_sign
                 return (
-                    ni.x + xx * cx + scale * yy_disp * nx,
-                    ni.y + xx * cy + scale * yy_disp * ny,
+                    ni.x + xx * sta * cx + scale * yy_disp * nx,
+                    ni.y + xx * sta * cy + scale * yy_disp * ny,
                 )
 
             if self.diagram_kind in ("shear", "moment"):
@@ -2188,10 +2547,10 @@ class ModelCanvas(QWidget):
                         poly_x, poly_y, color=color, linewidth=1.0, zorder=2,
                     )
                     # Close the polygon back along the member centerline.
-                    poly_x.append(ni.x + seg_xs[-1] * cx)
-                    poly_y.append(ni.y + seg_xs[-1] * cy)
-                    poly_x.append(ni.x + seg_xs[0] * cx)
-                    poly_y.append(ni.y + seg_xs[0] * cy)
+                    poly_x.append(ni.x + seg_xs[-1] * sta * cx)
+                    poly_y.append(ni.y + seg_xs[-1] * sta * cy)
+                    poly_x.append(ni.x + seg_xs[0] * sta * cx)
+                    poly_y.append(ni.y + seg_xs[0] * sta * cy)
                     self.ax.fill(
                         poly_x, poly_y, color=color, alpha=0.25, zorder=1,
                     )
@@ -2234,15 +2593,15 @@ class ModelCanvas(QWidget):
                 yy_disp = yy * ord_sign
                 # World-coords on the diagram polyline at this sample,
                 # using the same display flip applied to the fill.
-                world_x = ni.x + xx * cx + scale * yy_disp * nx
-                world_y = ni.y + xx * cy + scale * yy_disp * ny
+                world_x = ni.x + xx * sta * cx + scale * yy_disp * nx
+                world_y = ni.y + xx * sta * cy + scale * yy_disp * ny
                 # World-coords of the matching point on the element
                 # axis itself — that's what the snap engine should
                 # snap to (so a left-click in modelling tools still
                 # lands on the member geometry, not on the offset
                 # diagram polyline).
-                axis_x = ni.x + xx * cx
-                axis_y = ni.y + xx * cy
+                axis_x = ni.x + xx * sta * cx
+                axis_y = ni.y + xx * sta * cy
                 # Marker colour follows the sign convention used for the
                 # fill (blue positive / red negative for V & M; legacy
                 # brown for axial).
@@ -2275,8 +2634,12 @@ class ModelCanvas(QWidget):
                     "L": L,
                 })
 
+        kind_note = (
+            f"{self.diagram_kind} (in-plane N/Vy/Mz)"
+            if result_is_3d else self.diagram_kind
+        )
         self.ax.annotate(
-            f"{self.diagram_kind} diagram × {scale:.2g}  ·  max |·| = {max_ord:.3g} {unit}",
+            f"{kind_note} diagram × {scale:.2g}  ·  max |·| = {max_ord:.3g} {unit}",
             (0.02, 0.94), xycoords="axes fraction",
             fontsize=8, color=color, va="top",
         )
@@ -2344,6 +2707,31 @@ class ModelCanvas(QWidget):
             self._user_view_dirty = True
 
 
+def _mechanical_world_components(
+    lam, cx: float, cy: float, cz: float, coord_system: str,
+) -> list[tuple[tuple[float, float, float], float]]:
+    """``[(world_direction, magnitude)]`` for a UDL / point load.
+
+    ``lam`` is the element's 3×3 local triad (rows x̂, ŷ, ẑ in world
+    coordinates, from :func:`structural_analysis.element3d.local_axes`).
+    The 3D successor of :func:`_udl_visual_components` /
+    :func:`_pointload_visual_components` (kept below for their pinned
+    2D contract): callers project the world directions onto the active
+    view plane. For an XY-plane member, x̂/ŷ project to the legacy
+    tangent / normal exactly.
+    """
+    if coord_system == "local":
+        return [(tuple(lam[0]), cx), (tuple(lam[1]), cy),
+                (tuple(lam[2]), cz)]
+    if coord_system == "global":
+        return [((1.0, 0.0, 0.0), cx), ((0.0, 1.0, 0.0), cy),
+                ((0.0, 0.0, 1.0), cz)]
+    if coord_system == "gravity":
+        return [((0.0, -1.0, 0.0), cy)]
+    # Defensive: unknown — legacy local-y rendering.
+    return [(tuple(lam[1]), cy)]
+
+
 def _udl_visual_components(
     ml: UniformDistributedLoad, tx: float, ty: float, nx: float, ny: float,
 ) -> list[tuple[float, float, float]]:
@@ -2398,6 +2786,9 @@ def _label_for_udl(ml: UniformDistributedLoad) -> str:
             return f"UDL qX={ml.wx:+.3g} glob"
         return f"UDL qY={ml.wy:+.3g} glob"
     # local
+    wz = getattr(ml, "wz", 0.0)
+    if wz != 0.0:
+        return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g},{wz:+.3g})"
     if ml.wx != 0.0 and ml.wy != 0.0:
         return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g})"
     if ml.wx != 0.0:
@@ -2412,6 +2803,10 @@ def _label_for_pointload(ml: PointLoad) -> str:
         return f"P {ml.py:+.3g}@{ml.a:.3g} grav"
     if cs == "global":
         suffix = " glob"
+    pz = getattr(ml, "pz", 0.0)
+    if pz != 0.0:
+        return (f"P ({ml.px:+.3g},{ml.py:+.3g},{pz:+.3g})"
+                f"@{ml.a:.3g}{suffix}")
     if ml.px != 0.0 and ml.py != 0.0:
         return f"P ({ml.px:+.3g},{ml.py:+.3g})@{ml.a:.3g}{suffix}"
     if ml.px != 0.0:

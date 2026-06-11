@@ -212,6 +212,29 @@ class Element3D:
         q_local = self.raw_local_stiffness(nodes) @ d_local - p_full
         return d_local, q_local
 
+    def lumped_mass_local(self, nodes: dict) -> np.ndarray:
+        """Translational-only lumped mass (modal groundwork, v0.33).
+
+        Half the bar mass ``ρ·A·L`` at each end on the translational
+        DOFs, in the kN-m-s consistent system (Mg). The 3D modal
+        solver is not wired up yet — these matrices exist so the mass
+        assembler can be generalised without touching the elements.
+        """
+        L, _ = length_and_xhat(nodes[self.node_i], nodes[self.node_j])
+        m_bar = (self.rho / 1000.0) * self.A
+        if m_bar <= 0.0:
+            return np.zeros((self.n_local_dofs, self.n_local_dofs))
+        half = 0.5 * m_bar * L
+        M = np.zeros((self.n_local_dofs, self.n_local_dofs))
+        for nid_block in range(2):
+            base = nid_block * (self.n_local_dofs // 2)
+            for k in range(3):
+                M[base + k, base + k] = half
+        return M
+
+    def consistent_mass_local(self, nodes: dict) -> np.ndarray:
+        raise NotImplementedError
+
 
 @dataclass
 class FrameElement3D(Element3D):
@@ -237,6 +260,13 @@ class FrameElement3D(Element3D):
     roll: float = 0.0
     release_i: bool = False
     release_j: bool = False
+    # Rigid end offsets (v0.33) — same semantics as the 2D element:
+    # the analytical nodes stay at the joint centerlines; the flexible
+    # span runs from ``offset_i`` to ``L − offset_j`` along the member
+    # axis, and the joint DOFs see ``k = Tᵀ·k_flex(L_flex)·T`` with the
+    # rigid-arm kinematics extended to both bending planes.
+    offset_i: float = 0.0
+    offset_j: float = 0.0
 
     @property
     def kind(self) -> str:
@@ -246,14 +276,55 @@ class FrameElement3D(Element3D):
     def n_local_dofs(self) -> int:
         return 12
 
+    @property
+    def has_offsets(self) -> bool:
+        """True when either rigid end offset is nonzero."""
+        return self.offset_i != 0.0 or self.offset_j != 0.0
+
     def dof_keys(self) -> list[tuple[int, str]]:
         names = ("ux", "uy", "uz", "rx", "ry", "rz")
         return ([(self.node_i, n) for n in names]
                 + [(self.node_j, n) for n in names])
 
-    def raw_local_stiffness(self, nodes: dict) -> np.ndarray:
-        """Textbook 12×12 space-frame stiffness (no releases)."""
+    def flexible_length(self, nodes: dict) -> float:
+        """Length of the deformable span (mirrors the 2D element)."""
         L, _ = self.local_triad(nodes)
+        if self.offset_i < 0.0 or self.offset_j < 0.0:
+            raise ValueError(
+                f"Element {self.id}: rigid end offsets must be >= 0 "
+                f"(got offset_i={self.offset_i}, "
+                f"offset_j={self.offset_j})."
+            )
+        L_flex = L - self.offset_i - self.offset_j
+        if L_flex <= 0.0:
+            raise ValueError(
+                f"Element {self.id}: rigid offsets ({self.offset_i} + "
+                f"{self.offset_j}) consume the whole member length "
+                f"{L:.6g} m — flexible span must be > 0."
+            )
+        return L_flex
+
+    def _offset_transform(self) -> np.ndarray:
+        """12×12 rigid-arm transform T mapping joint DOFs → face DOFs.
+
+        Small-rotation kinematics ``u_face = u_joint + θ × r`` with the
+        face at ``r = (+e_i, 0, 0)`` from the i-joint and
+        ``r = (−e_j, 0, 0)`` from the j-joint::
+
+            v_face = v ± e·θz       w_face = w ∓ e·θy
+
+        Restricting to the in-plane DOFs reproduces the 2D element's
+        ``T[1,2] = +e_i`` / ``T[4,5] = −e_j`` exactly.
+        """
+        T = np.eye(12)
+        T[1, 5] = self.offset_i
+        T[2, 4] = -self.offset_i
+        T[7, 11] = -self.offset_j
+        T[8, 10] = self.offset_j
+        return T
+
+    def _stiffness_for_length(self, L: float) -> np.ndarray:
+        """Textbook 12×12 space-frame stiffness for a span of ``L``."""
         a = self.E * self.A / L
         t = self.G * self.J / L
         L2, L3 = L * L, L * L * L
@@ -290,6 +361,68 @@ class FrameElement3D(Element3D):
         k[4, 4] = k[10, 10] = by3
         k[4, 10] = k[10, 4] = by4
         return k
+
+    def raw_local_stiffness(self, nodes: dict) -> np.ndarray:
+        """12×12 stiffness on the full node-to-node length — the legacy
+        primitive (no rigid-offset transform; see
+        :meth:`joint_local_stiffness`)."""
+        L, _ = self.local_triad(nodes)
+        return self._stiffness_for_length(L)
+
+    def joint_local_stiffness(self, nodes: dict) -> np.ndarray:
+        """Local stiffness in JOINT coordinates, rigid offsets included.
+
+        ``k_joint = Tᵀ · k_flex(L_flex) · T``; bit-identical to
+        :meth:`raw_local_stiffness` when both offsets are zero.
+        """
+        if not self.has_offsets:
+            return self.raw_local_stiffness(nodes)
+        k_flex = self._stiffness_for_length(self.flexible_length(nodes))
+        T = self._offset_transform()
+        return T.T @ k_flex @ T
+
+    def consistent_mass_local(self, nodes: dict) -> np.ndarray:
+        """12×12 space-beam consistent mass (modal groundwork, v0.33).
+
+        Hermitian bending blocks in BOTH planes (the local-z plane
+        carries the θy = −dw/dx sign flip), linear axial terms, and a
+        torsional block using the polar-inertia ratio
+        ``Ip/A ≈ (Iy + Iz)/A``. Mass in Mg (kN·s²/m). Rigid offsets
+        are ignored for mass in V1 (same simplification as 2D
+        releases: stiffness-side devices don't reshape mass).
+        """
+        L, _ = self.local_triad(nodes)
+        m_bar = (self.rho / 1000.0) * self.A
+        if m_bar <= 0.0:
+            return np.zeros((12, 12))
+        coef = m_bar * L / 420.0
+        L2 = L * L
+        rx2 = (self.Iy + self.Iz) / self.A if self.A > 0 else 0.0
+        M = np.zeros((12, 12))
+        # Axial (and torsion via the polar ratio).
+        M[0, 0] = M[6, 6] = 140.0
+        M[0, 6] = M[6, 0] = 70.0
+        M[3, 3] = M[9, 9] = 140.0 * rx2
+        M[3, 9] = M[9, 3] = 70.0 * rx2
+        # Bending about local z (uy, rz) — the 2D Hermitian block.
+        M[1, 1] = M[7, 7] = 156.0
+        M[1, 7] = M[7, 1] = 54.0
+        M[1, 5] = M[5, 1] = 22.0 * L
+        M[7, 11] = M[11, 7] = -22.0 * L
+        M[1, 11] = M[11, 1] = -13.0 * L
+        M[5, 7] = M[7, 5] = 13.0 * L
+        M[5, 5] = M[11, 11] = 4.0 * L2
+        M[5, 11] = M[11, 5] = -3.0 * L2
+        # Bending about local y (uz, ry) — sign-flipped rotations.
+        M[2, 2] = M[8, 8] = 156.0
+        M[2, 8] = M[8, 2] = 54.0
+        M[2, 4] = M[4, 2] = -22.0 * L
+        M[8, 10] = M[10, 8] = 22.0 * L
+        M[2, 10] = M[10, 2] = 13.0 * L
+        M[4, 8] = M[8, 4] = -13.0 * L
+        M[4, 4] = M[10, 10] = 4.0 * L2
+        M[4, 10] = M[10, 4] = -3.0 * L2
+        return coef * M
 
     # ── member loads ──
 
@@ -351,8 +484,16 @@ class FrameElement3D(Element3D):
         return p
 
     def local_consistent_load(self, nodes: dict) -> np.ndarray:
-        """Fixed-fixed equivalent nodal loads for all member loads."""
+        """Fixed-fixed equivalent nodal loads for all member loads.
+
+        With rigid end offsets, member loads act on the FLEXIBLE span:
+        fixed-end vectors are built on ``L_flex`` at the offset faces
+        and mapped to joint coordinates via ``Tᵀ`` (mirroring the 2D
+        element — zero offsets short-circuit to the legacy math).
+        """
         L, lam = self.local_triad(nodes)
+        x0 = self.offset_i
+        L_eff = self.flexible_length(nodes) if self.has_offsets else L
         p = np.zeros(12)
         for load in self.member_loads:
             if isinstance(load, UniformDistributedLoad):
@@ -360,7 +501,7 @@ class FrameElement3D(Element3D):
                     lam, load.wx, load.wy, getattr(load, "wz", 0.0),
                     load.coord_system,
                 )
-                p += self._udl_fixed_end(L, w)
+                p += self._udl_fixed_end(L_eff, w)
             elif isinstance(load, PointLoad):
                 a = float(load.a)
                 if not (0 <= a <= L + 1e-10):
@@ -368,11 +509,23 @@ class FrameElement3D(Element3D):
                         f"Element {self.id}: point load a={a:.3f} "
                         f"outside L={L:.3f}."
                     )
+                if self.has_offsets and not (
+                    self.offset_i - 1e-10 <= a
+                    <= L - self.offset_j + 1e-10
+                ):
+                    raise ValueError(
+                        f"Element {self.id}: point load at a={a:.3f} m "
+                        f"falls inside a rigid end zone (flexible span "
+                        f"is [{self.offset_i:.3f}, "
+                        f"{L - self.offset_j:.3f}] m). Move the load "
+                        "onto the flexible span or reduce the rigid "
+                        "offsets — loads are not silently relocated."
+                    )
                 P = self._project_to_local(
                     lam, load.px, load.py, getattr(load, "pz", 0.0),
                     load.coord_system,
                 )
-                p += self._point_fixed_end(L, a, P)
+                p += self._point_fixed_end(L_eff, a - x0, P)
             elif isinstance(load, FrameTemperatureLoad):
                 dT_mean = 0.5 * (load.t_top + load.t_bottom)
                 if dT_mean != 0.0:
@@ -402,17 +555,31 @@ class FrameElement3D(Element3D):
                 raise TypeError(
                     f"Unsupported load on element {self.id}: {type(load)}"
                 )
+        if self.has_offsets:
+            # Face fixed-end forces → joint coordinates (face shears
+            # pick up the rigid-arm moments; thermal pairs pass
+            # through unchanged).
+            return self._offset_transform().T @ p
         return p
 
     def self_weight_fixed_end_local(self, nodes: dict) -> np.ndarray:
-        """RAW fixed-end vector for self-weight (global −Y gravity)."""
+        """RAW fixed-end vector for self-weight (global −Y gravity).
+
+        Built on the FLEXIBLE span when rigid offsets are present (the
+        rigid zones are idealised joint material — same V1 limitation
+        as the 2D element), then mapped to joint coordinates.
+        """
         rho = float(self.rho)
         if rho == 0.0 or self.A == 0.0:
             return np.zeros(12)
         L, lam = self.local_triad(nodes)
+        L_eff = self.flexible_length(nodes) if self.has_offsets else L
         w_mag = rho * self.A * STANDARD_GRAVITY / 1000.0  # kN/m
         w_local = lam @ np.array([0.0, -w_mag, 0.0])
-        return self._udl_fixed_end(L, w_local)
+        p = self._udl_fixed_end(L_eff, w_local)
+        if self.has_offsets:
+            return self._offset_transform().T @ p
+        return p
 
     # ── moment releases (local-z hinges, mirroring 2D semantics) ──
 
@@ -441,7 +608,10 @@ class FrameElement3D(Element3D):
         if not released:
             return p_arr.copy()
         retained = [i for i in range(12) if i not in released]
-        k = self.raw_local_stiffness(nodes)
+        # Joint-coordinate stiffness so releases condense consistently
+        # when rigid offsets are present (identical to the raw matrix
+        # at zero offsets).
+        k = self.joint_local_stiffness(nodes)
         kab = k[np.ix_(retained, released)]
         kbb = k[np.ix_(released, released)]
         p_out = np.zeros(12, dtype=float)
@@ -454,7 +624,7 @@ class FrameElement3D(Element3D):
     def assembled_local_stiffness_and_load(
         self, nodes: dict,
     ) -> tuple[np.ndarray, np.ndarray]:
-        k = self.raw_local_stiffness(nodes)
+        k = self.joint_local_stiffness(nodes)
         p = self.local_consistent_load(nodes)
         released = self._released_dofs()
         if not released:
@@ -478,7 +648,9 @@ class FrameElement3D(Element3D):
         """Recovery with back-substitution of released rotations."""
         R = self.transformation_matrix(nodes)
         d_from_global = R @ u_global_elem
-        k_full = self.raw_local_stiffness(nodes)
+        # Joint-coordinate stiffness so q is the end-force at the
+        # analytical joints (matches assembly + equilibrium check).
+        k_full = self.joint_local_stiffness(nodes)
         p_full = self.local_consistent_load(nodes)
         if p_extra_local is not None:
             p_full = p_full + np.asarray(p_extra_local, dtype=float)
@@ -541,6 +713,22 @@ class TrussElement3D(Element3D):
                 )
         return p
 
+    def consistent_mass_local(self, nodes: dict) -> np.ndarray:
+        """Consistent translational mass for a space truss bar:
+        ``m̄·L/6 · [[2I₃, I₃], [I₃, 2I₃]]`` in Mg units."""
+        L, _ = self.local_triad(nodes)
+        m_bar = (self.rho / 1000.0) * self.A
+        if m_bar <= 0.0:
+            return np.zeros((6, 6))
+        c = m_bar * L / 6.0
+        eye3 = np.eye(3)
+        M = np.zeros((6, 6))
+        M[:3, :3] = 2.0 * eye3
+        M[3:, 3:] = 2.0 * eye3
+        M[:3, 3:] = eye3
+        M[3:, :3] = eye3
+        return c * M
+
 
 # ═══════════════════════════════════════════════════════════════
 #  2D → 3D promotion
@@ -561,10 +749,8 @@ def promote_element_to_3d(elem, model) -> Element3D:
         J  = section.J if > 0, else Iy + Iz (polar approximation)
         G  = effective material G (E/2 when ν or the material is
              unavailable — the ν = 0 isotropic identity)
-
-    Raises:
-        ValueError: For 2D features without a 3D counterpart yet
-            (rigid end offsets).
+        roll / rigid end offsets / releases pass straight through
+        (v0.33 — offsets use the 12-DOF rigid-arm transform).
     """
     from .element import FrameElement2D, TrussElement2D
     from .model import effective_material
@@ -580,19 +766,17 @@ def promote_element_to_3d(elem, model) -> Element3D:
             member_loads=elem.member_loads,
         )
     if isinstance(elem, FrameElement2D):
-        if elem.has_offsets:
-            raise ValueError(
-                f"Element {elem.id}: rigid end offsets are not yet "
-                "supported in 3D analysis. Remove the offsets or keep "
-                "the model planar (all z = 0)."
-            )
         G = elem.E / 2.0
         try:
             G = effective_material(model, elem).G
         except (KeyError, TypeError, ValueError):
             pass
         sec = model.sections.get(elem.section_id) if model else None
-        Iy = elem.I
+        # v0.33: a section may carry a true out-of-plane inertia
+        # (``Section.Iy``); 0 keeps the symmetric Iy = Iz default.
+        Iy = (sec.Iy if (sec is not None
+                         and getattr(sec, "Iy", 0.0) > 0.0)
+              else elem.I)
         J = sec.J if (sec is not None and sec.J > 0.0) else Iy + elem.I
         return FrameElement3D(
             id=elem.id, node_i=elem.node_i, node_j=elem.node_j,
@@ -601,7 +785,9 @@ def promote_element_to_3d(elem, model) -> Element3D:
             material_id_override=elem.material_id_override,
             member_loads=elem.member_loads,
             Iy=Iy, Iz=elem.I, J=J, G=G,
+            roll=getattr(elem, "roll", 0.0),
             release_i=elem.release_i, release_j=elem.release_j,
+            offset_i=elem.offset_i, offset_j=elem.offset_j,
         )
     raise TypeError(
         f"Cannot promote element {elem!r} to 3D — unknown element type."

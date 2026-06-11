@@ -263,6 +263,9 @@ class MainWindow(QMainWindow):
         # 3D work plane (v0.32): out-of-plane coordinate assigned to
         # geometry created by canvas clicks in the current view.
         self._working_depth: float = 0.0
+        # v0.33 — storey manager: named z-levels, persisted in the
+        # .spa.json view state. GUI metadata only.
+        self._storeys: list[tuple[str, float]] = []
         self._modal_result = None
         self._modal_results_dialog = None
         self._view3d_window = None
@@ -322,6 +325,11 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical, self)
         self.canvas = ModelCanvas(splitter, lambda: self._model,
                                     grid_provider=lambda: self._grid)
+        # Depth-aware snapping (v0.33): bias stacked-node picks
+        # toward the active working depth.
+        self.canvas.working_depth_provider = (
+            lambda: self._working_depth
+        )
         splitter.addWidget(self.canvas)
 
         result_frame = QFrame(splitter)
@@ -431,6 +439,15 @@ class MainWindow(QMainWindow):
                        "extruded along its section profile.",
             triggered=self._open_view3d,
         )
+        # v0.33 — interactive OpenGL viewport (orbit / pick / draw in
+        # space). Optional dependency: pyqtgraph + PyOpenGL.
+        self.act_open_viewport3d = QAction(
+            "3D viewport (&beta)…", self,
+            statusTip="Open the interactive OpenGL viewport: orbit with "
+                      "the mouse, pick nodes/elements, and place "
+                      "geometry on a construction plane in space.",
+            triggered=self._open_viewport3d,
+        )
         # ── 3D work planes (v0.32) ──
         # Radio group selecting the canvas projection: the legacy XY
         # front view (editable), the XZ plan / ZY side elevations
@@ -459,6 +476,14 @@ class MainWindow(QMainWindow):
         self.act_working_depth = QAction(
             "Working &depth…", self,
             triggered=self._set_working_depth,
+        )
+        self.act_storeys = QAction(
+            "S&toreys…", self,
+            triggered=self._manage_storeys,
+        )
+        self.act_storeys.setToolTip(
+            "Name the z-levels you build on (Level 1 = 0, Level 2 = 3 …) "
+            "and jump the working depth between them."
         )
         self.act_working_depth.setToolTip(
             "Out-of-plane coordinate given to nodes created by canvas "
@@ -788,6 +813,7 @@ class MainWindow(QMainWindow):
         m_view = self.menuBar().addMenu("&View")
         m_view.addAction(self.act_fit_view)
         m_view.addAction(self.act_open_view3d)
+        m_view.addAction(self.act_open_viewport3d)
         m_view.addSeparator()
         plane_menu = m_view.addMenu("Work &plane")
         plane_menu.setStatusTip(
@@ -798,6 +824,7 @@ class MainWindow(QMainWindow):
         for a in self._view_plane_actions.values():
             plane_menu.addAction(a)
         m_view.addAction(self.act_working_depth)
+        m_view.addAction(self.act_storeys)
         m_view.addSeparator()
         m_view.addAction(self.act_grid_system)
         m_view.addAction(self.act_grid_spacing)
@@ -1145,6 +1172,16 @@ class MainWindow(QMainWindow):
                 "(View → Working depth…)."
             )
 
+    def _open_viewport3d(self) -> None:
+        """Open (or raise) the interactive OpenGL viewport (v0.33)."""
+        existing = getattr(self, "_viewport3d", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        from .viewport3d import open_viewport3d
+        self._viewport3d = open_viewport3d(self)
+
     def _set_working_depth(self) -> None:
         from PyQt6.QtWidgets import QInputDialog
         value, ok = QInputDialog.getDouble(
@@ -1154,8 +1191,29 @@ class MainWindow(QMainWindow):
         )
         if not ok:
             return
+        self._apply_working_depth(float(value))
+
+    def _apply_working_depth(self, value: float) -> None:
+        from .storeys import storey_name_for_depth
         self._working_depth = float(value)
-        self.set_status(f"Working depth set to {value:g} m.")
+        storey = storey_name_for_depth(self._storeys, self._working_depth)
+        suffix = f" ({storey})" if storey else ""
+        self.set_status(f"Working depth set to {value:g} m{suffix}.")
+
+    def _manage_storeys(self) -> None:
+        from .storeys import StoreyManagerDialog
+        d = StoreyManagerDialog(
+            self, storeys=self._storeys,
+            current_depth=self._working_depth,
+        )
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        if d.result_storeys is not None:
+            self._storeys = d.result_storeys
+            self._modified = True
+            self._update_title()
+        if d.activated_depth is not None:
+            self._apply_working_depth(d.activated_depth)
 
     def _update_selection_status(self) -> None:
         nn = len(self.canvas.get_selected_nodes())
@@ -2348,12 +2406,16 @@ class MainWindow(QMainWindow):
             if value_text:
                 parts.append(value_text)
         self._coord_label.setText("  |  ".join(parts))
-        # Repaint canvas if the snap marker changed.
-        self.canvas.redraw()
         try:
             self._active_tool.on_motion(hit, cursor_px=cursor_px)
         except Exception:
             pass
+        # v0.33.1 — cursor decorations (snap marker, rubber-band
+        # preview, box-select rect) repaint via a cached-background
+        # blit instead of the old full-scene rebuild per mouse move,
+        # which made the canvas visibly lag on real models. Runs AFTER
+        # the tool hook so preview state is already fresh.
+        self.canvas.update_hover_overlay()
 
     def _diagram_value_text_for_hit(self, hit: HitResult) -> str | None:
         """Return a "Moment: +12.3 kN·m @ x=4.5 m" tail for the status
@@ -3329,6 +3391,8 @@ class MainWindow(QMainWindow):
         self.canvas.snap_engine.enabled_kinds = set(enabled)
         for kind, action in self._snap_actions.items():
             action.setChecked(kind in enabled)
+        # v0.33 — restore the project's storey list.
+        self._storeys = list(getattr(view, "storeys", []) or [])
         # Repaint so the new xlim/ylim and snap-toggle state show up.
         self.canvas.redraw()
 
@@ -3359,6 +3423,7 @@ class MainWindow(QMainWindow):
                     xlim=tuple(self.canvas.ax.get_xlim()),
                     ylim=tuple(self.canvas.ax.get_ylim()),
                     snap_kinds=sorted(self.canvas.snap_engine.enabled_kinds),
+                    storeys=list(self._storeys),
                 )
                 project = Project(
                     model=self._model, grid=self._grid,

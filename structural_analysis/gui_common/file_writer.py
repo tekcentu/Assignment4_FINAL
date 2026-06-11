@@ -133,6 +133,8 @@ def write_input_file(model: StructuralModel, path: str) -> None:
             line += f"  width={_fmt(s.width)}"
         if s.J != 0.0:
             line += f"  J={_fmt(s.J)}"
+        if getattr(s, "Iy", 0.0) != 0.0:
+            line += f"  Iy={_fmt(s.Iy)}"
         if s.shape_type and s.shape_type != "manual":
             line += f"  shape={s.shape_type}"
         if s.b != 0.0:
@@ -191,6 +193,9 @@ def write_input_file(model: StructuralModel, path: str) -> None:
                 line += f"  offset_i={_fmt(off_i)}"
             if off_j:
                 line += f"  offset_j={_fmt(off_j)}"
+            roll = float(getattr(elem, "roll", 0.0) or 0.0)
+            if roll:
+                line += f"  roll={_fmt(roll)}"
         out.append(line)
     out.append("")
 

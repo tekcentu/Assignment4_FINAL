@@ -4239,8 +4239,9 @@ def test_nodal_load_dialog_has_load_case_combo(qt_app):
 
 def test_nodal_load_dialog_accept_returns_load_case_in_tuple(qt_app):
     """v0.17 widened the NodalLoadDialog result tuple from (fx,fy,mz) to
-    (fx,fy,mz,load_case). app._edit_nodal_load was updated to unpack four
-    values; this test pins the contract."""
+    (fx,fy,mz,load_case); v0.33 APPENDS the 3D components (fz,mx,my) so
+    the legacy four-value prefix keeps its positions. This test pins
+    both contracts."""
     from structural_analysis.gui_qt.dialogs import NodalLoadDialog
 
     w = MainWindow()
@@ -4250,7 +4251,13 @@ def test_nodal_load_dialog_accept_returns_load_case_in_tuple(qt_app):
     d._entries["mz"].setText("0.0")
     d._case_combo.setEditText("WIND")
     result = d._accept()
-    assert result == (10.0, -5.0, 0.0, "WIND")
+    assert result[:4] == (10.0, -5.0, 0.0, "WIND")
+    assert result[4:] == (0.0, 0.0, 0.0)
+
+    d._entries["fz"].setText("3.0")
+    d._entries["mx"].setText("1.5")
+    d._entries["my"].setText("-2.0")
+    assert d._accept() == (10.0, -5.0, 0.0, "WIND", 3.0, 1.5, -2.0)
 
 
 def test_nodal_load_dialog_existing_load_prefills_case(qt_app):
@@ -5139,7 +5146,7 @@ def test_nodal_load_manager_add_appends_undoable_row(qt_app, monkeypatch):
     # tuple as (fx, fy, mz, load_case).
     monkeypatch.setattr(
         NodalLoadManagerDialog, "_open_form",
-        lambda self, existing=None: (0.0, -10.0, 0.0, "DEAD"),
+        lambda self, existing=None: (0.0, -10.0, 0.0, "DEAD", 0.0, 0.0, 0.0),
     )
     d = NodalLoadManagerDialog(
         w, host=w, model=w._model, node_id=1,
@@ -5165,7 +5172,7 @@ def test_nodal_load_manager_edit_only_changes_selected_row(qt_app, monkeypatch):
     d._table.selectRow(1)
     monkeypatch.setattr(
         NodalLoadManagerDialog, "_open_form",
-        lambda self, existing=None: (0.0, -30.0, 0.0, "LIVE"),
+        lambda self, existing=None: (0.0, -30.0, 0.0, "LIVE", 0.0, 0.0, 0.0),
     )
     d._on_edit()
     # DEAD row unchanged.
@@ -5230,7 +5237,7 @@ def test_nodal_load_manager_add_rejects_zero_load(qt_app, monkeypatch):
     )
     monkeypatch.setattr(
         NodalLoadManagerDialog, "_open_form",
-        lambda self, existing=None: (0.0, 0.0, 0.0, "DEAD"),
+        lambda self, existing=None: (0.0, 0.0, 0.0, "DEAD", 0.0, 0.0, 0.0),
     )
     d = NodalLoadManagerDialog(
         w, host=w, model=w._model, node_id=1,
@@ -5251,7 +5258,7 @@ def test_nodal_load_manager_invalidates_stale_results(qt_app, monkeypatch):
     w._result = object()
     monkeypatch.setattr(
         NodalLoadManagerDialog, "_open_form",
-        lambda self, existing=None: (0.0, -20.0, 0.0, "DEFAULT"),
+        lambda self, existing=None: (0.0, -20.0, 0.0, "DEFAULT", 0.0, 0.0, 0.0),
     )
     d = NodalLoadManagerDialog(
         w, host=w, model=w._model, node_id=1,
@@ -5337,7 +5344,7 @@ def test_nodal_load_manager_handles_intervening_rows_correctly(qt_app, monkeypat
     d._table.selectRow(1)
     monkeypatch.setattr(
         NodalLoadManagerDialog, "_open_form",
-        lambda self, existing=None: (0.0, -30.0, 0.0, "LIVE"),
+        lambda self, existing=None: (0.0, -30.0, 0.0, "LIVE", 0.0, 0.0, 0.0),
     )
     d._on_edit()
     # Node-2 row (global index 1) untouched.

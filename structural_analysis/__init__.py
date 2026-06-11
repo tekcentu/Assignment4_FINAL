@@ -1,10 +1,10 @@
 """2D/3D Structural Analysis Package — CE 4011 Assignment 4."""
 
-__version__ = "0.32.0"
+__version__ = "0.33.2"
 __what_is_new__ = (
-    "3D FEM: 6-DOF space frames/trusses with auto-promotion · "
-    "Work planes XY/XZ/ZY + isometric, working depth, node Z · "
-    "6-DOF supports, SUPPORTS3D/LOADS3D file format"
+    "3D viewport renders on every GPU: light bg, compat GL profile, "
+    "pyqtgraph>=0.14 · Fast canvas via blitted cursor overlay · "
+    "3D loads/offsets/Iy/roll, Tab cycles stacks, storeys"
 )
 
 from .model import (

@@ -358,13 +358,36 @@ def test_promotion_maps_section_properties():
     assert p.member_loads is elem.member_loads
 
 
-def test_promotion_rejects_rigid_offsets_in_3d():
-    m = _portal_frame_2d()
-    m.elements[0].offset_i = 0.3
-    m.force_3d = True
-    r = run_analysis(m, verbose=False)
-    assert r.status == "error"
-    assert any("rigid end offsets" in w for w in r.warnings)
+def test_rigid_offsets_match_2d_through_3d_pipeline():
+    """v0.33: rigid end offsets work in 3D via the 12-DOF rigid-arm
+    transform — the planar response must match the 2D element."""
+    def build():
+        m = _portal_frame_2d()
+        # Offsets on the loaded beam (the strongest coupling case).
+        m.elements[1].offset_i = 0.4
+        m.elements[1].offset_j = 0.3
+        return m
+
+    r2 = run_analysis(build(), verbose=False)
+    assert r2.status == "ok"
+
+    m3 = build()
+    m3.supports[1] = Support(1, True, True, True,
+                             uz=True, rx=True, ry=True)
+    m3.supports[4] = Support(4, True, True, False,
+                             settle_uy=-0.01, uz=True)
+    m3.force_3d = True
+    r3 = run_analysis(m3, verbose=False)
+    assert r3.status == "ok"
+
+    for nid in m3.nodes:
+        for dof in ("ux", "uy", "rz"):
+            assert _disp(r3, nid, dof) == pytest.approx(
+                _disp(r2, nid, dof), rel=1e-9, abs=1e-14,
+            ), f"node {nid} {dof}"
+    f2 = r2.member_results[2]["f_local"]
+    f3 = r3.member_results[2]["f_local_inplane"]
+    np.testing.assert_allclose(f3, f2, rtol=1e-9, atol=1e-9)
 
 
 def test_truss_promotion():
@@ -441,3 +464,64 @@ def test_3d_truss_rejects_transverse_loads():
     nodes = {1: Node(1, 0, 0, 0), 2: Node(2, 1, 0, 0)}
     with pytest.raises(TypeError, match="transverse"):
         t.local_consistent_load(nodes)
+
+
+# ── v0.33: mass matrices (3D modal groundwork) ─────────────────
+
+
+def test_space_frame_consistent_mass_properties():
+    nodes = {1: Node(1, 0.0, 0.0, 0.0), 2: Node(2, L, 0.0, 0.0)}
+    e = _space_frame(rho=7850.0)
+    M = e.consistent_mass_local(nodes)
+    np.testing.assert_allclose(M, M.T, atol=1e-12)
+    # Positive semi-definite.
+    assert np.min(np.linalg.eigvalsh(M)) > -1e-9
+    # Rigid translation along each axis mobilises the full bar mass.
+    m_total = (7850.0 / 1000.0) * A * L
+    for axes in ((0, 6), (1, 7), (2, 8)):
+        v = np.zeros(12)
+        v[list(axes)] = 1.0
+        assert v @ M @ v == pytest.approx(m_total, rel=1e-12)
+
+
+def test_space_frame_lumped_mass_translations_only():
+    nodes = {1: Node(1, 0.0, 0.0, 0.0), 2: Node(2, L, 0.0, 0.0)}
+    e = _space_frame(rho=7850.0)
+    M = e.lumped_mass_local(nodes)
+    m_total = (7850.0 / 1000.0) * A * L
+    assert np.trace(M) == pytest.approx(3 * m_total, rel=1e-12)
+    for rot_dof in (3, 4, 5, 9, 10, 11):
+        assert M[rot_dof, rot_dof] == 0.0
+
+
+def test_space_truss_consistent_mass_total():
+    nodes = {1: Node(1, 0.0, 0.0, 0.0), 2: Node(2, 1.0, 2.0, 2.0)}
+    t = TrussElement3D(id=1, node_i=1, node_j=2, E=E, A=A, rho=1000.0)
+    M = t.consistent_mass_local(nodes)
+    m_total = 1.0 * A * 3.0  # ρ/1000 · A · L, L = 3
+    v = np.zeros(6)
+    v[[0, 3]] = 1.0
+    assert v @ M @ v == pytest.approx(m_total, rel=1e-12)
+
+
+# ── v0.33: Section.Iy and element roll in promotion ────────────
+
+
+def test_promotion_uses_section_iy_when_set():
+    from structural_analysis.model import Material, Section
+
+    m = _portal_frame_2d()
+    m.materials[1] = Material(id=1, E=E, nu=0.25)
+    m.sections[1] = Section(id=1, material_id=1, A=A, I=IZ, Iy=IY)
+    m.elements[0].section_id = 1
+    p = promote_element_to_3d(m.elements[0], m)
+    assert p.Iy == IY and p.Iz == IZ
+
+
+def test_promotion_carries_roll_and_offsets():
+    m = _portal_frame_2d()
+    m.elements[0].roll = 0.5
+    m.elements[0].offset_i = 0.2
+    p = promote_element_to_3d(m.elements[0], m)
+    assert p.roll == 0.5
+    assert p.offset_i == 0.2 and p.has_offsets
