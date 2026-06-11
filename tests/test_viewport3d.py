@@ -176,3 +176,27 @@ def test_viewport_member_tool_uses_command_stack(qt_app):
         assert len(w._model.elements) == 0
     finally:
         vp.close()
+
+
+def test_pyqtgraph_version_advisory(monkeypatch):
+    pytest.importorskip("pyqtgraph")
+    import pyqtgraph
+    from structural_analysis.gui_qt import viewport3d
+
+    monkeypatch.setattr(pyqtgraph, "__version__", "0.13.7")
+    msg = viewport3d._pyqtgraph_version_advisory()
+    assert msg is not None and "pip install -U pyqtgraph" in msg
+
+    monkeypatch.setattr(pyqtgraph, "__version__", "0.14.0")
+    assert viewport3d._pyqtgraph_version_advisory() is None
+
+
+def test_scene_view_requests_compatibility_profile(qt_app):
+    pytest.importorskip("pyqtgraph.opengl")
+    from PyQt6.QtGui import QSurfaceFormat
+    from structural_analysis.gui_qt.viewport3d import _SceneView
+
+    view = _SceneView(on_click=lambda x, y: None)
+    fmt = view.format()
+    assert (fmt.profile()
+            == QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)

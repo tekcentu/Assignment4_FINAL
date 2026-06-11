@@ -64,6 +64,34 @@ def gl_available() -> tuple[bool, str]:
     return True, ""
 
 
+def _pyqtgraph_version_advisory() -> str | None:
+    """Warn when pyqtgraph predates the shader-based GL renderer.
+
+    Before 0.13.4-ish the grid / axis / line items rendered through
+    legacy fixed-function OpenGL, which silently draws NOTHING on the
+    core-profile contexts many Windows drivers hand out — exactly the
+    "black viewport, only the scatter dots visible" failure. 0.14 made
+    every item shader-based, so it renders on any context.
+    """
+    try:
+        import pyqtgraph
+        parts = tuple(
+            int(p) for p in pyqtgraph.__version__.split(".")[:2]
+        )
+    except Exception:  # noqa: BLE001 — unparsable dev version: skip
+        return None
+    if parts < (0, 14):
+        import sys
+        return (
+            f"pyqtgraph {pyqtgraph.__version__} renders with legacy "
+            "OpenGL — on many GPUs the grid and member lines stay "
+            "invisible (black screen with only the node dots showing). "
+            "Upgrade with: "
+            f"{sys.executable} -m pip install -U pyqtgraph"
+        )
+    return None
+
+
 _PICK_RADIUS_PX = 14.0
 _DRAG_THRESHOLD_PX = 5.0
 
@@ -92,6 +120,21 @@ if gl is not None:
 
         def __init__(self, on_click) -> None:
             super().__init__()
+            # pyqtgraph's grid / axis / line items render through the
+            # legacy fixed-function pipeline; on drivers that hand Qt a
+            # CORE-profile context they silently draw nothing (the
+            # reported "black viewport, only the support dots visible"
+            # — scatter items are shader-based and survive). Request a
+            # 2.1 compatibility context explicitly. Must be set before
+            # the widget is first shown.
+            from PyQt6.QtGui import QSurfaceFormat
+            fmt = QSurfaceFormat()
+            fmt.setVersion(2, 1)
+            fmt.setProfile(
+                QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile,
+            )
+            fmt.setDepthBufferSize(24)
+            self.setFormat(fmt)
             self._on_click = on_click
             self._press_pos = None
 
@@ -135,12 +178,19 @@ class Viewport3DWindow(QMainWindow):
 
         self._view = _SceneView(on_click=self._handle_click)
         self.setCentralWidget(self._view)
+        # Light background to match the 2D canvas — pyqtgraph's default
+        # is black, which swallowed the dark node markers.
+        self._view.setBackgroundColor("#f7f7f7")
         self._view.setCameraPosition(distance=20.0, elevation=22.0,
                                      azimuth=-60.0)
 
         self._grid = gl.GLGridItem()
         self._grid.setSize(20, 20)
         self._grid.setSpacing(1, 1)
+        try:
+            self._grid.setColor((110, 110, 110, 140))
+        except Exception:  # noqa: BLE001 — older pyqtgraph without setColor
+            pass
         self._view.addItem(self._grid)
         self._axes = gl.GLAxisItem()
         self._axes.setSize(3, 3, 3)
@@ -154,8 +204,16 @@ class Viewport3DWindow(QMainWindow):
 
         self.refresh()
         self._update_grid()
-        self._status("Orbit: left-drag · pan: middle-drag · zoom: wheel. "
-                     "Short left-clicks use the active tool.")
+        advisory = _pyqtgraph_version_advisory()
+        if advisory:
+            QMessageBox.warning(self, "3D viewport — old pyqtgraph",
+                                advisory)
+            self._status(advisory)
+        else:
+            self._status(
+                "Orbit: left-drag · pan: middle-drag · zoom: wheel. "
+                "Short left-clicks use the active tool."
+            )
 
     # ── UI ──
 
@@ -284,12 +342,12 @@ class Viewport3DWindow(QMainWindow):
         if frame_pts:
             self._scene_items.append(gl.GLLinePlotItem(
                 pos=np.array(frame_pts), mode="lines",
-                color=(0.12, 0.47, 0.71, 1.0), width=2.5, antialias=True,
+                color=(0.12, 0.47, 0.71, 1.0), width=2.5, antialias=False,
             ))
         if truss_pts:
             self._scene_items.append(gl.GLLinePlotItem(
                 pos=np.array(truss_pts), mode="lines",
-                color=(0.84, 0.15, 0.16, 1.0), width=2.0, antialias=True,
+                color=(0.84, 0.15, 0.16, 1.0), width=2.0, antialias=False,
             ))
 
         # Nodes (selected ones gold and bigger), supports orange.
@@ -345,7 +403,7 @@ class Viewport3DWindow(QMainWindow):
                         self._scene_items.append(gl.GLLinePlotItem(
                             pos=np.array(def_pts), mode="lines",
                             color=(1.0, 0.5, 0.05, 0.9), width=1.5,
-                            antialias=True,
+                            antialias=False,
                         ))
 
         for item in self._scene_items:
@@ -375,6 +433,11 @@ class Viewport3DWindow(QMainWindow):
         model = self._host.model()
         mvp = self._mvp()
         if mvp is None:
+            self._status(
+                "3D picking unavailable — the OpenGL driver did not "
+                "expose the camera matrices. Orbit/zoom still work; "
+                "please report your GPU/driver so picking can be fixed."
+            )
             return None
         w = max(self._view.width(), 1)
         h = max(self._view.height(), 1)
