@@ -3,6 +3,22 @@
 Diagrams of the `structural_analysis` package: the layered design, the
 analysis pipeline, the domain model, and the GUI command/undo flow.
 
+> **3D pipeline (v0.32).** `assembler.model_is_3d` decides per solve
+> whether a model needs the 6-DOF-per-node space pipeline (node z != 0,
+> 3D supports/loads, native `Element3D`, or `force_3d`). When it does,
+> `prepare_solve_elements` promotes every 2D element to its
+> `element3d.FrameElement3D` / `TrussElement3D` equivalent (Iz = Iy =
+> section I, J from the section or the polar fallback, G from the
+> material) — the model itself is never mutated. `DofManager` numbers
+> ux/uy/uz/rx/ry/rz with the same dynamic rotational-omission rules as
+> 2D, the solver is shared unchanged, and the postprocessor recovers
+> 12-component member forces plus an in-plane `(N, Vy, Mz)` slice that
+> keeps the 2D diagram overlays working. Planar models keep the legacy
+> 2D pipeline bit-identically. On the GUI side the canvas projects the
+> model onto a selectable work plane (XY/XZ/ZY/ISO) through a
+> read-only projected-node facade; geometry creation stays on the XY
+> plane at the user's working depth.
+
 All diagrams are [Mermaid](https://mermaid.js.org/) — they render natively on
 GitHub and in most IDEs.
 

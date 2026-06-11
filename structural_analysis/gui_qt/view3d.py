@@ -88,12 +88,15 @@ def _world_axes_for(orientation: str
 
 
 def _node_world(node_x: float, node_y: float,
-                 orientation: str) -> np.ndarray:
-    """Lift a 2D node ``(x, y)`` into the 3D world per orientation.
-    Elevation goes on Z for z_up, on Y for y_up."""
+                 orientation: str, node_z: float = 0.0) -> np.ndarray:
+    """Map a model node ``(x, y, z)`` into the 3D display world per
+    orientation. Elevation (model y) goes on display Z for z_up, on
+    display Y for y_up; the model's out-of-plane z (v0.32 — native 3D
+    geometry) fills the remaining axis. Planar models (z = 0) render
+    exactly as before."""
     if orientation == _ORIENT_Z_UP:
-        return np.array([node_x, 0.0, node_y])
-    return np.array([node_x, node_y, 0.0])
+        return np.array([node_x, node_z, node_y])
+    return np.array([node_x, node_y, node_z])
 
 
 def _element_frame(p_i: np.ndarray, p_j: np.ndarray,
@@ -168,10 +171,12 @@ def _set_equal_aspect(ax, model: StructuralModel,
         return
     xs = [n.x for n in model.nodes.values()]
     ys = [n.y for n in model.nodes.values()]
+    zs = [getattr(n, "z", 0.0) for n in model.nodes.values()]
     pad = outline_padding
     x_lo, x_hi = min(xs) - pad, max(xs) + pad
     elev_lo, elev_hi = min(ys) - pad, max(ys) + pad
-    width_lo, width_hi = -pad, pad
+    # Native 3D geometry occupies the "width" axis too.
+    width_lo, width_hi = min(zs) - pad, max(zs) + pad
     if orientation == _ORIENT_Z_UP:
         y_lo, y_hi = width_lo, width_hi
         z_lo, z_hi = elev_lo, elev_hi
@@ -352,8 +357,10 @@ class View3DWindow(QMainWindow):
                 max(abs(y) for y, _ in outline),
                 max(abs(z) for _, z in outline),
             )
-            p_i = _node_world(ni.x, ni.y, orientation)
-            p_j = _node_world(nj.x, nj.y, orientation)
+            p_i = _node_world(ni.x, ni.y, orientation,
+                              getattr(ni, "z", 0.0))
+            p_j = _node_world(nj.x, nj.y, orientation,
+                              getattr(nj, "z", 0.0))
             faces = _element_mesh(
                 p_i, p_j, outline, in_plane_axis, out_of_plane_axis,
             )

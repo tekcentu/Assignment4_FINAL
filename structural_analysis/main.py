@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from .model import StructuralModel, AnalysisResult
 from .multi_case_result import MultiCaseAnalysisResult
 from .element import FrameElement2D, TrussElement2D
+from .element3d import FrameElement3D, TrussElement3D
 from .file_io import read_input_file
 from .assembler import assemble_global_system, DofManager
 from .solver import solve_system
@@ -94,16 +95,23 @@ def run_analysis(
         if verbose:
             print(msg)
 
+    from .assembler import model_is_3d
+    is_3d = model_is_3d(model)
+    dim_tag = "3D" if is_3d else "2D"
+
     log("=" * 70)
-    log(f"  2D Structural Analysis — {model.title}")
+    log(f"  {dim_tag} Structural Analysis — {model.title}")
     log("=" * 70)
 
     # ── Step A: Input ──
     log("\n── Step A: Input ──")
-    n_frame = sum(1 for e in model.elements if isinstance(e, FrameElement2D))
-    n_truss = sum(1 for e in model.elements if isinstance(e, TrussElement2D))
+    n_frame = sum(1 for e in model.elements
+                  if isinstance(e, (FrameElement2D, FrameElement3D)))
+    n_truss = sum(1 for e in model.elements
+                  if isinstance(e, (TrussElement2D, TrussElement3D)))
     n_released = sum(1 for e in model.elements
-                     if isinstance(e, FrameElement2D) and (e.release_i or e.release_j))
+                     if isinstance(e, (FrameElement2D, FrameElement3D))
+                     and (e.release_i or e.release_j))
     n_member_loaded = sum(1 for e in model.elements if e.member_loads)
 
     log(f"  Nodes: {len(model.nodes)}, Elements: {len(model.elements)} "
@@ -131,19 +139,24 @@ def run_analysis(
     log(f"  Active DOFs: {dofs.n_total}, Free DOFs (NumEq): {NumEq}")
 
     # E matrix
+    dof_headers = {"ux": "Tx", "uy": "Ty", "uz": "Tz",
+                   "rx": "Rx", "ry": "Ry", "rz": "Rz"}
     E_display = dofs.e_matrix_for_display(model)
     log(f"\n  E matrix (equation numbers):")
-    log(f"  {'Node':>6}  {'Tx':>6}  {'Ty':>6}  {'Rz':>6}")
+    log("  " + f"{'Node':>6}" + "".join(
+        f"  {dof_headers[d]:>6}" for d in dofs.dof_names))
     for nid in model.node_ids:
         eq = E_display[nid]
-        log(f"  {nid:>6}  {eq[0]:>6}  {eq[1]:>6}  {eq[2]:>6}")
+        log(f"  {nid:>6}" + "".join(f"  {v:>6}" for v in eq))
 
-    # G vectors
+    # G vectors — built from the solve-time elements (in 3D mode the
+    # promoted space elements own the 12-entry DOF map).
     log(f"\n  G vectors:")
-    for elem in model.elements:
+    solve_elems = [ed["element"] for ed in elem_data.values()]
+    for elem in solve_elems:
         G = dofs.g_vector_for_display(elem)
         rel = ""
-        if isinstance(elem, FrameElement2D):
+        if isinstance(elem, (FrameElement2D, FrameElement3D)):
             if elem.release_i and elem.release_j:
                 rel = " [both released]"
             elif elem.release_i:
@@ -178,7 +191,7 @@ def run_analysis(
     has_settlement = False
     for nid in model.node_ids:
         sup = model.support_for(nid)
-        for dof in ("ux", "uy", "rz"):
+        for dof in dofs.dof_names:
             idx = dofs.index(nid, dof)
             if idx is None:
                 continue
@@ -190,7 +203,7 @@ def run_analysis(
         log("  Support settlements applied:")
         for nid in model.node_ids:
             sup = model.support_for(nid)
-            for dof in ("ux", "uy", "rz"):
+            for dof in dofs.dof_names:
                 v = sup.prescribed(dof)
                 if v != 0.0 and getattr(sup, dof):
                     log(f"    Node {nid} {dof}: {v:+.6e}")
@@ -211,36 +224,57 @@ def run_analysis(
     log(f"  Residual ||K_ff·D_f − F_f|| = {residual:.4e}")
 
     # Displacement table
+    disp_units = {"ux": "m", "uy": "m", "uz": "m",
+                  "rx": "rad", "ry": "rad", "rz": "rad"}
     log(f"\n  Nodal displacements:")
-    log(f"  {'Node':>6}  {'ux (m)':>14}  {'uy (m)':>14}  {'rz (rad)':>14}")
+    log("  " + f"{'Node':>6}" + "".join(
+        f"  {f'{d} ({disp_units[d]})':>14}" for d in dofs.dof_names))
     for nid in model.node_ids:
         nm = dofs.active_map[nid]
-        ux = D[nm["ux"]] if nm["ux"] is not None else 0.0
-        uy = D[nm["uy"]] if nm["uy"] is not None else 0.0
-        rz = D[nm["rz"]] if nm["rz"] is not None else 0.0
-        log(f"  {nid:>6}  {ux:>14.6e}  {uy:>14.6e}  {rz:>14.6e}")
+        vals = [D[nm[d]] if nm.get(d) is not None else 0.0
+                for d in dofs.dof_names]
+        log(f"  {nid:>6}" + "".join(f"  {v:>14.6e}" for v in vals))
 
     # ── Step E: Member End Forces ──
     log("\n── Step E: Member End Forces ──")
     member_results = compute_member_forces(model, D, dofs, elem_data)
 
-    log(f"  {'Elem':>6} {'Type':>6}  {'N_i':>10}  {'V_i':>10}  {'M_i':>10}"
-        f"  {'N_j':>10}  {'V_j':>10}  {'M_j':>10}")
-    for elem in model.elements:
-        f = member_results[elem.id]["f_local"]
-        log(f"  {elem.id:>6} {elem.kind:>6}  " +
-            "  ".join(f"{f[j]:>10.4f}" for j in range(6)))
+    if is_3d:
+        cols = ["N", "Vy", "Vz", "T", "My", "Mz"]
+        log(f"  {'Elem':>6} {'Type':>7} {'End':>4}  " +
+            "  ".join(f"{c:>10}" for c in cols))
+        for elem in solve_elems:
+            f = member_results[elem.id]["f_local"]
+            half = len(f) // 2
+            for end, sl in (("i", f[:half]), ("j", f[half:])):
+                padded = list(sl) + [0.0] * (6 - len(sl))
+                log(f"  {elem.id:>6} {elem.kind:>7} {end:>4}  " +
+                    "  ".join(f"{v:>10.4f}" for v in padded))
+    else:
+        log(f"  {'Elem':>6} {'Type':>6}  {'N_i':>10}  {'V_i':>10}  {'M_i':>10}"
+            f"  {'N_j':>10}  {'V_j':>10}  {'M_j':>10}")
+        for elem in model.elements:
+            f = member_results[elem.id]["f_local"]
+            log(f"  {elem.id:>6} {elem.kind:>6}  " +
+                "  ".join(f"{f[j]:>10.4f}" for j in range(6)))
 
     # ── Step F: Reactions & Equilibrium ──
     log("\n── Step F: Support Reactions ──")
     reactions = compute_reactions(model, K, D, F, dofs)
 
-    log(f"  {'Node':>6}  {'Rx (kN)':>12}  {'Ry (kN)':>12}  {'Mz (kN·m)':>12}")
+    reaction_headers = {
+        "ux": "Rx (kN)", "uy": "Ry (kN)", "uz": "Rz (kN)",
+        "rx": "Mx (kN·m)", "ry": "My (kN·m)", "rz": "Mz (kN·m)",
+    }
+    log("  " + f"{'Node':>6}" + "".join(
+        f"  {reaction_headers[d]:>12}" for d in dofs.dof_names))
     for nid in sorted(reactions.keys()):
         r = reactions[nid]
-        log(f"  {nid:>6}  {r.get('ux', 0):>12.4f}  {r.get('uy', 0):>12.4f}  {r.get('rz', 0):>12.4f}")
+        log(f"  {nid:>6}" + "".join(
+            f"  {r.get(d, 0):>12.4f}" for d in dofs.dof_names))
 
-    eq_res, eq_msgs = equilibrium_check(model, member_results, dofs)
+    eq_res, eq_msgs = equilibrium_check(model, member_results, dofs,
+                                        elem_data)
     for m in eq_msgs:
         log(f"  {m}")
     log(f"  Max equilibrium residual at free nodes: {eq_res:.4e}")
@@ -248,7 +282,13 @@ def run_analysis(
     # Global equilibrium
     total_rx = sum(r.get("ux", 0) for r in reactions.values()) + sum(l.fx for l in model.nodal_loads)
     total_ry = sum(r.get("uy", 0) for r in reactions.values()) + sum(l.fy for l in model.nodal_loads)
-    log(f"  Global: ΣFx = {total_rx:.4f}, ΣFy = {total_ry:.4f}")
+    if is_3d:
+        total_rz = (sum(r.get("uz", 0) for r in reactions.values())
+                    + sum(l.fz for l in model.nodal_loads))
+        log(f"  Global: ΣFx = {total_rx:.4f}, ΣFy = {total_ry:.4f}, "
+            f"ΣFz = {total_rz:.4f}")
+    else:
+        log(f"  Global: ΣFx = {total_rx:.4f}, ΣFy = {total_ry:.4f}")
 
     # ── Step G: Storage Report ──
     log("\n── Step G: Storage Report ──")
@@ -274,7 +314,7 @@ def run_analysis(
         status="ok", title=model.title,
         warnings=warnings + solve_warnings,
         E_map=dofs.active_map, num_eq=NumEq,
-        G_vectors={e.id: dofs.g_vector_for_display(e) for e in model.elements},
+        G_vectors={e.id: dofs.g_vector_for_display(e) for e in solve_elems},
         K=K, F=F, D=D, residual=residual,
         member_results=member_results,
         reactions=reactions, eq_residual=eq_res,

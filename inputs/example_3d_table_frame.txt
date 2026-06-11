@@ -1,0 +1,74 @@
+# Example 3D building cell: 4 columns + 4 ring beams ("table" frame).
+#
+# Geometry (Y is the vertical axis in this program):
+#   bases  1-4 at y=0:  (0,0,0) (4,0,0) (4,0,4) (0,0,4)   — fully fixed
+#   tops   5-8 at y=3:  one column above each base
+#   beams  ring 5-6-7-8-5 at the top
+#
+# Loads:
+#   * gravity UDL 12 kN/m on every beam (MEMBER_UDL ... gravity)
+#   * wind +X on the x=0 face top corners (nodes 5 and 8) via LOADS3D
+#
+# Everything is drawn as plain FRAME members; the solver promotes them
+# to 12-DOF space elements automatically because the nodes carry z.
+#
+# GUI walkthrough to build this interactively:
+#   1. View -> Work plane -> XY, draw the z=0 portal (columns 1-5, 2-6,
+#      beam 5-6) with the Frame tool.
+#   2. View -> Working depth... = 4, draw the z=4 portal the same way.
+#   3. View -> Work plane -> XZ (plan) to SEE both portals; select a
+#      top-node pair (Shift-click) and Model -> Connect selected
+#      nodes... for each of the two cross beams.
+#   4. Support tool on each base with ux/uy/rz + uz/rx/ry checked.
+#   5. Run -> Solve; inspect in View -> Work plane views or the
+#      3D viewer.
+
+TITLE
+Example 3D table frame (4 columns + 4 ring beams)
+
+NODES 8
+1  0.0  0.0  0.0
+2  4.0  0.0  0.0
+3  4.0  0.0  4.0
+4  0.0  0.0  4.0
+5  0.0  3.0  0.0
+6  4.0  3.0  0.0
+7  4.0  3.0  4.0
+8  0.0  3.0  4.0
+
+MATERIALS 1
+1  210000000.0  1.2e-05  7850.0  Steel_S275  nu=0.3
+
+SECTIONS 2
+1  1  7.81e-03  5.70e-05  0.200  HEB200_col  J=5.93e-07
+2  1  5.38e-03  8.36e-05  0.300  IPE300_beam  J=2.01e-07
+
+ELEMENTS 8
+# columns
+1  1  5  1  FRAME
+2  2  6  1  FRAME
+3  3  7  1  FRAME
+4  4  8  1  FRAME
+# top ring beams
+5  5  6  2  FRAME
+6  6  7  2  FRAME
+7  7  8  2  FRAME
+8  8  5  2  FRAME
+
+SUPPORTS3D 4
+1  1 1 1 1 1 1
+2  1 1 1 1 1 1
+3  1 1 1 1 1 1
+4  1 1 1 1 1 1
+
+# Gravity dead load on the four ring beams (12 kN/m, global -Y).
+MEMBER_UDL 4
+5  0.0  12.0  gravity
+6  0.0  12.0  gravity
+7  0.0  12.0  gravity
+8  0.0  12.0  gravity
+
+# Wind +X on the windward (x = 0) top corners.
+LOADS3D 2
+5  15.0  0.0  0.0  0.0  0.0  0.0
+8  15.0  0.0  0.0  0.0  0.0  0.0

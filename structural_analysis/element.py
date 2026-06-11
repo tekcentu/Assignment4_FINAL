@@ -239,6 +239,18 @@ class Element2D:
         """
         return [0, 1, 2, 3, 4, 5]
 
+    def dof_keys(self) -> list[tuple[int, str]]:
+        """(node_id, dof_name) per local DOF, in local DOF order.
+
+        The dimension-generic counterpart of the hard-coded key list
+        the assembler and postprocessor used to build inline; 3D
+        elements override with their 12-/6-entry equivalents.
+        """
+        return [
+            (self.node_i, "ux"), (self.node_i, "uy"), (self.node_i, "rz"),
+            (self.node_j, "ux"), (self.node_j, "uy"), (self.node_j, "rz"),
+        ]
+
     def consistent_mass_local(self, nodes: dict) -> np.ndarray:
         """Return the 6×6 consistent mass matrix in the local frame.
 

@@ -31,6 +31,9 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .element import Element2D, FrameElement2D, TrussElement2D
+from .element3d import (
+    Element3D, FrameElement3D, TrussElement3D, promote_element_to_3d,
+)
 from .model import NODE_COINCIDENCE_TOL, STANDARD_GRAVITY, StructuralModel
 
 
@@ -38,6 +41,58 @@ from .model import NODE_COINCIDENCE_TOL, STANDARD_GRAVITY, StructuralModel
 # results panel readable on pathological imports. The full set is
 # always available by re-running the check.
 _MAX_COINCIDENT_PAIRS_IN_WARNING: int = 10
+
+
+# Per-node DOF name tuples for the two pipelines. Order matters: it is
+# the column order of the displayed E matrix and the per-node DOF
+# numbering order.
+DOF_NAMES_2D: tuple[str, ...] = ("ux", "uy", "rz")
+DOF_NAMES_3D: tuple[str, ...] = ("ux", "uy", "uz", "rx", "ry", "rz")
+
+
+def model_is_3d(model: StructuralModel) -> bool:
+    """Decide whether ``model`` needs the 6-DOF-per-node 3D pipeline.
+
+    True when the model carries any out-of-plane content:
+    a node with z ≠ 0, a native :class:`Element3D`, a support using a
+    3D-only DOF/settlement, a nodal load with fz/mx/my, a member load
+    with a z component — or when ``model.force_3d`` is set.
+
+    A model where all of those are absent solves through the legacy 2D
+    pipeline, bit-identical to pre-3D versions.
+    """
+    if getattr(model, "force_3d", False):
+        return True
+    if any(getattr(n, "z", 0.0) != 0.0 for n in model.nodes.values()):
+        return True
+    if any(isinstance(e, Element3D) for e in model.elements):
+        return True
+    if any(getattr(s, "has_3d_content", False)
+           for s in model.supports.values()):
+        return True
+    if any(getattr(ld, "has_3d_content", False)
+           for ld in model.nodal_loads):
+        return True
+    for elem in model.elements:
+        for ld in getattr(elem, "member_loads", []) or []:
+            if getattr(ld, "wz", 0.0) or getattr(ld, "pz", 0.0):
+                return True
+    return False
+
+
+def prepare_solve_elements(model: StructuralModel) -> tuple[bool, list]:
+    """Return ``(is_3d, solve_elements)`` for the assembly pass.
+
+    In 2D mode the model's own element list is returned unchanged. In
+    3D mode every 2D element is promoted to its space equivalent (see
+    :func:`structural_analysis.element3d.promote_element_to_3d`);
+    native 3D elements pass through. The model itself is never
+    mutated — promotion is a per-solve view.
+    """
+    is_3d = model_is_3d(model)
+    if not is_3d:
+        return False, list(model.elements)
+    return True, [promote_element_to_3d(e, model) for e in model.elements]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -69,25 +124,45 @@ class DofManager:
     restrained_indices: list[int]
     labels: dict[int, str]
     n_total: int
+    # Per-node DOF name order for this model — DOF_NAMES_2D for the
+    # legacy planar pipeline, DOF_NAMES_3D for the 6-DOF space solve.
+    dof_names: tuple[str, ...] = DOF_NAMES_2D
+
+    @property
+    def is_3d(self) -> bool:
+        """True when this numbering uses the 6-DOF-per-node space set."""
+        return len(self.dof_names) == 6
 
     @classmethod
-    def from_model(cls, model: StructuralModel) -> DofManager:
+    def from_model(
+        cls,
+        model: StructuralModel,
+        elements: list | None = None,
+        is_3d: bool | None = None,
+    ) -> DofManager:
         """Build DOF numbering from the model.
 
         Rotational DOFs are only created at a node if:
-        1. A FrameElement2D with an unreleased end connects there, OR
-        2. A support restrains Rz there, OR
-        3. A nodal load has a non-zero Mz there.
+        1. A frame element with an unreleased end connects there, OR
+        2. A support restrains the rotation there, OR
+        3. A nodal load has a non-zero moment there.
 
         Args:
             model: The structural model to number DOFs for.
+            elements: Solve-time element list (promoted in 3D mode).
+                Defaults to ``prepare_solve_elements(model)``.
+            is_3d: Pipeline override; auto-detected when None.
 
         Returns:
             A new DofManager instance with all DOF mappings computed.
         """
+        if elements is None or is_3d is None:
+            is_3d, elements = prepare_solve_elements(model)
+        if is_3d:
+            return cls._from_model_3d(model, elements)
         rotation_active: dict[int, bool] = defaultdict(bool)
 
-        for elem in model.elements:
+        for elem in elements:
             if isinstance(elem, FrameElement2D):
                 if not elem.release_i:
                     rotation_active[elem.node_i] = True
@@ -138,6 +213,81 @@ class DofManager:
             n_total=idx,
         )
 
+    @classmethod
+    def _from_model_3d(
+        cls, model: StructuralModel, elements: list,
+    ) -> DofManager:
+        """6-DOF-per-node numbering for the space pipeline.
+
+        Translations (ux, uy, uz) are always active. Rotations follow
+        the same dynamic-omission rule as the 2D pipeline, per axis:
+
+        * rx / ry activate where any :class:`FrameElement3D` connects
+          (torsion and out-of-plane bending always couple there);
+        * rz activates where a frame connects with an UNRELEASED end
+          (a hinge about local z mirrors the 2D moment release);
+        * a support restraining a rotation, or a nodal moment about an
+          axis, activates that axis explicitly.
+
+        Pure space-truss nodes therefore carry only translations —
+        no singular rotational equations, same UX as the 2D solver.
+        """
+        rot_active: dict[int, set[str]] = defaultdict(set)
+
+        for elem in elements:
+            if isinstance(elem, FrameElement3D):
+                for nid in (elem.node_i, elem.node_j):
+                    rot_active[nid].update(("rx", "ry"))
+                if not elem.release_i:
+                    rot_active[elem.node_i].add("rz")
+                if not elem.release_j:
+                    rot_active[elem.node_j].add("rz")
+
+        for nid, sup in model.supports.items():
+            for dof in ("rx", "ry", "rz"):
+                if getattr(sup, dof):
+                    rot_active[nid].add(dof)
+
+        for load in model.nodal_loads:
+            for dof, val in (("rx", load.mx), ("ry", load.my),
+                             ("rz", load.mz)):
+                if abs(val) > 0:
+                    rot_active[load.node_id].add(dof)
+
+        active_map: dict[int, dict[str, int | None]] = {}
+        labels: dict[int, str] = {}
+        idx = 0
+        for nid in model.node_ids:
+            node_map: dict[str, int | None] = {}
+            for dof in DOF_NAMES_3D:
+                if dof.startswith("r") and dof not in rot_active[nid]:
+                    node_map[dof] = None
+                    continue
+                node_map[dof] = idx
+                labels[idx] = f"Node {nid} {dof.upper()}"
+                idx += 1
+            active_map[nid] = node_map
+
+        restrained: list[int] = []
+        for nid in model.node_ids:
+            sup = model.support_for(nid)
+            for dof in DOF_NAMES_3D:
+                i = active_map[nid].get(dof)
+                if i is not None and getattr(sup, dof):
+                    restrained.append(i)
+        restrained = sorted(set(restrained))
+        restrained_set = set(restrained)
+        free = [i for i in range(idx) if i not in restrained_set]
+
+        return cls(
+            active_map=active_map,
+            free_indices=free,
+            restrained_indices=restrained,
+            labels=labels,
+            n_total=idx,
+            dof_names=DOF_NAMES_3D,
+        )
+
     # ── helpers ──
 
     def index(self, node_id: int, dof: str) -> int | None:
@@ -152,20 +302,19 @@ class DofManager:
         """
         return self.active_map[node_id][dof]
 
-    def element_dof_map(self, elem: Element2D) -> list[int | None]:
-        """Build the 6-entry DOF address vector for an element.
+    def element_dof_map(self, elem) -> list[int | None]:
+        """Build the DOF address vector for an element.
 
         Args:
-            elem: The element to build the DOF map for.
+            elem: The element to build the DOF map for (2D or 3D).
 
         Returns:
-            List of 6 global DOF indices (or None for inactive DOFs).
+            List of global DOF indices (or None for inactive DOFs),
+            one per local DOF — 6 entries for 2D elements, 12 for a
+            space frame, 6 for a space truss.
         """
         local_mask = elem.assembly_local_indices()
-        keys = [
-            (elem.node_i, "ux"), (elem.node_i, "uy"), (elem.node_i, "rz"),
-            (elem.node_j, "ux"), (elem.node_j, "uy"), (elem.node_j, "rz"),
-        ]
+        keys = elem.dof_keys()
         mapping: list[int | None] = []
         for pos, key in enumerate(keys):
             if local_mask[pos] is None:
@@ -181,8 +330,10 @@ class DofManager:
             model: The structural model (used for node iteration order).
 
         Returns:
-            Dict mapping node_id to [eq_tx, eq_ty, eq_rz] where 0 means
-            restrained or inactive and positive integers are free equation numbers.
+            Dict mapping node_id to one equation number per entry of
+            ``self.dof_names`` ([Tx, Ty, Rz] in 2D; six entries in 3D)
+            where 0 means restrained or inactive and positive integers
+            are free equation numbers.
         """
         # Build reverse map: global_index -> equation_number (1-based among free)
         free_set = set(self.free_indices)
@@ -195,7 +346,7 @@ class DofManager:
         E: dict[int, list[int]] = {}
         for nid in model.node_ids:
             row = []
-            for dof in ("ux", "uy", "rz"):
+            for dof in self.dof_names:
                 gi = self.active_map[nid].get(dof)
                 if gi is None or gi not in free_set:
                     row.append(0)
@@ -290,6 +441,9 @@ def _find_coincident_node_pairs(
         for nj in nodes[i + 1:]:
             dx = ni.x - nj.x
             dy = ni.y - nj.y
+            dz = getattr(ni, "z", 0.0) - getattr(nj, "z", 0.0)
+            if abs(dz) >= tol:
+                continue
             # Cheap bounding-box pre-filter rules out the obviously-
             # distant majority before the hypot call. The strict
             # Euclidean check below is what actually decides whether
@@ -299,7 +453,7 @@ def _find_coincident_node_pairs(
             # claim (per gemini PR-21 review).
             if abs(dx) >= tol or abs(dy) >= tol:
                 continue
-            dist = float(np.hypot(dx, dy))
+            dist = float(np.sqrt(dx * dx + dy * dy + dz * dz))
             if dist >= tol:
                 continue
             a, b = (ni.id, nj.id) if ni.id < nj.id else (nj.id, ni.id)
@@ -312,7 +466,11 @@ def _find_coincident_node_pairs(
 # ═══════════════════════════════════════════════════════════════
 
 
-def validate_model(model: StructuralModel, dofs: DofManager) -> list[str]:
+def validate_model(
+    model: StructuralModel,
+    dofs: DofManager,
+    elements: list | None = None,
+) -> list[str]:
     """Pre-assembly validation of the structural model.
 
     Checks for: undefined nodes, non-positive properties, zero-length
@@ -322,6 +480,9 @@ def validate_model(model: StructuralModel, dofs: DofManager) -> list[str]:
     Args:
         model: The structural model to validate.
         dofs: The DOF manager (used for free-DOF checks).
+        elements: Solve-time element list — in 3D mode the promoted
+            space elements (their length math is z-aware). Defaults to
+            ``model.elements`` (the legacy 2D behaviour).
 
     Returns:
         List of warning strings. Non-fatal issues are returned as warnings.
@@ -331,21 +492,30 @@ def validate_model(model: StructuralModel, dofs: DofManager) -> list[str]:
             non-positive properties, undefined nodes).
     """
     warnings: list[str] = []
+    if elements is None:
+        elements = model.elements
 
     if not model.nodes:
         raise ValueError("No nodes defined.")
-    if not model.elements:
+    if not elements:
         raise ValueError("No elements defined.")
 
     # Element checks
     incidence: dict[int, int] = defaultdict(int)
-    for elem in model.elements:
+    for elem in elements:
         if elem.node_i not in model.nodes or elem.node_j not in model.nodes:
             raise ValueError(f"Element {elem.id} references undefined node.")
         if elem.A <= 0 or elem.E <= 0:
             raise ValueError(f"Element {elem.id} has non-positive A or E.")
         if isinstance(elem, FrameElement2D) and elem.I <= 0:
             raise ValueError(f"Frame element {elem.id} has non-positive I.")
+        if isinstance(elem, FrameElement3D):
+            for prop in ("Iy", "Iz", "J", "G"):
+                if getattr(elem, prop) <= 0:
+                    raise ValueError(
+                        f"3D frame element {elem.id} has non-positive "
+                        f"{prop}."
+                    )
         elem.length_cos_sin(model.nodes)  # raises if zero-length
         incidence[elem.node_i] += 1
         incidence[elem.node_j] += 1
@@ -382,8 +552,7 @@ def validate_model(model: StructuralModel, dofs: DofManager) -> list[str]:
     components = _connectivity_components(model)
     for comp in components:
         has_support = any(
-            model.support_for(nid).ux or model.support_for(nid).uy or model.support_for(nid).rz
-            for nid in comp
+            model.support_for(nid).any_restrained for nid in comp
         )
         if not has_support:
             raise ValueError(
@@ -397,19 +566,42 @@ def validate_model(model: StructuralModel, dofs: DofManager) -> list[str]:
             f"K is block-diagonal."
         )
 
+    # 3D pipeline: a model promoted from a planar drawing often still
+    # carries 2D-only supports — nothing restrains the out-of-plane
+    # rigid-body modes and K_ff is guaranteed singular. Surface the
+    # actionable hint here instead of letting the SVD mechanism report
+    # be the first clue.
+    if dofs.is_3d and not any(
+        s.uz for s in model.supports.values()
+    ):
+        warnings.append(
+            "3D analysis: no support restrains UZ — the structure can "
+            "translate freely out of plane (singular K). Add UZ (and "
+            "where needed RX/RY) restraints to the supports."
+        )
+
     # Free rotational DOFs with no bending stiffness
     for idx in dofs.free_indices:
         label = dofs.labels[idx]
-        if "RZ" not in label:
+        parts = label.split()
+        dof_name = parts[-1]  # "UX" … "RZ"
+        if not dof_name.startswith("R"):
             continue
-        nid = int(label.split()[1])
-        has_stiffness = any(
-            isinstance(el, FrameElement2D) and (
-                (el.node_i == nid and not el.release_i) or
-                (el.node_j == nid and not el.release_j)
+        nid = int(parts[1])
+        if dof_name == "RZ":
+            has_stiffness = any(
+                isinstance(el, (FrameElement2D, FrameElement3D)) and (
+                    (el.node_i == nid and not el.release_i) or
+                    (el.node_j == nid and not el.release_j)
+                )
+                for el in elements
             )
-            for el in model.elements
-        )
+        else:  # RX / RY — any connected space frame is stiff there
+            has_stiffness = any(
+                isinstance(el, FrameElement3D)
+                and nid in (el.node_i, el.node_j)
+                for el in elements
+            )
         if not has_stiffness:
             warnings.append(
                 f"{label} is free but has no bending stiffness — "
@@ -441,8 +633,9 @@ def assemble_global_system(
             warnings: list[str] — validation warnings.
             elem_data: dict[int, dict] — per-element data for postprocessing.
     """
-    dofs = DofManager.from_model(model)
-    warnings = validate_model(model, dofs)
+    is_3d, solve_elements = prepare_solve_elements(model)
+    dofs = DofManager.from_model(model, solve_elements, is_3d)
+    warnings = validate_model(model, dofs, solve_elements)
 
     n = dofs.n_total
     K = np.zeros((n, n))
@@ -450,14 +643,20 @@ def assemble_global_system(
     elem_data: dict[int, dict] = {}
 
     # Nodal loads
+    load_components = [("ux", "fx"), ("uy", "fy"), ("rz", "mz")]
+    if is_3d:
+        load_components += [("uz", "fz"), ("rx", "mx"), ("ry", "my")]
     for load in model.nodal_loads:
-        for dof, val in [("ux", load.fx), ("uy", load.fy), ("rz", load.mz)]:
+        for dof, attr in load_components:
             idx = dofs.index(load.node_id, dof)
             if idx is not None:
-                F[idx] += val
+                F[idx] += getattr(load, attr)
 
-    # Element contributions
-    for elem in model.elements:
+    # Element contributions. In 3D mode ``solve_elements`` holds the
+    # promoted space elements; ``elem_data["element"]`` stores the
+    # SOLVE element (the one whose stiffness was assembled) so the
+    # postprocessor recovers forces with the same matrices.
+    for elem in solve_elements:
         k_global, p_global = elem.global_stiffness_and_load(model.nodes)
         mapping = dofs.element_dof_map(elem)
 
@@ -483,7 +682,8 @@ def assemble_global_system(
     # postprocessor can feed them into ``q = K·d − p`` recovery without
     # the loads ever being attached as member_loads.
     if model.include_self_weight:
-        _apply_self_weight(model, dofs, F, elem_data)
+        _apply_self_weight(model, dofs, F, elem_data,
+                           elements=solve_elements)
 
     return K, F, dofs, warnings, elem_data
 
@@ -493,6 +693,7 @@ def _apply_self_weight(
     dofs: DofManager,
     F: np.ndarray,
     elem_data: dict[int, dict],
+    elements: list | None = None,
 ) -> None:
     """Inject gravity loads on every element into the global F vector.
 
@@ -516,9 +717,17 @@ def _apply_self_weight(
     of each endpoint — no member-load object is ever attached.
 
     Elements with ``ρ = 0`` or ``A = 0`` contribute nothing.
+
+    In 3D mode ``elements`` carries the promoted space elements:
+    frames build their fixed-end vector through
+    ``FrameElement3D.self_weight_fixed_end_local`` (gravity stays
+    global −Y); trusses lump half the bar weight at each endpoint's
+    uy DOF exactly as in 2D.
     """
     g = STANDARD_GRAVITY
-    for elem in model.elements:
+    if elements is None:
+        elements = model.elements
+    for elem in elements:
         rho = float(getattr(elem, "rho", 0.0))
         A = float(getattr(elem, "A", 0.0))
         if rho == 0.0 or A == 0.0:
@@ -530,7 +739,26 @@ def _apply_self_weight(
 
         w = rho * A * g / 1000.0  # kN/m, magnitude in global -Y
 
-        if isinstance(elem, FrameElement2D):
+        if isinstance(elem, FrameElement3D):
+            p_local_raw = elem.self_weight_fixed_end_local(model.nodes)
+            elem_data[elem.id]["self_weight_p_local"] = p_local_raw
+            p_local = elem.condense_local_load_for_releases(
+                p_local_raw, model.nodes,
+            )
+            R = elem.transformation_matrix(model.nodes)
+            p_global = R.T @ p_local
+            mapping = dofs.element_dof_map(elem)
+            for a, I in enumerate(mapping):
+                if I is None:
+                    continue
+                F[I] += p_global[a]
+        elif isinstance(elem, TrussElement3D):
+            half_kN = w * L / 2.0
+            for nid in (elem.node_i, elem.node_j):
+                idx = dofs.index(nid, "uy")
+                if idx is not None:
+                    F[idx] -= half_kN
+        elif isinstance(elem, FrameElement2D):
             # Built by the element so rigid end offsets are honoured
             # (flexible-span weight, mapped to joint coordinates via
             # Tᵀ); identical to the legacy inline wL/2, ±wL²/12 vector

@@ -29,6 +29,7 @@ from ..element import FrameElement2D, TrussElement2D
 from ..model import (
     FrameTemperatureLoad,
     NodalLoad,
+    Node,
     PointLoad,
     StructuralModel,
     Support,
@@ -57,6 +58,44 @@ from .element_graphics import (
 
 _TOOLBAR_REMOVE = {"Subplots", "Customize"}
 # _DEFAULT_VISUAL_DEPTH_* constants are imported from gui_common.geometry above.
+
+
+# ── 3D view planes (v0.32) ─────────────────────────────────────────
+# The canvas stays a 2D matplotlib surface; 3D models are shown as an
+# orthographic projection onto a selectable work plane (plus a
+# display-only isometric mode). "XY" is the legacy front view and is a
+# strict identity projection — every 2D model renders bit-identically.
+VIEW_PLANES: tuple[str, ...] = ("XY", "XZ", "ZY", "ISO")
+
+# Axis labels of the (horizontal, vertical) plane axes per view.
+_VIEW_AXIS_LABELS: dict[str, tuple[str, str]] = {
+    "XY": ("X", "Y"),
+    "XZ": ("X", "Z"),
+    "ZY": ("Z", "Y"),
+}
+
+_ISO_C = math.cos(math.radians(30.0))
+_ISO_S = math.sin(math.radians(30.0))
+
+
+class _ProjectedModelView:
+    """Read-only model facade whose nodes carry view-plane coordinates.
+
+    Every canvas drawing / hit-test path reads ``model.nodes[..].x/.y``;
+    swapping the node dict for projected copies lets all of that code
+    serve any work plane untouched. Everything else (elements,
+    supports, loads, sections, …) delegates to the real model.
+    """
+
+    def __init__(self, model: StructuralModel, project) -> None:
+        self._base = model
+        self.nodes = {
+            nid: Node(nid, *project(n.x, n.y, getattr(n, "z", 0.0)))
+            for nid, n in model.nodes.items()
+        }
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
 
 
 class AppNavigationToolbar(NavigationToolbar2QT):
@@ -108,6 +147,11 @@ class ModelCanvas(QWidget):
         super().__init__(parent)
         self._model = model_provider
         self._grid_provider = grid_provider or (lambda: GridSystem())
+        # 3D work plane (v0.32). "XY" keeps the legacy behaviour;
+        # "XZ" / "ZY" are orthographic plan / side elevations; "ISO"
+        # is a display-only isometric projection (creation tools are
+        # gated by the host via ``is_editable_view``).
+        self._view_plane: str = "XY"
         self.grid_spacing: float = 0.5
         self.snap_enabled: bool = True
         self.snap_engine = SnapEngine(tolerance_px=10.0)
@@ -278,6 +322,80 @@ class ModelCanvas(QWidget):
         self._mpl_canvas.mpl_connect("scroll_event", self._handle_scroll)
 
     # ── public API ──
+
+    # ── 3D view plane (v0.32) ──
+
+    @property
+    def view_plane(self) -> str:
+        return self._view_plane
+
+    @property
+    def is_editable_view(self) -> bool:
+        """True when geometry-creation tools may run in this view.
+
+        Creation clicks resolve to world coordinates only on the XY
+        work plane (with the host's working depth supplying z); the
+        other planes and the isometric mode are for inspection and
+        selection.
+        """
+        return self._view_plane == "XY"
+
+    def set_view_plane(self, name: str) -> None:
+        name = str(name).upper()
+        if name not in VIEW_PLANES:
+            raise ValueError(
+                f"Unknown view plane {name!r}; expected one of "
+                f"{VIEW_PLANES}."
+            )
+        if name == self._view_plane:
+            return
+        self._view_plane = name
+        # Projection changed — old pan/zoom extents are meaningless.
+        self.clear_element_preview()
+        self.fit_to_view()
+
+    def project_xyz(self, x: float, y: float, z: float) -> tuple[float, float]:
+        """World (x, y, z) → current view-plane (u, v).
+
+        Linear and origin-preserving, so the same map serves points
+        and vectors (displacements, reactions).
+        """
+        vp = self._view_plane
+        if vp == "XY":
+            return x, y
+        if vp == "XZ":
+            return x, z
+        if vp == "ZY":
+            return z, y
+        # Isometric, Y up: X recedes right, Z recedes left.
+        return (x - z) * _ISO_C, y + (x + z) * _ISO_S
+
+    def plane_to_world(
+        self, u: float, v: float, depth: float = 0.0,
+    ) -> tuple[float, float, float]:
+        """View-plane (u, v) → world (x, y, z) using ``depth`` for the
+        out-of-plane axis. Only meaningful for the orthographic views
+        (``is_editable_view`` guards the ISO case at the call sites).
+        """
+        vp = self._view_plane
+        if vp == "XY":
+            return u, v, depth
+        if vp == "XZ":
+            return u, depth, v
+        if vp == "ZY":
+            return depth, v, u
+        raise ValueError("Isometric view has no inverse projection.")
+
+    def projected_model(self):
+        """The model as seen by the current view plane.
+
+        XY is an identity projection — the real model is returned so
+        legacy behaviour (and object identity) is fully preserved.
+        """
+        model = self._model()
+        if self._view_plane == "XY":
+            return model
+        return _ProjectedModelView(model, self.project_xyz)
 
     def set_grid_spacing(self, spacing: float) -> None:
         if spacing <= 0:
@@ -682,7 +800,7 @@ class ModelCanvas(QWidget):
         return round(x / s) * s, round(y / s) * s
 
     def _hit_test(self, event) -> HitResult:
-        model = self._model()
+        model = self.projected_model()
         grid = self._grid_provider()
 
         bbox = self.ax.bbox
@@ -815,25 +933,28 @@ class ModelCanvas(QWidget):
         length = 0.08 * span
         self.ax.plot(0.0, 0.0, marker="o", markersize=4,
                      color="#222222", zorder=8)
-        self.ax.annotate(
-            "", xy=(length, 0.0), xytext=(0.0, 0.0),
-            arrowprops=dict(arrowstyle="->", color="#222222", lw=1.4),
-            zorder=8,
-        )
-        self.ax.annotate(
-            "", xy=(0.0, length), xytext=(0.0, 0.0),
-            arrowprops=dict(arrowstyle="->", color="#222222", lw=1.4),
-            zorder=8,
-        )
         self.ax.annotate("0,0", (0.0, 0.0), xytext=(4, -14),
                          textcoords="offset points", fontsize=8,
                          color="#222222", zorder=9)
-        self.ax.annotate("X", (length, 0.0), xytext=(4, -2),
-                         textcoords="offset points", fontsize=8,
-                         color="#222222", zorder=9)
-        self.ax.annotate("Y", (0.0, length), xytext=(4, 2),
-                         textcoords="offset points", fontsize=8,
-                         color="#222222", zorder=9)
+        # Project each world axis onto the view plane; axes that look
+        # at the camera (zero projected length) are skipped. The XY
+        # view reproduces the legacy X / Y pair exactly.
+        for name, vec in (("X", (1.0, 0.0, 0.0)),
+                          ("Y", (0.0, 1.0, 0.0)),
+                          ("Z", (0.0, 0.0, 1.0))):
+            du, dv = self.project_xyz(*vec)
+            norm = math.hypot(du, dv)
+            if norm < 1e-9:
+                continue
+            ex, ey = length * du / norm, length * dv / norm
+            self.ax.annotate(
+                "", xy=(ex, ey), xytext=(0.0, 0.0),
+                arrowprops=dict(arrowstyle="->", color="#222222", lw=1.4),
+                zorder=8,
+            )
+            self.ax.annotate(name, (ex, ey), xytext=(4, 2),
+                             textcoords="offset points", fontsize=8,
+                             color="#222222", zorder=9)
 
     def _draw_snap_marker(self) -> None:
         c = self._snap_marker
@@ -863,7 +984,7 @@ class ModelCanvas(QWidget):
     def _draw_element_preview(self) -> None:
         if self._element_preview is not None:
             start_node_id, end_x, end_y, kind = self._element_preview
-            start = self._model().nodes.get(start_node_id)
+            start = self.projected_model().nodes.get(start_node_id)
             if start is None:
                 return
             start_x, start_y = start.x, start.y
@@ -953,7 +1074,7 @@ class ModelCanvas(QWidget):
         instead of N — matters for redraw / pan / zoom responsiveness
         on larger models.
         """
-        model = self._model()
+        model = self.projected_model()
         element_by_id = {elem.id: elem for elem in model.elements}
         # ── elements: behind selection (zorder < _draw_selection's 1.5) ──
         warn_xs: list[float | None] = []
@@ -1025,7 +1146,7 @@ class ModelCanvas(QWidget):
             )
 
     def _draw_selection(self) -> None:
-        model = self._model()
+        model = self.projected_model()
         element_by_id = {elem.id: elem for elem in model.elements}
         # Paint element-band highlights behind the element line so the
         # crisp element stroke still reads through. Use one segmented plot
@@ -1101,7 +1222,7 @@ class ModelCanvas(QWidget):
         self.ax.add_patch(rect)
 
     def _draw_model(self) -> None:
-        model = self._model()
+        model = self.projected_model()
         # Pre-compute the largest force/UDL/point-load magnitude in the
         # model so every drawn arrow length is proportional to the
         # actual load magnitude relative to the rest of the model. We
@@ -1151,7 +1272,8 @@ class ModelCanvas(QWidget):
             nj = model.nodes.get(elem.node_j)
             if ni is None or nj is None:
                 continue
-            is_frame = isinstance(elem, FrameElement2D)
+            is_frame = (isinstance(elem, FrameElement2D)
+                        or getattr(elem, "kind", "") == "frame3d")
             if is_frame:
                 frame_xs.extend([ni.x, nj.x, None])
                 frame_ys.extend([ni.y, nj.y, None])
@@ -1502,8 +1624,17 @@ class ModelCanvas(QWidget):
                          markerfacecolor="white", zorder=4)
         else:
             self.ax.plot(x, y, marker="x", markersize=10, color="black", zorder=4)
+        # 3D-only restraints have no dedicated glyph on the 2D canvas;
+        # tag them textually so a space support is distinguishable from
+        # its planar lookalike.
+        extra_3d = [d for d in ("uz", "rx", "ry")
+                    if getattr(sup, d, False)]
+        if extra_3d:
+            self.ax.annotate("+" + "/".join(extra_3d), (x, y),
+                             xytext=(8, 6), textcoords="offset points",
+                             fontsize=7, color="#444444", zorder=6)
         labels = []
-        for dof in ("ux", "uy", "rz"):
+        for dof in ("ux", "uy", "rz", "uz", "rx", "ry"):
             v = sup.prescribed(dof)
             if v != 0.0 and getattr(sup, dof):
                 labels.append(f"{dof}={v:+.3g}")
@@ -1557,6 +1688,20 @@ class ModelCanvas(QWidget):
             self.ax.annotate(f"M={ld.mz:+.3g}", (x, y), xytext=(8, -8),
                              textcoords="offset points", fontsize=7,
                              color="#2ca02c", zorder=6,
+                             alpha=case_alpha)
+        # 3D-only components: compact textual tag (the canvas draws
+        # in-plane arrows only; the 3D viewer shows true directions).
+        parts_3d = [
+            f"{name}={val:+.3g}"
+            for name, val in (("Fz", getattr(ld, "fz", 0.0)),
+                              ("Mx", getattr(ld, "mx", 0.0)),
+                              ("My", getattr(ld, "my", 0.0)))
+            if val
+        ]
+        if parts_3d:
+            self.ax.annotate(", ".join(parts_3d), (x, y),
+                             xytext=(8, -18), textcoords="offset points",
+                             fontsize=7, color="#2ca02c", zorder=6,
                              alpha=case_alpha)
 
     def _draw_member_loads(self, elem, ni, nj, load_scales: dict) -> None:
@@ -1676,6 +1821,12 @@ class ModelCanvas(QWidget):
             )
 
     def _node_displacement(self, nid: int) -> tuple[float, float]:
+        """In-plane displacement components for the current view.
+
+        For 3D results the (ux, uy, uz) vector is projected onto the
+        active work plane with the same linear map used for geometry,
+        so the deformed overlay stays consistent in every view.
+        """
         result = self._result
         if result is None or result.D is None:
             return 0.0, 0.0
@@ -1683,9 +1834,12 @@ class ModelCanvas(QWidget):
         if emap is None:
             return 0.0, 0.0
         D = result.D
-        ux = float(D[emap["ux"]]) if emap["ux"] is not None else 0.0
-        uy = float(D[emap["uy"]]) if emap["uy"] is not None else 0.0
-        return ux, uy
+
+        def _val(dof: str) -> float:
+            idx = emap.get(dof)
+            return float(D[idx]) if idx is not None else 0.0
+
+        return self.project_xyz(_val("ux"), _val("uy"), _val("uz"))
 
     def _node_rotation(self, nid: int) -> float:
         """Return θ_z at ``nid`` from the global displacement vector, or
@@ -1723,7 +1877,7 @@ class ModelCanvas(QWidget):
         condensation — so the Hermite curve is correct even at hinge joints.
         Pure visualization; solver outputs are not modified.
         """
-        nodes = self._model().nodes
+        nodes = self.projected_model().nodes
         ni = nodes[elem.node_i]
         nj = nodes[elem.node_j]
         L, c, s = elem.length_cos_sin(nodes)
@@ -1732,6 +1886,16 @@ class ModelCanvas(QWidget):
         if mr is None or "d_local" not in mr:
             return [ni.x, nj.x], [ni.y, nj.y]
         d = mr["d_local"]
+        if len(d) != 6:
+            # 3D solve (12 local DOFs): fall back to a straight line
+            # between the projected displaced endpoints — the smooth
+            # Hermite interpolation is a planar formulation.
+            uxi, uyi = self._node_displacement(elem.node_i)
+            uxj, uyj = self._node_displacement(elem.node_j)
+            return (
+                [ni.x + scale * uxi, nj.x + scale * uxj],
+                [ni.y + scale * uyi, nj.y + scale * uyj],
+            )
         ui_loc, vi_loc, thi = float(d[0]), float(d[1]), float(d[2])
         uj_loc, vj_loc, thj = float(d[3]), float(d[4]), float(d[5])
         n = max(2, int(self.deformed_stations))
@@ -1749,7 +1913,7 @@ class ModelCanvas(QWidget):
 
     def _draw_deformed(self) -> None:
         result = self._result
-        model = self._model()
+        model = self.projected_model()
         if result.D is None:
             return
         span = self._model_span()
@@ -1771,6 +1935,8 @@ class ModelCanvas(QWidget):
             if mr is None or "d_local" not in mr:
                 continue
             d = mr["d_local"]
+            if len(d) != 6:
+                continue  # 3D solve — endpoint displacements suffice
             try:
                 L, _c, _s = elem.length_cos_sin(model.nodes)
             except (ValueError, ZeroDivisionError):
@@ -1827,7 +1993,7 @@ class ModelCanvas(QWidget):
 
     def _draw_mode_shape(self) -> None:
         mr = self._modal_result
-        model = self._model()
+        model = self.projected_model()
         k = self._modal_mode_idx
         if mr is None or k < 0 or k >= mr.n_modes:
             return
@@ -1871,14 +2037,16 @@ class ModelCanvas(QWidget):
 
     def _draw_reactions(self) -> None:
         result = self._result
-        model = self._model()
+        model = self.projected_model()
         if not result.reactions:
             return
         span = self._model_span()
         max_r = 0.0
         for r in result.reactions.values():
-            max_r = max(max_r,
-                        ((r.get("ux", 0)) ** 2 + (r.get("uy", 0)) ** 2) ** 0.5)
+            ru, rv = self.project_xyz(
+                r.get("ux", 0.0), r.get("uy", 0.0), r.get("uz", 0.0),
+            )
+            max_r = max(max_r, (ru ** 2 + rv ** 2) ** 0.5)
         if max_r <= 0:
             return
         arrow_len = 0.10 * span / max_r
@@ -1886,8 +2054,9 @@ class ModelCanvas(QWidget):
             n = model.nodes.get(nid)
             if n is None:
                 continue
-            rx = r.get("ux", 0.0)
-            ry = r.get("uy", 0.0)
+            rx, ry = self.project_xyz(
+                r.get("ux", 0.0), r.get("uy", 0.0), r.get("uz", 0.0),
+            )
             if rx or ry:
                 self.ax.annotate(
                     "",
@@ -1917,15 +2086,30 @@ class ModelCanvas(QWidget):
         # set from a previous result kind doesn't survive.
         self._diagram_critical_points = []
         result = self._result
-        model = self._model()
+        model = self.projected_model()
         if not result.member_results:
             return
         span = self._model_span()
         max_ord = 0.0
         per_elem = []
+        result_is_3d = any(
+            len(mr.get("f_local", ())) == 12
+            for mr in result.member_results.values()
+        )
+        if result_is_3d and self._view_plane != "XY":
+            self.ax.annotate(
+                "N/V/M diagrams for 3D results are shown in the XY "
+                "view only",
+                (0.02, 0.94), xycoords="axes fraction",
+                fontsize=8, color="#8c564b", va="top",
+            )
+            return
         for elem in model.elements:
             mr = result.member_results.get(elem.id)
             if mr is None:
+                continue
+            if getattr(elem, "kind", "") in ("frame3d", "truss3d"):
+                # Native space elements have no planar diagram math yet.
                 continue
             ni = model.nodes.get(elem.node_i)
             nj = model.nodes.get(elem.node_j)
@@ -1937,8 +2121,12 @@ class ModelCanvas(QWidget):
             # counts (e.g. 5) may miss the true peak between stations —
             # surfaced to the user via the menu tooltip + status hint.
             n = max(2, int(self.diagram_stations))
+            # 3D solves store the in-plane (N, Vy, Mz) slice alongside
+            # the 12-component vector — the diagram helpers keep their
+            # 2D sign convention.
+            f_local = mr.get("f_local_inplane", mr["f_local"])
             xs, ys = _diagram_ordinates(
-                elem, ni, nj, mr["f_local"], self.diagram_kind, n_samples=n,
+                elem, ni, nj, f_local, self.diagram_kind, n_samples=n,
             )
             if xs is None:
                 continue
@@ -2094,7 +2282,7 @@ class ModelCanvas(QWidget):
         )
 
     def _model_span(self) -> float:
-        model = self._model()
+        model = self.projected_model()
         if not model.nodes:
             return 1.0
         xs = [n.x for n in model.nodes.values()]
@@ -2115,7 +2303,7 @@ class ModelCanvas(QWidget):
         rectangle ends up filling the widget with the gridlines and
         origin markers running edge to edge.
         """
-        model = self._model()
+        model = self.projected_model()
         grid = self._grid_provider()
         xs: list[float] = [n.x for n in model.nodes.values()]
         ys: list[float] = [n.y for n in model.nodes.values()]

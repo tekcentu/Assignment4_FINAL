@@ -370,17 +370,17 @@ def _read_text_or_raise(text: str):
 
 
 def test_reader_rejects_udl_with_surplus_numeric_token():
-    """``MEMBER_UDL: 1  0  -10  5`` has an extra numeric beyond wx/wy.
-    Before PR #27 the fixed coord-system slot would catch this; the
-    capped metadata-start scan in v0.17 must still reject it rather
-    than silently dropping the ``5`` (Codex P2 finding on PR #27)."""
+    """A numeric beyond every known UDL component must be rejected
+    rather than silently dropped (Codex P2 finding on PR #27). Since
+    the 3D upgrade the third numeric is the valid ``wz`` component,
+    so the surplus slot is now the FOURTH numeric."""
     body = (
         "TITLE\ntoo-many-numerics\n\n"
         "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
         "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
         "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
         "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
-        "MEMBER_UDL 1\n1  0.0  -10.0  5\n\n"
+        "MEMBER_UDL 1\n1  0.0  -10.0  5  7\n\n"
     )
     with pytest.raises(ValueError):
         _read_text_or_raise(body)
@@ -546,15 +546,16 @@ def test_sum_all_is_never_written_as_a_case():
 
 
 def test_reader_rejects_pointload_with_surplus_numeric_token():
-    """``MEMBER_POINT_LOADS: 1  3  0  -20  99  case=LIVE`` has an
-    extra numeric ``99`` beyond px/py. Must be rejected."""
+    """A numeric beyond every known point-load component must be
+    rejected. Since the 3D upgrade the third numeric after ``a`` is
+    the valid ``pz`` component, so the surplus slot is the fourth."""
     body = (
         "TITLE\ntoo-many-numerics\n\n"
         "NODES 2\n1  0.0  0.0\n2  6.0  0.0\n\n"
         "MATERIALS 1\n1  2.1e8  1.2e-5  7850.0\n\n"
         "SECTIONS 1\n1  1  0.01  1e-4  0.3\n\n"
         "ELEMENTS 1\n1  1  2  1  FRAME\n\n"
-        "MEMBER_POINT_LOADS 1\n1  3.0  0.0  -20.0  99  case=LIVE\n\n"
+        "MEMBER_POINT_LOADS 1\n1  3.0  0.0  -20.0  99  111  case=LIVE\n\n"
     )
     with pytest.raises(ValueError):
         _read_text_or_raise(body)

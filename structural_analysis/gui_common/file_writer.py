@@ -74,10 +74,19 @@ def write_input_file(model: StructuralModel, path: str) -> None:
     out.append("")
 
     node_ids = sorted(model.nodes)
+    # Emit the z column only when the model actually leaves the XY
+    # plane — planar models round-trip byte-identically to pre-3D
+    # output.
+    has_z = any(
+        getattr(model.nodes[nid], "z", 0.0) != 0.0 for nid in node_ids
+    )
     out.append(f"NODES {len(node_ids)}")
     for nid in node_ids:
         n = model.nodes[nid]
-        out.append(f"{nid}  {_fmt(n.x)}  {_fmt(n.y)}")
+        row = f"{nid}  {_fmt(n.x)}  {_fmt(n.y)}"
+        if has_z:
+            row += f"  {_fmt(getattr(n, 'z', 0.0))}"
+        out.append(row)
     out.append("")
 
     # MATERIALS (new shape): id  E  alpha  density  [name]  [key=value ...]
@@ -187,23 +196,55 @@ def write_input_file(model: StructuralModel, path: str) -> None:
 
     if model.supports:
         sup_items = sorted(model.supports.items())
-        out.append(f"SUPPORTS {len(sup_items)}")
-        for nid, s in sup_items:
-            line = f"{nid}  {int(s.ux)}  {int(s.uy)}  {int(s.rz)}"
-            if s.settle_ux or s.settle_uy or s.settle_rz:
-                line += (f"   {_fmt(s.settle_ux or 0.0)}"
-                         f"  {_fmt(s.settle_uy or 0.0)}"
-                         f"  {_fmt(s.settle_rz or 0.0)}")
-            out.append(line)
+        # Any 3D restraint/settlement switches the whole block to the
+        # SUPPORTS3D shape (a widened SUPPORTS row would be ambiguous
+        # with the legacy "3 flags + 3 settlements" form).
+        any_sup_3d = any(
+            getattr(s, "has_3d_content", False) for _, s in sup_items
+        )
+        if any_sup_3d:
+            out.append(f"SUPPORTS3D {len(sup_items)}")
+            for nid, s in sup_items:
+                line = (f"{nid}  {int(s.ux)}  {int(s.uy)}  {int(s.uz)}"
+                        f"  {int(s.rx)}  {int(s.ry)}  {int(s.rz)}")
+                settles = [s.settle_ux, s.settle_uy, s.settle_uz,
+                           s.settle_rx, s.settle_ry, s.settle_rz]
+                if any(settles):
+                    line += "  " + "  ".join(
+                        _fmt(v or 0.0) for v in settles
+                    )
+                out.append(line)
+        else:
+            out.append(f"SUPPORTS {len(sup_items)}")
+            for nid, s in sup_items:
+                line = f"{nid}  {int(s.ux)}  {int(s.uy)}  {int(s.rz)}"
+                if s.settle_ux or s.settle_uy or s.settle_rz:
+                    line += (f"   {_fmt(s.settle_ux or 0.0)}"
+                             f"  {_fmt(s.settle_uy or 0.0)}"
+                             f"  {_fmt(s.settle_rz or 0.0)}")
+                out.append(line)
         out.append("")
 
-    out.append(f"LOADS {len(model.nodal_loads)}")
-    for ld in model.nodal_loads:
-        out.append(
-            f"{ld.node_id}  {_fmt(ld.fx)}  {_fmt(ld.fy)}  "
-            f"{_fmt(ld.mz)}"
-            + _case_token(getattr(ld, "load_case", "DEFAULT"))
-        )
+    any_load_3d = any(
+        getattr(ld, "has_3d_content", False) for ld in model.nodal_loads
+    )
+    if any_load_3d:
+        out.append(f"LOADS3D {len(model.nodal_loads)}")
+        for ld in model.nodal_loads:
+            out.append(
+                f"{ld.node_id}  {_fmt(ld.fx)}  {_fmt(ld.fy)}"
+                f"  {_fmt(ld.fz)}  {_fmt(ld.mx)}  {_fmt(ld.my)}"
+                f"  {_fmt(ld.mz)}"
+                + _case_token(getattr(ld, "load_case", "DEFAULT"))
+            )
+    else:
+        out.append(f"LOADS {len(model.nodal_loads)}")
+        for ld in model.nodal_loads:
+            out.append(
+                f"{ld.node_id}  {_fmt(ld.fx)}  {_fmt(ld.fy)}  "
+                f"{_fmt(ld.mz)}"
+                + _case_token(getattr(ld, "load_case", "DEFAULT"))
+            )
     out.append("")
 
     udls: list[tuple[int, UniformDistributedLoad]] = []
@@ -225,6 +266,10 @@ def write_input_file(model: StructuralModel, path: str) -> None:
         out.append(f"MEMBER_UDL {len(udls)}")
         for eid, u in udls:
             row = f"{eid}  {_fmt(u.wx)}  {_fmt(u.wy)}"
+            # Optional 3D component — only emitted when non-zero so 2D
+            # rows stay byte-identical.
+            if getattr(u, "wz", 0.0) != 0.0:
+                row += f"  {_fmt(u.wz)}"
             # Emit the coord-system token only when it differs from the
             # default. Legacy files (no global loads) round-trip
             # byte-identical to pre-v0.15.0 output.
@@ -237,6 +282,8 @@ def write_input_file(model: StructuralModel, path: str) -> None:
         out.append(f"MEMBER_POINT_LOADS {len(points)}")
         for eid, p in points:
             row = f"{eid}  {_fmt(p.a)}  {_fmt(p.px)}  {_fmt(p.py)}"
+            if getattr(p, "pz", 0.0) != 0.0:
+                row += f"  {_fmt(p.pz)}"
             if p.coord_system != "local":
                 row += f"  {p.coord_system}"
             row += _case_token(getattr(p, "load_case", "DEFAULT"))
@@ -333,6 +380,8 @@ def write_input_file(model: StructuralModel, path: str) -> None:
     opt_lines: list[str] = []
     if model.include_self_weight:
         opt_lines.append("include_self_weight=true")
+    if getattr(model, "force_3d", False):
+        opt_lines.append("force_3d=true")
     if model.self_weight_case != "DEFAULT":
         opt_lines.append(f"self_weight_case={model.self_weight_case}")
     if opt_lines:

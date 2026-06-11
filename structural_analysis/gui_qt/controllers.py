@@ -68,6 +68,30 @@ class _Host(Protocol):
         is_crossing: bool,
     ) -> None: ...
     def select_to_neutral_mode(self) -> None: ...
+    # 3D work plane (v0.32) — duck-typed on the host; helpers below
+    # fall back to legacy behaviour when the host doesn't provide them.
+    def working_z(self) -> float: ...
+    def can_edit_geometry(self) -> bool: ...
+
+
+def _host_working_z(host) -> float:
+    """Working depth for new geometry (0.0 on legacy hosts)."""
+    getter = getattr(host, "working_z", None)
+    return float(getter()) if callable(getter) else 0.0
+
+
+def _host_can_edit(host) -> bool:
+    """False when the canvas is in a display-only view (isometric)."""
+    getter = getattr(host, "can_edit_geometry", None)
+    return bool(getter()) if callable(getter) else True
+
+
+_VIEW_BLOCKED_MSG = (
+    "Geometry editing works on the XY work plane only — switch back "
+    "via View → Work plane → XY. Use View → Working depth to build "
+    "at other z levels, and Model → Connect selected nodes for "
+    "out-of-plane members."
+)
 
 
 class Tool:
@@ -300,6 +324,9 @@ class NodeTool(Tool):
     ) -> None:
         if button != "left":
             return
+        if not _host_can_edit(self.host):
+            self.host.set_status(_VIEW_BLOCKED_MSG)
+            return
         if hit.node_id is not None:
             self.host.set_status(f"Node {hit.node_id} already at this location.")
             return
@@ -318,7 +345,9 @@ class NodeTool(Tool):
                 element_id=elem_id, x=x_world, y=y_world,
             ))
             return
-        self.host.execute(AddNodeCmd(x=hit.x, y=hit.y))
+        self.host.execute(AddNodeCmd(
+            x=hit.x, y=hit.y, z=_host_working_z(self.host),
+        ))
 
 
 class _PairTool(Tool):
@@ -409,6 +438,9 @@ class _PairTool(Tool):
         shift: bool = False,
     ) -> None:
         if button != "left":
+            return
+        if not _host_can_edit(self.host):
+            self.host.set_status(_VIEW_BLOCKED_MSG)
             return
         if self._first is None:
             self._first = self._resolve_endpoint(hit)

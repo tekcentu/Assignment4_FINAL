@@ -1334,21 +1334,35 @@ class SupportDialog(_ModalDialog):
         s = self._existing
         self._cb_ux = QCheckBox("Restrain ux (translate x)", body)
         self._cb_uy = QCheckBox("Restrain uy (translate y)", body)
-        self._cb_rz = QCheckBox("Restrain rz (rotation)", body)
+        self._cb_rz = QCheckBox("Restrain rz (rotation about z)", body)
+        # 3D DOFs (v0.32). Restraining any of them switches the solve
+        # to the 6-DOF space pipeline automatically.
+        self._cb_uz = QCheckBox("Restrain uz (translate z — 3D)", body)
+        self._cb_rx = QCheckBox("Restrain rx (rotation about x — 3D)", body)
+        self._cb_ry = QCheckBox("Restrain ry (rotation about y — 3D)", body)
         if s:
             self._cb_ux.setChecked(s.ux)
             self._cb_uy.setChecked(s.uy)
             self._cb_rz.setChecked(s.rz)
+            self._cb_uz.setChecked(getattr(s, "uz", False))
+            self._cb_rx.setChecked(getattr(s, "rx", False))
+            self._cb_ry.setChecked(getattr(s, "ry", False))
         v.addWidget(self._cb_ux)
         v.addWidget(self._cb_uy)
         v.addWidget(self._cb_rz)
+        v.addWidget(self._cb_uz)
+        v.addWidget(self._cb_rx)
+        v.addWidget(self._cb_ry)
 
         v.addWidget(QLabel("Settlement (blank = none):", body))
         form = QFormLayout()
         self._settle: dict[str, QLineEdit] = {}
         for label, key in [("Δux (m)", "settle_ux"),
                            ("Δuy (m)", "settle_uy"),
-                           ("Δrz (rad)", "settle_rz")]:
+                           ("Δrz (rad)", "settle_rz"),
+                           ("Δuz (m — 3D)", "settle_uz"),
+                           ("Δrx (rad — 3D)", "settle_rx"),
+                           ("Δry (rad — 3D)", "settle_ry")]:
             e = QLineEdit(body)
             if s is not None:
                 val = getattr(s, key)
@@ -1364,26 +1378,35 @@ class SupportDialog(_ModalDialog):
     def _accept(self) -> tuple[str, Support | None]:
         if self._cb_remove.isChecked():
             return ("remove", None)
-        ux = self._cb_ux.isChecked()
-        uy = self._cb_uy.isChecked()
-        rz = self._cb_rz.isChecked()
-        if not (ux or uy or rz):
+        flags = {
+            "ux": self._cb_ux.isChecked(),
+            "uy": self._cb_uy.isChecked(),
+            "rz": self._cb_rz.isChecked(),
+            "uz": self._cb_uz.isChecked(),
+            "rx": self._cb_rx.isChecked(),
+            "ry": self._cb_ry.isChecked(),
+        }
+        if not any(flags.values()):
             raise ValueError("Select at least one restrained DOF, "
                              "or check 'Remove support'.")
-        s_ux = parse_float(self._settle["settle_ux"].text(), "Δux", allow_blank=True)
-        s_uy = parse_float(self._settle["settle_uy"].text(), "Δuy", allow_blank=True)
-        s_rz = parse_float(self._settle["settle_rz"].text(), "Δrz", allow_blank=True)
-        if s_ux is not None and not ux:
-            raise ValueError("Δux is set but ux is not restrained.")
-        if s_uy is not None and not uy:
-            raise ValueError("Δuy is set but uy is not restrained.")
-        if s_rz is not None and not rz:
-            raise ValueError("Δrz is set but rz is not restrained.")
+        settles: dict[str, float | None] = {}
+        for dof in ("ux", "uy", "rz", "uz", "rx", "ry"):
+            val = parse_float(
+                self._settle[f"settle_{dof}"].text(),
+                f"Δ{dof}", allow_blank=True,
+            )
+            if val is not None and not flags[dof]:
+                raise ValueError(
+                    f"Δ{dof} is set but {dof} is not restrained."
+                )
+            settles[f"settle_{dof}"] = (
+                val if val not in (None, 0.0) else None
+            )
         return ("set", Support(
-            node_id=self._node_id, ux=ux, uy=uy, rz=rz,
-            settle_ux=s_ux if s_ux not in (None, 0.0) else None,
-            settle_uy=s_uy if s_uy not in (None, 0.0) else None,
-            settle_rz=s_rz if s_rz not in (None, 0.0) else None,
+            node_id=self._node_id,
+            ux=flags["ux"], uy=flags["uy"], rz=flags["rz"],
+            uz=flags["uz"], rx=flags["rx"], ry=flags["ry"],
+            **settles,
         ))
 
 
@@ -3287,7 +3310,7 @@ class NodePropertiesDialog(QDialog):
 
         form.addRow("Node ID:", QLabel(str(node_id)))
         form.addRow("Coordinates:",
-                     QLabel(f"x = {node.x:g} m,  y = {node.y:g} m"))
+                     QLabel(f"x = {node.x:g} m,  y = {node.y:g} m,  z = {getattr(node, 'z', 0.0):g} m"))
         form.addRow("Support:", QLabel(_support_summary(support)))
         form.addRow("Nodal load:", QLabel(_nodal_load_summary(model, node_id)))
 
@@ -3321,13 +3344,18 @@ def _node_displacement(result, node_id: int) -> str:
     if nm is None or result.D is None:
         return "(not available)"
     parts = []
-    for dof in ("ux", "uy", "rz"):
+    # 3D results carry the six-key DOF map; 2D keeps the legacy triple.
+    dof_names = (
+        ("ux", "uy", "uz", "rx", "ry", "rz") if "uz" in nm
+        else ("ux", "uy", "rz")
+    )
+    for dof in dof_names:
         idx = nm.get(dof)
         if idx is None:
             parts.append(f"{dof} = 0  (restrained)")
         else:
             val = float(result.D[idx])
-            unit = "rad" if dof == "rz" else "m"
+            unit = "rad" if dof.startswith("r") else "m"
             parts.append(f"{dof} = {val:.6e} {unit}")
     return ",  ".join(parts)
 
@@ -4201,7 +4229,8 @@ def _element_local_forces(result, elem_id: int):
 
 
 class FineNodeDialog(_ModalDialog):
-    """Add a node at typed (x, y) coordinates — alternative to canvas click."""
+    """Add a node at typed (x, y, z) coordinates — alternative to canvas
+    click. A non-zero Z switches the model to the 3D solve pipeline."""
 
     def __init__(self, parent, *, model: StructuralModel) -> None:
         self._model = model
@@ -4211,22 +4240,27 @@ class FineNodeDialog(_ModalDialog):
         form = QFormLayout(body)
         self._x_entry = QLineEdit(body)
         self._y_entry = QLineEdit(body)
+        self._z_entry = QLineEdit(body)
         self._x_entry.setText("0.0")
         self._y_entry.setText("0.0")
+        self._z_entry.setText("0.0")
         form.addRow("X (m):", self._x_entry)
         form.addRow("Y (m):", self._y_entry)
+        form.addRow("Z (m, 3D):", self._z_entry)
         hint = QLabel(
             "The node is created via the same Add-Node command used by\n"
-            "canvas clicks — undo / duplicate detection still apply.",
+            "canvas clicks — undo / duplicate detection still apply.\n"
+            "A non-zero Z makes the model 3D (6 DOF per node).",
             body,
         )
         hint.setWordWrap(True)
         form.addRow(hint)
 
-    def _accept(self) -> tuple[float, float]:
+    def _accept(self) -> tuple[float, float, float]:
         x = parse_float(self._x_entry.text(), "X")
         y = parse_float(self._y_entry.text(), "Y")
-        return (x, y)
+        z = parse_float(self._z_entry.text(), "Z")
+        return (x, y, z)
 
 
 class BuildingWizardDialog(_ModalDialog):

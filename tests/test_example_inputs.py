@@ -46,6 +46,12 @@ def test_example_modal_when_applicable(path: str):
     strictly positive frequencies. Otherwise the solver must refuse
     with a clear ValueError (no silent garbage answer)."""
     model = read_input_file(path)
+    from structural_analysis.assembler import model_is_3d
+    if model_is_3d(model):
+        # Modal is 2D-only for now — the solver must refuse clearly.
+        with pytest.raises(ValueError, match="3D"):
+            solve_modal(model)
+        return
     has_mass = any(getattr(e, "rho", 0.0) > 0.0 for e in model.elements)
     if not has_mass:
         with pytest.raises(ValueError, match="density"):

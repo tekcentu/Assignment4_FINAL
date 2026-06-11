@@ -1,0 +1,33 @@
+# Example 3D model: right-angle grillage in the XZ plane, fixed at
+# node 1, vertical (global -Y) tip load at node 3.
+#
+# 3D additions exercised here:
+#   * NODES rows carry an optional 4th column (z)
+#   * SUPPORTS3D: node  ux uy uz rx ry rz  [6 settlements]
+#   * LOADS3D:   node  fx fy fz mx my mz  [case=NAME]
+# Frame members are promoted to 12-DOF space elements at solve time
+# (Iz = Iy = section I; J from the section; G = E / (2(1+nu))).
+
+TITLE
+Example 3D grillage (bending + torsion coupling)
+
+NODES 3
+1  0.0  0.0  0.0
+2  3.0  0.0  0.0
+3  3.0  0.0  3.0
+
+MATERIALS 1
+1  200000000.0  0.0  0.0  Steel  nu=0.25
+
+SECTIONS 1
+1  1  0.01  4e-05  0.4  Grillage  J=3e-05
+
+ELEMENTS 2
+1  1  2  1  FRAME
+2  2  3  1  FRAME
+
+SUPPORTS3D 1
+1  1 1 1 1 1 1
+
+LOADS3D 1
+3  0.0  -10.0  0.0  0.0  0.0  0.0

@@ -147,7 +147,12 @@ def read_input_file(filepath: str) -> StructuralModel:
                     i += 1
                 parts = lines[i].split("#")[0].split()
                 nid = int(parts[0])
-                model.nodes[nid] = Node(nid, float(parts[1]), float(parts[2]))
+                # Optional 4th column: z coordinate (3D models). Legacy
+                # 3-column rows keep parsing identically with z = 0.
+                z = float(parts[3]) if len(parts) > 3 else 0.0
+                model.nodes[nid] = Node(
+                    nid, float(parts[1]), float(parts[2]), z,
+                )
 
         elif keyword == "MATERIALS":
             count = int(tokens[1])
@@ -373,7 +378,8 @@ def read_input_file(filepath: str) -> StructuralModel:
                     n_j = model.nodes.get(en)
                     if n_i is not None and n_j is not None:
                         L_tot = ((n_j.x - n_i.x) ** 2
-                                 + (n_j.y - n_i.y) ** 2) ** 0.5
+                                 + (n_j.y - n_i.y) ** 2
+                                 + (n_j.z - n_i.z) ** 2) ** 0.5
                         if offset_i + offset_j >= L_tot:
                             raise ValueError(
                                 f"Element {eid}: offset_i + offset_j = "
@@ -433,6 +439,42 @@ def read_input_file(filepath: str) -> StructuralModel:
                     settle_rz=s_rz if (s_rz and s_rz != 0.0) else None,
                 )
 
+        elif keyword == "SUPPORTS3D":
+            # 3D support rows. A separate section keyword (instead of
+            # widening SUPPORTS) because a 6-token row would be
+            # ambiguous with the legacy "3 flags + 3 settlements" form.
+            # Format:
+            #   <node>  <ux> <uy> <uz> <rx> <ry> <rz>
+            #           [s_ux s_uy s_uz s_rx s_ry s_rz]
+            count = int(tokens[1])
+            for _ in range(count):
+                i += 1
+                while i < len(lines) and (not lines[i] or lines[i].startswith("#")):
+                    i += 1
+                parts = lines[i].split("#")[0].split()
+                if len(parts) < 7:
+                    raise ValueError(
+                        f"SUPPORTS3D row {parts!r}: expected "
+                        "'node ux uy uz rx ry rz [6 settlements]'."
+                    )
+                nid = int(parts[0])
+                flags = [bool(int(p)) for p in parts[1:7]]
+
+                def _settle(idx: int) -> float | None:
+                    if len(parts) <= 7 + idx:
+                        return None
+                    v = float(parts[7 + idx])
+                    return v if v != 0.0 else None
+
+                model.supports[nid] = Support(
+                    nid, flags[0], flags[1], flags[5],
+                    settle_ux=_settle(0), settle_uy=_settle(1),
+                    settle_rz=_settle(5),
+                    uz=flags[2], rx=flags[3], ry=flags[4],
+                    settle_uz=_settle(2), settle_rx=_settle(3),
+                    settle_ry=_settle(4),
+                )
+
         elif keyword == "LOADS":
             count = int(tokens[1])
             for _ in range(count):
@@ -447,6 +489,33 @@ def read_input_file(filepath: str) -> StructuralModel:
                 model.nodal_loads.append(NodalLoad(
                     int(parts[0]), float(parts[1]), float(parts[2]),
                     float(parts[3]), load_case=meta["load_case"],
+                ))
+
+        elif keyword == "LOADS3D":
+            # Six-component nodal loads for 3D models. Format:
+            #   <node>  <fx> <fy> <fz> <mx> <my> <mz>  [case=NAME]
+            count = int(tokens[1])
+            for _ in range(count):
+                i += 1
+                while i < len(lines) and (not lines[i] or lines[i].startswith("#")):
+                    i += 1
+                parts = lines[i].split("#")[0].split()
+                if len(parts) < 7:
+                    raise ValueError(
+                        f"LOADS3D row {parts!r}: expected "
+                        "'node fx fy fz mx my mz [case=NAME]'."
+                    )
+                meta = _parse_load_metadata(
+                    parts, start_idx=7, section="LOADS3D",
+                    accept_coord_system=False,
+                )
+                model.nodal_loads.append(NodalLoad(
+                    int(parts[0]),
+                    fx=float(parts[1]), fy=float(parts[2]),
+                    fz=float(parts[3]),
+                    mx=float(parts[4]), my=float(parts[5]),
+                    mz=float(parts[6]),
+                    load_case=meta["load_case"],
                 ))
 
         elif keyword == "MEMBER_POINT_LOADS":
@@ -470,11 +539,16 @@ def read_input_file(filepath: str) -> StructuralModel:
                 # by signature ('=' for key=value, or a known
                 # coord_system keyword) so we don't try to parse
                 # ``case=DEAD`` as a float.
+                # optional_count=3 (v0.32): a third numeric is the 3D
+                # pz component. Pre-3D files with a stray third numeric
+                # were already rejected (it landed in the metadata
+                # range), so accepting it now changes no valid file.
                 start_idx = _find_metadata_start(
-                    parts, mandatory_end=2, optional_count=2,
+                    parts, mandatory_end=2, optional_count=3,
                 )
                 px = float(parts[2]) if start_idx > 2 else 0.0
                 py = float(parts[3]) if start_idx > 3 else 0.0
+                pz = float(parts[4]) if start_idx > 4 else 0.0
                 meta = _parse_load_metadata(
                     parts, start_idx=start_idx, section="MEMBER_POINT_LOADS",
                     accept_coord_system=True,
@@ -482,7 +556,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                 for elem in model.elements:
                     if elem.id == eid:
                         elem.member_loads.append(PointLoad(
-                            py=py, a=a, px=px,
+                            py=py, a=a, px=px, pz=pz,
                             coord_system=meta["coord_system"],
                             load_case=meta["load_case"],
                         ))
@@ -500,11 +574,13 @@ def read_input_file(filepath: str) -> StructuralModel:
                 # MEMBER_POINT_LOADS above — wx and wy are optional but
                 # the trailing tokens (coord_system / case=) must not
                 # be parsed as floats.
+                # optional_count=3 (v0.32): third numeric = 3D wz.
                 start_idx = _find_metadata_start(
-                    parts, mandatory_end=1, optional_count=2,
+                    parts, mandatory_end=1, optional_count=3,
                 )
                 wx = float(parts[1]) if start_idx > 1 else 0.0
                 wy = float(parts[2]) if start_idx > 2 else 0.0
+                wz = float(parts[3]) if start_idx > 3 else 0.0
                 meta = _parse_load_metadata(
                     parts, start_idx=start_idx, section="MEMBER_UDL",
                     accept_coord_system=True,
@@ -512,7 +588,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                 for elem in model.elements:
                     if elem.id == eid:
                         elem.member_loads.append(UniformDistributedLoad(
-                            wy=wy, wx=wx,
+                            wy=wy, wx=wx, wz=wz,
                             coord_system=meta["coord_system"],
                             load_case=meta["load_case"],
                         ))
@@ -591,6 +667,8 @@ def read_input_file(filepath: str) -> StructuralModel:
                 val = val.strip()
                 if key == "include_self_weight":
                     model.include_self_weight = _parse_bool(val, key)
+                elif key == "force_3d":
+                    model.force_3d = _parse_bool(val, key)
                 elif key == "self_weight_case":
                     if not val:
                         raise ValueError(
@@ -602,7 +680,7 @@ def read_input_file(filepath: str) -> StructuralModel:
                     raise ValueError(
                         f"Unknown ANALYSIS_OPTIONS key {key!r}. "
                         "Allowed: ['include_self_weight', "
-                        "'self_weight_case']."
+                        "'self_weight_case', 'force_3d']."
                     )
 
         elif keyword == "LOAD_CASES":
@@ -989,7 +1067,11 @@ def _find_metadata_start(
             float(tok)
         except ValueError:
             return idx
-    return cap
+    # Clamp to the row length: a row shorter than the cap simply has
+    # no metadata (and callers guard optional reads with
+    # ``start_idx > slot``, so the returned value must never point
+    # past the final token).
+    return min(cap, len(parts))
 
 
 def _parse_load_metadata(
