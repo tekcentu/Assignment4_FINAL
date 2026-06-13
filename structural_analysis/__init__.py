@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.32.0"
+__version__ = "0.34.0"
 __what_is_new__ = (
-    "Three new combined examples in File → Open example… · "
-    "Show load cases + combinations, rigid offsets, diagonal bracing and modal together · "
-    "example_09 braced frame · example_10 rigid offsets · example_11 kitchen-sink"
+    "Fix: default reference grid stays visible when a structural grid is shown · "
+    "Fix: grid A/B/1/2 labels now gated by the toggle (off by default) · "
+    "Grid lines + plain coordinates always show; letters only when enabled"
 )
 
 from .model import (

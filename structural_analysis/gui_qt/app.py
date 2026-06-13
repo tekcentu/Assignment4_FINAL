@@ -437,14 +437,15 @@ class MainWindow(QMainWindow):
             triggered=lambda _checked=False: self._do_clear_generated_grid(),
         )
         self.act_show_grid_labels_on_ticks = QAction(
-            "Show grid line &labels with coords", self,
+            "Show grid line &labels (A / B / 1 / 2)", self,
             checkable=True, checked=False,
             triggered=self._toggle_show_grid_labels_on_ticks,
         )
         self.act_show_grid_labels_on_ticks.setToolTip(
-            "When the structural grid is shown, append its letter labels "
-            "in parentheses next to the coordinate values on the axes "
-            "(e.g. '3 (A)'). Display only — snap behavior is unchanged."
+            "Show the structural grid's letter labels — near the spines and "
+            "appended to the matching axis coordinate (e.g. '3 (A)'). Off by "
+            "default: the grid shows just its lines and plain coordinates. "
+            "Display only — snap behavior is unchanged."
         )
         self.act_fit_view = QAction("&Fit to view", self, shortcut="Home",
                                       triggered=self._do_fit_view)

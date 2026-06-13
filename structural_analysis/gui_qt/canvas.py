@@ -937,8 +937,24 @@ class ModelCanvas(QWidget):
 
         if self.show_default_grid:
             alpha = 0.4 if gen_visible else 1.0
-            self.ax.grid(True, which="major", linestyle=":", linewidth=0.5,
-                         color="#cccccc", alpha=alpha)
+            if gen_visible:
+                # The major ticks are pinned to the generated-grid
+                # coordinates (so the spine reads those constant values),
+                # which means ax.grid(major) alone would collapse the
+                # default reference grid onto just those few lines — the
+                # user reported it "never shows" once a grid is generated.
+                # Keep it an independent layer by drawing the fine
+                # reference grid on the MINOR ticks at adaptive spacing.
+                self.ax.xaxis.set_minor_locator(
+                    AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
+                self.ax.yaxis.set_minor_locator(
+                    AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
+                self.ax.tick_params(which="minor", length=0)
+                self.ax.grid(True, which="both", linestyle=":",
+                             linewidth=0.5, color="#cccccc", alpha=alpha)
+            else:
+                self.ax.grid(True, which="major", linestyle=":",
+                             linewidth=0.5, color="#cccccc", alpha=alpha)
         else:
             self.ax.grid(False)
         if not gen_visible:
@@ -968,17 +984,25 @@ class ModelCanvas(QWidget):
             // self.MAX_LABELED_GRID_LINES,
         )
 
+        # The A/B/1/2 letter labels are gated behind the "show grid line
+        # labels" toggle. Previously they were always drawn whenever the
+        # generated grid was visible, so the toggle looked like it did
+        # nothing ("even without it active it already shows"). Now the
+        # toggle is the single control: off → just the coloured grid
+        # lines + plain numeric coordinates; on → the letters too (here
+        # near the spines, and appended to the axis coords by the
+        # FixedLocator formatter). The grid LINES always draw — only the
+        # letters are gated.
+        show_letters = self.show_generated_grid_labels_on_ticks
         # Anchor letter labels with a MIXED transform so they always sit
         # just inside the top / right spine regardless of the current
-        # view interval. The previous data-only anchor at max(y0, y1) /
-        # max(x0, x1) went stale on scroll-zoom (which never redraws),
-        # and the letters visibly drifted off the canvas.
+        # view interval (data-only anchors went stale on scroll-zoom).
         x_label_tx = self.ax.get_xaxis_transform()  # x: data, y: axes
         y_label_tx = self.ax.get_yaxis_transform()  # x: axes, y: data
         for idx, ln in enumerate(x_lines):
             self.ax.axvline(ln.coord, color="#aac8ff", linewidth=0.7,
                             linestyle="-", alpha=0.6, zorder=0)
-            if idx % label_stride == 0:
+            if show_letters and idx % label_stride == 0:
                 self.ax.text(ln.coord, 1.0, f"  {ln.label}",
                              transform=x_label_tx,
                              color="#3060c0", fontsize=8, va="bottom",
@@ -986,7 +1010,7 @@ class ModelCanvas(QWidget):
         for idx, ln in enumerate(y_lines):
             self.ax.axhline(ln.coord, color="#aac8ff", linewidth=0.7,
                             linestyle="-", alpha=0.6, zorder=0)
-            if idx % label_stride == 0:
+            if show_letters and idx % label_stride == 0:
                 self.ax.text(1.0, ln.coord, f"  {ln.label}",
                              transform=y_label_tx,
                              color="#3060c0", fontsize=8, va="center",
