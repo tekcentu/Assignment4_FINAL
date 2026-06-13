@@ -1,0 +1,60 @@
+# ═══════════════════════════════════════════════════════════════════
+#  Example 10 — Portal frame with rigid end offsets
+#  Combines: per-frame RIGID END OFFSETS (offset_i / offset_j) +
+#  named LOAD CASES + a LOAD COMBINATION.
+# ═══════════════════════════════════════════════════════════════════
+#
+#   2(0,5) ─────── beam (elem 3) ─────── 3(10,5)
+#     │   offset_i=0.3        offset_j=0.3 │
+#   col1 offset_j=0.3            offset_j=0.3 col2
+#     │                                    │
+#   1(0,0)                               4(10,0)   ← both bases fixed
+#
+#  The 0.3 m rigid zones at each beam-column joint model the finite
+#  size of the connection: the member is rigid over the offset and
+#  flexible only across the clear span between offsets. Rigid offsets
+#  are a FRAME-only feature (a truss would reject them).
+#
+#  The single material is given zero density on purpose, so this stays
+#  a pure static example (the modal solver correctly refuses a massless
+#  model).
+# ═══════════════════════════════════════════════════════════════════
+
+TITLE
+Portal frame with rigid end offsets — cases and combination
+
+NODES 4
+1   0.0  0.0
+2   0.0  5.0
+3  10.0  5.0
+4  10.0  0.0
+
+# id  E  alpha  density  name   (density 0 → static-only demo)
+MATERIALS 1
+1  33000000.0  1e-05  0.0  Concrete_C30_static
+
+# id  material_id  A  I  depth  name
+SECTIONS 1
+1  1  0.15  0.003125  0.5  Concrete_30x50
+
+# Rigid end offsets given as offset_i / offset_j key=value tokens.
+ELEMENTS 3
+1  1  2  1  FRAME  offset_j=0.3                # left column (rigid at top joint)
+2  4  3  1  FRAME  offset_j=0.3                # right column (rigid at top joint)
+3  2  3  1  FRAME  offset_i=0.3  offset_j=0.3  # beam (rigid at both joints)
+
+SUPPORTS 2
+1  1  1  1            # fixed base
+4  1  1  1            # fixed base
+
+# Gravity UDL on the beam, split into DEAD and LIVE cases.
+MEMBER_UDL 2
+3  0.0  -20.0  global  case=DEAD
+3  0.0  -15.0  global  case=LIVE
+
+LOAD_CASES 2
+DEAD
+LIVE
+
+LOAD_COMBINATIONS 1
+ULS  1.2*DEAD  1.6*LIVE     # gravity strength combination
