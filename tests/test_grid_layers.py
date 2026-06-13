@@ -236,6 +236,150 @@ def test_empty_grid_uses_adaptive_on_both_axes(qt_app):
     )
 
 
+# ── generated-grid letter labels stick to the top/right spine ────────────
+
+
+def _generated_letter_texts(canvas):
+    """Letter labels for the X+Y generated grid (color "#3060c0")."""
+    return [t for t in canvas.ax.texts if t.get_color() == "#3060c0"]
+
+
+def test_x_line_letter_labels_use_xaxis_transform(qt_app):
+    """The X-line letters must use the get_xaxis_transform() mixed
+    transform (x: data, y: axes) so they always sit on the top spine
+    regardless of the current view interval. This is the deterministic
+    pure-Python assertion that the labels can't drift on scroll-zoom."""
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 3.0)],
+        y_lines=[],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.redraw()
+    letters = _generated_letter_texts(canvas)
+    assert letters, "expected generated X-line letter labels"
+    expected = canvas.ax.get_xaxis_transform()
+    for t in letters:
+        assert t.get_transform() is expected
+
+
+def test_y_line_letter_labels_use_yaxis_transform(qt_app):
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[],
+        y_lines=[GridLine("1", 0.0), GridLine("2", 3.2)],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.redraw()
+    letters = _generated_letter_texts(canvas)
+    assert letters, "expected generated Y-line letter labels"
+    expected = canvas.ax.get_yaxis_transform()
+    for t in letters:
+        assert t.get_transform() is expected
+
+
+def test_x_line_letter_label_sits_on_top_spine_after_zoom(qt_app):
+    """End-to-end: after a hard scroll-zoom-style xlim/ylim change
+    (without a redraw), the on-screen pixel Y of an X-line letter label
+    equals the pixel Y of the top spine. Catches the original bug
+    (anchored at stale data Y → drifts off the canvas)."""
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0)], y_lines=[],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.redraw()
+    letters = _generated_letter_texts(canvas)
+    assert letters
+    label = letters[0]
+    # Simulate scroll-zoom: change limits without going through redraw().
+    canvas.ax.set_xlim(-100.0, 100.0)
+    canvas.ax.set_ylim(-100.0, 100.0)
+    canvas.fig.canvas.draw()
+    label_y_px = label.get_window_extent().y0
+    top_spine_y_px = canvas.ax.transAxes.transform((0.0, 1.0))[1]
+    # Mixed-transform anchor at y=1.0 (axes) sits exactly on the spine;
+    # 2 px tolerance covers anti-aliasing + the va="bottom" offset.
+    assert abs(label_y_px - top_spine_y_px) <= 2.0, (
+        f"X-line letter drifted off the top spine "
+        f"({label_y_px} vs {top_spine_y_px})"
+    )
+
+
+# ── optional "show grid letter next to coord" toggle ─────────────────────
+
+
+def _xaxis_label_texts_at_draw(canvas):
+    canvas.fig.canvas.draw()
+    return [t.get_text() for t in canvas.ax.xaxis.get_majorticklabels()
+            if t.get_visible()]
+
+
+def test_letters_on_ticks_off_by_default(qt_app):
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 3.0)], y_lines=[],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    assert canvas.show_generated_grid_labels_on_ticks is False
+    canvas.redraw()
+    labels = _xaxis_label_texts_at_draw(canvas)
+    assert labels, "expected some x-axis tick labels"
+    for lbl in labels:
+        assert "(" not in lbl, f"unexpected letter on tick: {lbl!r}"
+
+
+def test_letters_on_ticks_when_enabled(qt_app):
+    """When the toggle is on, FixedLocator ticks at generated-grid
+    coordinates render as '<num> (<letter>)'."""
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 3.0)], y_lines=[],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_generated_grid_labels_on_ticks = True
+    canvas.redraw()
+    labels = _xaxis_label_texts_at_draw(canvas)
+    assert "0 (A)" in labels
+    assert "3 (B)" in labels
+
+
+def test_letters_on_ticks_only_on_generated_axes(qt_app):
+    """Axes that aren't covered by the generated grid (AdaptiveGridLocator)
+    must NOT pick up parentheses — the formatter is per-axis."""
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0)], y_lines=[],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_generated_grid_labels_on_ticks = True
+    canvas.redraw()
+    canvas.fig.canvas.draw()
+    y_labels = [t.get_text() for t in canvas.ax.yaxis.get_majorticklabels()
+                if t.get_visible()]
+    for lbl in y_labels:
+        assert "(" not in lbl
+
+
+def test_letters_on_ticks_ignores_non_grid_ticks(qt_app):
+    """Even with the toggle on, the FixedLocator only ticks ON the
+    generated coords, so every visible tick on a covered axis carries
+    its matching letter (no orphan '5 ()' labels)."""
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 3.0)], y_lines=[],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_generated_grid_labels_on_ticks = True
+    canvas.redraw()
+    labels = _xaxis_label_texts_at_draw(canvas)
+    # Every visible label should have either no parenthesis (no match,
+    # shouldn't happen on a FixedLocator) or a non-empty letter.
+    for lbl in labels:
+        if "(" in lbl:
+            assert lbl.endswith(")") and "()" not in lbl
+
+
 # ── snap behavior must not change with display toggles ───────────────────
 
 
@@ -377,3 +521,25 @@ def test_undo_of_grid_change_refreshes_action_enable_state(qt_app):
     assert w.act_clear_generated_grid.isEnabled() is True
     w.act_undo.trigger()
     assert w.act_clear_generated_grid.isEnabled() is False
+
+
+def test_show_grid_labels_action_disabled_without_grid(qt_app):
+    w = _make_window(qt_app, _model_with_nodes())
+    assert w._grid.is_empty()
+    assert w.act_show_grid_labels_on_ticks.isEnabled() is False
+    w._do_generate_grid_from_nodes()
+    assert w.act_show_grid_labels_on_ticks.isEnabled() is True
+    w._do_clear_generated_grid()
+    assert w.act_show_grid_labels_on_ticks.isEnabled() is False
+
+
+def test_show_grid_labels_action_flips_canvas_flag(qt_app):
+    w = _make_window(qt_app, _model_with_nodes())
+    w._do_generate_grid_from_nodes()
+    assert w.canvas.show_generated_grid_labels_on_ticks is False
+    w.act_show_grid_labels_on_ticks.setChecked(True)
+    w._toggle_show_grid_labels_on_ticks()
+    assert w.canvas.show_generated_grid_labels_on_ticks is True
+    w.act_show_grid_labels_on_ticks.setChecked(False)
+    w._toggle_show_grid_labels_on_ticks()
+    assert w.canvas.show_generated_grid_labels_on_ticks is False

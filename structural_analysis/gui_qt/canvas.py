@@ -20,7 +20,7 @@ from matplotlib import patheffects as _path_effects
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT,
 )
-from matplotlib.ticker import FixedLocator, Locator
+from matplotlib.ticker import FixedLocator, FuncFormatter, Locator, ScalarFormatter
 
 from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
@@ -177,6 +177,11 @@ class ModelCanvas(QWidget):
         # display flags.
         self.show_default_grid: bool = True
         self.show_generated_grid: bool = True
+        # When True AND a generated grid is visible, axis tick labels on
+        # generated-line coordinates render as "<num> (<letter>)" — e.g.
+        # "3 (A)". Default OFF: clean numeric spine. Toggled from
+        # View → Grid → "Show grid line labels with coords".
+        self.show_generated_grid_labels_on_ticks: bool = False
 
         self.show_deformed: bool = True
         self.show_reactions: bool = True
@@ -838,23 +843,59 @@ class ModelCanvas(QWidget):
     # ── drawing ──
 
     def _install_axis_locators(self, grid, gen_visible: bool) -> None:
-        """Choose the spine tick locator per axis.
+        """Choose the spine tick locator + formatter per axis.
 
         When the generated grid is visible, an axis that has grid lines
         ticks exactly on those line coordinates (FixedLocator) so the
-        spine reads the structural coordinates as constant values.
-        Otherwise — and for an axis the generated grid doesn't cover —
-        the AdaptiveGridLocator gives readable default-spacing ticks at
-        any zoom.
+        spine reads the structural coordinates as constant values; the
+        formatter optionally appends the line letter in parentheses
+        (e.g. ``"3 (A)"``) when ``show_generated_grid_labels_on_ticks``
+        is on. Otherwise — and for an axis the generated grid doesn't
+        cover — the AdaptiveGridLocator gives readable default-spacing
+        ticks at any zoom, paired with the default ScalarFormatter (so
+        ``ticklabel_format(useOffset=False)`` still applies).
         """
-        def _axis_locator(lines):
+        def _install(axis, lines):
             if gen_visible and lines:
                 coords = sorted({float(ln.coord) for ln in lines})
-                return FixedLocator(coords)
-            return AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS)
+                axis.set_major_locator(FixedLocator(coords))
+                # FuncFormatter emits plain f"{value:g}" — offset
+                # notation is impossible by construction, so no
+                # set_useOffset call is needed on this path.
+                axis.set_major_formatter(self._grid_letter_formatter(lines))
+            else:
+                axis.set_major_locator(AdaptiveGridLocator(
+                    self.grid_spacing, self.MAX_AXIS_LABELS))
+                # Keep the default ScalarFormatter that ax.clear()
+                # already installed, but kill the "+1e3" offset corner
+                # that grows when coordinates are far from zero.
+                fmt = axis.get_major_formatter()
+                if isinstance(fmt, ScalarFormatter):
+                    fmt.set_useOffset(False)
+                    fmt.set_scientific(False)
 
-        self.ax.xaxis.set_major_locator(_axis_locator(grid.x_lines))
-        self.ax.yaxis.set_major_locator(_axis_locator(grid.y_lines))
+        _install(self.ax.xaxis, grid.x_lines)
+        _install(self.ax.yaxis, grid.y_lines)
+
+    def _grid_letter_formatter(self, lines):
+        """Tick formatter that optionally appends ``"(<letter>)"`` to the
+        coordinate values on generated-grid lines.
+
+        Lookup uses a 6-decimal rounding so tiny floating-point drift in
+        the FixedLocator ticks vs the source ``GridLine.coord`` doesn't
+        skip a match.
+        """
+        by_coord = {round(float(ln.coord), 6): ln.label for ln in lines}
+
+        def _fmt(value, _pos):
+            # ``f"{value:g}"`` matches matplotlib's plain-number look and
+            # already obeys the ticklabel_format(useOffset=False) intent.
+            num = f"{value:g}"
+            if not self.show_generated_grid_labels_on_ticks:
+                return num
+            letter = by_coord.get(round(float(value), 6))
+            return f"{num} ({letter})" if letter else num
+        return FuncFormatter(_fmt)
 
     def _draw_grid(self) -> None:
         grid = self._grid_provider()
@@ -874,13 +915,25 @@ class ModelCanvas(QWidget):
         # never collide as the user zooms. ax.clear() (in redraw) resets
         # the locator, so this runs every redraw; matplotlib re-invokes
         # the locator on every draw, which keeps scroll-zoom readable.
+        # _install_axis_locators also disables the "+1e3" offset corner
+        # on whichever axes carry a ScalarFormatter (the AdaptiveGridLocator
+        # path) — the FixedLocator + FuncFormatter path is offset-free
+        # by construction, so a blanket ax.ticklabel_format would raise.
         self._install_axis_locators(grid, gen_visible)
-        # Show absolute metre values on the spine — never the confusing
-        # "+1e3" offset-notation corner label matplotlib adds when the
-        # coordinates are large. ax.clear() re-enables it, so set this
-        # every redraw alongside the locator.
-        self.ax.ticklabel_format(
-            style="plain", useOffset=False, axis="both")
+        # Mirror tick labels to the top + right spines too. The default
+        # axes margins already reserve pixel space on all four sides
+        # (no tight_layout / constrained_layout is in use), so enabling
+        # the top/right labels is purely additive — it does not affect
+        # set_aspect("equal") / _set_axes_limits fitting. ax.clear()
+        # resets tick_params, so this lives here next to the locator.
+        self.ax.tick_params(axis="x", which="major",
+                            top=True, labeltop=True,
+                            bottom=True, labelbottom=True,
+                            labelsize=8)
+        self.ax.tick_params(axis="y", which="major",
+                            right=True, labelright=True,
+                            left=True, labelleft=True,
+                            labelsize=8)
 
         if self.show_default_grid:
             alpha = 0.4 if gen_visible else 1.0
@@ -915,20 +968,29 @@ class ModelCanvas(QWidget):
             // self.MAX_LABELED_GRID_LINES,
         )
 
+        # Anchor letter labels with a MIXED transform so they always sit
+        # just inside the top / right spine regardless of the current
+        # view interval. The previous data-only anchor at max(y0, y1) /
+        # max(x0, x1) went stale on scroll-zoom (which never redraws),
+        # and the letters visibly drifted off the canvas.
+        x_label_tx = self.ax.get_xaxis_transform()  # x: data, y: axes
+        y_label_tx = self.ax.get_yaxis_transform()  # x: axes, y: data
         for idx, ln in enumerate(x_lines):
             self.ax.axvline(ln.coord, color="#aac8ff", linewidth=0.7,
                             linestyle="-", alpha=0.6, zorder=0)
             if idx % label_stride == 0:
-                self.ax.text(ln.coord, max(y0, y1), f"  {ln.label}",
+                self.ax.text(ln.coord, 1.0, f"  {ln.label}",
+                             transform=x_label_tx,
                              color="#3060c0", fontsize=8, va="bottom",
-                             ha="center", zorder=1)
+                             ha="center", zorder=1, clip_on=False)
         for idx, ln in enumerate(y_lines):
             self.ax.axhline(ln.coord, color="#aac8ff", linewidth=0.7,
                             linestyle="-", alpha=0.6, zorder=0)
             if idx % label_stride == 0:
-                self.ax.text(max(x0, x1), ln.coord, f"  {ln.label}",
+                self.ax.text(1.0, ln.coord, f"  {ln.label}",
+                             transform=y_label_tx,
                              color="#3060c0", fontsize=8, va="center",
-                             ha="left", zorder=1)
+                             ha="left", zorder=1, clip_on=False)
 
     # Origin-axis arrow length, in screen pixels (zoom-invariant).
     _ORIGIN_AXIS_PX = 46.0

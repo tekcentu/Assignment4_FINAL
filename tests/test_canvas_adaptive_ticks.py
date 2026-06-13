@@ -113,6 +113,41 @@ def test_canvas_installs_adaptive_locator(qt_app):
     )
 
 
+# ── tick labels mirrored to top/right spines ─────────────────────────────
+
+
+def test_tick_labels_are_mirrored_to_top_and_right(qt_app):
+    """The top + right spines were blank; coordinate numbers should
+    appear on all four sides now (no impact on fitting/aspect)."""
+    canvas = _empty_canvas(qt_app)
+    canvas.redraw()
+    # ax.xaxis lists per-tick objects; each carries labels for both
+    # the bottom (label1) and top (label2) sides.
+    x_ticks = canvas.ax.xaxis.get_major_ticks()
+    y_ticks = canvas.ax.yaxis.get_major_ticks()
+    assert x_ticks and y_ticks
+    assert any(t.label2.get_visible() for t in x_ticks), (
+        "top spine should carry mirrored X tick labels"
+    )
+    assert any(t.label2.get_visible() for t in y_ticks), (
+        "right spine should carry mirrored Y tick labels"
+    )
+    # Bottom + left still rendered (no regression on existing labels).
+    assert any(t.label1.get_visible() for t in x_ticks)
+    assert any(t.label1.get_visible() for t in y_ticks)
+
+
+def test_top_right_mirror_does_not_change_fit_limits(qt_app):
+    """Regression: mirroring labels must not perturb _set_axes_limits.
+    The pre/post-redraw xlim/ylim are identical."""
+    canvas = _empty_canvas(qt_app)
+    canvas.redraw()
+    before = (canvas.ax.get_xlim(), canvas.ax.get_ylim())
+    canvas.redraw()
+    after = (canvas.ax.get_xlim(), canvas.ax.get_ylim())
+    assert before == after
+
+
 # ── origin axes must be a fixed on-screen size (no zoom blow-out) ────────
 
 

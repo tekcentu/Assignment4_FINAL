@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.30.9"
+__version__ = "0.30.10"
 __what_is_new__ = (
-    "Origin X/Y arrows are a fixed on-screen size — no longer overshoot on zoom · "
-    "Shown generated grid puts its line coordinates on the axes (constant values) · "
-    "Default/generated grids independent; snap behavior still unchanged"
+    "Coordinate numbers mirrored to top/right spines (no fit/aspect impact) · "
+    "Generated-grid letter labels stick to the spine — no more drift on zoom · "
+    "Optional: show grid letter next to coord on the axes, e.g. '3 (A)'"
 )
 
 from .model import (
