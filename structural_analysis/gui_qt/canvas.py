@@ -950,7 +950,14 @@ class ModelCanvas(QWidget):
                 self.ax.yaxis.set_minor_locator(
                     AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
                 self.ax.tick_params(which="minor", length=0)
-                self.ax.grid(True, which="both", linestyle=":",
+                # Reference grid on the MINOR ticks only. The major ticks
+                # are the generated coordinates, already marked by the
+                # solid light-blue lines; turning on the major grid too
+                # (which="both") would draw a second dotted line under the
+                # blue one at each generated coord, making those reference
+                # lines darker than the rest. "minor" keeps the faint
+                # reference grid uniform.
+                self.ax.grid(True, which="minor", linestyle=":",
                              linewidth=0.5, color="#cccccc", alpha=alpha)
             else:
                 self.ax.grid(True, which="major", linestyle=":",

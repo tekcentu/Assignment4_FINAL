@@ -79,8 +79,12 @@ def test_default_grid_remains_visible_when_generated_is_populated(qt_app):
     )
     canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
     canvas.redraw()
-    assert any(ln.get_visible() for ln in canvas.ax.get_xgridlines())
-    assert any(ln.get_visible() for ln in canvas.ax.get_ygridlines())
+    # With a generated grid shown, the fine reference grid lives on the
+    # MINOR ticks (the majors are pinned to the generated coordinates).
+    x_minor = [t.gridline for t in canvas.ax.xaxis.get_minor_ticks()]
+    y_minor = [t.gridline for t in canvas.ax.yaxis.get_minor_ticks()]
+    assert any(ln.get_visible() for ln in x_minor)
+    assert any(ln.get_visible() for ln in y_minor)
 
 
 def test_generated_grid_can_be_hidden_independently(qt_app):
@@ -132,10 +136,11 @@ def test_both_layers_shown_default_grid_is_faded(qt_app):
     )
     canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
     canvas.redraw()
-    # When generated grid is drawn, the default's alpha must be < 1.
+    # The reference grid (minor ticks, when a generated grid is shown)
+    # must be drawn lighter so the generated grid stays dominant.
+    x_minor = [t.gridline for t in canvas.ax.xaxis.get_minor_ticks()]
     default_alpha = next(
-        ln.get_alpha() for ln in canvas.ax.get_xgridlines()
-        if ln.get_visible()
+        ln.get_alpha() for ln in x_minor if ln.get_visible()
     )
     assert default_alpha is not None and default_alpha < 1.0
 
@@ -514,7 +519,10 @@ def test_generate_grid_from_nodes_does_not_disable_default_grid(qt_app):
     w._do_generate_grid_from_nodes()
     w.canvas.redraw()
     assert w.canvas.show_default_grid is True
-    assert any(ln.get_visible() for ln in w.canvas.ax.get_xgridlines())
+    # The default reference grid stays visible — on the MINOR ticks, since
+    # the majors are now pinned to the generated grid's coordinates.
+    minor = [t.gridline for t in w.canvas.ax.xaxis.get_minor_ticks()]
+    assert any(ln.get_visible() for ln in minor)
 
 
 def test_clear_generated_grid_keeps_default_grid_enabled(qt_app):
