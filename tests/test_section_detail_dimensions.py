@@ -176,6 +176,43 @@ def test_detail_and_dialog_share_one_dimension_helper(qt_app):
     assert dialog_txt == ["b = 0.3", "h = 0.5"]
 
 
+def _all_labels_fit(fig, ax) -> bool:
+    fig.canvas.draw()
+    ax_bb = ax.get_window_extent()
+    for t in ax.texts:
+        bb = t.get_window_extent()
+        if not (bb.x0 >= ax_bb.x0 - 1 and bb.x1 <= ax_bb.x1 + 1
+                and bb.y0 >= ax_bb.y0 - 1 and bb.y1 <= ax_bb.y1 + 1):
+            return False
+    return True
+
+
+@pytest.mark.parametrize("b,h,tf,tw,figsize", [
+    (0.4, 0.4, 0.0, 0.0, (1.6, 1.6)),    # square — the reported overflow case
+    (0.6, 0.3, 0.0, 0.0, (1.6, 1.6)),    # wide
+    (0.2, 0.5, 0.0, 0.0, (1.3, 2.4)),    # tall, narrow panel
+    (0.3, 0.4, 0.02, 0.012, (1.6, 1.6)),  # I-section with tf/tw
+    (900.0, 500.0, 0.0, 0.0, (2.4, 1.3)),  # large values, wide panel
+])
+def test_section_dimension_labels_fit_in_panel(qt_app, b, h, tf, tw, figsize):
+    """Every dimension label must stay inside the panel — the square case
+    used to overflow the right edge (the 'h = …' label was unreadable)."""
+    from matplotlib.figure import Figure
+    from structural_analysis.gui_qt.element_graphics import (
+        annotate_section_dimensions,
+    )
+    fig = Figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_axis_off()
+    ax.fill([-b / 2, b / 2, b / 2, -b / 2],
+            [-h / 2, -h / 2, h / 2, h / 2])
+    annotate_section_dimensions(ax, b=b, h=h, tf=tf, tw=tw, units=" m")
+    assert _all_labels_fit(fig, ax), (
+        f"labels overflow for b={b} h={h} tf={tf} tw={tw} fig={figsize}"
+    )
+
+
 def test_dimension_helper_fallback_and_i_section_formatting(qt_app):
     """The shared helper covers the manual √A fallback (≈ prefix) and the
     I-section tf/tw labels — the cases each call site relies on."""

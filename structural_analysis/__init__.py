@@ -3,8 +3,8 @@
 __version__ = "0.33.0"
 __what_is_new__ = (
     "Section dimension labels (b / h / tf / tw) now share one drawing helper · "
-    "Element-Details thumbnail and Add-Section preview can no longer drift · "
-    "No visible change — pure de-duplication"
+    "Labels pinned to the panel edges with leaders — no more clipped 'h =' on squares · "
+    "Element-Details thumbnail and Add-Section preview can no longer drift"
 )
 
 from .model import (

@@ -688,44 +688,53 @@ def annotate_section_dimensions(
     * ``color`` — label colour (a muted grey for the dialog's *example*
       outline vs the default near-black).
 
-    After annotating, the data view is padded so the labels don't clip.
-    No-ops when ``b`` or ``h`` is non-positive.
+    The label TEXT is anchored in **axes-fraction** coordinates (pinned to
+    the panel edges) with a thin leader line to the dimensioned edge in
+    DATA coordinates. This is what keeps every label readable: data-space
+    padding can't fit a fixed-pixel-width label like "h = 0.4 m" beside a
+    square section in a small equal-aspect panel (the label ran off the
+    right edge), but an edge-anchored label always stays inside. No-ops
+    when ``b`` or ``h`` is non-positive.
     """
     if not (b > 0.0 and h > 0.0):
         return
 
-    if fallback:
-        ax.annotate(f"≈ {b:g}{units}", xy=(0.0, -h / 2.0),
-                    xytext=(0.0, -h / 2.0 - 0.20 * h),
-                    ha="center", va="top", fontsize=7, color=color)
-        ax.annotate(f"≈ {h:g}{units}", xy=(b / 2.0, 0.0),
-                    xytext=(b / 2.0 + 0.20 * b, 0.0),
-                    ha="left", va="center", fontsize=7, color=color)
-    else:
-        ax.annotate(f"b = {b:g}{units}", xy=(0.0, -h / 2.0),
-                    xytext=(0.0, -h / 2.0 - 0.20 * h),
-                    ha="center", va="top", fontsize=8, color=color)
-        ax.annotate(f"h = {h:g}{units}", xy=(b / 2.0, 0.0),
-                    xytext=(b / 2.0 + 0.20 * b, 0.0),
-                    ha="left", va="center", fontsize=8, color=color)
-        if tf > 0.0:
-            ax.annotate(f"tf = {tf:g}", xy=(-b / 2.0, h / 2.0 - tf / 2.0),
-                        xytext=(-b / 2.0 - 0.22 * b, h / 2.0 - tf / 2.0),
-                        ha="right", va="center", fontsize=7, color=color)
-        if tw > 0.0:
-            ax.annotate(f"tw = {tw:g}", xy=(tw / 2.0, 0.0),
-                        xytext=(tw / 2.0 + 0.20 * b, -0.25 * h),
-                        ha="left", va="center", fontsize=7, color=color)
+    # Thin, head-less grey leader from the dimensioned edge (data) to the
+    # edge-pinned label (axes fraction). annotation_clip=False lets the
+    # label sit in the margin band outside the data area.
+    lead = dict(arrowstyle="-", color="#999999", lw=0.6,
+                shrinkA=0.0, shrinkB=2.0)
 
-    # Breathing room so the dimension labels stay inside the panel.
+    def _ann(text, xy, xytext, ha, va, fs):
+        ax.annotate(text, xy=xy, xycoords="data",
+                    xytext=xytext, textcoords="axes fraction",
+                    ha=ha, va=va, fontsize=fs, color=color,
+                    arrowprops=lead, annotation_clip=False)
+
+    if fallback:
+        _ann(f"≈ {b:g}{units}", (0.0, -h / 2.0), (0.5, 0.015),
+             "center", "bottom", 7)
+        _ann(f"≈ {h:g}{units}", (b / 2.0, 0.0), (0.985, 0.5),
+             "right", "center", 7)
+    else:
+        _ann(f"b = {b:g}{units}", (0.0, -h / 2.0), (0.5, 0.015),
+             "center", "bottom", 8)
+        _ann(f"h = {h:g}{units}", (b / 2.0, 0.0), (0.985, 0.5),
+             "right", "center", 8)
+        if tf > 0.0:
+            _ann(f"tf = {tf:g}", (-b / 2.0, h / 2.0 - tf / 2.0),
+                 (0.015, 0.985), "left", "top", 7)
+        if tw > 0.0:
+            _ann(f"tw = {tw:g}", (tw / 2.0, 0.0), (0.015, 0.45),
+                 "left", "center", 7)
+
+    # Leave a symmetric breathing band around the section so it doesn't
+    # touch the panel edges (the labels live in that band). Symmetric
+    # margins keep the equal-aspect section undistorted; the labels are in
+    # axes-fraction coords so they don't feed back into the data limits.
     ax.relim()
     ax.autoscale_view()
-    x0, x1 = ax.get_xlim()
-    y0, y1 = ax.get_ylim()
-    pad_x = (x1 - x0) * 0.30 + 1e-6
-    pad_y = (y1 - y0) * 0.25 + 1e-6
-    ax.set_xlim(x0 - pad_x, x1 + pad_x)
-    ax.set_ylim(y0 - pad_y, y1 + pad_y)
+    ax.margins(0.20)
 
 
 # ── Main entry point ─────────────────────────────────────────────
