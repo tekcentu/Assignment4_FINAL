@@ -637,15 +637,82 @@ def _draw_section_thumbnail(ax, section: Optional[Section]) -> None:
             linewidth=1.2, alpha=0.95, zorder=2)
     ax.set_aspect("equal", adjustable="datalim")
 
+    # Dimension annotations — the detail view used to show only the
+    # outline + a shape-name caption, so the user couldn't read off the
+    # actual section sizes. Annotate b / h (and tf / tw for I-sections)
+    # right on the thumbnail, matching the Add-Section live preview.
+    _annotate_section_dimensions(ax, section, zs, ys)
+
     shape = getattr(section, "shape_type", None) or "manual"
     if shape == "manual":
-        ax.text(0.5, -0.04,
-                "Approximate area-equivalent\nsquare fallback (√A)",
+        ax.text(0.5, -0.16,
+                "area-equivalent square (√A) — drawn size is approximate",
                 transform=ax.transAxes, ha="center", va="top",
                 fontsize=6, style="italic", color="#666")
     else:
-        ax.text(0.5, -0.04, shape, transform=ax.transAxes,
+        ax.text(0.5, -0.16, shape, transform=ax.transAxes,
                 ha="center", va="top", fontsize=7, color="#555")
+
+
+def _annotate_section_dimensions(ax, section: "Section", zs, ys) -> None:
+    """Label the cross-section's measured sizes on a section thumbnail.
+
+    ``zs`` / ``ys`` are the drawn outline coordinates (z = horizontal /
+    width, y = vertical / depth). Overall width and depth come from the
+    drawn outline's bounding box, so the labels always match what's on
+    screen — including the manual √A fallback square, whose side is
+    annotated honestly rather than left unlabelled. Known shapes get
+    ``b`` / ``h`` from the section fields; I-sections also get
+    ``tf`` / ``tw``. After annotating, the view is padded so the labels
+    don't run off the panel edge (same approach as the dialog preview).
+    """
+    if not zs or not ys:
+        return
+    z_min, z_max = min(zs), max(zs)
+    y_min, y_max = min(ys), max(ys)
+    w = z_max - z_min            # width  (along local z)
+    d = y_max - y_min            # depth  (along local y)
+    if w <= 0.0 or d <= 0.0:
+        return
+
+    shape = getattr(section, "shape_type", None) or "manual"
+    if shape == "manual":
+        # The outline is a √A equivalent square; label its side.
+        ax.annotate(f"≈ {w:g} m", xy=(0.0, y_min),
+                    xytext=(0.0, y_min - 0.20 * d),
+                    ha="center", va="top", fontsize=7, color="#333")
+        ax.annotate(f"≈ {d:g} m", xy=(z_max, 0.0),
+                    xytext=(z_max + 0.20 * w, 0.0),
+                    ha="left", va="center", fontsize=7, color="#333")
+    else:
+        b = section.b if getattr(section, "b", 0.0) > 0.0 else w
+        h = section.h if getattr(section, "h", 0.0) > 0.0 else d
+        ax.annotate(f"b = {b:g} m", xy=(0.0, y_min),
+                    xytext=(0.0, y_min - 0.20 * d),
+                    ha="center", va="top", fontsize=8, color="#333")
+        ax.annotate(f"h = {h:g} m", xy=(z_max, 0.0),
+                    xytext=(z_max + 0.20 * w, 0.0),
+                    ha="left", va="center", fontsize=8, color="#333")
+        if shape == "i_section":
+            tf, tw = getattr(section, "tf", 0.0), getattr(section, "tw", 0.0)
+            if tf > 0.0:
+                ax.annotate(f"tf = {tf:g}", xy=(-b / 2.0, h / 2.0 - tf / 2.0),
+                            xytext=(-b / 2.0 - 0.24 * b, h / 2.0 - tf / 2.0),
+                            ha="right", va="center", fontsize=7, color="#333")
+            if tw > 0.0:
+                ax.annotate(f"tw = {tw:g}", xy=(tw / 2.0, 0.0),
+                            xytext=(tw / 2.0 + 0.20 * b, -0.28 * h),
+                            ha="left", va="center", fontsize=7, color="#333")
+
+    # Breathing room so the dimension labels stay inside the panel.
+    ax.relim()
+    ax.autoscale_view()
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    pad_x = (x1 - x0) * 0.32 + 1e-6
+    pad_y = (y1 - y0) * 0.28 + 1e-6
+    ax.set_xlim(x0 - pad_x, x1 + pad_x)
+    ax.set_ylim(y0 - pad_y, y1 + pad_y)
 
 
 # ── Main entry point ─────────────────────────────────────────────

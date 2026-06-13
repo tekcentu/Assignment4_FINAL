@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.30.10"
+__version__ = "0.31.0"
 __what_is_new__ = (
-    "Coordinate numbers mirrored to top/right spines (no fit/aspect impact) · "
-    "Generated-grid letter labels stick to the spine — no more drift on zoom · "
-    "Optional: show grid letter next to coord on the axes, e.g. '3 (A)'"
+    "Element Details section preview now shows measured dimensions (b / h, tf / tw) · "
+    "Manual sections label the √A equivalent-square side instead of an unlabelled shape · "
+    "Matches the Add-Section live-preview annotations"
 )
 
 from .model import (
