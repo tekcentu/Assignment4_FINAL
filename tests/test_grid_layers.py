@@ -152,6 +152,90 @@ def test_both_layers_hidden_draws_no_grid(qt_app):
             if ln.get_color() == "#aac8ff"] == []
 
 
+# ── generated grid coordinates appear on the spine (constant values) ─────
+
+
+def _locator_locs(locator):
+    from matplotlib.ticker import FixedLocator
+    assert isinstance(locator, FixedLocator)
+    return sorted(float(v) for v in locator.locs)
+
+
+def test_visible_generated_grid_puts_its_coords_on_the_axes(qt_app):
+    """When the generated grid is shown, the spine ticks land on the
+    structural grid-line coordinates (e.g. 0, 3, 6 / 0, 3.2) — their
+    constant values — instead of the default adaptive spacing."""
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 3.0), GridLine("C", 6.0)],
+        y_lines=[GridLine("1", 0.0), GridLine("2", 3.2)],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.redraw()
+    assert _locator_locs(canvas.ax.xaxis.get_major_locator()) == [0.0, 3.0, 6.0]
+    assert _locator_locs(canvas.ax.yaxis.get_major_locator()) == [0.0, 3.2]
+
+
+def test_generated_coords_shown_even_when_default_grid_hidden(qt_app):
+    """The reported case: hiding the default grid must not revert the
+    spine to the default 'every 2.5 m' spacing — it still shows the
+    generated coordinates."""
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 3.0)],
+        y_lines=[GridLine("1", 0.0)],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_default_grid = False
+    canvas.redraw()
+    assert _locator_locs(canvas.ax.xaxis.get_major_locator()) == [0.0, 3.0]
+
+
+def test_hidden_generated_grid_reverts_to_adaptive_ticks(qt_app):
+    from structural_analysis.gui_qt.canvas import AdaptiveGridLocator
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 3.0)], y_lines=[],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_generated_grid = False
+    canvas.redraw()
+    assert isinstance(
+        canvas.ax.xaxis.get_major_locator(), AdaptiveGridLocator
+    )
+
+
+def test_axis_without_generated_lines_stays_adaptive(qt_app):
+    """A grid that only defines X lines must leave the Y spine on the
+    adaptive locator, not collapse it to a single tick."""
+    from structural_analysis.gui_qt.canvas import AdaptiveGridLocator
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    from matplotlib.ticker import FixedLocator
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 3.0)], y_lines=[],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.redraw()
+    assert isinstance(
+        canvas.ax.xaxis.get_major_locator(), FixedLocator
+    )
+    assert isinstance(
+        canvas.ax.yaxis.get_major_locator(), AdaptiveGridLocator
+    )
+
+
+def test_empty_grid_uses_adaptive_on_both_axes(qt_app):
+    from structural_analysis.gui_qt.canvas import AdaptiveGridLocator
+    canvas = _canvas(qt_app, _model_with_nodes())
+    canvas.redraw()
+    assert isinstance(
+        canvas.ax.xaxis.get_major_locator(), AdaptiveGridLocator
+    )
+    assert isinstance(
+        canvas.ax.yaxis.get_major_locator(), AdaptiveGridLocator
+    )
+
+
 # ── snap behavior must not change with display toggles ───────────────────
 
 
