@@ -633,6 +633,11 @@ def _draw_section_thumbnail(ax, section: Optional[Section]) -> None:
 
     zs = [p[1] for p in pts]
     ys = [p[0] for p in pts]
+    if not zs or not ys:
+        # section_outline never returns an empty polygon today (it returns
+        # 4 / 12 vertices or raises, which is caught above), but guard the
+        # max()/min() calls so a future change can't crash the detail view.
+        return
     ax.fill(zs, ys, facecolor="#cfe3f6", edgecolor=_MEMBER_COLOR,
             linewidth=1.2, alpha=0.95, zorder=2)
     ax.set_aspect("equal", adjustable="datalim")
