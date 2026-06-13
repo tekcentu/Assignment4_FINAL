@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.32.0"
+__version__ = "0.33.0"
 __what_is_new__ = (
-    "Three new combined examples in File → Open example… · "
-    "Show load cases + combinations, rigid offsets, diagonal bracing and modal together · "
-    "example_09 braced frame · example_10 rigid offsets · example_11 kitchen-sink"
+    "Section dimension labels (b / h / tf / tw) now share one drawing helper · "
+    "Labels pinned to the panel edges with leaders — no more clipped 'h =' on squares · "
+    "Element-Details thumbnail and Add-Section preview can no longer drift"
 )
 
 from .model import (

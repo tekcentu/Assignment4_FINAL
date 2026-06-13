@@ -635,53 +635,22 @@ class SectionDialog(_ModalDialog):
         ax.fill(zs, ys, facecolor="#cfe3f6", edgecolor="#1f3a5f",
                 linewidth=1.2, alpha=0.95)
 
-        # Dimension labels — small, positioned just outside the outline.
-        # b = width along z, h = depth along y; tf / tw only for I.
-        b = derived.get("width", 0.0)
-        h = derived.get("depth", 0.0)
-        if b > 0 and h > 0:
-            ax.annotate(
-                f"b = {b:g}",
-                xy=(0.0, -h / 2.0), xytext=(0.0, -h / 2.0 - 0.18 * h),
-                ha="center", va="top", fontsize=8, color="#333",
-            )
-            ax.annotate(
-                f"h = {h:g}",
-                xy=(b / 2.0, 0.0), xytext=(b / 2.0 + 0.18 * b, 0.0),
-                ha="left", va="center", fontsize=8, color="#333",
-            )
-        if shape == "i_section":
-            # section.tf / section.tw are already populated from the
-            # same input fields by _section_from_inputs (which only
-            # runs when the text parses cleanly), so re-parsing the
-            # widgets here would only repeat work and risk drifting
-            # from the geometry we just drew.
-            tf, tw = section.tf, section.tw
-            if tf > 0:
-                ax.annotate(
-                    f"tf = {tf:g}",
-                    xy=(-b / 2.0, h / 2.0 - tf / 2.0),
-                    xytext=(-b / 2.0 - 0.22 * b, h / 2.0 - tf / 2.0),
-                    ha="right", va="center", fontsize=8, color="#333",
-                )
-            if tw > 0:
-                ax.annotate(
-                    f"tw = {tw:g}",
-                    xy=(tw / 2.0, 0.0),
-                    xytext=(tw / 2.0 + 0.18 * b, -0.25 * h),
-                    ha="left", va="center", fontsize=8, color="#333",
-                )
-
-        # A little breathing room around the outline so the dimension
-        # labels don't run off the edge of the figure.
-        ax.relim()
-        ax.autoscale_view()
-        x0, x1 = ax.get_xlim()
-        y0, y1 = ax.get_ylim()
-        pad_x = (x1 - x0) * 0.30 + 1e-6
-        pad_y = (y1 - y0) * 0.25 + 1e-6
-        ax.set_xlim(x0 - pad_x, x1 + pad_x)
-        ax.set_ylim(y0 - pad_y, y1 + pad_y)
+        # Dimension labels via the shared helper — single source of truth
+        # for label placement with the Element-Details section thumbnail
+        # (element_graphics.annotate_section_dimensions). b = width along z,
+        # h = depth along y; tf / tw only for I-sections. ``units=""`` keeps
+        # the dialog's bare numbers (the form rows already say "(m)"). The
+        # helper also pads the view so labels don't clip.
+        from .element_graphics import annotate_section_dimensions
+        # section.tf / section.tw are already populated from the same input
+        # fields by _section_from_inputs, so reuse them rather than
+        # re-parsing the widgets and risking drift from the drawn geometry.
+        tf = section.tf if shape == "i_section" else 0.0
+        tw = section.tw if shape == "i_section" else 0.0
+        annotate_section_dimensions(
+            ax, b=derived.get("width", 0.0), h=derived.get("depth", 0.0),
+            tf=tf, tw=tw, units="",
+        )
 
         self._preview_canvas.draw_idle()
 
@@ -728,51 +697,27 @@ class SectionDialog(_ModalDialog):
         ax.fill(zs, ys, facecolor="#e8eef5", edgecolor="#9aa9bf",
                 linewidth=1.2, alpha=0.9, linestyle="--")
 
-        # Dimension annotations — same set the real preview shows,
-        # so the example reads as "this is what your input will draw".
+        # Dimension annotations via the shared helper — same placement the
+        # real preview and the Element-Details thumbnail use, drawn in the
+        # muted example palette (``color="#666"``).
+        from .element_graphics import annotate_section_dimensions
         b_ann = dims.get("b", dims.get("h", 0.0))
         h_ann = dims["h"]
-        ax.annotate(
-            f"b = {b_ann:g}",
-            xy=(0.0, -h_ann / 2.0),
-            xytext=(0.0, -h_ann / 2.0 - 0.18 * h_ann),
-            ha="center", va="top", fontsize=8, color="#666",
+        annotate_section_dimensions(
+            ax, b=b_ann, h=h_ann,
+            tf=dims.get("tf", 0.0) if shape_key == "i_section" else 0.0,
+            tw=dims.get("tw", 0.0) if shape_key == "i_section" else 0.0,
+            units="", color="#666",
         )
-        ax.annotate(
-            f"h = {h_ann:g}",
-            xy=(b_ann / 2.0, 0.0),
-            xytext=(b_ann / 2.0 + 0.18 * b_ann, 0.0),
-            ha="left", va="center", fontsize=8, color="#666",
-        )
-        if shape_key == "i_section":
-            ax.annotate(
-                f"tf = {dims['tf']:g}",
-                xy=(-b_ann / 2.0, h_ann / 2.0 - dims["tf"] / 2.0),
-                xytext=(-b_ann / 2.0 - 0.22 * b_ann,
-                         h_ann / 2.0 - dims["tf"] / 2.0),
-                ha="right", va="center", fontsize=8, color="#666",
-            )
-            ax.annotate(
-                f"tw = {dims['tw']:g}",
-                xy=(dims["tw"] / 2.0, 0.0),
-                xytext=(dims["tw"] / 2.0 + 0.18 * b_ann, -0.25 * h_ann),
-                ha="left", va="center", fontsize=8, color="#666",
-            )
 
+        # The view padding is handled by annotate_section_dimensions above;
+        # this label is in axes-fraction coords so it doesn't affect limits.
         ax.text(
             0.5, 0.97,
             f"example {shape_key} (type dimensions to override)",
             ha="center", va="top", transform=ax.transAxes,
             fontsize=8, color="#888", style="italic",
         )
-        ax.relim()
-        ax.autoscale_view()
-        x0, x1 = ax.get_xlim()
-        y0, y1 = ax.get_ylim()
-        pad_x = (x1 - x0) * 0.30 + 1e-6
-        pad_y = (y1 - y0) * 0.25 + 1e-6
-        ax.set_xlim(x0 - pad_x, x1 + pad_x)
-        ax.set_ylim(y0 - pad_y, y1 + pad_y)
 
     def _section_from_inputs(self, shape: str,
                               derived: dict[str, float]) -> Section:
