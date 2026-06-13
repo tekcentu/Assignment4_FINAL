@@ -436,6 +436,16 @@ class MainWindow(QMainWindow):
             "&Clear generated grid", self,
             triggered=lambda _checked=False: self._do_clear_generated_grid(),
         )
+        self.act_show_grid_labels_on_ticks = QAction(
+            "Show grid line &labels with coords", self,
+            checkable=True, checked=False,
+            triggered=self._toggle_show_grid_labels_on_ticks,
+        )
+        self.act_show_grid_labels_on_ticks.setToolTip(
+            "When the structural grid is shown, append its letter labels "
+            "in parentheses next to the coordinate values on the axes "
+            "(e.g. '3 (A)'). Display only — snap behavior is unchanged."
+        )
         self.act_fit_view = QAction("&Fit to view", self, shortcut="Home",
                                       triggered=self._do_fit_view)
         self.act_open_view3d = QAction(
@@ -773,6 +783,7 @@ class MainWindow(QMainWindow):
         m_grid = m_view.addMenu("&Grid")
         m_grid.addAction(self.act_show_default_grid)
         m_grid.addAction(self.act_show_generated_grid)
+        m_grid.addAction(self.act_show_grid_labels_on_ticks)
         m_grid.addSeparator()
         m_grid.addAction(self.act_generate_grid_from_nodes)
         m_grid.addAction(self.act_clear_generated_grid)
@@ -2393,6 +2404,13 @@ class MainWindow(QMainWindow):
         has_grid = not self._grid.is_empty()
         self.act_show_generated_grid.setEnabled(has_grid)
         self.act_clear_generated_grid.setEnabled(has_grid)
+        self.act_show_grid_labels_on_ticks.setEnabled(has_grid)
+
+    def _toggle_show_grid_labels_on_ticks(self) -> None:
+        self.canvas.show_generated_grid_labels_on_ticks = (
+            self.act_show_grid_labels_on_ticks.isChecked()
+        )
+        self.canvas.redraw()
 
     def _do_generate_grid_from_nodes(self) -> None:
         """Build a GridSystem from unique node X/Y coordinates and apply

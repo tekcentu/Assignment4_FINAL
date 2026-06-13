@@ -20,7 +20,7 @@ from matplotlib import patheffects as _path_effects
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT,
 )
-from matplotlib.ticker import Locator
+from matplotlib.ticker import FixedLocator, FuncFormatter, Locator, ScalarFormatter
 
 from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
@@ -177,6 +177,11 @@ class ModelCanvas(QWidget):
         # display flags.
         self.show_default_grid: bool = True
         self.show_generated_grid: bool = True
+        # When True AND a generated grid is visible, axis tick labels on
+        # generated-line coordinates render as "<num> (<letter>)" — e.g.
+        # "3 (A)". Default OFF: clean numeric spine. Toggled from
+        # View → Grid → "Show grid line labels with coords".
+        self.show_generated_grid_labels_on_ticks: bool = False
 
         self.show_deformed: bool = True
         self.show_reactions: bool = True
@@ -837,23 +842,62 @@ class ModelCanvas(QWidget):
 
     # ── drawing ──
 
-    def _draw_grid(self) -> None:
-        # Spine coordinate numbers use an adaptive locator so they never
-        # collide as the user zooms — a fixed step would pile up on
-        # zoom-out. ax.clear() (in redraw) resets the locator, so it is
-        # re-installed here every redraw; between redraws matplotlib keeps
-        # re-invoking it, which is what makes scroll-zoom stay readable.
-        self.ax.xaxis.set_major_locator(
-            AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
-        self.ax.yaxis.set_major_locator(
-            AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
-        # Show absolute metre values on the spine — never the confusing
-        # "+1e3" offset-notation corner label matplotlib adds when the
-        # coordinates are large. ax.clear() re-enables it, so set this
-        # every redraw alongside the locator.
-        self.ax.ticklabel_format(
-            style="plain", useOffset=False, axis="both")
+    def _install_axis_locators(self, grid, gen_visible: bool) -> None:
+        """Choose the spine tick locator + formatter per axis.
 
+        When the generated grid is visible, an axis that has grid lines
+        ticks exactly on those line coordinates (FixedLocator) so the
+        spine reads the structural coordinates as constant values; the
+        formatter optionally appends the line letter in parentheses
+        (e.g. ``"3 (A)"``) when ``show_generated_grid_labels_on_ticks``
+        is on. Otherwise — and for an axis the generated grid doesn't
+        cover — the AdaptiveGridLocator gives readable default-spacing
+        ticks at any zoom, paired with the default ScalarFormatter (so
+        ``ticklabel_format(useOffset=False)`` still applies).
+        """
+        def _install(axis, lines):
+            if gen_visible and lines:
+                coords = sorted({float(ln.coord) for ln in lines})
+                axis.set_major_locator(FixedLocator(coords))
+                # FuncFormatter emits plain f"{value:g}" — offset
+                # notation is impossible by construction, so no
+                # set_useOffset call is needed on this path.
+                axis.set_major_formatter(self._grid_letter_formatter(lines))
+            else:
+                axis.set_major_locator(AdaptiveGridLocator(
+                    self.grid_spacing, self.MAX_AXIS_LABELS))
+                # Keep the default ScalarFormatter that ax.clear()
+                # already installed, but kill the "+1e3" offset corner
+                # that grows when coordinates are far from zero.
+                fmt = axis.get_major_formatter()
+                if isinstance(fmt, ScalarFormatter):
+                    fmt.set_useOffset(False)
+                    fmt.set_scientific(False)
+
+        _install(self.ax.xaxis, grid.x_lines)
+        _install(self.ax.yaxis, grid.y_lines)
+
+    def _grid_letter_formatter(self, lines):
+        """Tick formatter that optionally appends ``"(<letter>)"`` to the
+        coordinate values on generated-grid lines.
+
+        Lookup uses a 6-decimal rounding so tiny floating-point drift in
+        the FixedLocator ticks vs the source ``GridLine.coord`` doesn't
+        skip a match.
+        """
+        by_coord = {round(float(ln.coord), 6): ln.label for ln in lines}
+
+        def _fmt(value, _pos):
+            # ``f"{value:g}"`` matches matplotlib's plain-number look and
+            # already obeys the ticklabel_format(useOffset=False) intent.
+            num = f"{value:g}"
+            if not self.show_generated_grid_labels_on_ticks:
+                return num
+            letter = by_coord.get(round(float(value), 6))
+            return f"{num} ({letter})" if letter else num
+        return FuncFormatter(_fmt)
+
+    def _draw_grid(self) -> None:
         grid = self._grid_provider()
         # The two layers are drawn independently — populating a GridSystem
         # no longer hides the default reference grid. When both are on,
@@ -861,6 +905,36 @@ class ModelCanvas(QWidget):
         # visually dominant; when only the default is on, it uses its
         # full weight as the user expects.
         gen_visible = self.show_generated_grid and not grid.is_empty()
+
+        # Spine tick locators. When the generated grid is visible we put
+        # the ticks ON the structural grid-line coordinates so the spine
+        # shows their constant values (e.g. 0, 3, 6 / 0, 3.2) — those are
+        # the meaningful coordinates the user wants to read off. With no
+        # generated grid we fall back to the AdaptiveGridLocator, which
+        # coarsens in a 1-2-5 progression so the default-spacing numbers
+        # never collide as the user zooms. ax.clear() (in redraw) resets
+        # the locator, so this runs every redraw; matplotlib re-invokes
+        # the locator on every draw, which keeps scroll-zoom readable.
+        # _install_axis_locators also disables the "+1e3" offset corner
+        # on whichever axes carry a ScalarFormatter (the AdaptiveGridLocator
+        # path) — the FixedLocator + FuncFormatter path is offset-free
+        # by construction, so a blanket ax.ticklabel_format would raise.
+        self._install_axis_locators(grid, gen_visible)
+        # Mirror tick labels to the top + right spines too. The default
+        # axes margins already reserve pixel space on all four sides
+        # (no tight_layout / constrained_layout is in use), so enabling
+        # the top/right labels is purely additive — it does not affect
+        # set_aspect("equal") / _set_axes_limits fitting. ax.clear()
+        # resets tick_params, so this lives here next to the locator.
+        self.ax.tick_params(axis="x", which="major",
+                            top=True, labeltop=True,
+                            bottom=True, labelbottom=True,
+                            labelsize=8)
+        self.ax.tick_params(axis="y", which="major",
+                            right=True, labelright=True,
+                            left=True, labelleft=True,
+                            labelsize=8)
+
         if self.show_default_grid:
             alpha = 0.4 if gen_visible else 1.0
             self.ax.grid(True, which="major", linestyle=":", linewidth=0.5,
@@ -894,47 +968,67 @@ class ModelCanvas(QWidget):
             // self.MAX_LABELED_GRID_LINES,
         )
 
+        # Anchor letter labels with a MIXED transform so they always sit
+        # just inside the top / right spine regardless of the current
+        # view interval. The previous data-only anchor at max(y0, y1) /
+        # max(x0, x1) went stale on scroll-zoom (which never redraws),
+        # and the letters visibly drifted off the canvas.
+        x_label_tx = self.ax.get_xaxis_transform()  # x: data, y: axes
+        y_label_tx = self.ax.get_yaxis_transform()  # x: axes, y: data
         for idx, ln in enumerate(x_lines):
             self.ax.axvline(ln.coord, color="#aac8ff", linewidth=0.7,
                             linestyle="-", alpha=0.6, zorder=0)
             if idx % label_stride == 0:
-                self.ax.text(ln.coord, max(y0, y1), f"  {ln.label}",
+                self.ax.text(ln.coord, 1.0, f"  {ln.label}",
+                             transform=x_label_tx,
                              color="#3060c0", fontsize=8, va="bottom",
-                             ha="center", zorder=1)
+                             ha="center", zorder=1, clip_on=False)
         for idx, ln in enumerate(y_lines):
             self.ax.axhline(ln.coord, color="#aac8ff", linewidth=0.7,
                             linestyle="-", alpha=0.6, zorder=0)
             if idx % label_stride == 0:
-                self.ax.text(max(x0, x1), ln.coord, f"  {ln.label}",
+                self.ax.text(1.0, ln.coord, f"  {ln.label}",
+                             transform=y_label_tx,
                              color="#3060c0", fontsize=8, va="center",
-                             ha="left", zorder=1)
+                             ha="left", zorder=1, clip_on=False)
+
+    # Origin-axis arrow length, in screen pixels (zoom-invariant).
+    _ORIGIN_AXIS_PX = 46.0
 
     def _draw_origin_axes(self) -> None:
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
         if not (x0 <= 0.0 <= x1 and y0 <= 0.0 <= y1):
             return
-        span = max(x1 - x0, y1 - y0, 1.0)
-        length = 0.08 * span
+        # The arrows are anchored at the origin (data) but sized in screen
+        # pixels via offset-points, so they stay a constant on-screen
+        # length at any zoom. The previous data-relative length
+        # (0.08 × view-span) went stale on scroll-zoom — which only calls
+        # draw_idle(), never redraw() — so after zooming in the arrows
+        # kept their old, larger data length and shot off the canvas.
+        L = self._ORIGIN_AXIS_PX
+        arrow = dict(arrowstyle="<-", color="#222222", lw=1.4)
         self.ax.plot(0.0, 0.0, marker="o", markersize=4,
                      color="#222222", zorder=8)
+        # arrowstyle "<-" puts the head at the xytext (offset) end, so the
+        # arrow runs from the origin outward by L pixels.
         self.ax.annotate(
-            "", xy=(length, 0.0), xytext=(0.0, 0.0),
-            arrowprops=dict(arrowstyle="->", color="#222222", lw=1.4),
-            zorder=8,
+            "", xy=(0.0, 0.0), xycoords="data",
+            xytext=(L, 0.0), textcoords="offset points",
+            arrowprops=arrow, zorder=8,
         )
         self.ax.annotate(
-            "", xy=(0.0, length), xytext=(0.0, 0.0),
-            arrowprops=dict(arrowstyle="->", color="#222222", lw=1.4),
-            zorder=8,
+            "", xy=(0.0, 0.0), xycoords="data",
+            xytext=(0.0, L), textcoords="offset points",
+            arrowprops=arrow, zorder=8,
         )
         self.ax.annotate("0,0", (0.0, 0.0), xytext=(4, -14),
                          textcoords="offset points", fontsize=8,
                          color="#222222", zorder=9)
-        self.ax.annotate("X", (length, 0.0), xytext=(4, -2),
+        self.ax.annotate("X", (0.0, 0.0), xytext=(L + 4, -2),
                          textcoords="offset points", fontsize=8,
                          color="#222222", zorder=9)
-        self.ax.annotate("Y", (0.0, length), xytext=(4, 2),
+        self.ax.annotate("Y", (0.0, 0.0), xytext=(4, L + 4),
                          textcoords="offset points", fontsize=8,
                          color="#222222", zorder=9)
 

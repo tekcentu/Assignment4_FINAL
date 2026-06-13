@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.30.8"
+__version__ = "0.30.10"
 __what_is_new__ = (
-    "Default and generated grids are independent visual layers (toggle each) · "
-    "View → Grid: Generate from nodes, Clear generated grid (undoable) · "
-    "Snap behavior unchanged — display toggles never silently affect clicks"
+    "Coordinate numbers mirrored to top/right spines (no fit/aspect impact) · "
+    "Generated-grid letter labels stick to the spine — no more drift on zoom · "
+    "Optional: show grid letter next to coord on the axes, e.g. '3 (A)'"
 )
 
 from .model import (

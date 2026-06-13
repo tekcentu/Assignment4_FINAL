@@ -113,6 +113,93 @@ def test_canvas_installs_adaptive_locator(qt_app):
     )
 
 
+# ── tick labels mirrored to top/right spines ─────────────────────────────
+
+
+def test_tick_labels_are_mirrored_to_top_and_right(qt_app):
+    """The top + right spines were blank; coordinate numbers should
+    appear on all four sides now (no impact on fitting/aspect)."""
+    canvas = _empty_canvas(qt_app)
+    canvas.redraw()
+    # ax.xaxis lists per-tick objects; each carries labels for both
+    # the bottom (label1) and top (label2) sides.
+    x_ticks = canvas.ax.xaxis.get_major_ticks()
+    y_ticks = canvas.ax.yaxis.get_major_ticks()
+    assert x_ticks and y_ticks
+    assert any(t.label2.get_visible() for t in x_ticks), (
+        "top spine should carry mirrored X tick labels"
+    )
+    assert any(t.label2.get_visible() for t in y_ticks), (
+        "right spine should carry mirrored Y tick labels"
+    )
+    # Bottom + left still rendered (no regression on existing labels).
+    assert any(t.label1.get_visible() for t in x_ticks)
+    assert any(t.label1.get_visible() for t in y_ticks)
+
+
+def test_top_right_mirror_does_not_change_fit_limits(qt_app):
+    """Regression: mirroring labels must not perturb _set_axes_limits.
+    The pre/post-redraw xlim/ylim are identical."""
+    canvas = _empty_canvas(qt_app)
+    canvas.redraw()
+    before = (canvas.ax.get_xlim(), canvas.ax.get_ylim())
+    canvas.redraw()
+    after = (canvas.ax.get_xlim(), canvas.ax.get_ylim())
+    assert before == after
+
+
+# ── origin axes must be a fixed on-screen size (no zoom blow-out) ────────
+
+
+def _origin_arrow_annotations(canvas):
+    """The two empty-text origin arrows drawn in offset-point coords."""
+    from matplotlib.text import Annotation
+    return [
+        t for t in canvas.ax.texts
+        if isinstance(t, Annotation)
+        and t.get_text() == ""
+        and getattr(t, "anncoords", None) == "offset points"
+    ]
+
+
+def _origin_model(qt_app):
+    from structural_analysis.gui_qt.canvas import ModelCanvas
+    from structural_analysis.model import StructuralModel, Node
+    m = StructuralModel(title="origin")
+    # Ensure the origin is inside the data so _draw_origin_axes draws.
+    m.nodes = {1: Node(1, -5.0, -5.0), 2: Node(2, 5.0, 5.0)}
+    return ModelCanvas(None, model_provider=lambda: m)
+
+
+def test_origin_axes_use_fixed_pixel_length(qt_app):
+    canvas = _origin_model(qt_app)
+    canvas.redraw()
+    arrows = _origin_arrow_annotations(canvas)
+    assert len(arrows) == 2
+    offsets = sorted(tuple(a.xyann) for a in arrows)
+    L = canvas._ORIGIN_AXIS_PX
+    # One arrow points +X (L, 0), the other +Y (0, L) — in pixels.
+    assert offsets == [(0.0, L), (L, 0.0)]
+
+
+def test_origin_axes_length_is_zoom_invariant(qt_app):
+    """The previous data-relative length grew with the view span and
+    overshot the canvas after a scroll-zoom (which doesn't redraw)."""
+    canvas = _origin_model(qt_app)
+    canvas.ax.set_xlim(-50.0, 50.0)
+    canvas.ax.set_ylim(-50.0, 50.0)
+    canvas.redraw()
+    wide = sorted(tuple(a.xyann) for a in _origin_arrow_annotations(canvas))
+    # Now a hard zoom-in + redraw — pixel offsets must be identical.
+    canvas.ax.set_xlim(-1.0, 1.0)
+    canvas.ax.set_ylim(-1.0, 1.0)
+    canvas.redraw()
+    tight = sorted(tuple(a.xyann) for a in _origin_arrow_annotations(canvas))
+    assert wide == tight
+    L = canvas._ORIGIN_AXIS_PX
+    assert tight == [(0.0, L), (L, 0.0)]
+
+
 def test_zoom_out_keeps_axis_labels_bounded(qt_app):
     canvas = _empty_canvas(qt_app)
     canvas.redraw()
