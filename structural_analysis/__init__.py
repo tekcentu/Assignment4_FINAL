@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.34.0"
+__version__ = "0.34.1"
 __what_is_new__ = (
-    "Fix: default reference grid stays visible when a structural grid is shown · "
-    "Fix: grid A/B/1/2 labels now gated by the toggle (off by default) · "
-    "Grid lines + plain coordinates always show; letters only when enabled"
+    "Polish: faint reference grid is uniform (minor ticks only, no double-draw) · "
+    "Robustness: section thumbnail guards against an empty outline · "
+    "Follow-ups to the section + grid review notes"
 )
 
 from .model import (
