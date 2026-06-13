@@ -152,6 +152,78 @@ def test_both_layers_hidden_draws_no_grid(qt_app):
             if ln.get_color() == "#aac8ff"] == []
 
 
+def test_default_reference_grid_survives_generated_via_minor_ticks(qt_app):
+    """Regression for the reported bug: with a generated grid shown, the
+    major ticks are pinned to the few generated coordinates, so the fine
+    default reference grid must live on the MINOR ticks — otherwise it
+    collapses onto those lines and the user sees no reference grid. The
+    minor locator gives many more reference lines than the 2 generated
+    x-coords, and they are drawn (grid on 'both')."""
+    from matplotlib.ticker import FixedLocator
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 6.0)],
+        y_lines=[GridLine("1", 0.0), GridLine("2", 3.0)],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_default_grid = True
+    canvas.redraw()
+    # Majors are the 2 generated coords; the reference grid is the minors.
+    assert isinstance(canvas.ax.xaxis.get_major_locator(), FixedLocator)
+    minor_x = canvas.ax.xaxis.get_minor_locator().tick_values(
+        *canvas.ax.get_xlim())
+    assert len(minor_x) > 2, "fine reference grid must add lines beyond the 2 generated coords"
+    minor_gridlines = [t.gridline for t in canvas.ax.xaxis.get_minor_ticks()]
+    assert any(gl.get_visible() for gl in minor_gridlines)
+
+
+def test_default_grid_off_draws_no_minor_reference(qt_app):
+    """Hiding the default grid must remove the minor reference grid too."""
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 6.0)], y_lines=[],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_default_grid = False
+    canvas.redraw()
+    assert not any(ln.get_visible() for ln in canvas.ax.get_xgridlines())
+    minor_gridlines = [t.gridline for t in canvas.ax.xaxis.get_minor_ticks()]
+    assert not any(gl.get_visible() for gl in minor_gridlines)
+
+
+# ── grid-line letter labels are gated behind the toggle ──────────────────
+
+
+def test_letters_hidden_by_default_but_lines_drawn(qt_app):
+    """The reported bug: the A/B/1/2 labels showed even with the toggle
+    off. Now, toggle off → coloured grid LINES but NO letter labels."""
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 6.0)],
+        y_lines=[GridLine("1", 0.0)],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    assert canvas.show_generated_grid_labels_on_ticks is False
+    canvas.redraw()
+    # Grid lines are still drawn …
+    assert [ln for ln in canvas.ax.lines if ln.get_color() == "#aac8ff"]
+    # … but no letter overlay text.
+    assert _generated_letter_texts(canvas) == []
+
+
+def test_letters_shown_when_toggle_on(qt_app):
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 6.0)],
+        y_lines=[GridLine("1", 0.0)],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_generated_grid_labels_on_ticks = True
+    canvas.redraw()
+    overlay = sorted(t.get_text().strip() for t in _generated_letter_texts(canvas))
+    assert overlay == ["1", "A", "B"]
+
+
 # ── generated grid coordinates appear on the spine (constant values) ─────
 
 
@@ -255,6 +327,7 @@ def test_x_line_letter_labels_use_xaxis_transform(qt_app):
         y_lines=[],
     )
     canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_generated_grid_labels_on_ticks = True
     canvas.redraw()
     letters = _generated_letter_texts(canvas)
     assert letters, "expected generated X-line letter labels"
@@ -270,6 +343,7 @@ def test_y_line_letter_labels_use_yaxis_transform(qt_app):
         y_lines=[GridLine("1", 0.0), GridLine("2", 3.2)],
     )
     canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_generated_grid_labels_on_ticks = True
     canvas.redraw()
     letters = _generated_letter_texts(canvas)
     assert letters, "expected generated Y-line letter labels"
@@ -288,6 +362,7 @@ def test_x_line_letter_label_sits_on_top_spine_after_zoom(qt_app):
         x_lines=[GridLine("A", 0.0)], y_lines=[],
     )
     canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.show_generated_grid_labels_on_ticks = True
     canvas.redraw()
     letters = _generated_letter_texts(canvas)
     assert letters

@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.33.0"
+__version__ = "0.34.0"
 __what_is_new__ = (
-    "Section dimension labels (b / h / tf / tw) now share one drawing helper · "
-    "Labels pinned to the panel edges with leaders — no more clipped 'h =' on squares · "
-    "Element-Details thumbnail and Add-Section preview can no longer drift"
+    "Fix: default reference grid stays visible when a structural grid is shown · "
+    "Fix: grid A/B/1/2 labels now gated by the toggle (off by default) · "
+    "Grid lines + plain coordinates always show; letters only when enabled"
 )
 
 from .model import (

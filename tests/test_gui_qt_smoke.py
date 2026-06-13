@@ -6831,6 +6831,9 @@ def test_labeled_grid_draws_only_visible_viewport_lines(qt_app):
         x_count=80, x_spacing=1.0,
         y_count=80, y_spacing=1.0,
     )
+    # The letter labels are gated behind the toggle; enable it so this
+    # test can verify which in-viewport letters get drawn.
+    w.canvas.show_generated_grid_labels_on_ticks = True
     w.canvas.redraw()
     w.canvas.ax.set_xlim(10.0, 14.0)
     w.canvas.ax.set_ylim(20.0, 24.0)
