@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.31.0"
+__version__ = "0.32.0"
 __what_is_new__ = (
-    "Element Details section preview now shows measured dimensions (b / h, tf / tw) · "
-    "Manual sections label the √A equivalent-square side instead of an unlabelled shape · "
-    "Matches the Add-Section live-preview annotations"
+    "Three new combined examples in File → Open example… · "
+    "Show load cases + combinations, rigid offsets, diagonal bracing and modal together · "
+    "example_09 braced frame · example_10 rigid offsets · example_11 kitchen-sink"
 )
 
 from .model import (
