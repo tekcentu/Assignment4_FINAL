@@ -640,10 +640,22 @@ def _draw_section_thumbnail(ax, section: Optional[Section]) -> None:
     # Dimension annotations — the detail view used to show only the
     # outline + a shape-name caption, so the user couldn't read off the
     # actual section sizes. Annotate b / h (and tf / tw for I-sections)
-    # right on the thumbnail, matching the Add-Section live preview.
-    _annotate_section_dimensions(ax, section, zs, ys)
-
+    # right on the thumbnail through the SAME shared helper the Add-Section
+    # dialog preview uses, so the two panels can't drift. Overall width /
+    # depth come from the drawn outline's bounding box, so the labels match
+    # what's on screen (incl. the manual √A fallback square).
     shape = getattr(section, "shape_type", None) or "manual"
+    w = max(zs) - min(zs)
+    h_box = max(ys) - min(ys)
+    if shape == "manual":
+        annotate_section_dimensions(ax, b=w, h=h_box, fallback=True)
+    else:
+        b = section.b if getattr(section, "b", 0.0) > 0.0 else w
+        h = section.h if getattr(section, "h", 0.0) > 0.0 else h_box
+        tf = getattr(section, "tf", 0.0) if shape == "i_section" else 0.0
+        tw = getattr(section, "tw", 0.0) if shape == "i_section" else 0.0
+        annotate_section_dimensions(ax, b=b, h=h, tf=tf, tw=tw)
+
     if shape == "manual":
         ax.text(0.5, -0.16,
                 "area-equivalent square (√A) — drawn size is approximate",
@@ -654,63 +666,64 @@ def _draw_section_thumbnail(ax, section: Optional[Section]) -> None:
                 ha="center", va="top", fontsize=7, color="#555")
 
 
-def _annotate_section_dimensions(ax, section: "Section", zs, ys) -> None:
-    """Label the cross-section's measured sizes on a section thumbnail.
+def annotate_section_dimensions(
+    ax, *, b: float, h: float, tf: float = 0.0, tw: float = 0.0,
+    fallback: bool = False, units: str = " m", color: str = "#333",
+) -> None:
+    """Single source of truth for the b / h / tf / tw dimension labels on a
+    section thumbnail.
 
-    ``zs`` / ``ys`` are the drawn outline coordinates (z = horizontal /
-    width, y = vertical / depth). Overall width and depth come from the
-    drawn outline's bounding box, so the labels always match what's on
-    screen — including the manual √A fallback square, whose side is
-    annotated honestly rather than left unlabelled. Known shapes get
-    ``b`` / ``h`` from the section fields; I-sections also get
-    ``tf`` / ``tw``. After annotating, the view is padded so the labels
-    don't run off the panel edge (same approach as the dialog preview).
+    Used by BOTH the Element-Details section preview (``_draw_section_thumbnail``
+    above) and the Add-Section dialog previews (``dialogs.py``) so the
+    label-placement geometry can't drift between the two panels. Positions
+    are derived from the origin-centred section's ``b`` / ``h`` (every shape
+    from :func:`section_outline` is centred on the origin), so all callers
+    place labels identically. Cosmetics that callers legitimately differ on
+    are parameters:
+
+    * ``fallback`` — a manual √A equivalent square: label the two sides as
+      ``"≈ <n><units>"`` instead of ``"b = …"`` / ``"h = …"``.
+    * ``units`` — suffix on the overall b / h labels (``" m"`` in the detail
+      view, ``""`` in the dialog where a "(m)" form label is already shown).
+    * ``color`` — label colour (a muted grey for the dialog's *example*
+      outline vs the default near-black).
+
+    After annotating, the data view is padded so the labels don't clip.
+    No-ops when ``b`` or ``h`` is non-positive.
     """
-    if not zs or not ys:
-        return
-    z_min, z_max = min(zs), max(zs)
-    y_min, y_max = min(ys), max(ys)
-    w = z_max - z_min            # width  (along local z)
-    d = y_max - y_min            # depth  (along local y)
-    if w <= 0.0 or d <= 0.0:
+    if not (b > 0.0 and h > 0.0):
         return
 
-    shape = getattr(section, "shape_type", None) or "manual"
-    if shape == "manual":
-        # The outline is a √A equivalent square; label its side.
-        ax.annotate(f"≈ {w:g} m", xy=(0.0, y_min),
-                    xytext=(0.0, y_min - 0.20 * d),
-                    ha="center", va="top", fontsize=7, color="#333")
-        ax.annotate(f"≈ {d:g} m", xy=(z_max, 0.0),
-                    xytext=(z_max + 0.20 * w, 0.0),
-                    ha="left", va="center", fontsize=7, color="#333")
+    if fallback:
+        ax.annotate(f"≈ {b:g}{units}", xy=(0.0, -h / 2.0),
+                    xytext=(0.0, -h / 2.0 - 0.20 * h),
+                    ha="center", va="top", fontsize=7, color=color)
+        ax.annotate(f"≈ {h:g}{units}", xy=(b / 2.0, 0.0),
+                    xytext=(b / 2.0 + 0.20 * b, 0.0),
+                    ha="left", va="center", fontsize=7, color=color)
     else:
-        b = section.b if getattr(section, "b", 0.0) > 0.0 else w
-        h = section.h if getattr(section, "h", 0.0) > 0.0 else d
-        ax.annotate(f"b = {b:g} m", xy=(0.0, y_min),
-                    xytext=(0.0, y_min - 0.20 * d),
-                    ha="center", va="top", fontsize=8, color="#333")
-        ax.annotate(f"h = {h:g} m", xy=(z_max, 0.0),
-                    xytext=(z_max + 0.20 * w, 0.0),
-                    ha="left", va="center", fontsize=8, color="#333")
-        if shape == "i_section":
-            tf, tw = getattr(section, "tf", 0.0), getattr(section, "tw", 0.0)
-            if tf > 0.0:
-                ax.annotate(f"tf = {tf:g}", xy=(-b / 2.0, h / 2.0 - tf / 2.0),
-                            xytext=(-b / 2.0 - 0.24 * b, h / 2.0 - tf / 2.0),
-                            ha="right", va="center", fontsize=7, color="#333")
-            if tw > 0.0:
-                ax.annotate(f"tw = {tw:g}", xy=(tw / 2.0, 0.0),
-                            xytext=(tw / 2.0 + 0.20 * b, -0.28 * h),
-                            ha="left", va="center", fontsize=7, color="#333")
+        ax.annotate(f"b = {b:g}{units}", xy=(0.0, -h / 2.0),
+                    xytext=(0.0, -h / 2.0 - 0.20 * h),
+                    ha="center", va="top", fontsize=8, color=color)
+        ax.annotate(f"h = {h:g}{units}", xy=(b / 2.0, 0.0),
+                    xytext=(b / 2.0 + 0.20 * b, 0.0),
+                    ha="left", va="center", fontsize=8, color=color)
+        if tf > 0.0:
+            ax.annotate(f"tf = {tf:g}", xy=(-b / 2.0, h / 2.0 - tf / 2.0),
+                        xytext=(-b / 2.0 - 0.22 * b, h / 2.0 - tf / 2.0),
+                        ha="right", va="center", fontsize=7, color=color)
+        if tw > 0.0:
+            ax.annotate(f"tw = {tw:g}", xy=(tw / 2.0, 0.0),
+                        xytext=(tw / 2.0 + 0.20 * b, -0.25 * h),
+                        ha="left", va="center", fontsize=7, color=color)
 
     # Breathing room so the dimension labels stay inside the panel.
     ax.relim()
     ax.autoscale_view()
     x0, x1 = ax.get_xlim()
     y0, y1 = ax.get_ylim()
-    pad_x = (x1 - x0) * 0.32 + 1e-6
-    pad_y = (y1 - y0) * 0.28 + 1e-6
+    pad_x = (x1 - x0) * 0.30 + 1e-6
+    pad_y = (y1 - y0) * 0.25 + 1e-6
     ax.set_xlim(x0 - pad_x, x1 + pad_x)
     ax.set_ylim(y0 - pad_y, y1 + pad_y)
 

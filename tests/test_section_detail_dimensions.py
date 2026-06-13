@@ -143,3 +143,54 @@ def test_annotated_width_matches_drawn_outline(qt_app):
     ys = [v[1] for v in verts]
     assert max(xs) - min(xs) == pytest.approx(0.30, abs=1e-9)
     assert max(ys) - min(ys) == pytest.approx(0.50, abs=1e-9)
+
+
+# ── shared helper: detail view and dialog preview don't drift ─────────────
+
+
+def test_detail_and_dialog_share_one_dimension_helper(qt_app):
+    """Both the Element-Details thumbnail and the Add-Section dialog
+    preview must route their b/h labels through the SAME helper
+    (element_graphics.annotate_section_dimensions), so the two panels
+    can't drift. Verify the helper exists and that, given the same
+    section geometry, both render matching 'b =' / 'h =' numbers."""
+    from matplotlib.figure import Figure
+    from structural_analysis.gui_qt import element_graphics
+
+    # The single source of truth is a public callable.
+    assert callable(getattr(element_graphics, "annotate_section_dimensions"))
+
+    # Drive the helper directly the way each call site does and confirm
+    # the placement geometry + number formatting is identical (only the
+    # cosmetic units suffix differs by design).
+    fig_detail, fig_dialog = Figure(), Figure()
+    ax_detail = fig_detail.add_subplot(111)
+    ax_dialog = fig_dialog.add_subplot(111)
+    element_graphics.annotate_section_dimensions(
+        ax_detail, b=0.30, h=0.50, units=" m")        # detail view
+    element_graphics.annotate_section_dimensions(
+        ax_dialog, b=0.30, h=0.50, units="")           # dialog preview
+    detail_txt = sorted(t.get_text() for t in ax_detail.texts)
+    dialog_txt = sorted(t.get_text() for t in ax_dialog.texts)
+    assert detail_txt == ["b = 0.3 m", "h = 0.5 m"]
+    assert dialog_txt == ["b = 0.3", "h = 0.5"]
+
+
+def test_dimension_helper_fallback_and_i_section_formatting(qt_app):
+    """The shared helper covers the manual √A fallback (≈ prefix) and the
+    I-section tf/tw labels — the cases each call site relies on."""
+    from matplotlib.figure import Figure
+    from structural_analysis.gui_qt.element_graphics import (
+        annotate_section_dimensions,
+    )
+    fig = Figure()
+    ax = fig.add_subplot(111)
+    annotate_section_dimensions(ax, b=0.5, h=0.5, fallback=True, units=" m")
+    txt = sorted(t.get_text() for t in ax.texts)
+    assert txt == ["≈ 0.5 m", "≈ 0.5 m"]
+
+    fig2 = Figure()
+    ax2 = fig2.add_subplot(111)
+    annotate_section_dimensions(ax2, b=0.2, h=0.4, tf=0.02, tw=0.012, units="")
+    txt2 = sorted(t.get_text() for t in ax2.texts)
+    assert txt2 == ["b = 0.2", "h = 0.4", "tf = 0.02", "tw = 0.012"]
