@@ -3550,7 +3550,6 @@ class ElementPropertiesDialog(QDialog):
         form.addRow("Kind:", QLabel(elem.kind.capitalize()))
         form.addRow("Nodes:", QLabel(f"{elem.node_i} → {elem.node_j}"))
         form.addRow("Length:", QLabel(f"{length:g} m"))
-
         if section is not None:
             sec_text = section.name or f"section {section.id}"
             form.addRow("Section:", QLabel(f"{sec_text}  (id {section.id})"))
@@ -4132,6 +4131,85 @@ def _direction_label_for_row(row) -> str:
     if row.direction:
         return row.direction
     return "—"
+
+    # ── Interactive handlers ──────────────────────────────────────────
+
+    def _on_diagram_motion(self, event) -> None:
+        """Synchronise the crosshair cursor across N/V/M axes and update
+        the readout strip.  Bound to both motion_notify and button_press."""
+        if not self._cursors or self._f_local_ref is None:
+            return
+        if event.inaxes not in self._diagram_axes_set:
+            for c in self._cursors:
+                c.set_alpha(0.0)
+            for lbl, base in (
+                (self._lbl_x, "x"),
+                (self._lbl_N, "N"),
+                (self._lbl_V, "V"),
+                (self._lbl_M, "M"),
+            ):
+                lbl.setText(f"{base}: —")
+            self._detail_canvas.draw_idle()
+            return
+
+        if event.xdata is None:
+            return
+        x = max(0.0, min(self._L, float(event.xdata)))
+        for c in self._cursors:
+            c.set_xdata([x, x])
+            c.set_alpha(0.7)
+
+        n_val = self._internal_force_at(
+            self._elem_ref, self._ni_ref, self._nj_ref,
+            self._f_local_ref, "axial", x)
+        v_val = self._internal_force_at(
+            self._elem_ref, self._ni_ref, self._nj_ref,
+            self._f_local_ref, "shear", x)
+        m_val = self._internal_force_at(
+            self._elem_ref, self._ni_ref, self._nj_ref,
+            self._f_local_ref, "moment", x)
+
+        self._lbl_x.setText(f"x: {x:.3f} m")
+        self._lbl_N.setText(f"N: {n_val:.3f} kN"
+                            if n_val is not None else "N: —")
+        self._lbl_V.setText(f"V: {v_val:.3f} kN"
+                            if v_val is not None else "V: —")
+        self._lbl_M.setText(f"M: {m_val:.3f} kN·m"
+                            if m_val is not None else "M: —")
+        self._detail_canvas.draw_idle()
+
+    def _toggle_maxima(self, state: int) -> None:
+        """Add / remove absolute-peak annotations on each diagram axis."""
+        for ann in self._maxima_annotations:
+            try:
+                ann.remove()
+            except ValueError:
+                pass
+        self._maxima_annotations.clear()
+
+        if state and self._f_local_ref is not None:
+            for kind, ax in (
+                ("axial",  self._ax_n),
+                ("shear",  self._ax_v),
+                ("moment", self._ax_m),
+            ):
+                xs, ys = self._sample_internal_force(
+                    self._elem_ref, self._ni_ref, self._nj_ref,
+                    self._f_local_ref, kind, n_samples=101,
+                )
+                if xs is None or ys is None:
+                    continue
+                peak_i = max(range(len(ys)), key=lambda i: abs(ys[i]))
+                ann = ax.annotate(
+                    f"{ys[peak_i]:.3g}",
+                    xy=(xs[peak_i], ys[peak_i]),
+                    xytext=(0, 10), textcoords="offset points",
+                    fontsize=7, color="#222", ha="center",
+                    arrowprops=dict(arrowstyle="->", lw=0.7, color="#444"),
+                )
+                self._maxima_annotations.append(ann)
+
+        self._detail_canvas.draw_idle()
 
 
 def _element_local_forces(result, elem_id: int):
