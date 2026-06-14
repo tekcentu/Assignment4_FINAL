@@ -938,20 +938,33 @@ class ModelCanvas(QWidget):
         if self.show_default_grid:
             alpha = 0.4 if gen_visible else 1.0
             if gen_visible:
-                # The major ticks are pinned to the generated-grid
-                # coordinates (so the spine reads those constant values),
-                # which means ax.grid(major) alone would collapse the
-                # default reference grid onto just those few lines — the
-                # user reported it "never shows" once a grid is generated.
-                # Keep it an independent layer by drawing the fine
-                # reference grid on the MINOR ticks at adaptive spacing.
-                self.ax.xaxis.set_minor_locator(
-                    AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
-                self.ax.yaxis.set_minor_locator(
-                    AdaptiveGridLocator(self.grid_spacing, self.MAX_AXIS_LABELS))
+                # Decide the reference grid PER AXIS, because a GridSystem
+                # may carry lines on only one axis. An axis WITH generated
+                # lines has its major ticks pinned to those coordinates
+                # (already marked by the solid light-blue lines), so we draw
+                # the faint reference grid on its MINOR ticks instead —
+                # drawing it on the majors too (which="both") would lay a
+                # second dotted line under each blue one, darkening those
+                # lines. An axis WITHOUT generated lines keeps the adaptive
+                # AdaptiveGridLocator on its MAJORS (see
+                # _install_axis_locators), so its reference grid must stay on
+                # the major ticks: a minor grid there would be pruned where
+                # the minor ticks coincide with the (identical) major ticks,
+                # leaving that axis with no reference lines at all.
                 self.ax.tick_params(which="minor", length=0)
-                self.ax.grid(True, which="both", linestyle=":",
-                             linewidth=0.5, color="#cccccc", alpha=alpha)
+                for axis, lines in (
+                    (self.ax.xaxis, grid.x_lines),
+                    (self.ax.yaxis, grid.y_lines),
+                ):
+                    if lines:
+                        axis.set_minor_locator(AdaptiveGridLocator(
+                            self.grid_spacing, self.MAX_AXIS_LABELS))
+                        axis.grid(True, which="minor", linestyle=":",
+                                  linewidth=0.5, color="#cccccc", alpha=alpha)
+                        axis.grid(False, which="major")
+                    else:
+                        axis.grid(True, which="major", linestyle=":",
+                                  linewidth=0.5, color="#cccccc", alpha=alpha)
             else:
                 self.ax.grid(True, which="major", linestyle=":",
                              linewidth=0.5, color="#cccccc", alpha=alpha)
