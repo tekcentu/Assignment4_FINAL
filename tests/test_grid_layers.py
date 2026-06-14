@@ -87,6 +87,34 @@ def test_default_grid_remains_visible_when_generated_is_populated(qt_app):
     assert any(ln.get_visible() for ln in y_minor)
 
 
+def test_one_axis_generated_grid_keeps_other_axis_reference_grid(qt_app):
+    """Regression: a GridSystem with lines on only ONE axis must still
+    show the dotted reference grid on the OTHER axis.
+
+    The axis with generated lines pins its majors to those coordinates and
+    carries the reference grid on its minors; the axis WITHOUT lines keeps
+    the adaptive locator on its majors, so its reference grid must live on
+    the majors — a minor grid there would be pruned where it coincides with
+    the (identical) major ticks, leaving that axis blank (the old
+    ``which="minor"`` bug)."""
+    from structural_analysis.gui_qt.grid import GridLine, GridSystem
+    # Lines on X only; Y is left to the adaptive default.
+    sys_grid = GridSystem(
+        x_lines=[GridLine("A", 0.0), GridLine("B", 6.0)],
+        y_lines=[],
+    )
+    canvas = _canvas(qt_app, _model_with_nodes(), lambda: sys_grid)
+    canvas.redraw()
+    # X carries generated lines → reference grid on its minor ticks.
+    x_minor = [t.gridline for t in canvas.ax.xaxis.get_minor_ticks()]
+    assert any(ln.get_visible() for ln in x_minor)
+    # Y has no generated lines → reference grid must stay on its majors.
+    y_major = list(canvas.ax.get_ygridlines())
+    assert any(ln.get_visible() for ln in y_major), (
+        "axis without generated lines must keep its major reference grid"
+    )
+
+
 def test_generated_grid_can_be_hidden_independently(qt_app):
     """Toggling show_generated_grid off must remove the labeled lines
     (the colored axvline/axhline strokes) while leaving the default

@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.34.1"
+__version__ = "0.34.2"
 __what_is_new__ = (
-    "Polish: faint reference grid is uniform (minor ticks only, no double-draw) · "
-    "Robustness: section thumbnail guards against an empty outline · "
-    "Follow-ups to the section + grid review notes"
+    "Fix: one-axis generated grids keep the reference grid on the other axis · "
+    "Reference grid is per-axis (minor where lines exist, major otherwise) · "
+    "Section thumbnail guards against an empty outline"
 )
 
 from .model import (
