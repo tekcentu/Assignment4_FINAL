@@ -118,6 +118,20 @@ def test_menu_handler_rejects_truss(qt_app, monkeypatch):
     assert w._precast_window is None  # no window opened for a truss
 
 
+def test_menu_trigger_bool_is_treated_as_no_target(qt_app):
+    """Regression: QAction.triggered passes checked=False, which PyQt
+    feeds into elem_id. The handler must treat a bool as 'use selection',
+    not look up element id False ('Element False not found')."""
+    w = MainWindow()
+    eid = _seed_frame(w)
+    w.canvas.select_element(eid)
+    # Simulate the menu action firing with the checked bool.
+    w._show_precast_stages(False)
+    assert w._precast_window is not None
+    assert w._precast_window._member is not None
+    assert w._precast_window._member.elem_id == eid
+
+
 def test_window_does_not_mutate_main_model(qt_app):
     w = MainWindow()
     eid = _seed_frame(w)

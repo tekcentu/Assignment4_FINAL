@@ -2561,6 +2561,11 @@ class MainWindow(QMainWindow):
         from .precast import resolve_single_frame
         from .precast_window import PrecastHandlingWindow
 
+        # QAction.triggered passes a ``checked`` bool; when this is wired
+        # straight to a menu action PyQt feeds that False into ``elem_id``.
+        # Treat any bool as "no explicit target → use the selection".
+        if isinstance(elem_id, bool):
+            elem_id = None
         ids = [elem_id] if elem_id is not None \
             else list(self.canvas.get_selected_elements())
         try:
