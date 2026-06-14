@@ -2,8 +2,9 @@
 
 Run under the offscreen Qt platform plugin so they work headless. The
 pure statics are exercised in ``test_precast.py``; here we only confirm
-the window constructs, drives the engine, rejects a truss selection
-clearly, and never mutates the main model.
+the window constructs, drives the engine across all three stages on a
+single sheet, rejects a truss selection clearly, and never mutates the
+main model.
 """
 
 from __future__ import annotations
@@ -23,8 +24,10 @@ except Exception as exc:  # noqa: BLE001
 from structural_analysis.element import FrameElement2D, TrussElement2D  # noqa: E402
 from structural_analysis.gui_qt.app import MainWindow  # noqa: E402
 from structural_analysis.gui_qt.precast import (  # noqa: E402
-    SCHEME_ONE_POINT,
+    STAGE_LIFTING,
+    STAGE_STOCK,
     STAGE_TRUCK,
+    STAGES,
 )
 from structural_analysis.gui_qt.precast_window import (  # noqa: E402
     PrecastHandlingWindow,
@@ -55,45 +58,85 @@ def _seed_frame(w: MainWindow, L: float = 8.0) -> int:
     return 1
 
 
-def test_window_constructs_and_targets_frame(qt_app):
+def test_window_constructs_with_all_three_stages_on_one_sheet(qt_app):
     w = MainWindow()
     eid = _seed_frame(w)
     win = PrecastHandlingWindow(w, lambda: w._model)
     win.set_target(eid)
-    # Default stage produces two reactions in the results table.
-    assert win._results.rowCount() == 2
+    # All three stages computed and rendered together — no stage selector.
+    assert set(win._rows.keys()) == set(STAGES)
+    assert set(win._last_results.keys()) == set(STAGES)
+    for key in STAGES:
+        assert len(win._last_results[key].reactions) == 2
+    # Only the lifting row owns the sling and suction controls.
+    assert win._rows[STAGE_LIFTING].sling_angle is not None
+    assert win._rows[STAGE_STOCK].sling_angle is None
+    assert win._rows[STAGE_TRUCK].sling_angle is None
     assert "Element 1" in win._member_label.text()
 
 
-def test_window_recomputes_on_stage_and_scheme_change(qt_app):
+def test_auto_space_seeds_per_stage_defaults(qt_app):
+    w = MainWindow()
+    eid = _seed_frame(w, L=10.0)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    # Truck stage: 0.1L / 0.9L; stock / lifting: 0.2L / 0.8L.
+    assert win._rows[STAGE_LIFTING].p1.value() == pytest.approx(2.0)
+    assert win._rows[STAGE_LIFTING].p2.value() == pytest.approx(8.0)
+    assert win._rows[STAGE_TRUCK].p1.value() == pytest.approx(1.0)
+    assert win._rows[STAGE_TRUCK].p2.value() == pytest.approx(9.0)
+
+    # Edit truck positions, then click Auto-space → defaults restored.
+    win._rows[STAGE_TRUCK].p1.setValue(3.0)
+    win._rows[STAGE_TRUCK].p2.setValue(6.0)
+    qt_app.processEvents()
+    win._rows[STAGE_TRUCK].auto_btn.click()
+    qt_app.processEvents()
+    assert win._rows[STAGE_TRUCK].p1.value() == pytest.approx(1.0)
+    assert win._rows[STAGE_TRUCK].p2.value() == pytest.approx(9.0)
+
+
+def test_global_daf_change_rescales_all_stages(qt_app):
     w = MainWindow()
     eid = _seed_frame(w)
     win = PrecastHandlingWindow(w, lambda: w._model)
     win.set_target(eid)
-
-    # Switch to one-point lifting → exactly one reaction row.
-    win._stage_combo.setCurrentIndex(0)  # lifting
-    idx = win._scheme_combo.findData(SCHEME_ONE_POINT)
-    win._scheme_combo.setCurrentIndex(idx)
+    base = {k: win._last_results[k].total_load for k in STAGES}
+    win._daf.setValue(1.5)
     qt_app.processEvents()
-    assert win._results.rowCount() == 1
+    for k in STAGES:
+        assert win._last_results[k].total_load == pytest.approx(1.5 * base[k])
 
-    # Truck stage → two supports, no sling columns.
-    tidx = win._stage_combo.findData(STAGE_TRUCK)
-    win._stage_combo.setCurrentIndex(tidx)
+
+def test_row_position_edit_triggers_recompute(qt_app):
+    w = MainWindow()
+    eid = _seed_frame(w, L=8.0)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    before = win._last_results[STAGE_STOCK].reactions
+    win._rows[STAGE_STOCK].p1.setValue(0.5)
+    win._rows[STAGE_STOCK].p2.setValue(7.5)
     qt_app.processEvents()
-    assert win._results.rowCount() == 2
+    after = win._last_results[STAGE_STOCK].reactions
+    assert after != before
+    # Other stages unaffected by editing only stock points.
+    assert (win._last_results[STAGE_LIFTING].reactions[0][0]
+            == pytest.approx(0.2 * 8.0))
 
 
-def test_copy_report_populates_clipboard(qt_app):
+def test_copy_report_includes_all_three_stages(qt_app):
     w = MainWindow()
     eid = _seed_frame(w)
     win = PrecastHandlingWindow(w, lambda: w._model)
     win.set_target(eid)
     win._copy_report()
     cb = QApplication.clipboard()
-    assert "Precast Handling Stage" in cb.text()
-    assert "display-only" in cb.text()
+    txt = cb.text()
+    assert "Precast Handling Stages" in txt
+    assert "Lifting" in txt
+    assert "Stock" in txt
+    assert "Truck" in txt
+    assert "display-only" in txt
 
 
 def test_menu_handler_rejects_truss(qt_app, monkeypatch):
@@ -138,11 +181,10 @@ def test_window_does_not_mutate_main_model(qt_app):
     before = copy.deepcopy(w._model)
     win = PrecastHandlingWindow(w, lambda: w._model)
     win.set_target(eid)
-    # Exercise several stages / inputs.
+    # Exercise several inputs across rows.
     win._daf.setValue(1.4)
-    win._suction.setValue(2.0)
-    qt_app.processEvents()
-    win._stage_combo.setCurrentIndex(1)
+    win._rows[STAGE_LIFTING].suction.setValue(2.0)
+    win._rows[STAGE_STOCK].p1.setValue(1.0)
     qt_app.processEvents()
 
     assert len(w._model.elements) == len(before.elements)

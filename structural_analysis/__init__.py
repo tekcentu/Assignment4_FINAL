@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.35.0"
+__version__ = "0.36.0"
 __what_is_new__ = (
-    "Precast Handling Stages: check one frame member through lifting / stock / "
-    "truck stages · Reactions, sling tensions, V/M (shared diagram helpers) · "
-    "Temporary tool — does not change the model"
+    "Precast Handling Stages V2: all three stages on one scrolling sheet · "
+    "Always 2 supports; per-stage Auto-space button · "
+    "Global DAF / weight / orientation drive all stages at once"
 )
 
 from .model import (

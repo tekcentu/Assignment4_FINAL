@@ -1,4 +1,4 @@
-"""Precast Handling Stage statics engine (V1) — Qt-free.
+"""Precast Handling Stage statics engine (V2) — Qt-free.
 
 Computes support / lifting reactions, sling tensions, and V/M diagrams
 for a single precast *frame* member during three temporary handling
@@ -11,6 +11,10 @@ Design notes
   selected element is snapshotted into a :class:`MemberSpec` (plain
   floats) so the main model can never be mutated by this tool.
 
+* Every stage uses **exactly two supports / lift points**. Statics
+  determinacy keeps the math closed-form; continuous-beam (3+ supports)
+  is out of scope for this tool.
+
 * V and M diagrams are NOT computed with a second BMD/SFD formula. The
   handling beam is modelled as a *free–free* member whose member loads
   are the self-weight UDL (plus optional extra UDL / suction) and the
@@ -19,7 +23,7 @@ Design notes
   integrate it. This honours the "single source of truth for N/V/M
   math" rule in ``CLAUDE.md``.
 
-* V1 calculates the **horizontal handling position only**. The window
+* V2 calculates the **horizontal handling position only**. The window
   may *display* the member at the model angle or a custom angle, but
   those are display-only — gravity projection for inclined handling is
   intentionally out of scope (see :data:`DISPLAY_ONLY_NOTE`).
@@ -53,9 +57,6 @@ STAGE_LABELS = {
     STAGE_TRUCK: "Truck / transport support",
 }
 
-SCHEME_ONE_POINT = "one_point"
-SCHEME_TWO_POINT = "two_point"
-
 ORIENT_HORIZONTAL = "horizontal"
 ORIENT_MODEL = "model_angle"
 ORIENT_CUSTOM = "custom"
@@ -65,7 +66,20 @@ DISPLAY_ONLY_NOTE = (
     "Diagrams computed for horizontal handling; angle is display-only."
 )
 
+# Per-stage default auto-even fractions of L for (point 1, point 2).
+DEFAULT_AUTO_POINTS = {
+    STAGE_LIFTING: (0.2, 0.8),
+    STAGE_STOCK: (0.2, 0.8),
+    STAGE_TRUCK: (0.1, 0.9),
+}
+
 _POS_TOL = 1e-9
+
+
+def auto_even_points(stage_key: str, length: float) -> tuple[float, float]:
+    """Return the default evenly-spaced two-point layout for a stage."""
+    f1, f2 = DEFAULT_AUTO_POINTS.get(stage_key, (0.2, 0.8))
+    return (round(f1 * length, 3), round(f2 * length, 3))
 
 
 # ── Member snapshot ───────────────────────────────────────────────
@@ -154,16 +168,19 @@ def resolve_single_frame(model, selected_ids):
 
 @dataclass
 class StageInput:
-    """User-editable handling-stage parameters (temporary UI state)."""
+    """User-editable handling-stage parameters (temporary UI state).
+
+    ``points`` is always exactly two positions along the member, from
+    end *i* (in metres). The two points must be distinct.
+    """
 
     stage: str = STAGE_LIFTING
-    points: tuple[float, ...] = ()       # positions along L, from end i (m)
-    lifting_scheme: str = SCHEME_TWO_POINT
-    sling_angle_deg: float = 60.0        # from horizontal
+    points: tuple[float, float] = (0.0, 0.0)   # (x1, x2), 0 ≤ xk ≤ L
+    sling_angle_deg: float = 60.0              # lifting only
     daf: float = 1.0
-    manual_weight: float | None = None   # kN/m override of self-weight UDL
-    suction: float = 0.0                 # kN/m downward, lifting only
-    extra_udl: float = 0.0               # kN/m downward
+    manual_weight: float | None = None         # kN/m override of self-weight
+    suction: float = 0.0                       # kN/m downward, lifting only
+    extra_udl: float = 0.0                     # kN/m downward
     orientation: str = ORIENT_HORIZONTAL
     custom_angle_deg: float = 0.0
 
@@ -189,18 +206,11 @@ class HandlingResult:
 # ── Core computation ──────────────────────────────────────────────
 
 
-def _required_point_count(stage: StageInput) -> int:
-    if stage.stage == STAGE_LIFTING and stage.lifting_scheme == SCHEME_ONE_POINT:
-        return 1
-    return 2
-
-
-def _validate_points(points, length: float, need: int) -> list[float]:
+def _validate_points(points, length: float) -> list[float]:
     pts = [float(p) for p in points]
-    if len(pts) != need:
+    if len(pts) != 2:
         raise ValueError(
-            f"This configuration needs exactly {need} "
-            f"support/lift point(s); got {len(pts)}."
+            f"Every stage needs exactly 2 support/lift points; got {len(pts)}."
         )
     for p in pts:
         if p < -_POS_TOL or p > length + _POS_TOL:
@@ -209,7 +219,7 @@ def _validate_points(points, length: float, need: int) -> list[float]:
                 f"[0, {length:g}] m."
             )
     pts = [min(max(p, 0.0), length) for p in pts]
-    if need == 2 and abs(pts[0] - pts[1]) < 1e-6:
+    if abs(pts[0] - pts[1]) < 1e-6:
         raise ValueError(
             "The two support/lift points must be at distinct positions."
         )
@@ -220,17 +230,8 @@ def _reactions(
     pts: list[float], total_load: float, centroid: float,
     warnings: list[str],
 ) -> list[tuple[float, float]]:
-    """Statically-determinate reactions for 1 or 2 supports under a load
+    """Statically-determinate reactions for two supports under a load
     resultant ``total_load`` acting at ``centroid``."""
-    if len(pts) == 1:
-        x = pts[0]
-        if abs(x - centroid) > 1e-6:
-            warnings.append(
-                "Single lift point is not at the member centroid "
-                f"({centroid:g} m): the member is not balanced and would "
-                "rotate. Reaction is reported as the total load."
-            )
-        return [(x, total_load)]
     a, b = sorted(pts)
     # ΣM about a: R_b·(b − a) = W·(centroid − a)
     r_b = total_load * (centroid - a) / (b - a)
@@ -284,8 +285,8 @@ def compute_handling(
     """Compute a handling stage for ``member`` (horizontal handling).
 
     Raises:
-        ValueError: on any invalid input (bad point count / position,
-            non-positive DAF, negative weights, bad sling angle, …).
+        ValueError: on any invalid input (bad point positions, non-positive
+            DAF, negative weights, bad sling angle, …).
     """
     warnings: list[str] = []
     L = float(member.length)
@@ -328,8 +329,7 @@ def compute_handling(
     if total_load <= 0.0:
         warnings.append("Total handling load is zero — check the weights.")
 
-    need = _required_point_count(stage)
-    pts = _validate_points(stage.points, L, need)
+    pts = _validate_points(stage.points, L)
     centroid = L / 2.0   # uniform full-length load → midspan
     reactions = _reactions(pts, total_load, centroid, warnings)
 
@@ -383,23 +383,16 @@ def compute_handling(
 # ── Report ────────────────────────────────────────────────────────
 
 
-def format_report(member: MemberSpec, stage: StageInput,
-                  result: HandlingResult) -> str:
-    """Render a plain-text handling-stage report for clipboard / copy."""
+def format_stage_block(stage: StageInput, result: HandlingResult) -> list[str]:
+    """Render the lines for one stage in the combined report."""
     lines: list[str] = []
-    lines.append("Precast Handling Stage — V1 (temporary, not saved)")
-    lines.append(f"Member: element {member.elem_id}"
-                 + (f"  ({member.section_name})" if member.section_name else ""))
-    lines.append(f"Length: {member.length:.4g} m")
-    lines.append(f"Stage: {STAGE_LABELS.get(result.stage, result.stage)}")
+    lines.append(f"── {STAGE_LABELS.get(result.stage, result.stage)} ──")
     if result.stage == STAGE_LIFTING:
-        lines.append(f"Lifting scheme: {stage.lifting_scheme}")
         lines.append(f"Sling angle (from horizontal): "
                      f"{stage.sling_angle_deg:g}°")
     lines.append(f"DAF: {stage.daf:g}")
     lines.append(f"Handling UDL (incl. DAF): {result.udl_per_m:.4g} kN/m")
     lines.append(f"Total handling load: {result.total_load:.4g} kN")
-    lines.append("")
     lines.append("Reactions (x [m], R [kN], upward +):")
     for i, (x, r) in enumerate(result.reactions):
         extra = ""
@@ -407,15 +400,34 @@ def format_report(member: MemberSpec, stage: StageInput,
             extra = (f"   T={result.sling_tensions[i]:.4g} kN"
                      f"   H={result.sling_horizontal[i]:.4g} kN")
         lines.append(f"  {x:.4g}\t{r:.4g}{extra}")
-    lines.append("")
     lines.append(f"Max shear |V|: {result.v_max:.4g} kN")
     lines.append(f"Max +moment: {result.m_pos_max:.4g} kN·m")
     lines.append(f"Max −moment: {result.m_neg_max:.4g} kN·m")
     if result.warnings:
-        lines.append("")
         lines.append("Warnings:")
         for w in result.warnings:
             lines.append(f"  - {w}")
+    return lines
+
+
+def format_report(
+    member: MemberSpec,
+    stage_results: list[tuple[StageInput, HandlingResult]],
+) -> str:
+    """Render a plain-text handling-stage report for clipboard / copy.
+
+    ``stage_results`` is a list of ``(StageInput, HandlingResult)`` in the
+    order to print (typically lifting, stock, truck).
+    """
+    lines: list[str] = []
+    lines.append("Precast Handling Stages — V2 (temporary, not saved)")
+    lines.append(f"Member: element {member.elem_id}"
+                 + (f"  ({member.section_name})" if member.section_name else ""))
+    lines.append(f"Length: {member.length:.4g} m")
+    lines.append(f"Self-weight (section): {member.self_weight:.4g} kN/m")
     lines.append("")
-    lines.append(result.display_note)
+    for stage, result in stage_results:
+        lines.extend(format_stage_block(stage, result))
+        lines.append("")
+    lines.append(DISPLAY_ONLY_NOTE)
     return "\n".join(lines)

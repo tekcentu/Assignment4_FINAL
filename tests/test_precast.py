@@ -1,9 +1,10 @@
 """Pure-logic tests for the precast handling-stage engine (no Qt).
 
-Covers reactions, sling tensions, DAF scaling, suction (lifting only),
-input validation, the display-only angle note, the wL²/8 cross-check
-that proves the V/M diagrams reuse the shared element_graphics helpers
-correctly, and that nothing here mutates the main model.
+Covers reactions (always two supports), sling tensions, DAF scaling,
+suction (lifting only), input validation, the display-only angle note,
+the wL²/8 cross-check that proves the V/M diagrams reuse the shared
+element_graphics helpers correctly, and that nothing here mutates the
+main model.
 
 Importing ``structural_analysis.gui_qt.precast`` pulls in matplotlib via
 ``element_graphics`` but no PyQt, so these run headless without a
@@ -19,14 +20,13 @@ import pytest
 from structural_analysis.element import FrameElement2D, TrussElement2D
 from structural_analysis.gui_qt.precast import (
     DISPLAY_ONLY_NOTE,
-    SCHEME_ONE_POINT,
-    SCHEME_TWO_POINT,
     STAGE_LIFTING,
     STAGE_STOCK,
     STAGE_TRUCK,
     HandlingResult,
     MemberSpec,
     StageInput,
+    auto_even_points,
     compute_handling,
     member_spec_from_element,
     resolve_single_frame,
@@ -102,23 +102,23 @@ def test_member_spec_rejects_truss():
         member_spec_from_element(m, t)
 
 
-# ── reactions ─────────────────────────────────────────────────────
+# ── auto-even spacing ─────────────────────────────────────────────
 
 
-def test_one_point_reaction_equals_total_load():
-    spec = _spec(L=8.0, w=10.0)
-    stage = StageInput(stage=STAGE_LIFTING, lifting_scheme=SCHEME_ONE_POINT,
-                       points=(4.0,), sling_angle_deg=90.0)
-    res = compute_handling(spec, stage)
-    assert res.total_load == pytest.approx(80.0)
-    assert len(res.reactions) == 1
-    assert res.reactions[0][1] == pytest.approx(res.total_load)
+def test_auto_even_points_uses_per_stage_defaults():
+    assert auto_even_points(STAGE_LIFTING, 10.0) == (2.0, 8.0)
+    assert auto_even_points(STAGE_STOCK, 10.0) == (2.0, 8.0)
+    # Truck stage moves the supports closer to the ends.
+    assert auto_even_points(STAGE_TRUCK, 10.0) == (1.0, 9.0)
+
+
+# ── reactions (always two supports) ───────────────────────────────
 
 
 def test_two_point_symmetric_reactions_equal():
     spec = _spec(L=8.0, w=10.0)
-    stage = StageInput(stage=STAGE_LIFTING, lifting_scheme=SCHEME_TWO_POINT,
-                       points=(1.6, 6.4), sling_angle_deg=60.0)
+    stage = StageInput(stage=STAGE_LIFTING, points=(1.6, 6.4),
+                       sling_angle_deg=60.0)
     res = compute_handling(spec, stage)
     r = [v for _x, v in res.reactions]
     assert r[0] == pytest.approx(r[1])
@@ -135,14 +135,6 @@ def test_eccentric_reactions_satisfy_equilibrium():
     assert ra + rb == pytest.approx(res.total_load)
     # ΣM about a = 0  →  rb·(b−a) == W·(centroid − a)
     assert rb * (xb - xa) == pytest.approx(res.total_load * (5.0 - a))
-
-
-def test_one_point_off_centroid_warns():
-    spec = _spec(L=8.0, w=10.0)
-    stage = StageInput(stage=STAGE_LIFTING, lifting_scheme=SCHEME_ONE_POINT,
-                       points=(2.0,), sling_angle_deg=90.0)
-    res = compute_handling(spec, stage)
-    assert any("centroid" in w for w in res.warnings)
 
 
 def test_stock_and_truck_support_reactions():
@@ -162,8 +154,8 @@ def test_stock_and_truck_support_reactions():
 def test_sling_tension_and_horizontal_component():
     import math
     spec = _spec(L=8.0, w=10.0)
-    stage = StageInput(stage=STAGE_LIFTING, lifting_scheme=SCHEME_TWO_POINT,
-                       points=(1.6, 6.4), sling_angle_deg=30.0)
+    stage = StageInput(stage=STAGE_LIFTING, points=(1.6, 6.4),
+                       sling_angle_deg=30.0)
     res = compute_handling(spec, stage)
     r = res.reactions[0][1]                      # 40 kN
     assert res.sling_tensions[0] == pytest.approx(r / math.sin(math.radians(30)))
@@ -172,8 +164,8 @@ def test_sling_tension_and_horizontal_component():
 
 def test_sling_angle_90_has_zero_horizontal():
     spec = _spec(L=8.0, w=10.0)
-    stage = StageInput(stage=STAGE_LIFTING, lifting_scheme=SCHEME_TWO_POINT,
-                       points=(1.6, 6.4), sling_angle_deg=90.0)
+    stage = StageInput(stage=STAGE_LIFTING, points=(1.6, 6.4),
+                       sling_angle_deg=90.0)
     res = compute_handling(spec, stage)
     assert res.sling_horizontal[0] == pytest.approx(0.0)
 
@@ -181,8 +173,8 @@ def test_sling_angle_90_has_zero_horizontal():
 def test_invalid_sling_angle_rejected():
     spec = _spec()
     for bad in (0.0, -10.0, 120.0):
-        stage = StageInput(stage=STAGE_LIFTING, lifting_scheme=SCHEME_TWO_POINT,
-                           points=(1.6, 6.4), sling_angle_deg=bad)
+        stage = StageInput(stage=STAGE_LIFTING, points=(1.6, 6.4),
+                           sling_angle_deg=bad)
         with pytest.raises(ValueError, match="angle"):
             compute_handling(spec, stage)
 
@@ -203,10 +195,8 @@ def test_daf_scales_effects_linearly():
 
 def test_suction_adds_load_for_lifting_only():
     spec = _spec(L=8.0, w=10.0)
-    lift_no = StageInput(stage=STAGE_LIFTING, lifting_scheme=SCHEME_TWO_POINT,
-                         points=(1.6, 6.4), suction=0.0)
-    lift_yes = StageInput(stage=STAGE_LIFTING, lifting_scheme=SCHEME_TWO_POINT,
-                          points=(1.6, 6.4), suction=4.0)
+    lift_no = StageInput(stage=STAGE_LIFTING, points=(1.6, 6.4), suction=0.0)
+    lift_yes = StageInput(stage=STAGE_LIFTING, points=(1.6, 6.4), suction=4.0)
     assert (compute_handling(spec, lift_yes).total_load
             > compute_handling(spec, lift_no).total_load)
     # Stock stage ignores suction (and warns).
@@ -237,11 +227,16 @@ def test_invalid_point_positions_rejected():
 def test_wrong_point_count_rejected():
     spec = _spec()
     with pytest.raises(ValueError, match="exactly 2"):
-        compute_handling(spec, StageInput(stage=STAGE_STOCK, points=(4.0,)))
-    with pytest.raises(ValueError, match="exactly 1"):
-        compute_handling(spec, StageInput(
-            stage=STAGE_LIFTING, lifting_scheme=SCHEME_ONE_POINT,
-            points=(2.0, 6.0)))
+        compute_handling(
+            spec,
+            StageInput(stage=STAGE_STOCK, points=(4.0,)),  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="exactly 2"):
+        compute_handling(
+            spec,
+            StageInput(stage=STAGE_LIFTING,
+                       points=(1.0, 4.0, 7.0)),  # type: ignore[arg-type]
+        )
 
 
 def test_coincident_two_points_rejected():
@@ -295,8 +290,7 @@ def test_compute_does_not_mutate_model_or_element():
     before = copy.deepcopy(m)
     spec = member_spec_from_element(m, m.elements[0])
     for stage in (
-        StageInput(stage=STAGE_LIFTING, lifting_scheme=SCHEME_TWO_POINT,
-                   points=(1.6, 6.4)),
+        StageInput(stage=STAGE_LIFTING, points=(1.6, 6.4)),
         StageInput(stage=STAGE_STOCK, points=(1.0, 7.0)),
         StageInput(stage=STAGE_TRUCK, points=(2.0, 6.0)),
     ):
