@@ -31,7 +31,7 @@ def _load(name: str):
 def _has_offset(model) -> bool:
     return any(
         isinstance(e, FrameElement2D)
-        and (getattr(e, "offset_i", 0.0) > 0.0 or getattr(e, "offset_j", 0.0) > 0.0)
+        and (e.offset_i > 0.0 or e.offset_j > 0.0)
         for e in model.elements
     )
 
@@ -41,7 +41,7 @@ def _has_truss_diagonal(model) -> bool:
 
 
 def _has_density(model) -> bool:
-    return any(getattr(e, "rho", 0.0) > 0.0 for e in model.elements)
+    return any(e.rho > 0.0 for e in model.elements)
 
 
 # ── example_09 — cases + combinations + bracing + modal ───────────────────
@@ -115,9 +115,15 @@ def test_example_11_combines_all_features():
 
 
 def test_example_11_rigid_offsets_are_frame_only():
-    """Sanity: no TRUSS element carries an offset (parser forbids it)."""
+    """Sanity: no TRUSS element carries an offset (parser forbids it).
+
+    Rigid offsets are a FRAME-only feature — TrussElement2D inherits from
+    Element2D, which does not define offset fields — so a truss must not
+    even have the attributes. hasattr is the strongest expression of that
+    invariant (it also catches a future field accidentally added to the
+    base/truss class)."""
     m = _load("example_11_combined_all_features.txt")
     for e in m.elements:
         if isinstance(e, TrussElement2D):
-            assert getattr(e, "offset_i", 0.0) == 0.0
-            assert getattr(e, "offset_j", 0.0) == 0.0
+            assert not hasattr(e, "offset_i")
+            assert not hasattr(e, "offset_j")
