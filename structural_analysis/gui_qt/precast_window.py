@@ -157,6 +157,10 @@ class _StageRow(QFrame):
         self.summary.setWordWrap(True)
         outer.addWidget(self.summary)
 
+        self.stress = QLabel("", self)
+        self.stress.setWordWrap(True)
+        outer.addWidget(self.stress)
+
         self.warning = QLabel("", self)
         self.warning.setWordWrap(True)
         self.warning.setStyleSheet("color: #b00;")
@@ -228,12 +232,17 @@ class _StageRow(QFrame):
             extra_udl=template.extra_udl,
             orientation=template.orientation,
             custom_angle_deg=template.custom_angle_deg,
+            stress_check_enabled=template.stress_check_enabled,
+            allowable_tensile_mpa=template.allowable_tensile_mpa,
+            manual_y_top=template.manual_y_top,
+            manual_y_bottom=template.manual_y_bottom,
         )
 
     # ── rendering ──
 
     def show_error(self, msg: str) -> None:
         self.summary.setText("")
+        self.stress.setText("")
         self.warning.setText(f"⚠ {msg}")
         for ax in (self._ax_member, self._ax_v, self._ax_m):
             ax.clear()
@@ -269,7 +278,34 @@ class _StageRow(QFrame):
         self.warning.setText(
             "\n".join(f"⚠ {w}" for w in result.warnings)
         )
+        self._render_stress(result.stress_check)
         self._draw(member, stage, result)
+
+    def _render_stress(self, sc: P.StressCheck) -> None:
+        if sc.skipped:
+            self.stress.setText(
+                f"Cracking check: skipped — {sc.skip_reason}"
+            )
+            self.stress.setStyleSheet("color: #777;")
+            return
+        peak_top = (
+            f"σ_top_max = {sc.max_top_tensile_mpa:.3g} MPa "
+            f"@ x = {sc.max_top_tensile_x:.3g} m"
+        )
+        peak_bot = (
+            f"σ_bot_max = {sc.max_bottom_tensile_mpa:.3g} MPa "
+            f"@ x = {sc.max_bottom_tensile_x:.3g} m"
+        )
+        gate = (
+            f"σ_allow = {sc.allowable_tensile_mpa:.3g} MPa · "
+            f"ratio = {sc.cracking_ratio:.3g} · {sc.cracking_status}"
+        )
+        self.stress.setText(f"{peak_top}   |   {peak_bot}   |   {gate}")
+        self.stress.setStyleSheet(
+            "color: #b00; font-weight: bold;"
+            if sc.cracking_status == "CRACKING WARNING"
+            else "color: #1a7f37;"
+        )
 
     def _draw(
         self,
@@ -408,8 +444,29 @@ class PrecastHandlingWindow(QMainWindow):
         self._extra_udl = _spin(glob, 0.0, 1e6, 0.0, 0.5, " kN/m")
         form.addRow("Extra handling UDL", self._extra_udl)
 
+        # ── Flexural cracking check (V1) ──
+        self._stress_enabled = QCheckBox("Run elastic σ = M·y / I check", glob)
+        self._stress_enabled.setChecked(True)
+        self._stress_enabled.toggled.connect(self._on_global_changed)
+        form.addRow("Cracking check", self._stress_enabled)
+
+        self._allowable_tensile = _spin(glob, 0.0, 100.0, 2.6, 0.1,
+                                        " MPa", decimals=2)
+        form.addRow("Allowable σ_t", self._allowable_tensile)
+
+        self._manual_y = QCheckBox("Manual y_top / y_bottom", glob)
+        self._manual_y.setChecked(False)
+        self._manual_y.toggled.connect(self._on_global_changed)
+        form.addRow("Fiber distances", self._manual_y)
+
+        self._y_top = _spin(glob, 0.0001, 100.0, 0.2, 0.01, " m", decimals=4)
+        form.addRow("y_top", self._y_top)
+        self._y_bottom = _spin(glob, 0.0001, 100.0, 0.2, 0.01, " m", decimals=4)
+        form.addRow("y_bottom", self._y_bottom)
+
         for sp in (self._custom_angle, self._daf,
-                   self._manual_weight, self._extra_udl):
+                   self._manual_weight, self._extra_udl,
+                   self._allowable_tensile, self._y_top, self._y_bottom):
             sp.valueChanged.connect(self._on_global_changed)
 
         col.addWidget(glob)
@@ -463,6 +520,12 @@ class PrecastHandlingWindow(QMainWindow):
         self._updating = True
         try:
             self._manual_weight.setValue(self._member.self_weight)
+            # Seed the auto y-distances from section depth so the user sees
+            # the values that will be used if they later toggle to manual.
+            half_depth = (self._member.depth / 2.0
+                          if self._member.depth > 0.0 else 0.2)
+            self._y_top.setValue(half_depth)
+            self._y_bottom.setValue(half_depth)
             for key, row in self._rows.items():
                 row.set_length(L)
                 row.load_inputs(self._stage_inputs[key])
@@ -496,6 +559,12 @@ class PrecastHandlingWindow(QMainWindow):
         self._custom_angle.setEnabled(
             self._orient_combo.currentData() == ORIENT_CUSTOM,
         )
+        check_on = self._stress_enabled.isChecked()
+        self._allowable_tensile.setEnabled(check_on)
+        self._manual_y.setEnabled(check_on)
+        manual = check_on and self._manual_y.isChecked()
+        self._y_top.setEnabled(manual)
+        self._y_bottom.setEnabled(manual)
 
     def _global_template(self, stage_key: str) -> StageInput:
         """Build a baseline StageInput from the global controls only.
@@ -503,6 +572,7 @@ class PrecastHandlingWindow(QMainWindow):
         The per-row controls (points, sling, suction) are layered on top
         in :meth:`_recompute_one`.
         """
+        manual_y = self._manual_y.isChecked()
         return StageInput(
             stage=stage_key,
             points=(0.0, 0.0),  # overwritten by row
@@ -512,6 +582,10 @@ class PrecastHandlingWindow(QMainWindow):
             extra_udl=self._extra_udl.value(),
             orientation=self._orient_combo.currentData(),
             custom_angle_deg=self._custom_angle.value(),
+            stress_check_enabled=self._stress_enabled.isChecked(),
+            allowable_tensile_mpa=self._allowable_tensile.value(),
+            manual_y_top=self._y_top.value() if manual_y else None,
+            manual_y_bottom=self._y_bottom.value() if manual_y else None,
         )
 
     # ── signal handlers ──

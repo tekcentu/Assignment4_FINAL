@@ -140,6 +140,47 @@ def test_copy_report_includes_all_three_stages(qt_app):
     assert "Support spacing" in txt
 
 
+def test_cracking_check_appears_in_summary_and_report(qt_app):
+    """End-to-end: stress check runs for the seeded frame and the result
+    shows up in each stage's stress label and in the copied report."""
+    w = MainWindow()
+    eid = _seed_frame(w, L=8.0)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    # Force a cracking warning by lowering the allowable.
+    win._allowable_tensile.setValue(0.05)
+    qt_app.processEvents()
+    for key in STAGES:
+        text = win._rows[key].stress.text()
+        assert "σ_bot_max" in text or "σ_top_max" in text
+    # Some stage hits "CRACKING WARNING" with this low allowable.
+    assert any(
+        "CRACKING WARNING" in win._rows[k].stress.text() for k in STAGES
+    )
+    win._copy_report()
+    cb_text = QApplication.clipboard().text()
+    assert "Flexural cracking check" in cb_text
+    assert "Allowable tensile stress" in cb_text
+    assert "CRACKING WARNING" in cb_text
+
+
+def test_manual_y_toggle_enables_y_spinboxes(qt_app):
+    w = MainWindow()
+    eid = _seed_frame(w, L=8.0)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    assert not win._y_top.isEnabled()
+    win._manual_y.setChecked(True)
+    qt_app.processEvents()
+    assert win._y_top.isEnabled()
+    assert win._y_bottom.isEnabled()
+    # Disabling the check disables the y boxes regardless of the manual toggle.
+    win._stress_enabled.setChecked(False)
+    qt_app.processEvents()
+    assert not win._y_top.isEnabled()
+    assert not win._allowable_tensile.isEnabled()
+
+
 def test_summary_shows_support_spacing(qt_app):
     w = MainWindow()
     eid = _seed_frame(w, L=8.0)

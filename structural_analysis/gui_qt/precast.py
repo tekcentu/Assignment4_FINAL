@@ -98,6 +98,8 @@ class MemberSpec:
     length: float            # m
     self_weight: float       # kN/m  (ρ·A·g / 1000, downward)
     depth: float = 0.0       # m
+    area: float = 0.0        # m²   (for σ = N/A; V1 assumes N = 0)
+    inertia: float = 0.0     # m⁴   (for σ = M·y/I)
     section_name: str = ""
     model_angle_deg: float = 0.0   # display-only orientation
 
@@ -125,11 +127,19 @@ def member_spec_from_element(model, elem) -> MemberSpec:
     w_self = rho * A * STANDARD_GRAVITY / 1000.0  # kN/m
     section = model.sections.get(getattr(elem, "section_id", None))
     name = section.name if section and section.name else ""
+    # Depth typically lives on the section; the element only carries it when
+    # the user opted in for thermal gradient. Fall back to the section so
+    # the stress check finds a usable y = depth / 2 by default.
+    depth = float(getattr(elem, "depth", 0.0))
+    if depth <= 0.0 and section is not None:
+        depth = float(getattr(section, "depth", 0.0))
     return MemberSpec(
         elem_id=int(elem.id),
         length=float(L),
         self_weight=w_self,
-        depth=float(getattr(elem, "depth", 0.0)),
+        depth=depth,
+        area=A,
+        inertia=float(getattr(elem, "I", 0.0)),
         section_name=name,
         model_angle_deg=math.degrees(math.atan2(s, c)),
     )
@@ -172,6 +182,12 @@ class StageInput:
 
     ``points`` is always exactly two positions along the member, from
     end *i* (in metres). The two points must be distinct.
+
+    The flexural-cracking fields (``stress_check_enabled``,
+    ``allowable_tensile_mpa``, ``manual_y_top``, ``manual_y_bottom``) are
+    physically member-level, but live on each stage's input so the engine
+    stays self-contained. The window mirrors a single set of global
+    controls into every stage.
     """
 
     stage: str = STAGE_LIFTING
@@ -183,6 +199,41 @@ class StageInput:
     extra_udl: float = 0.0                     # kN/m downward
     orientation: str = ORIENT_HORIZONTAL
     custom_angle_deg: float = 0.0
+    # Flexural cracking check (V1, elastic uncracked, σ = M·y / I).
+    stress_check_enabled: bool = True
+    allowable_tensile_mpa: float = 2.6
+    manual_y_top: float | None = None          # m, overrides depth/2 if set
+    manual_y_bottom: float | None = None       # m, overrides depth/2 if set
+
+
+@dataclass(frozen=True)
+class StressCheck:
+    """Flexural fiber-stress / cracking summary for one handling stage.
+
+    Sign convention: positive moment from the handling engine is sagging
+    (concave-up), so the **bottom fiber goes into tension under positive
+    M** and the **top fiber under negative M**. Tension is reported as a
+    positive stress (MPa). The ``*_tensile_mpa`` fields are clamped to 0
+    when the corresponding fiber stays in compression for the whole
+    diagram — so they really are *tensile* peaks, not signed extrema.
+    """
+
+    enabled: bool
+    skipped: bool
+    skip_reason: str
+    y_top: float                # m
+    y_bottom: float             # m
+    top_stations: tuple[tuple[float, float], ...]      # (x, σ_top MPa)
+    bottom_stations: tuple[tuple[float, float], ...]   # (x, σ_bot MPa)
+    max_top_tensile_mpa: float
+    max_top_tensile_x: float
+    max_bottom_tensile_mpa: float
+    max_bottom_tensile_x: float
+    controlling_fiber: str       # "top" / "bottom" / "none"
+    controlling_x: float         # x where the peak tensile stress occurs
+    allowable_tensile_mpa: float
+    cracking_ratio: float        # 0.0 when skipped or no tension
+    cracking_status: str         # "OK" / "CRACKING WARNING" / "skipped"
 
 
 @dataclass(frozen=True)
@@ -200,6 +251,7 @@ class HandlingResult:
     m_neg_max: float
     stations: tuple[tuple[float, float, float], ...]   # (x, V, M)
     warnings: tuple[str, ...]
+    stress_check: StressCheck
     display_note: str = DISPLAY_ONLY_NOTE
 
 
@@ -277,6 +329,133 @@ def _sample_vm(member: MemberSpec, udl_per_m: float,
     xs, vs = sample_internal_force(elem, ni, nj, f_local, "shear", n_samples)
     _, ms = sample_internal_force(elem, ni, nj, f_local, "moment", n_samples)
     return xs, vs, ms
+
+
+def _skipped_stress_check(
+    stage: StageInput, reason: str, *, y_top: float = 0.0, y_bot: float = 0.0,
+) -> StressCheck:
+    return StressCheck(
+        enabled=stage.stress_check_enabled,
+        skipped=True,
+        skip_reason=reason,
+        y_top=y_top,
+        y_bottom=y_bot,
+        top_stations=(),
+        bottom_stations=(),
+        max_top_tensile_mpa=0.0,
+        max_top_tensile_x=0.0,
+        max_bottom_tensile_mpa=0.0,
+        max_bottom_tensile_x=0.0,
+        controlling_fiber="none",
+        controlling_x=0.0,
+        allowable_tensile_mpa=float(stage.allowable_tensile_mpa),
+        cracking_ratio=0.0,
+        cracking_status="skipped",
+    )
+
+
+def _stress_check(
+    member: MemberSpec,
+    stage: StageInput,
+    stations: tuple[tuple[float, float, float], ...],
+) -> StressCheck:
+    """Compute the V1 flexural fiber stress / cracking check.
+
+    σ = M·y / I, evaluated at every station from the moment diagram and
+    converted to MPa (×0.001 from kN/m²). Tension is positive. Positive
+    moments produce bottom-fiber tension (sagging); negative moments
+    produce top-fiber tension (hogging). N = 0 in V1.
+    """
+    if not stage.stress_check_enabled:
+        return _skipped_stress_check(stage, "Stress check disabled by user.")
+
+    inertia = float(member.inertia)
+    if inertia <= 0.0:
+        return _skipped_stress_check(
+            stage,
+            f"Section moment of inertia I = {inertia:g} m⁴ is not "
+            "positive; cannot compute fiber stresses.",
+        )
+
+    # Resolve y_top / y_bottom. Manual override wins; otherwise depth/2 for
+    # symmetric sections. Never guess — if neither is available, skip.
+    half = float(member.depth) / 2.0 if member.depth > 0.0 else None
+    y_top = (float(stage.manual_y_top)
+             if stage.manual_y_top is not None else half)
+    y_bot = (float(stage.manual_y_bottom)
+             if stage.manual_y_bottom is not None else half)
+    if y_top is None or y_bot is None:
+        return _skipped_stress_check(
+            stage,
+            "Section depth is not set; enter manual y_top and y_bottom "
+            "to run the stress check.",
+        )
+    if y_top <= 0.0 or y_bot <= 0.0:
+        return _skipped_stress_check(
+            stage,
+            f"Fiber distances y_top = {y_top:g} m, y_bottom = {y_bot:g} m "
+            "must both be positive.",
+            y_top=y_top, y_bot=y_bot,
+        )
+
+    allowable = float(stage.allowable_tensile_mpa)
+
+    # σ = M·y / I  [kN/m²], → MPa via ×0.001.
+    # Sagging M > 0 ⇒ bottom tension, top compression. Tension is positive.
+    factor_top = -y_top / inertia * 0.001
+    factor_bot = +y_bot / inertia * 0.001
+    top = tuple((float(x), float(m) * factor_top) for x, _v, m in stations)
+    bot = tuple((float(x), float(m) * factor_bot) for x, _v, m in stations)
+
+    max_top_s, max_top_x = 0.0, 0.0
+    for x, s in top:
+        if s > max_top_s:
+            max_top_s, max_top_x = s, x
+    max_bot_s, max_bot_x = 0.0, 0.0
+    for x, s in bot:
+        if s > max_bot_s:
+            max_bot_s, max_bot_x = s, x
+
+    if max_top_s >= max_bot_s and max_top_s > 0.0:
+        controlling_fiber, controlling_x = "top", max_top_x
+        peak = max_top_s
+    elif max_bot_s > 0.0:
+        controlling_fiber, controlling_x = "bottom", max_bot_x
+        peak = max_bot_s
+    else:
+        controlling_fiber, controlling_x = "none", 0.0
+        peak = 0.0
+
+    if allowable <= 0.0:
+        return StressCheck(
+            enabled=True, skipped=True,
+            skip_reason=(f"Allowable tensile stress = {allowable:g} MPa is "
+                         "not positive; set a positive limit."),
+            y_top=y_top, y_bottom=y_bot,
+            top_stations=top, bottom_stations=bot,
+            max_top_tensile_mpa=max_top_s, max_top_tensile_x=max_top_x,
+            max_bottom_tensile_mpa=max_bot_s, max_bottom_tensile_x=max_bot_x,
+            controlling_fiber=controlling_fiber,
+            controlling_x=controlling_x,
+            allowable_tensile_mpa=allowable,
+            cracking_ratio=0.0,
+            cracking_status="skipped",
+        )
+
+    ratio = peak / allowable
+    status = "CRACKING WARNING" if ratio > 1.0 else "OK"
+    return StressCheck(
+        enabled=True, skipped=False, skip_reason="",
+        y_top=y_top, y_bottom=y_bot,
+        top_stations=top, bottom_stations=bot,
+        max_top_tensile_mpa=max_top_s, max_top_tensile_x=max_top_x,
+        max_bottom_tensile_mpa=max_bot_s, max_bottom_tensile_x=max_bot_x,
+        controlling_fiber=controlling_fiber,
+        controlling_x=controlling_x,
+        allowable_tensile_mpa=allowable,
+        cracking_ratio=ratio,
+        cracking_status=status,
+    )
 
 
 def compute_handling(
@@ -364,6 +543,8 @@ def compute_handling(
         v_max = m_pos_max = m_neg_max = 0.0
         stations = ()
 
+    stress = _stress_check(member, stage, stations)
+
     return HandlingResult(
         stage=stage.stage,
         total_load=total_load,
@@ -376,6 +557,7 @@ def compute_handling(
         m_neg_max=m_neg_max,
         stations=stations,
         warnings=tuple(warnings),
+        stress_check=stress,
         display_note=DISPLAY_ONLY_NOTE,
     )
 
@@ -406,10 +588,35 @@ def format_stage_block(stage: StageInput, result: HandlingResult) -> list[str]:
     lines.append(f"Max shear |V|: {result.v_max:.4g} kN")
     lines.append(f"Max +moment: {result.m_pos_max:.4g} kN·m")
     lines.append(f"Max −moment: {result.m_neg_max:.4g} kN·m")
+    lines.extend(_format_stress_block(result.stress_check))
     if result.warnings:
         lines.append("Warnings:")
         for w in result.warnings:
             lines.append(f"  - {w}")
+    return lines
+
+
+def _format_stress_block(sc: StressCheck) -> list[str]:
+    lines = ["Flexural cracking check (elastic, σ = M·y / I):"]
+    if sc.skipped:
+        lines.append(f"  Skipped: {sc.skip_reason}")
+        return lines
+    lines.append(f"  y_top = {sc.y_top:g} m   y_bottom = {sc.y_bottom:g} m")
+    lines.append(
+        f"  Max top tensile = {sc.max_top_tensile_mpa:.3g} MPa at "
+        f"x = {sc.max_top_tensile_x:.3g} m"
+    )
+    lines.append(
+        f"  Max bottom tensile = {sc.max_bottom_tensile_mpa:.3g} MPa at "
+        f"x = {sc.max_bottom_tensile_x:.3g} m"
+    )
+    lines.append(
+        f"  Allowable tensile stress = {sc.allowable_tensile_mpa:.3g} MPa"
+    )
+    lines.append(
+        f"  Cracking check: {sc.cracking_status}, "
+        f"ratio = {sc.cracking_ratio:.3g}"
+    )
     return lines
 
 

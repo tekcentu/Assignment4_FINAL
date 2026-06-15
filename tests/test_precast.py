@@ -58,9 +58,20 @@ def _model_with_one_frame(L: float = 8.0, A: float = 0.2,
     return m
 
 
-def _spec(L: float = 8.0, w: float = 10.0) -> MemberSpec:
+def _spec(L: float = 8.0, w: float = 10.0,
+         depth: float = 0.0, area: float = 0.0,
+         inertia: float = 0.0) -> MemberSpec:
     """A spec with an exact self-weight UDL so reactions are predictable."""
-    return MemberSpec(elem_id=1, length=L, self_weight=w, section_name="PC")
+    return MemberSpec(
+        elem_id=1, length=L, self_weight=w, section_name="PC",
+        depth=depth, area=area, inertia=inertia,
+    )
+
+
+def _stress_spec(L: float = 8.0, w: float = 10.0,
+                 depth: float = 0.4, inertia: float = 0.05) -> MemberSpec:
+    """A spec with section data populated so the stress check runs."""
+    return _spec(L=L, w=w, depth=depth, area=0.2, inertia=inertia)
 
 
 # ── selection / snapshot ──────────────────────────────────────────
@@ -302,3 +313,174 @@ def test_compute_does_not_mutate_model_or_element():
         compute_handling(spec, StageInput(stage=STAGE_STOCK, points=(1.0, 7.0))),
         HandlingResult,
     )
+
+
+# ── Flexural cracking check (V1) ──────────────────────────────────
+#
+# Sign convention used by the handling engine (cross-checked by
+# ``test_wl2_over_8_cross_check_uses_shared_helpers``):
+#
+#   Positive M = sagging (concave up).  Sagging puts the **bottom**
+#   fiber in tension and the top fiber in compression. Negative M is
+#   hogging, so the **top** fiber is in tension. Tensile stress is
+#   reported as a positive number; the *_tensile_mpa fields are
+#   clamped to 0 when their fiber stays in compression throughout
+#   the diagram.
+
+
+def test_stress_formula_rectangular_known_section():
+    """Simply-supported beam, supports at the ends: M_mid = wL²/8.
+
+    With y_top = y_bottom = h/2:
+      σ_bot,max = (wL²/8) · (h/2) / I  in kN/m²   → ×0.001 MPa
+    For L = 8 m, w = 10 kN/m, h = 0.4 m, I = 0.05 m⁴:
+      M = 80 kN·m
+      σ = 80 · 0.2 / 0.05 = 320 kN/m² = 0.32 MPa
+    """
+    spec = _stress_spec(L=8.0, w=10.0, depth=0.4, inertia=0.05)
+    stage = StageInput(stage=STAGE_STOCK, points=(0.0, 8.0))
+    res = compute_handling(spec, stage, n_samples=41)
+    sc = res.stress_check
+    assert not sc.skipped
+    assert sc.y_top == pytest.approx(0.2)
+    assert sc.y_bottom == pytest.approx(0.2)
+    assert sc.max_bottom_tensile_mpa == pytest.approx(0.32, rel=1e-3)
+    # Top fiber stays in compression for an SS sagging beam.
+    assert sc.max_top_tensile_mpa == pytest.approx(0.0)
+    assert sc.controlling_fiber == "bottom"
+    assert sc.controlling_x == pytest.approx(4.0, abs=0.2)
+
+
+def test_positive_moment_makes_bottom_fiber_tensile():
+    """Convention check: a fully-sagging diagram tensions the bottom."""
+    spec = _stress_spec()
+    stage = StageInput(stage=STAGE_STOCK, points=(0.0, 8.0))  # SS beam
+    sc = compute_handling(spec, stage).stress_check
+    # All bottom stresses are tensile (≥ 0) and top stresses non-tensile.
+    bottoms = [s for _x, s in sc.bottom_stations]
+    tops = [s for _x, s in sc.top_stations]
+    assert min(bottoms) >= -1e-9
+    assert max(tops) <= 1e-9
+    assert sc.controlling_fiber == "bottom"
+
+
+def test_negative_moment_makes_top_fiber_tensile():
+    """Two-point lift with overhangs gives hogging at the supports,
+    so the top fiber is the one that cracks."""
+    spec = _stress_spec(L=8.0, w=10.0)
+    stage = StageInput(stage=STAGE_LIFTING, points=(2.0, 6.0),
+                       sling_angle_deg=90.0)
+    sc = compute_handling(spec, stage).stress_check
+    assert sc.max_top_tensile_mpa > 0.0   # cantilever hogging tensions the top
+    # The controlling fiber should be top if it exceeds the bottom peak.
+    if sc.max_top_tensile_mpa >= sc.max_bottom_tensile_mpa:
+        assert sc.controlling_fiber == "top"
+
+
+def test_cracking_check_ok_and_warning():
+    """Same moment diagram, two different allowable stresses → flip status."""
+    spec = _stress_spec(L=8.0, w=10.0, depth=0.4, inertia=0.05)  # σ_bot = 0.32 MPa
+    points = (0.0, 8.0)
+    sc_ok = compute_handling(
+        spec, StageInput(stage=STAGE_STOCK, points=points,
+                         allowable_tensile_mpa=2.0),
+    ).stress_check
+    assert sc_ok.cracking_status == "OK"
+    assert sc_ok.cracking_ratio == pytest.approx(0.32 / 2.0, rel=1e-3)
+
+    sc_warn = compute_handling(
+        spec, StageInput(stage=STAGE_STOCK, points=points,
+                         allowable_tensile_mpa=0.2),
+    ).stress_check
+    assert sc_warn.cracking_status == "CRACKING WARNING"
+    assert sc_warn.cracking_ratio == pytest.approx(0.32 / 0.2, rel=1e-3)
+    assert sc_warn.cracking_ratio > 1.0
+
+
+def test_all_three_stages_report_stress_summary():
+    spec = _stress_spec(L=8.0, w=10.0)
+    for kind in (STAGE_LIFTING, STAGE_STOCK, STAGE_TRUCK):
+        stage = StageInput(stage=kind, points=(1.6, 6.4))
+        sc = compute_handling(spec, stage).stress_check
+        assert not sc.skipped
+        # Each stage reports a controlling station inside the member.
+        assert 0.0 <= sc.controlling_x <= spec.length
+        assert sc.cracking_status in ("OK", "CRACKING WARNING")
+
+
+def test_missing_section_data_skips_check_with_warning():
+    """No depth and no manual y → clear skip, no silent wrong stress."""
+    spec = _spec(L=8.0, w=10.0, inertia=0.05)   # depth defaults to 0
+    sc = compute_handling(
+        spec, StageInput(stage=STAGE_STOCK, points=(1.0, 7.0)),
+    ).stress_check
+    assert sc.skipped
+    assert sc.cracking_status == "skipped"
+    assert "depth" in sc.skip_reason.lower()
+    # All numeric peaks are 0; report stays explicit about being skipped.
+    assert sc.max_top_tensile_mpa == 0.0
+    assert sc.max_bottom_tensile_mpa == 0.0
+    assert sc.cracking_ratio == 0.0
+
+
+def test_missing_inertia_skips_check():
+    spec = _spec(L=8.0, w=10.0, depth=0.4)  # I=0
+    sc = compute_handling(
+        spec, StageInput(stage=STAGE_STOCK, points=(1.0, 7.0)),
+    ).stress_check
+    assert sc.skipped
+    assert "inertia" in sc.skip_reason.lower()
+
+
+def test_manual_y_override_runs_check_without_depth():
+    spec = _spec(L=8.0, w=10.0, inertia=0.05)   # no depth
+    sc = compute_handling(
+        spec,
+        StageInput(stage=STAGE_STOCK, points=(0.0, 8.0),
+                   manual_y_top=0.2, manual_y_bottom=0.2),
+    ).stress_check
+    assert not sc.skipped
+    assert sc.max_bottom_tensile_mpa == pytest.approx(0.32, rel=1e-3)
+
+
+def test_stress_check_disabled_is_skipped_explicitly():
+    spec = _stress_spec()
+    sc = compute_handling(
+        spec,
+        StageInput(stage=STAGE_STOCK, points=(0.0, 8.0),
+                   stress_check_enabled=False),
+    ).stress_check
+    assert sc.enabled is False
+    assert sc.skipped
+    assert sc.cracking_status == "skipped"
+
+
+def test_report_includes_stress_and_cracking_lines():
+    from structural_analysis.gui_qt.precast import format_report
+    spec = _stress_spec()
+    stage = StageInput(stage=STAGE_STOCK, points=(0.0, 8.0),
+                       allowable_tensile_mpa=0.2)  # forces a WARNING
+    res = compute_handling(spec, stage)
+    txt = format_report(spec, [(stage, res)])
+    assert "Flexural cracking check" in txt
+    assert "Max bottom tensile" in txt
+    assert "Allowable tensile stress" in txt
+    assert "CRACKING WARNING" in txt
+    assert "ratio" in txt
+
+
+def test_existing_reactions_and_moments_unchanged_by_stress_check_addition():
+    """Regression: the V1 reactions / shears / moments are the same with
+    or without the stress check enabled."""
+    spec = _stress_spec()
+    stage_on = StageInput(stage=STAGE_STOCK, points=(1.0, 7.0),
+                          stress_check_enabled=True)
+    stage_off = StageInput(stage=STAGE_STOCK, points=(1.0, 7.0),
+                           stress_check_enabled=False)
+    r_on = compute_handling(spec, stage_on)
+    r_off = compute_handling(spec, stage_off)
+    assert r_on.reactions == r_off.reactions
+    assert r_on.v_max == pytest.approx(r_off.v_max)
+    assert r_on.m_pos_max == pytest.approx(r_off.m_pos_max)
+    assert r_on.m_neg_max == pytest.approx(r_off.m_neg_max)
+    assert r_on.stations == r_off.stations

@@ -1,9 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.36.1"
+__version__ = "0.37.0"
 __what_is_new__ = (
-    "Precast sheet: mouse wheel scrolls the page instead of nudging spin "
-    "boxes · Shows support spacing per stage"
+    "Precast: elastic σ = M·y/I cracking check per stage · "
+    "Tensile stress, controlling x, ratio vs. allowable, OK / CRACKING · "
+    "Manual y_top / y_bottom override when section depth is missing"
 )
 
 from .model import (
