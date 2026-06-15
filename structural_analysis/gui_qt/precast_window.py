@@ -56,8 +56,29 @@ from .precast import (
 )
 
 
+class _NoScrollSpinBox(QDoubleSpinBox):
+    """A spin box that ignores the mouse wheel.
+
+    The window lives inside a :class:`QScrollArea`; without this, hovering
+    a spin box while scrolling the sheet would silently change its value
+    instead of scrolling the page. Ignoring the wheel lets the event
+    bubble up to the scroll area. Values are still editable by typing or
+    the up/down arrows.
+    """
+
+    def wheelEvent(self, event):  # noqa: N802 (Qt override)
+        event.ignore()
+
+
+class _NoScrollComboBox(QComboBox):
+    """A combo box that ignores the mouse wheel (see _NoScrollSpinBox)."""
+
+    def wheelEvent(self, event):  # noqa: N802 (Qt override)
+        event.ignore()
+
+
 def _spin(parent, lo, hi, val, step, suffix, *, decimals=3) -> QDoubleSpinBox:
-    sp = QDoubleSpinBox(parent)
+    sp = _NoScrollSpinBox(parent)
     sp.setRange(lo, hi)
     sp.setSingleStep(step)
     sp.setDecimals(decimals)
@@ -229,6 +250,8 @@ class _StageRow(QFrame):
         # Summary line — reactions and slings inline.
         parts = [f"UDL {result.udl_per_m:.4g} kN/m · "
                  f"W {result.total_load:.4g} kN"]
+        spacing = abs(result.reactions[1][0] - result.reactions[0][0])
+        parts.append(f"Support spacing = {spacing:.4g} m")
         for i, (x, r) in enumerate(result.reactions):
             if result.sling_tensions:
                 parts.append(
@@ -361,7 +384,7 @@ class PrecastHandlingWindow(QMainWindow):
         form = QFormLayout(glob)
         form.setContentsMargins(8, 8, 8, 8)
 
-        self._orient_combo = QComboBox(glob)
+        self._orient_combo = _NoScrollComboBox(glob)
         self._orient_combo.addItem("Horizontal handling", ORIENT_HORIZONTAL)
         self._orient_combo.addItem("Original model angle", ORIENT_MODEL)
         self._orient_combo.addItem("Custom angle", ORIENT_CUSTOM)

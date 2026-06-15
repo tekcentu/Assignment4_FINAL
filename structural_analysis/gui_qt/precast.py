@@ -393,6 +393,9 @@ def format_stage_block(stage: StageInput, result: HandlingResult) -> list[str]:
     lines.append(f"DAF: {stage.daf:g}")
     lines.append(f"Handling UDL (incl. DAF): {result.udl_per_m:.4g} kN/m")
     lines.append(f"Total handling load: {result.total_load:.4g} kN")
+    if len(result.reactions) == 2:
+        spacing = abs(result.reactions[1][0] - result.reactions[0][0])
+        lines.append(f"Support spacing: {spacing:.4g} m")
     lines.append("Reactions (x [m], R [kN], upward +):")
     for i, (x, r) in enumerate(result.reactions):
         extra = ""

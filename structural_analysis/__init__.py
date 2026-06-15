@@ -1,10 +1,9 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.36.0"
+__version__ = "0.36.1"
 __what_is_new__ = (
-    "Precast Handling Stages V2: all three stages on one scrolling sheet · "
-    "Always 2 supports; per-stage Auto-space button · "
-    "Global DAF / weight / orientation drive all stages at once"
+    "Precast sheet: mouse wheel scrolls the page instead of nudging spin "
+    "boxes · Shows support spacing per stage"
 )
 
 from .model import (

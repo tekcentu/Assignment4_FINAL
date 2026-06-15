@@ -137,6 +137,40 @@ def test_copy_report_includes_all_three_stages(qt_app):
     assert "Stock" in txt
     assert "Truck" in txt
     assert "display-only" in txt
+    assert "Support spacing" in txt
+
+
+def test_summary_shows_support_spacing(qt_app):
+    w = MainWindow()
+    eid = _seed_frame(w, L=8.0)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    # Stock auto-spaces to 0.2L / 0.8L → spacing 0.6·8 = 4.8 m.
+    assert "Support spacing = 4.8 m" in win._rows[STAGE_STOCK].summary.text()
+
+
+def test_spin_boxes_ignore_mouse_wheel(qt_app):
+    """Scrolling the sheet must not nudge spin-box values — the wheel
+    event is ignored so it bubbles up to the scroll area."""
+    from PyQt6.QtCore import QPoint, QPointF, Qt
+    from PyQt6.QtGui import QWheelEvent
+
+    w = MainWindow()
+    eid = _seed_frame(w, L=8.0)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    sp = win._rows[STAGE_STOCK].p1
+    before = sp.value()
+    ev = QWheelEvent(
+        QPointF(5, 5), QPointF(5, 5),
+        QPoint(0, 0), QPoint(0, 120),
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase, False,
+    )
+    sp.wheelEvent(ev)
+    qt_app.processEvents()
+    assert sp.value() == pytest.approx(before)
+    assert not ev.isAccepted()
 
 
 def test_menu_handler_rejects_truss(qt_app, monkeypatch):
