@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.40.0"
+__version__ = "0.40.1"
 __what_is_new__ = (
-    "Global Units V1 (display-only): kN/m, N/mm, kgf, tf, lbf, kip presets · "
-    "View → Units… and status-bar selector · "
-    "Internal solver and project files remain kN-m"
+    "Units V1: N/V/M hover + member-end-force readouts now convert · "
+    "Load arrows stay explicitly labelled kN / kN·m / kN/m (never misleading) · "
+    "Inputs/coords still kN-m (display-only)"
 )
 
 from .model import (

@@ -2215,16 +2215,22 @@ class MainWindow(QMainWindow):
             )
             return
         f_local = [float(v) for v in mr["f_local"]]
+        from ..gui_common import units as _U
+        pid = self._units_preset
+        fL = _U.force_label(pid)
+        mL = _U.moment_label(pid)
+        F = lambda v: _U.force_to_display(v, pid)   # noqa: E731
+        M = lambda v: _U.moment_to_display(v, pid)  # noqa: E731
         lines = [
             f"Element {elem_id} free-body / local end forces",
             f"Type: {getattr(elem, 'kind', elem.__class__.__name__)}",
             f"Nodes: {elem.node_i} -> {elem.node_j}",
             "",
             "Local member-end forces:",
-            f"  i-end: N={f_local[0]:+.6g} kN, V={f_local[1]:+.6g} kN, "
-            f"M={f_local[2]:+.6g} kN*m",
-            f"  j-end: N={f_local[3]:+.6g} kN, V={f_local[4]:+.6g} kN, "
-            f"M={f_local[5]:+.6g} kN*m",
+            f"  i-end: N={F(f_local[0]):+.6g} {fL}, V={F(f_local[1]):+.6g} {fL}, "
+            f"M={M(f_local[2]):+.6g} {mL}",
+            f"  j-end: N={F(f_local[3]):+.6g} {fL}, V={F(f_local[4]):+.6g} {fL}, "
+            f"M={M(f_local[5]):+.6g} {mL}",
             "",
             "Free-body convention:",
             "  N is local axial force; V is local transverse shear; "
@@ -2375,7 +2381,7 @@ class MainWindow(QMainWindow):
         bar when the cursor is near an element and a result is loaded.
         Returns ``None`` when no value is meaningful (truss + shear /
         moment, or the kind doesn't apply)."""
-        from .canvas import _diagram_value, _DIAGRAM_UNITS
+        from .canvas import _diagram_value
         if self._result is None or not self._result.member_results:
             return None
         elem = next((e for e in self._model.elements
@@ -2401,7 +2407,17 @@ class MainWindow(QMainWindow):
         value = _diagram_value(elem, ni, nj, mr["f_local"], kind, x_loc)
         if value is None:
             return None
-        unit = _DIAGRAM_UNITS.get(kind, "")
+        # Convert the result value to the active display preset; the x
+        # position is a coordinate and stays in metres in V1 (coordinate
+        # conversion is V2).
+        from ..gui_common import units as _U
+        pid = self._units_preset
+        if kind == "moment":
+            value = _U.moment_to_display(value, pid)
+            unit = _U.moment_label(pid)
+        else:
+            value = _U.force_to_display(value, pid)
+            unit = _U.force_label(pid)
         label = {"moment": "M", "shear": "V", "axial": "N"}.get(kind, kind)
         return f"{label}={value:+.4g} {unit} @ x={x_loc:.3f} m on e{elem.id}"
 

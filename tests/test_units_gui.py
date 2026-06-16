@@ -153,3 +153,75 @@ def test_unknown_qsettings_value_falls_back_to_default(qt_app):
         "units_preset", "junk_unit")
     w = MainWindow()
     assert w._units_preset == U.DEFAULT_PRESET_ID
+
+
+def test_member_end_force_readout_converts_with_preset(qt_app, monkeypatch):
+    """The element free-body / local-end-force readout (a result surface)
+    converts to the active preset."""
+    w = MainWindow()
+    _seed_solved(w)
+
+    captured = {}
+
+    class _FakeBox:
+        def __init__(self, *a, **k):
+            pass
+
+        def setWindowTitle(self, *_a):
+            pass
+
+        def setText(self, *_a):
+            pass
+
+        def setInformativeText(self, *_a):
+            pass
+
+        def setDetailedText(self, text):
+            captured["detail"] = text
+
+        def exec(self):
+            return 0
+
+    import structural_analysis.gui_qt.app as appmod
+    monkeypatch.setattr(appmod, "QMessageBox", _FakeBox)
+
+    w._set_units_preset("kip_ft")
+    w._show_element_results(1)
+    detail = captured.get("detail", "")
+    assert "kip" in detail
+    assert "kN" not in detail   # fully converted, no stray internal unit
+
+
+def test_load_render_labels_stay_kN_not_misleading(qt_app):
+    """V1 must not relabel un-converted load annotations. Even in kip
+    mode the canvas load tags must read kN / kN·m / kN/m so the user is
+    never misled into thinking loads were converted."""
+    from structural_analysis.gui_qt.canvas import (
+        _label_for_udl, _label_for_pointload,
+    )
+    from structural_analysis.model import UniformDistributedLoad, PointLoad
+    udl = UniformDistributedLoad(wy=10.0, coord_system="gravity")
+    pl = PointLoad(py=15.0, a=2.0, coord_system="gravity")
+    assert "kN/m" in _label_for_udl(udl)
+    assert "kN" in _label_for_pointload(pl)
+    # Switching the global preset doesn't touch these labels (they are
+    # not preset-aware — they are always internal kN).
+    w = MainWindow()
+    w._set_units_preset("kip_ft")
+    assert "kN/m" in _label_for_udl(udl)
+    assert "kN" in _label_for_pointload(pl)
+
+
+def test_diagram_hover_readout_converts_value_but_keeps_x_in_m(qt_app):
+    w = MainWindow()
+    _seed_solved(w)
+    w.canvas.diagram_kind = "axial"
+    w._set_units_preset("kip_ft")
+    # Build a synthetic hit on element 1 near its midpoint.
+    from structural_analysis.gui_qt.canvas import HitResult
+    hit = HitResult(x=2.5, y=0.0, element_id=1)
+    txt = w._diagram_value_text_for_hit(hit)
+    assert txt is not None
+    assert "kip" in txt          # value converted
+    assert "@ x=" in txt and " m " in txt   # coordinate stays metres
+

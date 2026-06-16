@@ -1817,7 +1817,7 @@ class ModelCanvas(QWidget):
                     ),
                     zorder=5,
                 )
-                self.ax.annotate(f"Fx={ld.fx:+.3g}", (x - dx, y),
+                self.ax.annotate(f"Fx={ld.fx:+.3g} kN", (x - dx, y),
                                  xytext=(0, 5), textcoords="offset points",
                                  fontsize=7, color="#2ca02c", zorder=6,
                                  alpha=case_alpha)
@@ -1833,12 +1833,12 @@ class ModelCanvas(QWidget):
                     ),
                     zorder=5,
                 )
-                self.ax.annotate(f"Fy={ld.fy:+.3g}", (x, y - dy),
+                self.ax.annotate(f"Fy={ld.fy:+.3g} kN", (x, y - dy),
                                  xytext=(5, 0), textcoords="offset points",
                                  fontsize=7, color="#2ca02c", zorder=6,
                                  alpha=case_alpha)
         if ld.mz:
-            self.ax.annotate(f"M={ld.mz:+.3g}", (x, y), xytext=(8, -8),
+            self.ax.annotate(f"M={ld.mz:+.3g} kN·m", (x, y), xytext=(8, -8),
                              textcoords="offset points", fontsize=7,
                              color="#2ca02c", zorder=6,
                              alpha=case_alpha)
@@ -2501,36 +2501,43 @@ def _pointload_visual_components(
 
 
 def _label_for_udl(ml: UniformDistributedLoad) -> str:
-    """Short magnitude-and-direction tag rendered under the element."""
+    """Short magnitude-and-direction tag rendered under the element.
+
+    The ``kN/m`` suffix is kept explicit so the tag stays honest when the
+    Global-Units display preset is something other than kN — member loads
+    are NOT converted in V1 (display/output-only), so they must read in
+    their true internal units.
+    """
     cs = getattr(ml, "coord_system", "local")
     if cs == "gravity":
-        return f"UDL {ml.wy:+.3g} grav"
+        return f"UDL {ml.wy:+.3g} kN/m grav"
     if cs == "global":
         if ml.wx != 0.0 and ml.wy != 0.0:
-            return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g}) glob"
+            return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g}) kN/m glob"
         if ml.wx != 0.0:
-            return f"UDL qX={ml.wx:+.3g} glob"
-        return f"UDL qY={ml.wy:+.3g} glob"
+            return f"UDL qX={ml.wx:+.3g} kN/m glob"
+        return f"UDL qY={ml.wy:+.3g} kN/m glob"
     # local
     if ml.wx != 0.0 and ml.wy != 0.0:
-        return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g})"
+        return f"UDL ({ml.wx:+.3g},{ml.wy:+.3g}) kN/m"
     if ml.wx != 0.0:
-        return f"UDL wx={ml.wx:+.3g}"
-    return f"UDL {ml.wy:+.3g}"
+        return f"UDL wx={ml.wx:+.3g} kN/m"
+    return f"UDL {ml.wy:+.3g} kN/m"
 
 
 def _label_for_pointload(ml: PointLoad) -> str:
+    """Point-load tag. ``kN`` suffix kept explicit (see _label_for_udl)."""
     cs = getattr(ml, "coord_system", "local")
     suffix = ""
     if cs == "gravity":
-        return f"P {ml.py:+.3g}@{ml.a:.3g} grav"
+        return f"P {ml.py:+.3g} kN @{ml.a:.3g} grav"
     if cs == "global":
         suffix = " glob"
     if ml.px != 0.0 and ml.py != 0.0:
-        return f"P ({ml.px:+.3g},{ml.py:+.3g})@{ml.a:.3g}{suffix}"
+        return f"P ({ml.px:+.3g},{ml.py:+.3g}) kN @{ml.a:.3g}{suffix}"
     if ml.px != 0.0:
-        return f"P px={ml.px:+.3g}@{ml.a:.3g}{suffix}"
-    return f"P {ml.py:+.3g}@{ml.a:.3g}{suffix}"
+        return f"P px={ml.px:+.3g} kN @{ml.a:.3g}{suffix}"
+    return f"P {ml.py:+.3g} kN @{ml.a:.3g}{suffix}"
 
 
 def _shift_pressed() -> bool:
