@@ -119,13 +119,25 @@ def member_spec_from_element(model, elem) -> MemberSpec:
     L, c, s = elem.length_cos_sin(model.nodes)
     if L <= 0.0:
         raise ValueError(f"Element {elem.id} has non-positive length.")
+    # Always re-derive geometry and density from the *live* section + material
+    # objects so the precast self-weight tracks edits made in the Section /
+    # Material editors. The element's own A / I / rho are kept in sync by the
+    # propagation commands, but during mid-edit states they can lag — falling
+    # back to them silently has produced "section reads 0 kN/m" reports in
+    # the wild (example_09 + a section/material round-trip).
+    section = model.sections.get(getattr(elem, "section_id", None))
     try:
         rho = float(effective_material(model, elem).density)
     except (KeyError, AttributeError):
         rho = float(getattr(elem, "rho", 0.0))
-    A = float(getattr(elem, "A", 0.0))
+    if section is not None:
+        A = float(getattr(section, "A", 0.0)) or float(getattr(elem, "A", 0.0))
+        inertia = (float(getattr(section, "I", 0.0))
+                   or float(getattr(elem, "I", 0.0)))
+    else:
+        A = float(getattr(elem, "A", 0.0))
+        inertia = float(getattr(elem, "I", 0.0))
     w_self = rho * A * STANDARD_GRAVITY / 1000.0  # kN/m
-    section = model.sections.get(getattr(elem, "section_id", None))
     name = section.name if section and section.name else ""
     # Depth typically lives on the section; the element only carries it when
     # the user opted in for thermal gradient. Fall back to the section so
@@ -139,7 +151,7 @@ def member_spec_from_element(model, elem) -> MemberSpec:
         self_weight=w_self,
         depth=depth,
         area=A,
-        inertia=float(getattr(elem, "I", 0.0)),
+        inertia=inertia,
         section_name=name,
         model_angle_deg=math.degrees(math.atan2(s, c)),
     )
@@ -506,7 +518,14 @@ def compute_handling(
     udl_per_m = (w_self + w_extra + w_suction) * daf   # kN/m, downward
     total_load = udl_per_m * L                         # kN
     if total_load <= 0.0:
-        warnings.append("Total handling load is zero — check the weights.")
+        if stage.manual_weight is None and member.self_weight <= 0.0:
+            warnings.append(
+                "Section self-weight is zero — the material density and "
+                "the section area must both be positive. Set them on the "
+                "Material / Section, or enter a manual weight."
+            )
+        else:
+            warnings.append("Total handling load is zero — check the weights.")
 
     pts = _validate_points(stage.points, L)
     centroid = L / 2.0   # uniform full-length load → midspan

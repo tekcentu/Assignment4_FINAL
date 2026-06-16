@@ -113,6 +113,35 @@ def test_member_spec_rejects_truss():
         member_spec_from_element(m, t)
 
 
+def test_member_spec_prefers_live_section_and_material_over_stale_element():
+    """Defensive: the precast self-weight tracks edits to the live Section
+    and Material even when the element's cached A / rho lag behind. This
+    is the symptom the user hit on example_09 (header read 0 kN/m
+    despite the section + material being well-defined).
+    """
+    m = _model_with_one_frame(L=6.0, A=0.15, rho=2500.0)
+    elem = m.elements[0]
+    # Simulate a stale element after some mid-edit GUI flow.
+    elem.A = 0.0
+    elem.rho = 0.0
+    spec = member_spec_from_element(m, elem)
+    assert spec.area == pytest.approx(0.15)
+    assert spec.self_weight == pytest.approx(2500 * 0.15 * 9.81 / 1000.0)
+
+
+def test_zero_self_weight_warning_names_section_and_material():
+    """When the *section* genuinely has no self-weight, the warning
+    points at ρ / A specifically instead of the generic "check the
+    weights" message.
+    """
+    spec = MemberSpec(elem_id=1, length=6.0, self_weight=0.0,
+                      area=0.0, inertia=0.05, depth=0.4, section_name="X")
+    res = compute_handling(
+        spec, StageInput(stage=STAGE_LIFTING, points=(1.2, 4.8)),
+    )
+    assert any("density" in w and "area" in w for w in res.warnings)
+
+
 # ── auto-even spacing ─────────────────────────────────────────────
 
 

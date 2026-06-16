@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.37.0"
+__version__ = "0.37.1"
 __what_is_new__ = (
-    "Precast: elastic σ = M·y/I cracking check per stage · "
-    "Tensile stress, controlling x, ratio vs. allowable, OK / CRACKING · "
-    "Manual y_top / y_bottom override when section depth is missing"
+    "Precast: self-weight reads live section A and material density · "
+    "Survives mid-edit element staleness · "
+    "Clearer warning when ρ or A is zero"
 )
 
 from .model import (
