@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.37.1"
+__version__ = "0.38.0"
 __what_is_new__ = (
-    "Precast: self-weight reads live section A and material density · "
-    "Survives mid-edit element staleness · "
-    "Clearer warning when ρ or A is zero"
+    "Precast: per-stage DAF + enable/disable with grey-out · "
+    "Richer stage sketch (UDL band, reaction arrows + values, sling T/H) · "
+    "OK/WARNING status chips and high-DAF soft warning"
 )
 
 from .model import (

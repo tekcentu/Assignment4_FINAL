@@ -96,16 +96,62 @@ def test_auto_space_seeds_per_stage_defaults(qt_app):
     assert win._rows[STAGE_TRUCK].p2.value() == pytest.approx(9.0)
 
 
-def test_global_daf_change_rescales_all_stages(qt_app):
+def test_per_stage_daf_rescales_only_that_stage(qt_app):
     w = MainWindow()
     eid = _seed_frame(w)
     win = PrecastHandlingWindow(w, lambda: w._model)
     win.set_target(eid)
     base = {k: win._last_results[k].total_load for k in STAGES}
-    win._daf.setValue(1.5)
+    # DAF now lives per stage row, not as a global control.
+    assert not hasattr(win, "_daf")
+    win._rows[STAGE_STOCK].daf.setValue(1.5)
     qt_app.processEvents()
-    for k in STAGES:
-        assert win._last_results[k].total_load == pytest.approx(1.5 * base[k])
+    assert win._last_results[STAGE_STOCK].total_load == pytest.approx(
+        1.5 * base[STAGE_STOCK])
+    # Other stages keep their own DAF (unchanged).
+    assert win._last_results[STAGE_LIFTING].total_load == pytest.approx(
+        base[STAGE_LIFTING])
+    assert win._last_results[STAGE_TRUCK].total_load == pytest.approx(
+        base[STAGE_TRUCK])
+
+
+def test_high_daf_emits_soft_warning_and_warning_chip(qt_app):
+    w = MainWindow()
+    eid = _seed_frame(w)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    win._rows[STAGE_STOCK].daf.setValue(2.5)
+    qt_app.processEvents()
+    res = win._last_results[STAGE_STOCK]
+    assert any("unusually high" in m for m in res.warnings)
+    assert "WARNING" in win._rows[STAGE_STOCK].status_chip.text()
+
+
+def test_disabled_stage_greys_out_and_is_skipped(qt_app):
+    w = MainWindow()
+    eid = _seed_frame(w)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    assert STAGE_STOCK in win._last_results
+    win._rows[STAGE_STOCK].enabled_cb.setChecked(False)
+    qt_app.processEvents()
+    # Dropped from results, controls greyed, chip reads DISABLED.
+    assert STAGE_STOCK not in win._last_results
+    assert not win._rows[STAGE_STOCK].p1.isEnabled()
+    assert not win._rows[STAGE_STOCK].daf.isEnabled()
+    assert win._rows[STAGE_STOCK].status_chip.text() == "DISABLED"
+    # Enabled stages still computed.
+    assert STAGE_LIFTING in win._last_results
+    # The copied report omits the disabled stage.
+    win._copy_report()
+    txt = QApplication.clipboard().text()
+    assert "Stock" not in txt
+    assert "Lifting" in txt
+    # Re-enabling restores it.
+    win._rows[STAGE_STOCK].enabled_cb.setChecked(True)
+    qt_app.processEvents()
+    assert STAGE_STOCK in win._last_results
+    assert win._rows[STAGE_STOCK].p1.isEnabled()
 
 
 def test_row_position_edit_triggers_recompute(qt_app):
@@ -162,6 +208,36 @@ def test_cracking_check_appears_in_summary_and_report(qt_app):
     assert "Flexural cracking check" in cb_text
     assert "Allowable tensile stress" in cb_text
     assert "CRACKING WARNING" in cb_text
+
+
+def test_stage_sketch_draws_member_udl_reactions_and_slings(qt_app):
+    """The in-dialog 2D sketch must show the member line, UDL load band,
+    upward reaction arrows + values, and (lifting only) sling lines with
+    T / H labels, plus populated V and M diagrams."""
+    w = MainWindow()
+    eid = _seed_frame(w, L=8.0)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+
+    lift = win._rows[STAGE_LIFTING]
+    member_texts = [t.get_text() for t in lift._ax_member.texts]
+    # UDL band label and reaction value labels.
+    assert any(s.startswith("w =") for s in member_texts)
+    assert any(s.startswith("R=") for s in member_texts)
+    # Sling tension / horizontal labels on the lifting row.
+    assert any("T=" in s and "H=" in s for s in member_texts)
+    # The member line itself is drawn.
+    assert len(lift._ax_member.lines) >= 1
+    # V and M diagrams are populated.
+    assert len(lift._ax_v.lines) >= 1
+    assert len(lift._ax_m.lines) >= 1
+    # The OK / WARNING chip is populated for an enabled, valid stage.
+    assert lift.status_chip.text() in ("OK", "WARNING")
+
+    # A non-lifting stage shows reactions but no sling T / H labels.
+    stock_texts = [t.get_text() for t in win._rows[STAGE_STOCK]._ax_member.texts]
+    assert any(s.startswith("R=") for s in stock_texts)
+    assert not any("T=" in s for s in stock_texts)
 
 
 def test_manual_y_toggle_enables_y_spinboxes(qt_app):
@@ -257,7 +333,7 @@ def test_window_does_not_mutate_main_model(qt_app):
     win = PrecastHandlingWindow(w, lambda: w._model)
     win.set_target(eid)
     # Exercise several inputs across rows.
-    win._daf.setValue(1.4)
+    win._rows[STAGE_LIFTING].daf.setValue(1.4)
     win._rows[STAGE_LIFTING].suction.setValue(2.0)
     win._rows[STAGE_STOCK].p1.setValue(1.0)
     qt_app.processEvents()

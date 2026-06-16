@@ -205,7 +205,8 @@ class StageInput:
     stage: str = STAGE_LIFTING
     points: tuple[float, float] = (0.0, 0.0)   # (x1, x2), 0 ≤ xk ≤ L
     sling_angle_deg: float = 60.0              # lifting only
-    daf: float = 1.0
+    daf: float = 1.0                           # per-stage dynamic amp. factor
+    enabled: bool = True                       # UI state: skip when False
     manual_weight: float | None = None         # kN/m override of self-weight
     suction: float = 0.0                       # kN/m downward, lifting only
     extra_udl: float = 0.0                     # kN/m downward
@@ -492,6 +493,11 @@ def compute_handling(
     if daf < 1.0:
         warnings.append(
             f"DAF = {daf:g} is below 1.0 (no dynamic amplification)."
+        )
+    elif daf > 2.0:
+        warnings.append(
+            f"DAF = {daf:g} is unusually high (> 2.0) — double-check the "
+            "dynamic-amplification assumption for this stage."
         )
 
     w_self = float(

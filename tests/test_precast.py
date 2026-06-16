@@ -233,6 +233,23 @@ def test_daf_scales_effects_linearly():
     assert ra.m_pos_max == pytest.approx(1.5 * rb.m_pos_max)
 
 
+def test_high_daf_emits_soft_warning():
+    spec = _spec(L=8.0, w=10.0)
+    res = compute_handling(
+        spec, StageInput(stage=STAGE_STOCK, points=(1.0, 7.0), daf=2.5),
+    )
+    assert any("unusually high" in w for w in res.warnings)
+    # A normal DAF is silent.
+    ok = compute_handling(
+        spec, StageInput(stage=STAGE_STOCK, points=(1.0, 7.0), daf=1.2),
+    )
+    assert not any("unusually high" in w for w in ok.warnings)
+
+
+def test_stage_input_enabled_defaults_true():
+    assert StageInput(stage=STAGE_STOCK).enabled is True
+
+
 def test_suction_adds_load_for_lifting_only():
     spec = _spec(L=8.0, w=10.0)
     lift_no = StageInput(stage=STAGE_LIFTING, points=(1.6, 6.4), suction=0.0)

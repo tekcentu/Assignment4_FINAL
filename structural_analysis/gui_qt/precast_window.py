@@ -112,8 +112,19 @@ class _StageRow(QFrame):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
 
+        # Title bar: stage name · status chip · enabled toggle.
+        title_bar = QHBoxLayout()
         title = QLabel(f"<b>{STAGE_LABELS[stage_key]}</b>", self)
-        outer.addWidget(title)
+        title_bar.addWidget(title)
+        title_bar.addStretch(1)
+        self.status_chip = QLabel("", self)
+        self._set_chip("OK", "OK")
+        title_bar.addWidget(self.status_chip)
+        self.enabled_cb = QCheckBox("Enabled", self)
+        self.enabled_cb.setChecked(True)
+        self.enabled_cb.toggled.connect(self._fire)
+        title_bar.addWidget(self.enabled_cb)
+        outer.addLayout(title_bar)
 
         controls = QGridLayout()
         controls.setHorizontalSpacing(8)
@@ -128,6 +139,9 @@ class _StageRow(QFrame):
         self.auto_btn = QPushButton("Auto-space", self)
         self.auto_btn.clicked.connect(self._auto_space_clicked)
         controls.addWidget(self.auto_btn, row, 4)
+        controls.addWidget(QLabel("DAF", self), row, 5)
+        self.daf = _spin(self, 0.1, 5.0, 1.0, 0.05, "", decimals=2)
+        controls.addWidget(self.daf, row, 6)
 
         # Lifting-only controls live on the lifting row.
         self.sling_angle: QDoubleSpinBox | None = None
@@ -138,8 +152,12 @@ class _StageRow(QFrame):
             self.sling_angle = _spin(self, 1.0, 90.0, 60.0, 1.0, " °",
                                      decimals=1)
             controls.addWidget(self.sling_angle, row, 1)
-            controls.addWidget(QLabel("Suction (kN/m)", self), row, 2)
+            controls.addWidget(
+                QLabel("Bed adhesion / suction (kN/m)", self), row, 2)
             self.suction = _spin(self, 0.0, 1e6, 0.0, 0.5, " kN/m")
+            self.suction.setToolTip(
+                "Downward bed adhesion / form suction on the lifting "
+                "stage only. 0.0 = off.")
             controls.addWidget(self.suction, row, 3)
 
         outer.addLayout(controls)
@@ -167,7 +185,7 @@ class _StageRow(QFrame):
         outer.addWidget(self.warning)
 
         # Wire up edits.
-        for sp in (self.p1, self.p2):
+        for sp in (self.p1, self.p2, self.daf):
             sp.valueChanged.connect(self._fire)
         if self.sling_angle is not None:
             self.sling_angle.valueChanged.connect(self._fire)
@@ -175,6 +193,20 @@ class _StageRow(QFrame):
             self.suction.valueChanged.connect(self._fire)
 
     # ── helpers ──
+
+    def _set_chip(self, text: str, kind: str) -> None:
+        """Style the title-bar status chip. ``kind`` ∈ {OK, WARNING, DISABLED}."""
+        palette = {
+            "OK": ("#1a7f37", "#e6f4ea"),
+            "WARNING": ("#b00020", "#fdecea"),
+            "DISABLED": ("#777", "#eeeeee"),
+        }
+        fg, bg = palette.get(kind, palette["OK"])
+        self.status_chip.setText(text)
+        self.status_chip.setStyleSheet(
+            f"color: {fg}; background: {bg}; border-radius: 7px; "
+            "padding: 1px 9px; font-weight: bold;"
+        )
 
     def _fire(self) -> None:
         if self._updating:
@@ -202,12 +234,18 @@ class _StageRow(QFrame):
         finally:
             self._updating = False
 
+    @property
+    def enabled(self) -> bool:
+        return self.enabled_cb.isChecked()
+
     def load_inputs(self, stage: StageInput) -> None:
         self._updating = True
         try:
             x1, x2 = stage.points
             self.p1.setValue(x1)
             self.p2.setValue(x2)
+            self.daf.setValue(stage.daf)
+            self.enabled_cb.setChecked(stage.enabled)
             if self.sling_angle is not None:
                 self.sling_angle.setValue(stage.sling_angle_deg)
             if self.suction is not None:
@@ -226,7 +264,8 @@ class _StageRow(QFrame):
             stage=template.stage,
             points=points,
             sling_angle_deg=sling_angle,
-            daf=template.daf,
+            daf=self.daf.value(),
+            enabled=self.enabled_cb.isChecked(),
             manual_weight=template.manual_weight,
             suction=suction,
             extra_udl=template.extra_udl,
@@ -237,6 +276,32 @@ class _StageRow(QFrame):
             manual_y_top=template.manual_y_top,
             manual_y_bottom=template.manual_y_bottom,
         )
+
+    def set_greyed(self, greyed: bool) -> None:
+        """Enable/disable every input except the Enabled toggle itself."""
+        live = not greyed
+        for sp in (self.p1, self.p2, self.daf, self.auto_btn):
+            sp.setEnabled(live)
+        if self.sling_angle is not None:
+            self.sling_angle.setEnabled(live)
+        if self.suction is not None:
+            self.suction.setEnabled(live)
+
+    def show_disabled(self) -> None:
+        """Grey the row out: clear text, chip → DISABLED, blank the axes."""
+        self.summary.setText("")
+        self.stress.setText("")
+        self.warning.setText("")
+        self._set_chip("DISABLED", "DISABLED")
+        for ax in (self._ax_member, self._ax_v, self._ax_m):
+            ax.clear()
+            ax.set_xticks([])
+            ax.set_yticks([])
+        self._ax_member.text(
+            0.5, 0.5, "Stage disabled", ha="center", va="center",
+            transform=self._ax_member.transAxes, color="#999", fontsize=10,
+        )
+        self.canvas.draw_idle()
 
     # ── rendering ──
 
@@ -278,6 +343,11 @@ class _StageRow(QFrame):
         self.warning.setText(
             "\n".join(f"⚠ {w}" for w in result.warnings)
         )
+        cracking = (result.stress_check.cracking_status == "CRACKING WARNING")
+        if result.warnings or cracking:
+            self._set_chip("WARNING", "WARNING")
+        else:
+            self._set_chip("OK", "OK")
         self._render_stress(result.stress_check)
         self._draw(member, stage, result)
 
@@ -325,30 +395,64 @@ class _StageRow(QFrame):
 
         ax = self._ax_member
         ax.clear()
-        ax.plot([0.0, L * ca], [0.0, L * sa], color="#1f3a5f", lw=4)
+        # Member line.
+        ax.plot([0.0, L * ca], [0.0, L * sa], color="#1f3a5f", lw=4, zorder=4)
 
-        for x, _r in result.reactions:
+        # UDL band: downward gravity arrows along the span + a label. Arrows
+        # point straight down (gravity) regardless of the display angle.
+        band = 0.13 * L
+        for i in range(0, 9):
+            x = i * L / 8.0
+            px, py = x * ca, x * sa
+            ax.annotate(
+                "", xy=(px, py), xytext=(px, py + band),
+                arrowprops=dict(arrowstyle="->", color="#c0508a", lw=0.9),
+                zorder=3,
+            )
+        ax.plot([0.0, L * ca], [band, L * sa + band],
+                color="#c0508a", lw=1.0, alpha=0.8, zorder=3)
+        ax.text((L / 2.0) * ca, (L / 2.0) * sa + band * 1.25,
+                f"w = {result.udl_per_m:.3g} kN/m",
+                ha="center", va="bottom", fontsize=7, color="#c0508a")
+
+        # Supports / lift points, upward reaction arrows + value labels, and
+        # (lifting only) sling lines with T / H labels.
+        arr = 0.22 * L
+        hx, hy = (L / 2.0) * ca, (L / 2.0) * sa + 0.32 * L
+        for i, (x, r) in enumerate(result.reactions):
             px, py = x * ca, x * sa
             if result.stage == STAGE_LIFTING:
-                hx, hy = (L / 2.0) * ca, (L / 2.0) * sa + 0.25 * L
-                ax.plot([px, hx], [py, hy], color="#1a7f37", lw=1.2)
-                ax.plot([px], [py], marker="v", color="#1a7f37", ms=9)
+                ax.plot([px, hx], [py, hy], color="#1a7f37", lw=1.2, zorder=3)
+                ax.plot([px], [py], marker="v", color="#1a7f37", ms=9,
+                        zorder=5)
+                if result.sling_tensions:
+                    mx, my = (px + hx) / 2.0, (py + hy) / 2.0
+                    ax.annotate(
+                        f"T={result.sling_tensions[i]:.3g} kN\n"
+                        f"H={result.sling_horizontal[i]:.3g} kN",
+                        xy=(mx, my), fontsize=6.5, color="#1a7f37",
+                        ha="left", va="center",
+                    )
             else:
-                ax.plot([px], [py - 0.04 * L], marker="^",
-                        color="#444", ms=12)
+                ax.plot([px], [py - 0.05 * L], marker="^", color="#444",
+                        ms=12, zorder=5)
+            # Upward reaction arrow + value (the support's vertical reaction).
+            ax.annotate(
+                "", xy=(px, py), xytext=(px, py - arr),
+                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1.6),
+                zorder=4,
+            )
+            ax.text(px, py - arr, f"R={r:.3g} kN", ha="center", va="top",
+                    fontsize=7, color="#1565c0")
         if result.stage == STAGE_LIFTING and result.reactions:
-            hx, hy = (L / 2.0) * ca, (L / 2.0) * sa + 0.25 * L
-            ax.plot([hx], [hy], marker="o", color="#1a7f37", ms=7)
+            ax.plot([hx], [hy], marker="o", color="#1a7f37", ms=7, zorder=5)
 
-        for i in range(1, 6):
-            x = i * L / 6.0
-            ax.annotate("", xy=(x * ca, x * sa - 0.06 * L),
-                        xytext=(x * ca, x * sa),
-                        arrowprops=dict(arrowstyle="->",
-                                        color="#999", lw=0.8))
-        ax.set_title("Member", fontsize=9)
+        status = "WARNING" if (result.warnings or result.stress_check
+                               .cracking_status == "CRACKING WARNING") else "OK"
+        ax.set_title(f"{STAGE_LABELS.get(result.stage, result.stage)} — "
+                     f"{status}", fontsize=9)
         ax.set_aspect("equal", adjustable="datalim")
-        ax.margins(0.15)
+        ax.margins(0.18)
         ax.tick_params(labelsize=7)
 
         xs = [s[0] for s in result.stations]
@@ -431,9 +535,6 @@ class PrecastHandlingWindow(QMainWindow):
                                    decimals=1)
         form.addRow("Custom angle", self._custom_angle)
 
-        self._daf = _spin(glob, 0.1, 5.0, 1.0, 0.05, "", decimals=2)
-        form.addRow("DAF", self._daf)
-
         self._auto_weight = QCheckBox("Auto (from section)", glob)
         self._auto_weight.setChecked(True)
         self._auto_weight.toggled.connect(self._on_global_changed)
@@ -464,7 +565,7 @@ class PrecastHandlingWindow(QMainWindow):
         self._y_bottom = _spin(glob, 0.0001, 100.0, 0.2, 0.01, " m", decimals=4)
         form.addRow("y_bottom", self._y_bottom)
 
-        for sp in (self._custom_angle, self._daf,
+        for sp in (self._custom_angle,
                    self._manual_weight, self._extra_udl,
                    self._allowable_tensile, self._y_top, self._y_bottom):
             sp.valueChanged.connect(self._on_global_changed)
@@ -576,7 +677,6 @@ class PrecastHandlingWindow(QMainWindow):
         return StageInput(
             stage=stage_key,
             points=(0.0, 0.0),  # overwritten by row
-            daf=self._daf.value(),
             manual_weight=(None if self._auto_weight.isChecked()
                            else self._manual_weight.value()),
             extra_udl=self._extra_udl.value(),
@@ -608,6 +708,16 @@ class PrecastHandlingWindow(QMainWindow):
             return
         ordered: list[tuple[StageInput, P.HandlingResult]] = []
         for key in STAGES:
+            row = self._rows[key]
+            if not row.enabled:
+                # Skip from calculation + report; grey the row out.
+                row.set_greyed(True)
+                row.show_disabled()
+                self._stage_inputs[key] = row.read_inputs(
+                    self._global_template(key))
+                self._last_results.pop(key, None)
+                continue
+            row.set_greyed(False)
             stage, result = self._recompute_one(key)
             if result is not None:
                 ordered.append((stage, result))
