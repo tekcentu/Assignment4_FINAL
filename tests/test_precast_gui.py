@@ -269,6 +269,75 @@ def test_vm_xaxis_tracks_member_length_after_target_switch(qt_app):
         assert x1 <= 4.2, f"M axis on {key} extends to {x1}, expected ≤ 4.2"
 
 
+def test_sling_angle_tooltip_and_label_clarify_th_only(qt_app):
+    """The sling-angle label and tooltip must make clear that the angle
+    drives T / H only and not the V / M / reaction calculation."""
+    from structural_analysis.gui_qt.precast_window import SLING_ANGLE_TOOLTIP
+    assert "T" in SLING_ANGLE_TOOLTIP and "H" in SLING_ANGLE_TOOLTIP
+    assert "does NOT" in SLING_ANGLE_TOOLTIP
+    assert ("anchor" in SLING_ANGLE_TOOLTIP.lower()
+            or "insert" in SLING_ANGLE_TOOLTIP.lower())
+
+    w = MainWindow()
+    eid = _seed_frame(w)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    sa = win._rows[STAGE_LIFTING].sling_angle
+    assert "T/H only" in sa.toolTip() or "T/H only" in SLING_ANGLE_TOOLTIP
+
+
+def test_sling_angle_auto_mode_updates_from_hook_height_and_spacing(qt_app):
+    """In Auto mode, sling angle = atan(hook_height / half_spacing) and
+    tracks both hook-height edits and lift-point spacing edits."""
+    import math as _math
+    w = MainWindow()
+    eid = _seed_frame(w, L=10.0)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    row = win._rows[STAGE_LIFTING]
+    # Auto-spaced lift points at (2, 8) → half_spacing = 3 m.
+    assert row.p1.value() == pytest.approx(2.0)
+    assert row.p2.value() == pytest.approx(8.0)
+
+    row.angle_mode.setCurrentIndex(
+        row.angle_mode.findData("auto"))
+    qt_app.processEvents()
+    # In auto mode the manual angle spinbox is read-only; hook-height live.
+    assert not row.sling_angle.isEnabled()
+    assert row.hook_height.isEnabled()
+
+    row.hook_height.setValue(3.0)
+    qt_app.processEvents()
+    expected = _math.degrees(_math.atan(3.0 / 3.0))   # 45°
+    assert row.sling_angle.value() == pytest.approx(expected, abs=0.05)
+
+    # Move lift points closer → half_spacing shrinks → angle steepens.
+    row.p1.setValue(4.0)
+    row.p2.setValue(6.0)
+    qt_app.processEvents()
+    expected = _math.degrees(_math.atan(3.0 / 1.0))   # ~71.6°
+    assert row.sling_angle.value() == pytest.approx(expected, abs=0.05)
+
+    # Switching back to Manual re-enables the angle spinbox.
+    row.angle_mode.setCurrentIndex(
+        row.angle_mode.findData("manual"))
+    qt_app.processEvents()
+    assert row.sling_angle.isEnabled()
+
+
+def test_low_sling_angle_warning_surfaces_in_window(qt_app):
+    w = MainWindow()
+    eid = _seed_frame(w, L=8.0)
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(eid)
+    row = win._rows[STAGE_LIFTING]
+    row.sling_angle.setValue(30.0)
+    qt_app.processEvents()
+    warns = win._last_results[STAGE_LIFTING].warnings
+    assert any("below 45°" in m for m in warns)
+    assert "WARNING" in row.status_chip.text()
+
+
 def test_manual_y_toggle_enables_y_spinboxes(qt_app):
     w = MainWindow()
     eid = _seed_frame(w, L=8.0)

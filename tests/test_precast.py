@@ -233,6 +233,52 @@ def test_daf_scales_effects_linearly():
     assert ra.m_pos_max == pytest.approx(1.5 * rb.m_pos_max)
 
 
+def test_low_sling_angle_emits_soft_warning_lifting_only():
+    """Angle < 45° warns on lifting; non-lifting stages don't read the
+    angle so the warning doesn't fire there even if angle is set low."""
+    spec = _spec(L=8.0, w=10.0)
+    res = compute_handling(spec, StageInput(
+        stage=STAGE_LIFTING, points=(2.0, 6.0), sling_angle_deg=30.0,
+    ))
+    assert any("below 45°" in w for w in res.warnings)
+    # 45° exactly is not "low".
+    ok = compute_handling(spec, StageInput(
+        stage=STAGE_LIFTING, points=(2.0, 6.0), sling_angle_deg=60.0,
+    ))
+    assert not any("below 45°" in w for w in ok.warnings)
+    # Stock stage ignores sling angle entirely.
+    stock = compute_handling(spec, StageInput(
+        stage=STAGE_STOCK, points=(1.0, 7.0), sling_angle_deg=10.0,
+    ))
+    assert not any("below 45°" in w for w in stock.warnings)
+
+
+def test_sling_angle_changes_T_and_H_but_not_reactions_v_or_m():
+    """Documents the simplified-handling assumption: rigging-force outputs
+    (T, H) depend on the sling angle; vertical reactions and the V / M
+    diagrams do not — those are pure-gravity statics on a horizontal
+    member."""
+    spec = _spec(L=8.0, w=10.0)
+    base = compute_handling(spec, StageInput(
+        stage=STAGE_LIFTING, points=(1.6, 6.4), sling_angle_deg=60.0,
+    ))
+    flat = compute_handling(spec, StageInput(
+        stage=STAGE_LIFTING, points=(1.6, 6.4), sling_angle_deg=30.0,
+    ))
+    # T and H differ with angle.
+    assert flat.sling_tensions != base.sling_tensions
+    assert flat.sling_horizontal != base.sling_horizontal
+    # Vertical reactions, |V|max, ±M_max identical.
+    assert flat.reactions == base.reactions
+    assert flat.v_max == pytest.approx(base.v_max)
+    assert flat.m_pos_max == pytest.approx(base.m_pos_max)
+    assert flat.m_neg_max == pytest.approx(base.m_neg_max)
+    # Station-by-station V/M identical too.
+    for a, b in zip(flat.stations, base.stations):
+        assert a[1] == pytest.approx(b[1])  # V
+        assert a[2] == pytest.approx(b[2])  # M
+
+
 def test_high_daf_emits_soft_warning():
     spec = _spec(L=8.0, w=10.0)
     res = compute_handling(

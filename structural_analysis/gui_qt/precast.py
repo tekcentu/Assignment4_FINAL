@@ -546,6 +546,11 @@ def compute_handling(
             raise ValueError(
                 "Sling angle must be in (0, 90] degrees from horizontal."
             )
+        if ang < 45.0:
+            warnings.append(
+                f"Sling angle {ang:g}° is below 45° — sling tension T "
+                "and horizontal component H are high; verify the rigging."
+            )
         theta = math.radians(ang)
         sin_t = math.sin(theta)
         tensions, horiz = [], []

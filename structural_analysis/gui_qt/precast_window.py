@@ -56,6 +56,17 @@ from .precast import (
 )
 
 
+SLING_ANGLE_TOOLTIP = (
+    "Sling angle from horizontal — T/H only.\n\n"
+    "Used for rigging force calculation only: it changes the sling "
+    "tension T and horizontal component H. It does NOT change vertical "
+    "reactions, shear, or moment in the simplified horizontal handling "
+    "model.\n\n"
+    "Not the same as the concrete insert / anchor / embedded-loop angle.\n\n"
+    "Auto mode: angle = atan(hook_height / ((x2 − x1) / 2))."
+)
+
+
 class _NoScrollSpinBox(QDoubleSpinBox):
     """A spin box that ignores the mouse wheel.
 
@@ -146,11 +157,17 @@ class _StageRow(QFrame):
         # Lifting-only controls live on the lifting row.
         self.sling_angle: QDoubleSpinBox | None = None
         self.suction: QDoubleSpinBox | None = None
+        self.angle_mode: QComboBox | None = None
+        self.hook_height: QDoubleSpinBox | None = None
         if stage_key == STAGE_LIFTING:
             row += 1
-            controls.addWidget(QLabel("Sling angle (°)", self), row, 0)
+            angle_label = QLabel(
+                "Sling angle from horizontal (T/H only)", self)
+            angle_label.setToolTip(SLING_ANGLE_TOOLTIP)
+            controls.addWidget(angle_label, row, 0)
             self.sling_angle = _spin(self, 1.0, 90.0, 60.0, 1.0, " °",
                                      decimals=1)
+            self.sling_angle.setToolTip(SLING_ANGLE_TOOLTIP)
             controls.addWidget(self.sling_angle, row, 1)
             controls.addWidget(
                 QLabel("Bed adhesion / suction (kN/m)", self), row, 2)
@@ -159,6 +176,25 @@ class _StageRow(QFrame):
                 "Downward bed adhesion / form suction on the lifting "
                 "stage only. 0.0 = off.")
             controls.addWidget(self.suction, row, 3)
+
+            row += 1
+            mode_label = QLabel("Angle mode", self)
+            mode_label.setToolTip(SLING_ANGLE_TOOLTIP)
+            controls.addWidget(mode_label, row, 0)
+            self.angle_mode = _NoScrollComboBox(self)
+            self.angle_mode.addItem("Manual angle", "manual")
+            self.angle_mode.addItem("Auto from hook height", "auto")
+            self.angle_mode.setToolTip(SLING_ANGLE_TOOLTIP)
+            controls.addWidget(self.angle_mode, row, 1)
+            controls.addWidget(QLabel("Hook height above member (m)", self),
+                               row, 2)
+            self.hook_height = _spin(self, 0.0, 1e3, 2.0, 0.1, " m",
+                                     decimals=2)
+            self.hook_height.setToolTip(
+                "Vertical distance from the lift points up to the hook. "
+                "Used in Auto mode: angle = atan(hook_height / "
+                "((x2 − x1) / 2)). Ignored in Manual mode.")
+            controls.addWidget(self.hook_height, row, 3)
 
         outer.addLayout(controls)
 
@@ -191,6 +227,11 @@ class _StageRow(QFrame):
             self.sling_angle.valueChanged.connect(self._fire)
         if self.suction is not None:
             self.suction.valueChanged.connect(self._fire)
+        if self.hook_height is not None:
+            self.hook_height.valueChanged.connect(self._fire)
+        if self.angle_mode is not None:
+            self.angle_mode.currentIndexChanged.connect(self._fire)
+        self._sync_auto_angle_state()
 
     # ── helpers ──
 
@@ -211,7 +252,41 @@ class _StageRow(QFrame):
     def _fire(self) -> None:
         if self._updating:
             return
+        self._sync_auto_angle_state()
+        self._sync_auto_angle_value()
         self._on_changed()
+
+    def _sync_auto_angle_state(self) -> None:
+        """Disable the manual sling-angle spinbox when Auto mode is active."""
+        if self.sling_angle is None or self.angle_mode is None:
+            return
+        auto = self.angle_mode.currentData() == "auto"
+        self.sling_angle.setEnabled(not auto)
+        if self.hook_height is not None:
+            self.hook_height.setEnabled(auto)
+
+    def _sync_auto_angle_value(self) -> None:
+        """In Auto mode, recompute the sling angle from hook height + spacing
+        and push it into the (read-only) angle spinbox."""
+        if (self.sling_angle is None or self.angle_mode is None
+                or self.hook_height is None):
+            return
+        if self.angle_mode.currentData() != "auto":
+            return
+        half_spacing = abs(self.p2.value() - self.p1.value()) / 2.0
+        h = self.hook_height.value()
+        if half_spacing <= 1e-9:
+            # Coincident points are rejected by the engine anyway; pin to
+            # vertical so the spinbox stays sane meanwhile.
+            ang = 90.0
+        else:
+            ang = math.degrees(math.atan(h / half_spacing))
+        ang = max(min(ang, 90.0), 1.0)  # spinbox bounds
+        self._updating = True
+        try:
+            self.sling_angle.setValue(ang)
+        finally:
+            self._updating = False
 
     def _auto_space_clicked(self) -> None:
         # The window injects the length via set_length(); use it here.
@@ -286,6 +361,14 @@ class _StageRow(QFrame):
             self.sling_angle.setEnabled(live)
         if self.suction is not None:
             self.suction.setEnabled(live)
+        if self.hook_height is not None:
+            self.hook_height.setEnabled(live)
+        if self.angle_mode is not None:
+            self.angle_mode.setEnabled(live)
+        # Auto mode keeps the angle spinbox disabled (it shows a computed
+        # value) — re-apply that after the bulk re-enable.
+        if live:
+            self._sync_auto_angle_state()
 
     def show_disabled(self) -> None:
         """Grey the row out: clear text, chip → DISABLED, blank the axes."""
