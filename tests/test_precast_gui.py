@@ -240,6 +240,35 @@ def test_stage_sketch_draws_member_udl_reactions_and_slings(qt_app):
     assert not any("T=" in s for s in stock_texts)
 
 
+def test_vm_xaxis_tracks_member_length_after_target_switch(qt_app):
+    """Regression: switching from a long member to a short one used to
+    leave the V / M x-axis stuck at the previous member's length (so a
+    4 m member showed a 0–10 m axis with empty space on the right)."""
+    w = MainWindow()
+    m = w._model
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 10.0, 0.0),
+               3: Node(3, 0.0, 0.0), 4: Node(4, 4.0, 0.0)}
+    m.materials = {1: Material(id=1, name="C", E=3e7, density=2400.0)}
+    m.sections = {1: Section(id=1, name="S", material_id=1, A=0.2, I=0.05,
+                             depth=0.4)}
+    m.elements = [
+        FrameElement2D(id=1, node_i=1, node_j=2, E=3e7, A=0.2, I=0.05,
+                       rho=2400.0, section_id=1),
+        FrameElement2D(id=2, node_i=3, node_j=4, E=3e7, A=0.2, I=0.05,
+                       rho=2400.0, section_id=1),
+    ]
+    m.supports = {1: Support(1, ux=True, uy=True, rz=True)}
+    win = PrecastHandlingWindow(w, lambda: w._model)
+    win.set_target(1)              # L = 10 m
+    win.set_target(2)              # L = 4 m
+    for key in STAGES:
+        x0, x1 = win._rows[key]._ax_v.get_xlim()
+        assert x1 <= 4.2, f"V axis on {key} extends to {x1}, expected ≤ 4.2"
+        assert x0 >= -0.2
+        x0, x1 = win._rows[key]._ax_m.get_xlim()
+        assert x1 <= 4.2, f"M axis on {key} extends to {x1}, expected ≤ 4.2"
+
+
 def test_manual_y_toggle_enables_y_spinboxes(qt_app):
     w = MainWindow()
     eid = _seed_frame(w, L=8.0)

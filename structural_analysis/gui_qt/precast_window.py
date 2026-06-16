@@ -469,6 +469,10 @@ class _StageRow(QFrame):
                 axd.fill_between(xs, ys, 0.0, color=color, alpha=0.15)
             axd.set_title(title, fontsize=9)
             axd.tick_params(labelsize=7)
+            # Pin the x-axis to the member span. Without this, switching to
+            # a shorter element leaves the previous longer member's xlim
+            # stale (matplotlib doesn't auto-shrink past axhline's extent).
+            axd.set_xlim(-0.02 * L, 1.02 * L)
         self._ax_m.set_xlabel("x (m)", fontsize=8)
         self._ax_v.set_xlabel("x (m)", fontsize=8)
 

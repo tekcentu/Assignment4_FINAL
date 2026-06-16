@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.38.0"
+__version__ = "0.38.1"
 __what_is_new__ = (
-    "Precast: per-stage DAF + enable/disable with grey-out · "
-    "Richer stage sketch (UDL band, reaction arrows + values, sling T/H) · "
-    "OK/WARNING status chips and high-DAF soft warning"
+    "Precast: V / M x-axis pinned to member span · "
+    "Switching to a shorter element no longer leaves blank space on the right · "
+    "Per-stage DAF and enable/disable still in place"
 )
 
 from .model import (
