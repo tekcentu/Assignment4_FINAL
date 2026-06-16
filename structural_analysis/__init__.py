@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.34.2"
+__version__ = "0.39.0"
 __what_is_new__ = (
-    "Fix: one-axis generated grids keep the reference grid on the other axis · "
-    "Reference grid is per-axis (minor where lines exist, major otherwise) · "
-    "Section thumbnail guards against an empty outline"
+    "Precast: sling angle relabelled 'from horizontal (T/H only)' + tooltip · "
+    "Auto angle from hook height + lift-point spacing · "
+    "Low-angle (< 45°) soft warning"
 )
 
 from .model import (

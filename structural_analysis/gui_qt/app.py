@@ -266,6 +266,7 @@ class MainWindow(QMainWindow):
         self._mass_summary_window = None
         self._joint_masses_window = None
         self._matrix_inspector_window = None
+        self._precast_window = None
         # Singleton element-detail inspector. Held alive across closes
         # so right-clicking a different element reuses the same window
         # (see _open_element_inspector). MainWindow owns the
@@ -586,6 +587,10 @@ class MainWindow(QMainWindow):
             "&Assembled joint masses…", self,
             triggered=self._show_joint_masses,
         )
+        self.act_precast_stages = QAction(
+            "&Precast handling stages…", self,
+            triggered=self._show_precast_stages,
+        )
         self.act_matrix_inspector = QAction(
             "Matrix / &DOF Inspector…", self,
             triggered=self._open_matrix_inspector,
@@ -873,6 +878,8 @@ class MainWindow(QMainWindow):
         m_run.addAction(self.act_mass_summary)
         m_run.addAction(self.act_joint_masses)
         m_run.addAction(self.act_matrix_inspector)
+        m_run.addSeparator()
+        m_run.addAction(self.act_precast_stages)
         m_run.addSeparator()
         m_run.addAction(self.act_clear_result)
 
@@ -1965,8 +1972,12 @@ class MainWindow(QMainWindow):
         n_targets = len(sel_for_offset)
         a_auto_off = None
         a_clear_off = None
+        a_precast = None
         if is_frame:
             menu.addSeparator()
+            a_precast = menu.addAction(
+                f"Element {elem_id}: Precast Handling Stages…"
+            )
             auto_label = (
                 f"Element {elem_id}: assign automatic rigid offsets"
                 if n_targets == 1
@@ -2014,6 +2025,8 @@ class MainWindow(QMainWindow):
             self._do_clear_rigid_offsets(
                 element_ids=sel_for_offset, prompt_on_empty=False,
             )
+        elif a_precast is not None and chosen is a_precast:
+            self._show_precast_stages(elem_id=elem_id)
         elif chosen is a_delete:
             self.execute(DeleteElementCmd(elem_id=elem_id))
 
@@ -2535,6 +2548,40 @@ class MainWindow(QMainWindow):
         self._mass_summary_window.show()
         self._mass_summary_window.raise_()
         self._mass_summary_window.activateWindow()
+
+    def _show_precast_stages(self, elem_id: int | None = None) -> None:
+        """Open the precast handling-stage window for one selected frame.
+
+        Resolves the target from the explicit ``elem_id`` (context-menu
+        entry) or the current canvas selection (menu entry). Refuses with
+        a clear message if the selection isn't exactly one frame element
+        (a truss is rejected explicitly). Singleton pattern mirrors
+        :meth:`_show_mass_summary`.
+        """
+        from .precast import resolve_single_frame
+        from .precast_window import PrecastHandlingWindow
+
+        # QAction.triggered passes a ``checked`` bool; when this is wired
+        # straight to a menu action PyQt feeds that False into ``elem_id``.
+        # Treat any bool as "no explicit target → use the selection".
+        if isinstance(elem_id, bool):
+            elem_id = None
+        ids = [elem_id] if elem_id is not None \
+            else list(self.canvas.get_selected_elements())
+        try:
+            elem = resolve_single_frame(self._model, ids)
+        except ValueError as e:
+            QMessageBox.warning(self, "Precast handling stages", str(e))
+            return
+
+        if self._precast_window is None:
+            self._precast_window = PrecastHandlingWindow(
+                self, lambda: self._model,
+            )
+        self._precast_window.set_target(elem.id)
+        self._precast_window.show()
+        self._precast_window.raise_()
+        self._precast_window.activateWindow()
 
     def _show_joint_masses(self) -> None:
         """Open the non-modal Assembled Joint Masses window, or raise it.
