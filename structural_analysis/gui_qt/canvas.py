@@ -186,6 +186,10 @@ class ModelCanvas(QWidget):
         self.show_deformed: bool = True
         self.show_reactions: bool = True
         self.show_diagrams: bool = False
+        # Global Units V1 display preset. Mutated by MainWindow's units
+        # selector via set_units_preset(); the canvas only uses it for
+        # *labels* on diagrams / reactions. Geometry is unaffected.
+        self._units_preset: str = "kN_m"
         self.show_section_labels: bool = False
         # v0.24.0: optional overlay drawing local x/y axis arrows and
         # i/j end labels on each element so users can see element
@@ -442,6 +446,12 @@ class ModelCanvas(QWidget):
 
     def clear_drag_rect(self) -> None:
         self._drag_rect = None
+
+    def set_units_preset(self, preset_id: str) -> None:
+        """Set the display units preset used for diagram / reaction
+        labels. Numeric internals (`_result`, geometry, scale) are
+        untouched — this only affects what's printed next to values."""
+        self._units_preset = preset_id
 
     def set_result(self, result) -> None:
         self._result = result
@@ -2171,8 +2181,11 @@ class ModelCanvas(QWidget):
                     zorder=5,
                 )
                 mag = (rx ** 2 + ry ** 2) ** 0.5
+                from ..gui_common import units as _U
+                pid = self._units_preset
                 self.ax.annotate(
-                    f"R={mag:.3g} kN",
+                    f"R={_U.force_to_display(mag, pid):.3g} "
+                    f"{_U.force_label(pid)}",
                     (n.x - rx * arrow_len, n.y - ry * arrow_len),
                     fontsize=7, color="#9467bd", zorder=6,
                 )
@@ -2224,7 +2237,21 @@ class ModelCanvas(QWidget):
         # Axial diagram keeps a single legacy fill colour; V and M are
         # split by sign and filled blue (positive) / red (negative).
         axial_color = "#8c564b"
-        unit = _DIAGRAM_UNITS[self.diagram_kind]
+        # Global Units V1: peak / readout labels use the user-selected
+        # preset. The polyline geometry already scales to max_ord, so we
+        # only convert what's *printed*; the visual stays calibrated.
+        from ..gui_common import units as _U
+        pid = self._units_preset
+        if self.diagram_kind == "moment":
+            unit = _U.moment_label(pid)
+
+            def _conv(v: float) -> float:
+                return _U.moment_to_display(v, pid)
+        else:
+            unit = _U.force_label(pid)
+
+            def _conv(v: float) -> float:
+                return _U.force_to_display(v, pid)
         # Conventional structural orientation: positive sagging moment
         # plots BELOW the member centerline; positive shear / axial
         # plot on the +normal side as before. The flip is display-only
@@ -2340,7 +2367,7 @@ class ModelCanvas(QWidget):
                              markersize=6, markeredgecolor="#222",
                              markeredgewidth=0.8, zorder=4)
                 self.ax.annotate(
-                    f"{yy:+.3g} {unit}",
+                    f"{_conv(yy):+.3g} {unit}",
                     (world_x, world_y),
                     xytext=(5, 5), textcoords="offset points",
                     fontsize=8, color="#222", zorder=6,
@@ -2362,7 +2389,8 @@ class ModelCanvas(QWidget):
                 })
 
         self.ax.annotate(
-            f"{self.diagram_kind} diagram × {scale:.2g}  ·  max |·| = {max_ord:.3g} {unit}",
+            f"{self.diagram_kind} diagram × {scale:.2g}  ·  "
+            f"max |·| = {_conv(max_ord):.3g} {unit}",
             (0.02, 0.94), xycoords="axes fraction",
             fontsize=8, color=color, va="top",
         )

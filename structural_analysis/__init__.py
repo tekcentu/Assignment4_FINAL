@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.39.0"
+__version__ = "0.40.0"
 __what_is_new__ = (
-    "Precast: sling angle relabelled 'from horizontal (T/H only)' + tooltip · "
-    "Auto angle from hook height + lift-point spacing · "
-    "Low-angle (< 45°) soft warning"
+    "Global Units V1 (display-only): kN/m, N/mm, kgf, tf, lbf, kip presets · "
+    "View → Units… and status-bar selector · "
+    "Internal solver and project files remain kN-m"
 )
 
 from .model import (
