@@ -49,6 +49,7 @@ from .snap import SnapCandidate, SnapEngine
 from .element_graphics import (
     sample_internal_force as _diagram_ordinates,
     internal_force_at as _diagram_value,
+    effective_member_loads as _effective_member_loads,
     _split_segments_by_sign as _diagram_sign_split,
     sign_fill_color as _diagram_sign_color,
     _RIGID_ZONE_COLOR,
@@ -2224,8 +2225,15 @@ class ModelCanvas(QWidget):
             # counts (e.g. 5) may miss the true peak between stations —
             # surfaced to the user via the menu tooltip + status hint.
             n = max(2, int(self.diagram_stations))
+            # Span loads must match the displayed result (single case /
+            # factored combination / SUM_ALL) — not the raw all-cases
+            # list — or the curve won't match its own end forces.
+            eff_loads = _effective_member_loads(
+                elem, self._active_case, model.load_combinations,
+            )
             xs, ys = _diagram_ordinates(
                 elem, ni, nj, mr["f_local"], self.diagram_kind, n_samples=n,
+                member_loads=eff_loads, split_discontinuities=True,
             )
             if xs is None:
                 continue
