@@ -1,0 +1,62 @@
+# ============================================================
+#  FINAL DEMO  —  A. demo_portal_frame
+# ============================================================
+#  Single-bay 2D portal frame for the live GUI demonstration.
+#  Deliberately small so it can be drawn from scratch on camera.
+#
+#  Units (consistent kN - m system used throughout this project):
+#     length        : m
+#     force         : kN
+#     moment        : kN-m
+#     modulus E     : kN/m^2
+#     area A        : m^2
+#     inertia I     : m^4
+#     density       : kg/m^3
+#
+#  Geometry: 6 m bay width, 4 m storey height.
+#     3 o-------------------o 4      <- beam (3 -> 4)
+#       |                   |
+#       | col 1-3           | col 2-4
+#       |                   |
+#     1 ^                   ^ 2      <- fixed bases
+#
+#  Loading:
+#     * Lateral load  H = 30 kN  applied at node 3 (+X, wind/seismic proxy)
+#     * Gravity UDL   w = 15 kN/m downward on the beam (element 3, local -y)
+# ============================================================
+
+TITLE
+Final Demo A - Single-bay portal frame (30 kN lateral + 15 kN/m gravity)
+
+NODES 4
+1   0.0   0.0
+2   6.0   0.0
+3   0.0   4.0
+4   6.0   4.0
+
+# id   E(kN/m^2)     alpha(1/C)   density(kg/m^3)   name
+MATERIALS 1
+1   33000000.0   1.0e-05   2500.0   Concrete_C30
+
+# id   mat   A(m^2)   I(m^4)      depth(m)   name
+SECTIONS 1
+1   1   0.15   0.003125   0.5   Concrete_30x50
+
+# id   ni   nj   sec   type
+ELEMENTS 3
+1   1   3   1   FRAME
+2   2   4   1   FRAME
+3   3   4   1   FRAME
+
+# node   ux  uy  rz      (1 = restrained)  -> both column bases fixed
+SUPPORTS 2
+1   1   1   1
+2   1   1   1
+
+# node   Fx(kN)   Fy(kN)   Mz(kN-m)
+LOADS 1
+3   30.0   0.0   0.0
+
+# elem   wx   wy(kN/m)     (local frame: wy is transverse, downward = negative)
+MEMBER_UDL 1
+3   0.0   -15.0

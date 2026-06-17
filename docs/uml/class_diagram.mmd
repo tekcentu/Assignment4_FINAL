@@ -1,0 +1,288 @@
+%% CE4011 Assignment 4 — 2D Structural Analysis
+%% Class diagram grounded in the actual source code (structural_analysis/).
+%% Focus: the computational engine first; editor/GUI classes only where they
+%% touch model creation or result visualization.
+%%
+%% Package mapping (real names):
+%%   "solver" / computational engine -> structural_analysis/*.py
+%%   "editor" / Qt-free shared logic  -> structural_analysis/gui_common/*.py
+%%   "gui"    / PyQt6 presentation     -> structural_analysis/gui_qt/*.py
+classDiagram
+    direction TB
+
+    %% ───────────────────────── Domain model (model.py) ─────────────────────────
+    class StructuralModel {
+        +str title
+        +dict~int,Node~ nodes
+        +dict~int,Material~ materials
+        +dict~int,Section~ sections
+        +list~Element2D~ elements
+        +dict~int,Support~ supports
+        +list~NodalLoad~ nodal_loads
+        +dict~str,LoadCase~ load_cases
+        +dict~str,LoadCombination~ load_combinations
+        +dict~int,JointMass~ joint_masses
+        +ModalMassSource modal_mass_source
+        +bool include_self_weight
+        +str self_weight_case
+        +node(node_id) Node
+        +support_for(node_id) Support
+        +node_ids() list~int~
+    }
+
+    class Node {
+        <<frozen>>
+        +int id
+        +float x
+        +float y
+    }
+    class Material {
+        <<frozen>>
+        +int id
+        +str name
+        +float E
+        +float alpha
+        +float density
+        +float nu
+        +G() float
+    }
+    class Section {
+        <<frozen>>
+        +int id
+        +int material_id
+        +float A
+        +float I
+        +float depth
+        +str shape_type
+    }
+    class Support {
+        <<frozen>>
+        +int node_id
+        +bool ux
+        +bool uy
+        +bool rz
+        +float settle_ux
+        +float settle_uy
+        +float settle_rz
+        +prescribed(dof) float
+    }
+    class NodalLoad {
+        <<frozen>>
+        +int node_id
+        +float fx
+        +float fy
+        +float mz
+        +str load_case
+    }
+    class UniformDistributedLoad {
+        <<frozen>>
+        +float wy
+        +float wx
+        +str coord_system
+        +str load_case
+    }
+    class PointLoad {
+        <<frozen>>
+        +float py
+        +float a
+        +float px
+        +str coord_system
+        +str load_case
+    }
+    class TrussTemperatureLoad {
+        <<frozen>>
+        +float delta_T
+        +str load_case
+    }
+    class FrameTemperatureLoad {
+        <<frozen>>
+        +float t_top
+        +float t_bottom
+        +str load_case
+    }
+    class LoadCase {
+        +str name
+        +bool enabled
+    }
+    class LoadCombination {
+        +str name
+        +dict~str,float~ terms
+    }
+    class AnalysisResult {
+        +str status
+        +list~str~ warnings
+        +int num_eq
+        +ndarray K
+        +ndarray F
+        +ndarray D
+        +float residual
+        +dict member_results
+        +dict reactions
+        +float eq_residual
+    }
+    class MultiCaseAnalysisResult {
+        +dict~str,AnalysisResult~ cases
+        +str active_case
+        +dict~str,str~ failed_cases
+        +get(name) AnalysisResult
+        +sum_all() AnalysisResult
+        +combination(comb) AnalysisResult
+    }
+
+    %% ───────────────────────── Element hierarchy (element.py) ───────────────────
+    class Element2D {
+        <<abstract>>
+        +int id
+        +int node_i
+        +int node_j
+        +float E
+        +float A
+        +float alpha
+        +float depth
+        +float rho
+        +int section_id
+        +int material_id_override
+        +list~MemberLoad~ member_loads
+        +kind() str
+        +raw_local_stiffness(nodes)*
+        +local_consistent_load(nodes)
+        +transformation_matrix(nodes)
+        +assembly_local_indices()
+        +consistent_mass_local(nodes)*
+        +global_stiffness_and_load(nodes)
+        +local_displacement_and_end_forces(nodes, u)
+    }
+    class FrameElement2D {
+        +float I
+        +bool release_i
+        +bool release_j
+        +float offset_i
+        +float offset_j
+        +kind() "frame"
+        +joint_local_stiffness(nodes)
+        +self_weight_fixed_end_local(nodes)
+        +condense_local_load_for_releases(p, nodes)
+    }
+    class TrussElement2D {
+        +kind() "truss"
+        +raw_local_stiffness(nodes)
+        +assembly_local_indices()
+    }
+
+    %% ───────────────────────── Engine services (modules) ───────────────────────
+    class DofManager {
+        +dict active_map
+        +list~int~ free_indices
+        +list~int~ restrained_indices
+        +dict labels
+        +int n_total
+        +from_model(model)$ DofManager
+        +index(node_id, dof)
+        +element_dof_map(elem)
+        +e_matrix_for_display(model)
+    }
+    class assembler {
+        <<module>>
+        +assemble_global_system(model)
+        +validate_model(model, dofs)
+    }
+    class solver {
+        <<module>>
+        +solve_system(K, F, dofs, D_prescribed)
+    }
+    class postprocessor {
+        <<module>>
+        +compute_member_forces(model, D, dofs, elem_data)
+        +compute_reactions(model, K, D, F, dofs)
+        +equilibrium_check(model, member_results, dofs)
+    }
+    class file_io {
+        <<module>>
+        +read_input_file(path) StructuralModel
+    }
+    class main {
+        <<module>>
+        +run_analysis(model, case)
+        +run_multi_case_analysis(model)
+        +run_from_file(path)
+    }
+    class modal {
+        <<module>>
+        +solve_modal(model) ModalResult
+    }
+
+    %% ───────────────────────── Editor layer (gui_common) ───────────────────────
+    class Command {
+        <<abstract>>
+        +do(model)
+        +undo(model)
+    }
+    class ModelValidationResult {
+        +list~ValidationIssue~ issues
+        +bool is_blocking
+    }
+
+    %% ───────────────────────── GUI layer (gui_qt) ──────────────────────────────
+    class MainWindow {
+        +StructuralModel model
+        +list~Command~ undo_stack
+        +run / solve()
+        +push(cmd)
+    }
+    class ModelCanvas {
+        +redraw()
+        +select / highlight()
+    }
+    class Tool {
+        <<abstract>>
+        +on_click(evt)
+        +on_key(evt)
+        +on_release(evt)
+    }
+    class element_graphics {
+        <<module>>
+        +evaluate_internal_force(elem, ni, nj, f_local, kind)
+        +sample_internal_force(...)
+        +internal_force_at(...)
+    }
+
+    %% ───────────────────────── Relationships ───────────────────────────────────
+    StructuralModel "1" *-- "*" Node
+    StructuralModel "1" *-- "*" Material
+    StructuralModel "1" *-- "*" Section
+    StructuralModel "1" *-- "*" Support
+    StructuralModel "1" *-- "*" Element2D
+    StructuralModel "1" *-- "*" NodalLoad
+    StructuralModel "1" *-- "*" LoadCase
+    StructuralModel "1" *-- "*" LoadCombination
+
+    Element2D <|-- FrameElement2D
+    Element2D <|-- TrussElement2D
+
+    Section --> Material : material_id
+    Element2D --> Section : section_id
+    FrameElement2D ..> UniformDistributedLoad : accepts
+    FrameElement2D ..> PointLoad : accepts
+    FrameElement2D ..> FrameTemperatureLoad : accepts
+    TrussElement2D ..> TrussTemperatureLoad : accepts
+
+    DofManager ..> StructuralModel : built from
+    assembler ..> StructuralModel : validates + assembles
+    assembler ..> DofManager : uses
+    solver ..> DofManager : uses
+    postprocessor ..> DofManager : uses
+    main ..> file_io : reads
+    main ..> assembler : assemble
+    main ..> solver : solve
+    main ..> postprocessor : recover
+    main ..> AnalysisResult : returns
+    main ..> MultiCaseAnalysisResult : returns
+    modal ..> StructuralModel : eigen-solve
+
+    Command ..> StructuralModel : do / undo
+    MainWindow *-- "1" ModelCanvas
+    MainWindow o-- "*" Command
+    MainWindow --> main : run_multi_case_analysis
+    ModelCanvas ..> element_graphics : N/V/M diagrams
+    Tool ..> MainWindow : mutates via Command
+    element_graphics ..> Element2D : reads f_local

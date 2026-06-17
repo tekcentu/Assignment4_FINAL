@@ -1,0 +1,51 @@
+# ============================================================
+#  FINAL DEMO  —  B. verification_cantilever
+# ============================================================
+#  Steel cantilever beam, hand-calculation friendly.
+#  Used for the verification table in docs/verification/final_verification.md.
+#
+#  Units: kN - m (see demo_portal_frame.txt header for the full list).
+#
+#  Model:
+#     1 (fixed) =========================> 2     P = 10 kN downward at the tip
+#                       L = 4 m
+#
+#  Section / material (steel IPE200, S275):
+#     E = 2.10e8 kN/m^2      (210 GPa)
+#     I = 1.94e-5 m^4
+#     A = 2.85e-3 m^2
+#     => EI = 2.10e8 * 1.94e-5 = 4074 kN-m^2
+#
+#  Closed-form hand-calculation results (tip transverse load P, length L):
+#     Tip deflection   delta = P L^3 / (3 EI) = 10 * 4^3 / (3 * 4074) = 5.2365e-2 m  (down)
+#     Tip rotation     theta = P L^2 / (2 EI) = 10 * 4^2 / (2 * 4074) = 1.9637e-2 rad
+#     Fixed-end moment M     = P L            = 10 * 4               = 40 kN-m
+#     Base shear       V     = P              =                        10 kN
+# ============================================================
+
+TITLE
+Final Demo B - Steel cantilever (L=4 m, tip load 10 kN) - verification model
+
+NODES 2
+1   0.0   0.0
+2   4.0   0.0
+
+# id   E(kN/m^2)      alpha(1/C)   density(kg/m^3)   name
+MATERIALS 1
+1   210000000.0   1.2e-05   7850.0   Steel_S275
+
+# id   mat   A(m^2)     I(m^4)      depth(m)   name
+SECTIONS 1
+1   1   0.00285   1.94e-05   0.2   Steel_IPE200
+
+# id   ni   nj   sec   type
+ELEMENTS 1
+1   1   2   1   FRAME
+
+# node   ux  uy  rz   -> node 1 fully fixed
+SUPPORTS 1
+1   1   1   1
+
+# node   Fx(kN)   Fy(kN)   Mz(kN-m)   -> 10 kN downward at the free tip
+LOADS 1
+2   0.0   -10.0   0.0

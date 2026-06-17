@@ -1,0 +1,65 @@
+<frozen runpy>:128: RuntimeWarning: 'structural_analysis.main' found in sys.modules after import of package 'structural_analysis', but prior to execution of 'structural_analysis.main'; this may result in unpredictable behaviour
+======================================================================
+  2D Structural Analysis — Final Demo B - Steel cantilever (L=4 m, tip load 10 kN) - verification model
+======================================================================
+
+── Step A: Input ──
+  Nodes: 2, Elements: 1 (frame: 1, truss: 0)
+  Materials: 1, Supports: 1, Nodal loads: 1
+
+── Step B: Equation Numbering ──
+  Active DOFs: 6, Free DOFs (NumEq): 3
+
+  E matrix (equation numbers):
+    Node      Tx      Ty      Rz
+       1       0       0       0
+       2       1       2       3
+
+  G vectors:
+  Elem 1 (1→2, frame): G = [0, 0, 0, 1, 2, 3]
+
+── Step C: Assembled Global K (6×6) ──
+  K =
+     149625.00         0.00         0.00   -149625.00         0.00         0.00
+          0.00       763.88      1527.75         0.00      -763.88      1527.75
+          0.00      1527.75      4074.00         0.00     -1527.75      2037.00
+    -149625.00         0.00         0.00    149625.00         0.00         0.00
+          0.00      -763.88     -1527.75         0.00       763.88     -1527.75
+          0.00      1527.75      2037.00         0.00     -1527.75      4074.00
+
+  K symmetry check: max|K − Kᵀ| = 0.00e+00
+
+  Load vector F:
+    F[0] (Node 1 UX) =       0.0000
+    F[1] (Node 1 UY) =       0.0000
+    F[2] (Node 1 RZ) =       0.0000
+    F[3] (Node 2 UX) =       0.0000
+    F[4] (Node 2 UY) =     -10.0000
+    F[5] (Node 2 RZ) =       0.0000
+
+── Step D: Solve K·D = F ──
+  Residual ||K_ff·D_f − F_f|| = 5.6108e-15
+
+  Nodal displacements:
+    Node          ux (m)          uy (m)        rz (rad)
+       1    0.000000e+00    0.000000e+00    0.000000e+00
+       2    0.000000e+00   -5.236459e-02   -1.963672e-02
+
+── Step E: Member End Forces ──
+    Elem   Type         N_i         V_i         M_i         N_j         V_j         M_j
+       1  frame      0.0000     10.0000     40.0000      0.0000    -10.0000      0.0000
+
+── Step F: Support Reactions ──
+    Node       Rx (kN)       Ry (kN)     Mz (kN·m)
+       1        0.0000       10.0000       40.0000
+  Max equilibrium residual at free nodes: 9.0580e-15
+  Global: ΣFx = 0.0000, ΣFy = 0.0000
+
+── Step G: Storage Report ──
+  Dense:  36 elements (6×6)
+  Banded: 36 elements (hbw = 5), savings = 0%
+  Note: bandwidth depends on node numbering order.
+
+======================================================================
+  Analysis complete.
+======================================================================

@@ -37,6 +37,61 @@ This package extends the Assignment 3 2D frame-truss solver with the two capabil
      `K_ff * D_f = F_f - K_fs * D_s`
 
 
+## Final submission (CE 4011)
+
+**Purpose.** A 2D structural-analysis program for plane frames and trusses based
+on the Direct Stiffness Method, with a pure-Python computational engine and a
+PyQt6 GUI. It computes displacements, member internal forces (N/V/M), and support
+reactions, and visualizes the deformed shape and force diagrams. It also supports
+thermal loads, support settlements, load combinations, and modal analysis.
+
+**Install** (Python ≥ 3.11):
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"     # or: pip install numpy scipy matplotlib PyQt6 pytest
+```
+
+Full steps and troubleshooting: [`docs/installation_manual.md`](docs/installation_manual.md).
+
+**Run the CLI solver:**
+
+```bash
+python -m structural_analysis.main examples/final_demo/demo_portal_frame.txt
+```
+
+**Launch the GUI:**
+
+```bash
+python -m structural_analysis.gui_qt
+```
+
+**Run the tests** (~670 tests; GUI smoke tests need an offscreen Qt platform):
+
+```bash
+QT_QPA_PLATFORM=offscreen python -m pytest -q
+```
+
+**Where things are:**
+
+| What | Location |
+|------|----------|
+| Final demo examples (portal frame, cantilever, backup) | [`examples/final_demo/`](examples/final_demo/) |
+| Demo example outputs | [`examples/final_demo/outputs/`](examples/final_demo/outputs/) |
+| Project report | [`report/final_project_report.md`](report/final_project_report.md) (+ `.pdf`) |
+| Installation manual | [`docs/installation_manual.md`](docs/installation_manual.md) |
+| User manual | [`docs/user_manual.md`](docs/user_manual.md) |
+| Verification (vs. hand calc) | [`docs/verification/final_verification.md`](docs/verification/final_verification.md) |
+| UML / architecture | [`docs/uml/`](docs/uml/) (`class_diagram.mmd`, `.dot`, `.png`, `architecture.md`) |
+| Video outline / checklists | [`docs/final_video_outline.md`](docs/final_video_outline.md), [`docs/final_video_checklist.md`](docs/final_video_checklist.md), [`docs/final_submission_checklist.md`](docs/final_submission_checklist.md) |
+| Demo video link | [`video_link.txt`](video_link.txt) |
+
+**Known limitations.** 2D only; linear-elastic; static + modal analysis (no
+nonlinearity, P-Δ, dynamics, or design-code checks); self-weight on rigid end
+zones is neglected. See the report's limitations section for the full list.
+
+---
+
 ## UML
 ```mermaid
 classDiagram
