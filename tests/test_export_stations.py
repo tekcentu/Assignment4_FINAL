@@ -25,7 +25,10 @@ except Exception as exc:  # noqa: BLE001
 from structural_analysis.element import FrameElement2D, TrussElement2D  # noqa: E402
 from structural_analysis.gui_qt.app import MainWindow  # noqa: E402
 from structural_analysis.model import (  # noqa: E402
-    Material, Node, Section, Support, NodalLoad,
+    Material, Node, Section, Support, NodalLoad, UniformDistributedLoad,
+)
+from structural_analysis.gui_qt.element_graphics import (  # noqa: E402
+    sample_internal_force, effective_member_loads,
 )
 
 
@@ -194,6 +197,50 @@ def test_export_truss_row_emits_only_axial(qt_app, tmp_path, monkeypatch):
         assert r[2] != ""        # N present
         assert r[3] == ""        # no V
         assert r[4] == ""        # no M
+
+
+def test_station_export_matches_canvas_sampling(qt_app, tmp_path, monkeypatch):
+    """The exported M column must equal what the canvas would sample for the
+    same active selection — both route through ``effective_member_loads`` +
+    ``sample_internal_force`` with the discontinuity split on (the
+    member-load reconstruction fix)."""
+    import csv
+    w = MainWindow()
+    m = w._model
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    m.materials = {1: Material(id=1, name="C", E=2e8, density=0.0)}
+    m.sections = {1: Section(id=1, name="S", material_id=1,
+                             A=0.02, I=0.08, depth=0.3)}
+    e = FrameElement2D(id=1, node_i=1, node_j=2, E=2e8,
+                       A=0.02, I=0.08, section_id=1)
+    e.member_loads.append(UniformDistributedLoad(wy=-10.0))
+    m.elements = [e]
+    m.supports = {1: Support(node_id=1, ux=True, uy=True, rz=False),
+                  2: Support(node_id=2, ux=False, uy=True, rz=False)}
+    w._run_static_solve(active_only=False)
+
+    out = tmp_path / "stations.csv"
+    import structural_analysis.gui_qt.app as appmod
+    monkeypatch.setattr(
+        appmod.QFileDialog, "getSaveFileName",
+        lambda *a, **k: (str(out), "CSV (*.csv)"),
+    )
+    w._export_station_results()
+
+    with open(out, newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))[1:]   # drop header
+    ni, nj = m.nodes[1], m.nodes[2]
+    eff = effective_member_loads(e, w._active_case, m.load_combinations)
+    f = w._result.member_results[1]["f_local"]
+    _, ms = sample_internal_force(
+        e, ni, nj, list(f), "moment",
+        member_loads=eff, split_discontinuities=True)
+    csv_m = [float(r[4]) for r in rows]
+    assert len(csv_m) == len(ms)
+    for got, exp in zip(csv_m, ms):
+        assert got == pytest.approx(exp, rel=1e-6, abs=1e-6)
+    # Sanity: a real sagging UDL midspan moment (wL²/8 = 45), not collapsed.
+    assert max(csv_m) == pytest.approx(45.0, rel=1e-3)
 
 
 def test_internal_model_untouched_by_export(qt_app, tmp_path, monkeypatch):
