@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.40.1"
+__version__ = "0.40.2"
 __what_is_new__ = (
-    "Units V1: N/V/M hover + member-end-force readouts now convert · "
-    "Load arrows stay explicitly labelled kN / kN·m / kN/m (never misleading) · "
-    "Inputs/coords still kN-m (display-only)"
+    "File → Export station results CSV (21 stations/member, SAP-compare) · "
+    "Columns scaled to active Units V1 preset · "
+    "Truss rows emit N only"
 )
 
 from .model import (

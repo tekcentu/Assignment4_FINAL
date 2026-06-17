@@ -388,6 +388,9 @@ class MainWindow(QMainWindow):
         self.act_save_as = QAction("Save &As…", self,
                                     shortcut=QKeySequence.StandardKey.SaveAs,
                                     triggered=self._do_save_as)
+        self.act_export_stations = QAction("Export station results…", self,
+                                            triggered=self._export_station_results)
+        self.act_export_stations.setEnabled(False)
         self.act_quit = QAction("&Quit", self, shortcut=QKeySequence.StandardKey.Quit,
                                  triggered=self.close)
 
@@ -736,6 +739,8 @@ class MainWindow(QMainWindow):
         self._populate_examples_menu()
         m_file.addAction(self.act_save)
         m_file.addAction(self.act_save_as)
+        m_file.addSeparator()
+        m_file.addAction(self.act_export_stations)
         m_file.addSeparator()
         m_file.addAction(self.act_quit)
 
@@ -3509,6 +3514,69 @@ class MainWindow(QMainWindow):
         self.set_status(f"Saved to {path}")
         return True
 
+    def _export_station_results(self) -> None:
+        """Write a SAP2000-comparable per-element station CSV.
+
+        Columns: Element, x (m), N, V, M — N/V/M scaled to the active
+        Units V1 preset, x kept in metres. Truss elements contribute
+        only N (V/M cells left blank). Station count = 21 (≈ SAP's
+        1/20 span output)."""
+        import csv
+        from .element_graphics import sample_internal_force
+        from ..gui_common import units as _units_mod
+
+        if self._result is None or not getattr(
+            self._result, "member_results", None,
+        ):
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export station results", "stations.csv",
+            "CSV (*.csv);;All files (*.*)",
+        )
+        if not path:
+            return
+        pid = self._units_preset
+        fl = _units_mod.force_label(pid)
+        ml = _units_mod.moment_label(pid)
+        rows: list[list[object]] = [
+            ["Element", "x (m)", f"N ({fl})", f"V ({fl})", f"M ({ml})"],
+        ]
+        for elem in self._model.elements:
+            mr = self._result.member_results.get(elem.id)
+            if mr is None:
+                continue
+            ni = self._model.nodes[elem.node_i]
+            nj = self._model.nodes[elem.node_j]
+            f_local = list(mr["f_local"])
+            xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local, "axial")
+            xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local, "shear")
+            xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local, "moment")
+            if xs_n is None:
+                continue
+            for i, x in enumerate(xs_n):
+                n_val = _units_mod.force_to_display(ys_n[i], pid)
+                v_cell = (
+                    f"{_units_mod.force_to_display(ys_v[i], pid):.6g}"
+                    if ys_v is not None else ""
+                )
+                m_cell = (
+                    f"{_units_mod.moment_to_display(ys_m[i], pid):.6g}"
+                    if ys_m is not None else ""
+                )
+                rows.append([
+                    elem.id, f"{x:.6g}", f"{n_val:.6g}", v_cell, m_cell,
+                ])
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                csv.writer(fh).writerows(rows)
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Export failed",
+                f"Could not write {path}:\n{exc}",
+            )
+            return
+        self.set_status(f"Station results exported → {path}")
+
     # ── solve ──
 
     def _do_solve(self) -> None:
@@ -4308,6 +4376,10 @@ class MainWindow(QMainWindow):
             if self._result else "(no analysis run yet)"
         )
         self._result_text.setPlainText(text)
+        self.act_export_stations.setEnabled(
+            self._result is not None
+            and bool(getattr(self._result, "member_results", None))
+        )
 
     # ── Global Units V1 ────────────────────────────────────────────
 
