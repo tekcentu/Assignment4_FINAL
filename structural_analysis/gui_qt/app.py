@@ -281,6 +281,20 @@ class MainWindow(QMainWindow):
         # frame/truss pair clicks until the user clears them.
         self._sticky_element: dict | None = None
 
+        # Global Units V1 — display-only preset. Persisted via QSettings
+        # under the QSettings key "units_preset"; never written to the
+        # project file (model numerics stay kN-m always).
+        from PyQt6.QtCore import QSettings
+        from ..gui_common import units as _units_mod
+        self._qsettings = QSettings("CE4011", "StructuralAnalysis")
+        saved = self._qsettings.value(
+            "units_preset", _units_mod.DEFAULT_PRESET_ID, type=str)
+        # Defensive: a stale or invalid stored value reverts to default.
+        self._units_preset: str = (
+            saved if saved in _units_mod.preset_ids()
+            else _units_mod.DEFAULT_PRESET_ID
+        )
+
         self._build_ui()
         self._build_actions()
         self._build_menus()
@@ -345,6 +359,24 @@ class MainWindow(QMainWindow):
         self._coord_label = QLabel("", self)
         self.statusBar().addWidget(self._status_label, stretch=1)
         self.statusBar().addPermanentWidget(self._coord_label)
+        # Global Units V1 — compact selector in the status bar (right side).
+        from ..gui_common import units as _units_mod
+        from PyQt6.QtWidgets import QComboBox as _QComboBox
+        units_label = QLabel("Units:", self)
+        self.statusBar().addPermanentWidget(units_label)
+        self._units_combo = _QComboBox(self)
+        for preset in _units_mod.all_presets():
+            self._units_combo.addItem(preset.label, preset.id)
+        # Sync to the QSettings-loaded preset before wiring the signal so
+        # the initial setCurrentIndex doesn't fire a redundant change.
+        idx = self._units_combo.findData(self._units_preset)
+        if idx >= 0:
+            self._units_combo.setCurrentIndex(idx)
+        self._units_combo.currentIndexChanged.connect(
+            self._on_units_combo_changed)
+        self._units_combo.setToolTip(
+            "Global display units. Internal model stays in kN-m.")
+        self.statusBar().addPermanentWidget(self._units_combo)
 
     def _build_actions(self) -> None:
         self.act_new = QAction("&New", self, shortcut=QKeySequence.StandardKey.New,
@@ -842,6 +874,30 @@ class MainWindow(QMainWindow):
             "release ends. Hidden automatically in dense models."
         )
         m_view.addAction(self.act_show_local_axes)
+
+        # ── Global Units V1 — display-only selector ────────────────
+        # 15 presets (force × length). The chosen preset only affects
+        # how results / labels are *rendered*; the solver, model, and
+        # project file stay in kN / m / kN·m. A copy of this submenu is
+        # also exposed as a compact QComboBox on the status bar.
+        from ..gui_common import units as _units_mod
+        from PyQt6.QtGui import QActionGroup
+        m_units = m_view.addMenu("&Units…")
+        m_units.setToolTip(
+            "Display units only. The internal model remains kN-m.")
+        self._units_action_group = QActionGroup(self)
+        self._units_action_group.setExclusive(True)
+        self._units_actions: dict[str, QAction] = {}
+        for preset in _units_mod.all_presets():
+            act = QAction(preset.label, self, checkable=True)
+            act.setData(preset.id)
+            act.setChecked(preset.id == self._units_preset)
+            act.triggered.connect(
+                lambda _checked=False, pid=preset.id:
+                self._set_units_preset(pid))
+            self._units_action_group.addAction(act)
+            m_units.addAction(act)
+            self._units_actions[preset.id] = act
 
         # Load cases & combinations are model/analysis DEFINITIONS, not
         # view options — they live under a dedicated Model menu rather
@@ -2159,16 +2215,22 @@ class MainWindow(QMainWindow):
             )
             return
         f_local = [float(v) for v in mr["f_local"]]
+        from ..gui_common import units as _U
+        pid = self._units_preset
+        fL = _U.force_label(pid)
+        mL = _U.moment_label(pid)
+        F = lambda v: _U.force_to_display(v, pid)   # noqa: E731
+        M = lambda v: _U.moment_to_display(v, pid)  # noqa: E731
         lines = [
             f"Element {elem_id} free-body / local end forces",
             f"Type: {getattr(elem, 'kind', elem.__class__.__name__)}",
             f"Nodes: {elem.node_i} -> {elem.node_j}",
             "",
             "Local member-end forces:",
-            f"  i-end: N={f_local[0]:+.6g} kN, V={f_local[1]:+.6g} kN, "
-            f"M={f_local[2]:+.6g} kN*m",
-            f"  j-end: N={f_local[3]:+.6g} kN, V={f_local[4]:+.6g} kN, "
-            f"M={f_local[5]:+.6g} kN*m",
+            f"  i-end: N={F(f_local[0]):+.6g} {fL}, V={F(f_local[1]):+.6g} {fL}, "
+            f"M={M(f_local[2]):+.6g} {mL}",
+            f"  j-end: N={F(f_local[3]):+.6g} {fL}, V={F(f_local[4]):+.6g} {fL}, "
+            f"M={M(f_local[5]):+.6g} {mL}",
             "",
             "Free-body convention:",
             "  N is local axial force; V is local transverse shear; "
@@ -2319,7 +2381,7 @@ class MainWindow(QMainWindow):
         bar when the cursor is near an element and a result is loaded.
         Returns ``None`` when no value is meaningful (truss + shear /
         moment, or the kind doesn't apply)."""
-        from .canvas import _diagram_value, _DIAGRAM_UNITS
+        from .canvas import _diagram_value
         if self._result is None or not self._result.member_results:
             return None
         elem = next((e for e in self._model.elements
@@ -2345,7 +2407,17 @@ class MainWindow(QMainWindow):
         value = _diagram_value(elem, ni, nj, mr["f_local"], kind, x_loc)
         if value is None:
             return None
-        unit = _DIAGRAM_UNITS.get(kind, "")
+        # Convert the result value to the active display preset; the x
+        # position is a coordinate and stays in metres in V1 (coordinate
+        # conversion is V2).
+        from ..gui_common import units as _U
+        pid = self._units_preset
+        if kind == "moment":
+            value = _U.moment_to_display(value, pid)
+            unit = _U.moment_label(pid)
+        else:
+            value = _U.force_to_display(value, pid)
+            unit = _U.force_label(pid)
         label = {"moment": "M", "shear": "V", "axial": "N"}.get(kind, kind)
         return f"{label}={value:+.4g} {unit} @ x={x_loc:.3f} m on e{elem.id}"
 
@@ -4230,9 +4302,59 @@ class MainWindow(QMainWindow):
             self._joint_masses_window.refresh()
 
     def _update_result_text(self) -> None:
-        text = format_result(self._model, self._result) if self._result \
-            else "(no analysis run yet)"
+        text = (
+            format_result(self._model, self._result,
+                          unit_preset=self._units_preset)
+            if self._result else "(no analysis run yet)"
+        )
         self._result_text.setPlainText(text)
+
+    # ── Global Units V1 ────────────────────────────────────────────
+
+    def _on_units_combo_changed(self, _idx: int) -> None:
+        pid = self._units_combo.currentData()
+        if pid:
+            self._set_units_preset(pid)
+
+    def _set_units_preset(self, preset_id: str) -> None:
+        """Switch the global display preset and refresh every visible
+        results surface. Internal model and AnalysisResult numerics are
+        untouched."""
+        from ..gui_common import units as _units_mod
+        if preset_id not in _units_mod.preset_ids():
+            return
+        if preset_id == getattr(self, "_units_preset", None):
+            # No-op when the user re-selects the active preset.
+            return
+        self._units_preset = preset_id
+        # Persist as a UI preference; the .spa.json schema is untouched.
+        self._qsettings.setValue("units_preset", preset_id)
+        # Keep menu / combo in sync (selecting one updates the other).
+        act = self._units_actions.get(preset_id)
+        if act is not None and not act.isChecked():
+            act.setChecked(True)
+        idx = self._units_combo.findData(preset_id)
+        if idx >= 0 and self._units_combo.currentIndex() != idx:
+            blocker = self._units_combo.blockSignals(True)
+            try:
+                self._units_combo.setCurrentIndex(idx)
+            finally:
+                self._units_combo.blockSignals(blocker)
+        # Re-render every display surface.
+        self.canvas.set_units_preset(preset_id)
+        self.canvas.redraw()
+        self._update_result_text()
+        if (self._element_inspector is not None
+                and self._element_inspector.isVisible()):
+            self._element_inspector.refresh(
+                self._model, self._result, multi_result=self._multi_result)
+        if (self._precast_window is not None
+                and self._precast_window.isVisible()):
+            self._precast_window.set_units_preset(preset_id)
+        label = _units_mod.preset_label(preset_id)
+        self._status_label.setText(
+            f"Units changed to {label}. Internal model remains kN-m."
+        )
 
     # ── title / close ──
 

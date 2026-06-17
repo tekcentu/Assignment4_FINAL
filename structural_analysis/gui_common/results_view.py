@@ -13,6 +13,7 @@ import re
 from ..element import FrameElement2D
 from ..model import AnalysisResult, StructuralModel
 from ..multi_case_result import MultiCaseAnalysisResult, SUM_ALL_KEY
+from . import units as _units
 from .validation import used_case_names
 
 
@@ -151,7 +152,22 @@ def resolve_view(
     return result, ""
 
 
-def format_result(model: StructuralModel, result: AnalysisResult | None) -> str:
+def format_result(
+    model: StructuralModel,
+    result: AnalysisResult | None,
+    *,
+    unit_preset: str = _units.DEFAULT_PRESET_ID,
+) -> str:
+    """Render an AnalysisResult as a text report.
+
+    ``unit_preset`` selects the display preset (force × length) from the
+    Global Units V1 helper. The default is ``"kN_m"``, which reproduces
+    the legacy bytes exactly so older callers (CLI, existing tests) see
+    no change.
+    """
+    length_lbl = _units.length_label(unit_preset)
+    force_lbl = _units.force_label(unit_preset)
+    moment_lbl = _units.moment_label(unit_preset)
     if result is None:
         return "(no analysis run yet)"
     lines: list[str] = []
@@ -190,8 +206,10 @@ def format_result(model: StructuralModel, result: AnalysisResult | None) -> str:
     if not has_disp_dofs:
         lines.append("  Max nodal displacement:      (no displacement DOFs)")
     elif max_disp_node is not None:
+        disp_disp = _units.length_to_display(max_disp, unit_preset)
         lines.append(
-            f"  Max nodal displacement:      |u| = {max_disp:.4e} m at node {max_disp_node}"
+            f"  Max nodal displacement:      |u| = {disp_disp:.4e} {length_lbl} "
+            f"at node {max_disp_node}"
         )
 
     # Step A
@@ -227,36 +245,59 @@ def format_result(model: StructuralModel, result: AnalysisResult | None) -> str:
     lines.append("\n── Step D: Solve K·D = F ──")
     lines.append(f"  Residual ||K_ff·D_f − F_f|| = {result.residual:.4e}")
     lines.append(f"\n  Nodal displacements:")
-    lines.append(f"  {'Node':>6}  {'ux (m)':>14}  {'uy (m)':>14}  {'rz (rad)':>14}")
+    h_ux = f"ux ({length_lbl})"
+    h_uy = f"uy ({length_lbl})"
+    lines.append(f"  {'Node':>6}  {h_ux:>14}  {h_uy:>14}  {'rz (rad)':>14}")
     D = result.D
     for nid in sorted(result.E_map):
         em = result.E_map[nid]
         ux = float(D[em["ux"]]) if em["ux"] is not None else 0.0
         uy = float(D[em["uy"]]) if em["uy"] is not None else 0.0
         rz = float(D[em["rz"]]) if em["rz"] is not None else 0.0
-        lines.append(f"  {nid:>6}  {ux:>14.6e}  {uy:>14.6e}  {rz:>14.6e}")
+        ux_d = _units.length_to_display(ux, unit_preset)
+        uy_d = _units.length_to_display(uy, unit_preset)
+        lines.append(f"  {nid:>6}  {ux_d:>14.6e}  {uy_d:>14.6e}  {rz:>14.6e}")
 
     # Step E
     lines.append("\n── Step E: Member End Forces ──")
     lines.append(f"  {'Elem':>6} {'Type':>6}  "
-                 f"{'N_i':>10}  {'V_i':>10}  {'M_i':>10}  "
-                 f"{'N_j':>10}  {'V_j':>10}  {'M_j':>10}")
+                 f"{'N_i ' + force_lbl:>10}  {'V_i ' + force_lbl:>10}  "
+                 f"{'M_i ' + moment_lbl:>14}  "
+                 f"{'N_j ' + force_lbl:>10}  {'V_j ' + force_lbl:>10}  "
+                 f"{'M_j ' + moment_lbl:>14}")
     for elem in model.elements:
         mr = result.member_results.get(elem.id)
         if mr is None:
             continue
         f_local = mr["f_local"]
         kind = "frame" if isinstance(elem, FrameElement2D) else "truss"
-        lines.append(f"  {elem.id:>6} {kind:>6}  " +
-                     "  ".join(f"{float(f_local[j]):>10.4f}" for j in range(6)))
+        # f_local layout: [N_i, V_i, M_i, N_j, V_j, M_j]
+        vals = [
+            _units.force_to_display(float(f_local[0]), unit_preset),
+            _units.force_to_display(float(f_local[1]), unit_preset),
+            _units.moment_to_display(float(f_local[2]), unit_preset),
+            _units.force_to_display(float(f_local[3]), unit_preset),
+            _units.force_to_display(float(f_local[4]), unit_preset),
+            _units.moment_to_display(float(f_local[5]), unit_preset),
+        ]
+        widths = (10, 10, 14, 10, 10, 14)
+        lines.append(
+            f"  {elem.id:>6} {kind:>6}  " +
+            "  ".join(f"{v:>{w}.4f}" for v, w in zip(vals, widths))
+        )
 
     # Step F
     lines.append("\n── Step F: Support Reactions ──")
-    lines.append(f"  {'Node':>6}  {'Rx (kN)':>12}  {'Ry (kN)':>12}  {'Mz (kN·m)':>12}")
+    h_rx = f"Rx ({force_lbl})"
+    h_ry = f"Ry ({force_lbl})"
+    h_mz = f"Mz ({moment_lbl})"
+    lines.append(f"  {'Node':>6}  {h_rx:>12}  {h_ry:>12}  {h_mz:>14}")
     for nid in sorted(result.reactions):
         r = result.reactions[nid]
-        lines.append(f"  {nid:>6}  {r.get('ux', 0):>12.4f}  "
-                     f"{r.get('uy', 0):>12.4f}  {r.get('rz', 0):>12.4f}")
+        rx = _units.force_to_display(r.get('ux', 0), unit_preset)
+        ry = _units.force_to_display(r.get('uy', 0), unit_preset)
+        mz = _units.moment_to_display(r.get('rz', 0), unit_preset)
+        lines.append(f"  {nid:>6}  {rx:>12.4f}  {ry:>12.4f}  {mz:>14.4f}")
     lines.append(f"  Max equilibrium residual at free nodes: {result.eq_residual:.4e}")
 
     lines.append("\n" + "=" * 70)

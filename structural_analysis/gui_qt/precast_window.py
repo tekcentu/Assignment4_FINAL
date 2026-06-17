@@ -588,6 +588,14 @@ class PrecastHandlingWindow(QMainWindow):
         self._last_results: dict[str, P.HandlingResult] = {}
         self._updating = False
         self._last_report = ""
+        # Global Units V1: the precast window keeps its own copy of the
+        # active preset so set_units_preset can be called either by the
+        # parent MainWindow when the user flips the global selector or
+        # directly by tests. Affects the copied report only — the
+        # numeric engine and the in-window sketch numbers stay in kN/m.
+        self._units_preset: str = "kN_m"
+        if parent is not None and hasattr(parent, "_units_preset"):
+            self._units_preset = parent._units_preset
 
         self._build_ui()
 
@@ -729,6 +737,15 @@ class PrecastHandlingWindow(QMainWindow):
         self._apply_enabled_state()
         self._recompute_all()
 
+    def set_units_preset(self, preset_id: str) -> None:
+        """Update the unit preset used for the copied report. The in-window
+        sketch and numeric engine stay in kN-m (V1 scope: report only)."""
+        self._units_preset = preset_id
+        # Re-render the copied report so a subsequent _copy_report uses
+        # the new units. The sketch axes don't depend on the preset in V1.
+        if self._member is not None:
+            self._recompute_all()
+
     def refresh(self) -> None:
         """Re-snapshot the current member if it still exists."""
         if self._member is None:
@@ -809,7 +826,8 @@ class PrecastHandlingWindow(QMainWindow):
             if result is not None:
                 ordered.append((stage, result))
         if ordered:
-            self._last_report = format_report(self._member, ordered)
+            self._last_report = format_report(
+                self._member, ordered, unit_preset=self._units_preset)
         else:
             self._last_report = ""
 

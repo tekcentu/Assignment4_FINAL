@@ -595,29 +595,54 @@ def compute_handling(
 # ── Report ────────────────────────────────────────────────────────
 
 
-def format_stage_block(stage: StageInput, result: HandlingResult) -> list[str]:
-    """Render the lines for one stage in the combined report."""
+def format_stage_block(
+    stage: StageInput,
+    result: HandlingResult,
+    *,
+    unit_preset: str = "kN_m",
+) -> list[str]:
+    """Render the lines for one stage in the combined report.
+
+    ``unit_preset`` selects the display units via ``gui_common.units``;
+    the default reproduces the legacy report byte-for-byte. Stress stays
+    in MPa for V1 regardless of preset (documented limitation).
+    """
+    from ..gui_common import units as _u
+    fL = _u.force_label(unit_preset)
+    lL = _u.length_label(unit_preset)
+    mL = _u.moment_label(unit_preset)
+    uL = _u.udl_label(unit_preset)
+    F = _u.force_to_display
+    L = _u.length_to_display
+    M = _u.moment_to_display
+    W = _u.udl_to_display
+
     lines: list[str] = []
     lines.append(f"── {STAGE_LABELS.get(result.stage, result.stage)} ──")
     if result.stage == STAGE_LIFTING:
         lines.append(f"Sling angle (from horizontal): "
                      f"{stage.sling_angle_deg:g}°")
     lines.append(f"DAF: {stage.daf:g}")
-    lines.append(f"Handling UDL (incl. DAF): {result.udl_per_m:.4g} kN/m")
-    lines.append(f"Total handling load: {result.total_load:.4g} kN")
+    lines.append(f"Handling UDL (incl. DAF): "
+                 f"{W(result.udl_per_m, unit_preset):.4g} {uL}")
+    lines.append(f"Total handling load: "
+                 f"{F(result.total_load, unit_preset):.4g} {fL}")
     if len(result.reactions) == 2:
         spacing = abs(result.reactions[1][0] - result.reactions[0][0])
-        lines.append(f"Support spacing: {spacing:.4g} m")
-    lines.append("Reactions (x [m], R [kN], upward +):")
+        lines.append(f"Support spacing: {L(spacing, unit_preset):.4g} {lL}")
+    lines.append(f"Reactions (x [{lL}], R [{fL}], upward +):")
     for i, (x, r) in enumerate(result.reactions):
         extra = ""
         if result.sling_tensions:
-            extra = (f"   T={result.sling_tensions[i]:.4g} kN"
-                     f"   H={result.sling_horizontal[i]:.4g} kN")
-        lines.append(f"  {x:.4g}\t{r:.4g}{extra}")
-    lines.append(f"Max shear |V|: {result.v_max:.4g} kN")
-    lines.append(f"Max +moment: {result.m_pos_max:.4g} kN·m")
-    lines.append(f"Max −moment: {result.m_neg_max:.4g} kN·m")
+            extra = (
+                f"   T={F(result.sling_tensions[i], unit_preset):.4g} {fL}"
+                f"   H={F(result.sling_horizontal[i], unit_preset):.4g} {fL}"
+            )
+        lines.append(f"  {L(x, unit_preset):.4g}\t"
+                     f"{F(r, unit_preset):.4g}{extra}")
+    lines.append(f"Max shear |V|: {F(result.v_max, unit_preset):.4g} {fL}")
+    lines.append(f"Max +moment: {M(result.m_pos_max, unit_preset):.4g} {mL}")
+    lines.append(f"Max −moment: {M(result.m_neg_max, unit_preset):.4g} {mL}")
     lines.extend(_format_stress_block(result.stress_check))
     if result.warnings:
         lines.append("Warnings:")
@@ -653,21 +678,31 @@ def _format_stress_block(sc: StressCheck) -> list[str]:
 def format_report(
     member: MemberSpec,
     stage_results: list[tuple[StageInput, HandlingResult]],
+    *,
+    unit_preset: str = "kN_m",
 ) -> str:
     """Render a plain-text handling-stage report for clipboard / copy.
 
     ``stage_results`` is a list of ``(StageInput, HandlingResult)`` in the
-    order to print (typically lifting, stock, truck).
+    order to print (typically lifting, stock, truck). ``unit_preset``
+    propagates to every per-stage block; the default keeps the legacy
+    text intact.
     """
+    from ..gui_common import units as _u
+    lL = _u.length_label(unit_preset)
+    uL = _u.udl_label(unit_preset)
+    L = _u.length_to_display
+    W = _u.udl_to_display
     lines: list[str] = []
     lines.append("Precast Handling Stages — V2 (temporary, not saved)")
     lines.append(f"Member: element {member.elem_id}"
                  + (f"  ({member.section_name})" if member.section_name else ""))
-    lines.append(f"Length: {member.length:.4g} m")
-    lines.append(f"Self-weight (section): {member.self_weight:.4g} kN/m")
+    lines.append(f"Length: {L(member.length, unit_preset):.4g} {lL}")
+    lines.append(f"Self-weight (section): "
+                 f"{W(member.self_weight, unit_preset):.4g} {uL}")
     lines.append("")
     for stage, result in stage_results:
-        lines.extend(format_stage_block(stage, result))
+        lines.extend(format_stage_block(stage, result, unit_preset=unit_preset))
         lines.append("")
     lines.append(DISPLAY_ONLY_NOTE)
     return "\n".join(lines)
