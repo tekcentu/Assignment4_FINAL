@@ -1,0 +1,56 @@
+digraph ClassDiagram {
+  graph [rankdir=TB, fontsize=10];
+  node [shape=record, fontsize=9];
+  edge [fontsize=8];
+
+  StructuralModel [label="{StructuralModel|title; nodes; materials; sections; elements; supports; nodal_loads; load_cases; load_combinations|node(); support_for(); node_ids}" ];
+  Node [label="{Node|id; x; y|}" ];
+  Material [label="{Material|id; name; E; alpha; density; nu|G}" ];
+  Section [label="{Section|id; material_id; A; I; depth; shape_type|}" ];
+  Support [label="{Support|node_id; ux; uy; rz; settlements|prescribed()}" ];
+  NodalLoad [label="{NodalLoad|node_id; fx; fy; mz; load_case|}" ];
+  LoadCase [label="{LoadCase|name; enabled; description|}" ];
+  LoadCombination [label="{LoadCombination|name; terms; description|}" ];
+  AnalysisResult [label="{AnalysisResult|status; D; member_results; reactions|}" ];
+
+  Element2D [label="{Element2D|id; node_i; node_j; E; A; member_loads|kind; transformation_matrix(); raw_local_stiffness(); global_stiffness_and_load(); local_displacement_and_end_forces()}" ];
+  FrameElement2D [label="{FrameElement2D|I; release_i; release_j; offsets|raw_local_stiffness(); consistent_mass_local(); local_consistent_load()}" ];
+  TrussElement2D [label="{TrussElement2D|axial-only element|raw_local_stiffness(); assembly_local_indices(); consistent_mass_local()}" ];
+  UDL [label="{UniformDistributedLoad|wy; wx; coord_system; load_case|}" ];
+  PointLoad [label="{PointLoad|py; a; px; coord_system; load_case|}" ];
+  TrussTemp [label="{TrussTemperatureLoad|delta_T; load_case|}" ];
+  FrameTemp [label="{FrameTemperatureLoad|t_top; t_bottom; load_case|}" ];
+  DofManager [label="{DofManager|active_map; free_indices; restrained_indices; labels|from_model(); element_dof_map()}" ];
+
+  MainWindow [label="{MainWindow|PyQt6 application shell|model(); select_node(); select_element(); set_status()}" ];
+  ModelCanvas [label="{ModelCanvas|matplotlib/Qt model view|select_node(); select_element(); toggle_snap(); set_element_preview()}" ];
+  Tool [label="{Tool|controller base|activate(); deactivate(); on_click(); on_motion(); on_key()}" ];
+  Command [label="{Command|undoable edit base|do(); undo()}" ];
+  ModelValidationResult [label="{ModelValidationResult|issues|has_errors(); has_warnings(); format_report()}" ];
+
+  FrameElement2D -> Element2D [arrowhead=empty];
+  TrussElement2D -> Element2D [arrowhead=empty];
+  StructuralModel -> Node [arrowhead=diamond, label="contains"];
+  StructuralModel -> Material [arrowhead=diamond, label="contains"];
+  StructuralModel -> Section [arrowhead=diamond, label="contains"];
+  StructuralModel -> Element2D [arrowhead=diamond, label="contains"];
+  StructuralModel -> Support [arrowhead=diamond, label="contains"];
+  StructuralModel -> NodalLoad [arrowhead=diamond, label="contains"];
+  StructuralModel -> LoadCase [arrowhead=diamond, label="contains"];
+  StructuralModel -> LoadCombination [arrowhead=diamond, label="contains"];
+  Section -> Material [label="material_id"];
+  Element2D -> Node [label="node_i/node_j"];
+  Element2D -> UDL [arrowhead=odiamond, label="member_loads"];
+  Element2D -> PointLoad [arrowhead=odiamond, label="member_loads"];
+  Element2D -> TrussTemp [arrowhead=odiamond, label="member_loads"];
+  Element2D -> FrameTemp [arrowhead=odiamond, label="member_loads"];
+  DofManager -> StructuralModel [style=dashed, label="from_model"];
+  DofManager -> Element2D [style=dashed, label="maps DOFs"];
+  MainWindow -> StructuralModel [arrowhead=odiamond];
+  MainWindow -> ModelCanvas [arrowhead=odiamond];
+  MainWindow -> Tool [style=dashed, label="uses"];
+  Tool -> Command [style=dashed, label="creates/executes"];
+  Command -> StructuralModel [style=dashed, label="do/undo mutates"];
+  ModelValidationResult -> StructuralModel [style=dashed, label="validates"];
+  AnalysisResult -> StructuralModel [style=dashed, label="produced from"];
+}

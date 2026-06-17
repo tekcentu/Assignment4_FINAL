@@ -1,0 +1,107 @@
+classDiagram
+direction TB
+
+class StructuralModel {
+  +title: str
+  +nodes: dict[int, Node]
+  +materials: dict[int, Material]
+  +sections: dict[int, Section]
+  +elements: list[Element2D]
+  +supports: dict[int, Support]
+  +nodal_loads: list[NodalLoad]
+  +load_cases: dict[str, LoadCase]
+  +load_combinations: dict[str, LoadCombination]
+  +node(node_id) Node
+  +support_for(node_id) Support
+  +node_ids: list[int]
+}
+class Node { +id: int; +x: float; +y: float }
+class Material { +id: int; +name: str; +E: float; +alpha: float; +density: float; +nu: float; +G float }
+class Section { +id: int; +material_id: int; +A: float; +I: float; +depth: float; +shape_type: str }
+class Support { +node_id: int; +ux: bool; +uy: bool; +rz: bool; +prescribed(dof) float }
+class NodalLoad { +node_id: int; +fx: float; +fy: float; +mz: float; +load_case: str }
+class UniformDistributedLoad { +wy: float; +wx: float; +coord_system: str; +load_case: str }
+class PointLoad { +py: float; +a: float; +px: float; +coord_system: str; +load_case: str }
+class TrussTemperatureLoad { +delta_T: float; +load_case: str }
+class FrameTemperatureLoad { +t_top: float; +t_bottom: float; +load_case: str }
+class LoadCase { +name: str; +enabled: bool; +description: str }
+class LoadCombination { +name: str; +terms: dict[str, float]; +description: str }
+class AnalysisResult { +status: str; +D; +member_results: dict; +reactions: dict }
+
+class Element2D {
+  +id: int
+  +node_i: int
+  +node_j: int
+  +E: float
+  +A: float
+  +member_loads: list[MemberLoad]
+  +kind str
+  +length_cos_sin(nodes)
+  +transformation_matrix(nodes)
+  +raw_local_stiffness(nodes)*
+  +local_consistent_load(nodes)
+  +global_stiffness_and_load(nodes)
+  +local_displacement_and_end_forces(nodes, u)
+}
+class FrameElement2D { +I: float; +release_i: bool; +release_j: bool; +raw_local_stiffness(nodes); +consistent_mass_local(nodes); +local_consistent_load(nodes) }
+class TrussElement2D { +raw_local_stiffness(nodes); +assembly_local_indices(); +consistent_mass_local(nodes); +local_consistent_load(nodes) }
+
+class DofManager { +active_map: dict; +free_indices: list; +restrained_indices: list; +from_model(model); +element_dof_map(elem) }
+class MainWindow { +model(); +select_node(); +select_element(); +set_status() }
+class ModelCanvas { +select_node(); +select_element(); +toggle_snap(); +set_element_preview() }
+class Tool { +activate(); +deactivate(); +on_click(); +on_motion(); +on_key() }
+class SelectTool
+class NodeTool
+class FrameTool
+class TrussTool
+class SupportTool
+class NodalLoadTool
+class MemberLoadTool
+class DeleteTool
+class Command { +do(); +undo() }
+class AddNodeCmd
+class AddMemberCmd
+class SetSupportCmd
+class AddNodalLoadCmd
+class AddMemberLoadCmd
+class ModelValidationResult { +has_errors(); +has_warnings(); +format_report() }
+
+Element2D <|-- FrameElement2D
+Element2D <|-- TrussElement2D
+Tool <|-- SelectTool
+Tool <|-- NodeTool
+Tool <|-- FrameTool
+Tool <|-- TrussTool
+Tool <|-- SupportTool
+Tool <|-- NodalLoadTool
+Tool <|-- MemberLoadTool
+Tool <|-- DeleteTool
+Command <|-- AddNodeCmd
+Command <|-- AddMemberCmd
+Command <|-- SetSupportCmd
+Command <|-- AddNodalLoadCmd
+Command <|-- AddMemberLoadCmd
+
+StructuralModel *-- Node
+StructuralModel *-- Material
+StructuralModel *-- Section
+StructuralModel *-- Element2D
+StructuralModel *-- Support
+StructuralModel *-- NodalLoad
+StructuralModel *-- LoadCase
+StructuralModel *-- LoadCombination
+Section --> Material : material_id
+Element2D --> Node : node_i/node_j
+Element2D o-- UniformDistributedLoad
+Element2D o-- PointLoad
+Element2D o-- TrussTemperatureLoad
+Element2D o-- FrameTemperatureLoad
+DofManager ..> StructuralModel : from_model
+DofManager ..> Element2D : element_dof_map
+MainWindow o-- StructuralModel
+MainWindow o-- ModelCanvas
+MainWindow ..> Tool
+Tool ..> Command : creates/executes
+Command ..> StructuralModel : mutates via do/undo
+ModelValidationResult ..> StructuralModel : validates
+AnalysisResult ..> StructuralModel : solver output
