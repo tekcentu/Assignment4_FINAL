@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.40.3"
+__version__ = "0.41.0"
 __what_is_new__ = (
-    "Fix: N/V/M diagrams + station export now use case-filtered / "
-    "factored member loads (matches the displayed combination) · "
-    "Point-load shear jumps render as true vertical steps"
+    "Canvas member-load glyphs now follow the active view: single case "
+    "shows that case only · combination shows the factored net load "
+    "(e.g. 1.2D+1.6L → -20 kN/m) · labels stay in kN / kN/m / kN·m"
 )
 
 from .model import (

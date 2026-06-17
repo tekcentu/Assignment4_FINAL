@@ -1860,7 +1860,22 @@ class ModelCanvas(QWidget):
         arrows (UDL: six along the element; PointLoad: one at ``a``).
         The arrow "tail offset" sign convention matches the legacy
         renderer so visual orientation stays consistent for existing
-        local loads."""
+        local loads.
+
+        Active-case-aware display (matches the N/V/M diagrams, which use
+        the case-consistent ``effective_member_loads``):
+
+        * ``active case loads only`` OFF (or SUM_ALL active) → every
+          assigned load is drawn (legacy all-load view).
+        * single case active → only that case's loads are drawn; loads
+          from other cases are hidden, not just dimmed.
+        * combination active → the factored *net* load is drawn (e.g.
+          ``1.2·DEAD + 1.6·LIVE`` → one ``-20 kN/m`` glyph), so the
+          arrows agree with the factored diagram.
+
+        Load magnitudes stay in internal units; labels keep the explicit
+        ``kN`` / ``kN/m`` / ``kN·m`` suffix (member loads are never
+        unit-converted in Global Units V1)."""
         if not elem.member_loads:
             return
         L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
@@ -1873,10 +1888,30 @@ class ModelCanvas(QWidget):
         udl_scale = load_scales.get("udl", 0.0)
         point_scale = load_scales.get("point", 0.0)
 
-        for ml in elem.member_loads:
-            # PR-A: dim loads belonging to non-active cases when the
-            # host has the "active case only" overlay on.
-            case_alpha = self._load_case_alpha(ml)
+        # Pick the load set + per-load alpha to match the active view.
+        model = self._model()
+        combos = getattr(model, "load_combinations", {}) or {}
+        is_combination = (
+            self._active_case_loads_only and self._active_case in combos
+        )
+        if not self._active_case_loads_only:
+            loads_to_draw = list(elem.member_loads)        # legacy all-load
+        elif is_combination:
+            loads_to_draw = _aggregate_member_loads(
+                _effective_member_loads(elem, self._active_case, combos)
+            )
+        else:
+            # Single case (or SUM_ALL / DEFAULT) → case-filtered set.
+            loads_to_draw = _effective_member_loads(
+                elem, self._active_case, combos,
+            )
+
+        for ml in loads_to_draw:
+            # Drawn loads already belong to the active view; the aggregated
+            # combination glyph has no single case so it always renders
+            # full-strength. For the all-load / single-case paths reuse the
+            # PR-A dimming helper (full alpha for the active set).
+            case_alpha = 1.0 if is_combination else self._load_case_alpha(ml)
             if isinstance(ml, UniformDistributedLoad):
                 labels.append(_label_for_udl(ml))
                 if udl_scale > 0:
@@ -2464,6 +2499,59 @@ class ModelCanvas(QWidget):
         no longer silently re-fits and throws their view away."""
         if not self._setting_axes_limits:
             self._user_view_dirty = True
+
+
+def _aggregate_member_loads(loads: list) -> list:
+    """Collapse a list of (already case-filtered / factored) member loads
+    into the net load actually acting on the element, for display.
+
+    Used for the active-combination view: ``effective_member_loads``
+    returns one factored copy per constituent term (e.g. ``1.2·DEAD`` and
+    ``1.6·LIVE``), and the diagrams sum them — so the glyph layer must
+    show the same *net* value (``-20 kN/m``), not two separate arrows.
+
+    UDLs are summed per ``coord_system`` (``wx`` / ``wy`` add); point
+    loads are summed per ``(coord_system, position a)``. Insertion order
+    of first appearance is preserved so the visual is stable. Thermal /
+    other loads carry through unchanged (they have no force magnitude to
+    sum and the evaluator ignores them in the span math)."""
+    udl_by_cs: dict[str, list[float]] = {}
+    udl_order: list[str] = []
+    pt_by_key: dict[tuple, list[float]] = {}
+    pt_order: list[tuple] = []
+    passthrough: list = []
+    for ml in loads:
+        if isinstance(ml, UniformDistributedLoad):
+            cs = getattr(ml, "coord_system", "local")
+            if cs not in udl_by_cs:
+                udl_by_cs[cs] = [0.0, 0.0]
+                udl_order.append(cs)
+            udl_by_cs[cs][0] += ml.wx
+            udl_by_cs[cs][1] += ml.wy
+        elif isinstance(ml, PointLoad):
+            cs = getattr(ml, "coord_system", "local")
+            key = (cs, round(float(ml.a), 9))
+            if key not in pt_by_key:
+                pt_by_key[key] = [0.0, 0.0]
+                pt_order.append(key)
+            pt_by_key[key][0] += ml.px
+            pt_by_key[key][1] += ml.py
+        else:
+            passthrough.append(ml)
+    out: list = []
+    for cs in udl_order:
+        wx, wy = udl_by_cs[cs]
+        if wx == 0.0 and wy == 0.0:
+            continue
+        out.append(UniformDistributedLoad(wx=wx, wy=wy, coord_system=cs))
+    for key in pt_order:
+        cs, a = key
+        px, py = pt_by_key[key]
+        if px == 0.0 and py == 0.0:
+            continue
+        out.append(PointLoad(px=px, py=py, a=a, coord_system=cs))
+    out.extend(passthrough)
+    return out
 
 
 def _udl_visual_components(
