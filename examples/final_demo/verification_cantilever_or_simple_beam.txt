@@ -1,0 +1,24 @@
+# Final verification model: cantilever beam with tip load
+# Units: kN, m. E in kN/m^2, A in m^2, I in m^4.
+# Hand check: L=4 m, P=10 kN downward, E=210000000 kN/m^2, I=8e-6 m^4.
+TITLE
+Final verification cantilever beam - tip load
+
+NODES 2
+1  0.0  0.0
+2  4.0  0.0
+
+MATERIALS 1
+1  210000000.0  0.0  7850.0  Steel_demo
+
+SECTIONS 1
+1  1  0.0100  8.0e-6  0.20  Verification_section
+
+ELEMENTS 1
+1  1  2  1  FRAME
+
+SUPPORTS 1
+1  1  1  1
+
+LOADS 1
+2  0.0  -10.0  0.0

@@ -328,3 +328,52 @@ The public repository for this assignment lives at:
 `https://github.com/tekcentu/StructureGUI`
 
 Update the report cover page accordingly.
+
+## Final demo and submission materials
+
+### Install and run
+
+From the repository root, install the package in editable mode with its development/test dependencies if needed:
+
+```bash
+python -m pip install -e .
+```
+
+Run the automated tests with:
+
+```bash
+QT_QPA_PLATFORM=offscreen python -m pytest -q
+```
+
+Launch the PyQt6 GUI with:
+
+```bash
+python -m structural_analysis.gui_qt
+```
+
+If the GUI cannot open in a headless environment, run the file-based examples through the Python API (`read_input_file()` and `run_analysis()`) to confirm the solver path.
+
+### Final demo examples
+
+Final recording backup/reproducibility examples are in `examples/final_demo/`:
+
+- `demo_portal_frame.txt` — portal frame used for the live GUI demo workflow.
+- `verification_cantilever_or_simple_beam.txt` — cantilever beam with a hand-checkable tip-load result.
+- `backup_demo_model.txt` — quick-load fallback if live drawing fails during recording.
+
+The video outline intentionally instructs the presenter to create the portal-frame model through the normal GUI workflow first. The saved files are backup and reproducibility assets, not a hardcoded demo path.
+
+### Verification and report documentation
+
+- Final verification table: `docs/verification/final_verification.md`.
+- Recording outline: `docs/final_video_outline.md`.
+- Recording checklist: `docs/final_video_checklist.md`.
+- UML/architecture report materials: `docs/uml/class_diagram.mmd`, `docs/uml/class_diagram.dot`, optional rendered `docs/uml/class_diagram.png`, and `docs/uml/architecture.md`.
+
+### Known limitations for final demo
+
+- The solver is a 2D linear-elastic frame/truss analysis tool; it is not a design-code checking package.
+- Results assume small-displacement behavior and valid user-defined units/properties.
+- Unstable or singular models are reported as solve failures rather than being stabilized with artificial restraints.
+- GUI diagrams are presentation/post-processing views and should not be treated as a separate solver.
+- The placeholder `video_link.txt` must be updated with the final unlisted video URL before submission.
