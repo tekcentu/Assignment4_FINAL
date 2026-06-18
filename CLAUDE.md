@@ -116,3 +116,42 @@ Plain-text sections parsed by `file_io.read_input_file`. Key Assignment-4 additi
 - `SUPPORTS`: `<node_id> <ux> <uy> <rz> [settle_ux settle_uy settle_rz]`.
 - `FRAME_TEMPERATURE`: `<element_id> <t_top> <t_bottom>` (mean → axial, difference → bending gradient).
 - `TRUSS_TEMPERATURE`: `<element_id> <delta_T>` (uniform ΔT along the bar).
+
+## Testing cadence for AI agents
+
+For day-to-day AI-agent development, use targeted tests first. Full GUI smoke is opt-in, not default.
+
+1. **Default development loop must be targeted and fast.**
+   Examples:
+   - Modal/mass change:
+     ```bash
+     python -m pytest tests/test_modal_lumped.py tests/test_modal_analysis.py tests/test_mass_lumped.py tests/test_modal_lumped_singularity_safety.py -q
+     ```
+   - GUI modal/mass change:
+     ```bash
+     QT_QPA_PLATFORM=offscreen python -m pytest tests/test_gui_qt_smoke.py -k "modal or mass or joint" -q
+     ```
+   - Building Wizard change:
+     ```bash
+     QT_QPA_PLATFORM=offscreen python -m pytest tests/test_gui_qt_smoke.py -k "wizard or section" -q
+     ```
+   - Diagram/canvas change: run the specific diagram/sign/canvas tests only.
+   - Documentation-only change: do not run the full suite unless docs tooling requires it.
+
+2. **Do not run the full GUI smoke suite by default.**
+   Only run it when: user explicitly asks, PR directly touches broad GUI startup/event-loop behavior, or it is the final pre-submission validation with enough time.
+
+3. **Do not run the full non-smoke suite repeatedly.**
+   Use targeted tests during implementation, then one broad check at the end if needed.
+
+4. **Always report tests in two groups:**
+   - Fast/targeted tests run during development
+   - Broad/final tests run before merge, if any
+
+5. **If a full suite is skipped, say so clearly and explain why.**
+
+6. **Never delete or weaken tests just to make the suite faster.**
+
+7. **For final-submission mode:**
+   - Prioritize: demo-blocking crashes, report/manual/verification files, targeted tests, one final broad non-smoke run only if time allows
+   - Avoid: repeated full-suite runs, full GUI smoke unless explicitly requested, new features, large refactors
