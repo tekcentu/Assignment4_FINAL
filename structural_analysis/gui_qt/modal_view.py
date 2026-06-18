@@ -57,10 +57,14 @@ class ModalResultsDialog(QDialog):
 
         v = QVBoxLayout(self)
 
+        # Final-submission build: modal mass is lumped only. We still
+        # display the tag from the result so any older saved ModalResult
+        # that was tagged "consistent" is reported truthfully — but the
+        # GUI never produces such a result going forward.
         _mass_label = (
-            "consistent"
-            if result.mass_formulation == "consistent"
-            else "lumped translational"
+            "lumped (row-sum)"
+            if result.mass_formulation == "lumped"
+            else f"{result.mass_formulation} (legacy)"
         )
         _src_summary = getattr(result, "mass_source_summary", "self-mass only")
         header_text = (

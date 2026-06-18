@@ -172,7 +172,7 @@ def joint_mass_table(
     model: StructuralModel,
     *,
     method: Method = "row_sum",
-    mass_formulation: MassFormulation = "consistent",
+    mass_formulation: MassFormulation = "lumped",
 ) -> JointMassReport:
     """Build the Assembled Joint Masses table for ``model``.
 

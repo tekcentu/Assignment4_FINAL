@@ -4276,7 +4276,7 @@ class MainWindow(QMainWindow):
                 n_modes=d.result_value["n_modes"],
                 normalisation=d.result_value["normalisation"],
                 mass_formulation=d.result_value.get(
-                    "mass_formulation", "consistent",
+                    "mass_formulation", "lumped",
                 ),
                 mass_source=getattr(self._model, "modal_mass_source", None),
             )

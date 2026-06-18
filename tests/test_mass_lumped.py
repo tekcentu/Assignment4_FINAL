@@ -190,14 +190,23 @@ def test_assemble_mass_lumped_per_direction_total_matches_rho_A_L():
     assert uy_total * 1000.0 == pytest.approx(expected_kg, rel=1e-12)
 
 
-def test_assemble_mass_default_is_consistent_and_unchanged():
-    """Backward compat: calling assemble_mass_matrix(model, dofs)
-    without the new kwarg must return exactly the consistent M."""
+def test_assemble_mass_default_is_lumped():
+    """Final-submission build: the default ``assemble_mass_matrix``
+    formulation is ``"lumped"`` (was ``"consistent"`` before the
+    lumped-only simplification). Explicit ``"lumped"`` must equal the
+    default. ``"consistent"`` is still accepted at this low-level API
+    (used by the diagnostic Joint Masses inspector and by element-
+    level unit tests) — only the modal solver path stops exposing it."""
     m, _, _, _ = _frame_at_angle(L=4.0, theta_deg=0.0)
     dofs = DofManager.from_model(m)
     M_default = assemble_mass_matrix(m, dofs)
-    M_explicit = assemble_mass_matrix(m, dofs, formulation="consistent")
-    np.testing.assert_allclose(M_default, M_explicit, rtol=0.0, atol=0.0)
+    M_lumped = assemble_mass_matrix(m, dofs, formulation="lumped")
+    np.testing.assert_allclose(M_default, M_lumped, rtol=0.0, atol=0.0)
+    # Sanity: the internal "consistent" path still assembles a different
+    # matrix (non-zero rotational diagonal), so it hasn't been silently
+    # aliased to lumped at the low-level API.
+    M_consistent = assemble_mass_matrix(m, dofs, formulation="consistent")
+    assert not np.allclose(M_default, M_consistent)
 
 
 def test_assemble_mass_unknown_formulation_raises():

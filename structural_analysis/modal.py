@@ -493,7 +493,7 @@ def solve_modal(
     n_modes: int = 6,
     normalisation: str = "mass",
     *,
-    mass_formulation: MassFormulation = "consistent",
+    mass_formulation: MassFormulation = "lumped",
     mass_source: ModalMassSource | None = None,
 ) -> ModalResult:
     """Run a free-vibration analysis and return a :class:`ModalResult`.
@@ -506,17 +506,24 @@ def solve_modal(
     solve, and prescribed settlements are ignored (free vibration
     studies displacements about the rest state).
 
+    The final-submission build exposes ONLY the lumped / row-sum mass
+    formulation. Higher modal accuracy can be obtained by subdividing
+    frame elements into smaller segments. Massless rotational DOFs are
+    handled by the existing static (Guyan) condensation path — no tiny
+    artificial mass is ever injected.
+
     Args:
         model: The structural model to analyse.
         n_modes: Maximum number of modes to return. Capped at the number
-            of free DOFs (consistent) or mass-bearing free DOFs
-            (lumped).
+            of mass-bearing free DOFs after condensation.
         normalisation: ``"mass"`` (default — eigenvectors satisfy
             ``φᵀ·M·φ = 1``) or ``"max"`` (each mode scaled so the
             largest absolute entry is 1).
-        mass_formulation: ``"consistent"`` (default — unchanged from
-            v0.9.1) or ``"lumped"`` (translational-only mass matrix,
-            rotational DOFs condensed out via Guyan reduction).
+        mass_formulation: ``"lumped"`` (default, the only supported
+            user-facing option). Passing ``"consistent"`` is accepted
+            for backward compatibility with saved files / older
+            scripts but emits a :class:`DeprecationWarning` and is
+            transparently mapped to ``"lumped"`` (no silent crash).
 
     Returns:
         A populated :class:`ModalResult`.
@@ -536,8 +543,27 @@ def solve_modal(
     if mass_formulation not in ("consistent", "lumped"):
         raise ValueError(
             f"Unknown mass formulation {mass_formulation!r}; "
-            "expected 'consistent' or 'lumped'."
+            "the only supported value is 'lumped'."
         )
+    if mass_formulation == "consistent":
+        # Graceful backward-compat for saved files / older scripts. The
+        # final-submission build only exposes the lumped formulation; we
+        # warn (clear, named warning category) and silently map to lumped
+        # so the user gets a working result instead of a crash. The
+        # internal element ``consistent_mass_local`` helper remains as a
+        # private/diagnostic API used by joint_mass_table and by a few
+        # low-level unit tests; it is no longer reachable through the
+        # modal solver path.
+        import warnings
+        warnings.warn(
+            "Consistent mass formulation is no longer supported in modal "
+            "analysis (final-submission build). Falling back to 'lumped'. "
+            "If higher modal accuracy is needed, subdivide frame elements "
+            "into smaller segments instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        mass_formulation = "lumped"
 
     # Resolve effective mass source (None → safe default = density only).
     effective_source = mass_source if mass_source is not None else ModalMassSource()

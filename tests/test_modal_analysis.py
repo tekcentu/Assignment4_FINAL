@@ -65,10 +65,15 @@ def test_clamped_free_beam_first_three_frequencies():
 
     f_n = (β_n L)² · √(EI / (ρ A L⁴)) / (2π)
     with β_n L = 1.8751, 4.6941, 7.8548 for n = 1, 2, 3.
+
+    Final-submission build (lumped only): we use a finer mesh (32
+    elements) so the lumped mass discretisation converges to the
+    closed-form within 1% on all three modes — this is the same
+    "subdivide for accuracy" guidance the Modal dialog now surfaces.
     """
     L, E, A, I, rho = 5.0, 200e6, 0.005, 1.0e-5, 7850.0  # kN/m², m², m⁴, kg/m³
     # Build the cantilever with a fine mesh so FE error is small.
-    model = _uniform_beam(n_elems=16, L=L, E=E, A=A, I=I, rho=rho,
+    model = _uniform_beam(n_elems=32, L=L, E=E, A=A, I=I, rho=rho,
                           fix_left=True, fix_right=False)
     r = solve_modal(model, n_modes=6, normalisation="mass")
     assert r.status == "ok"

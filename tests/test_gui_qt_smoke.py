@@ -830,7 +830,12 @@ def test_modal_results_dialog_round_trip(qt_app):
     m.supports = {1: Support(1, ux=True, uy=True, rz=True)}
 
     r = solve_modal(m, n_modes=3)
-    assert r.n_modes == 3
+    # Final-submission build: solve_modal defaults to lumped mass. The
+    # single free node has 3 free DOFs (ux, uy, rz) but only 2 are
+    # mass-bearing under lumped (rz is condensed out), so we expect 2
+    # modes instead of 3. The previous assertion (n_modes == 3) tested
+    # the v0.9.1 consistent default.
+    assert r.n_modes == 2
     assert r.frequencies[0] > 0.0
 
     calls: list[tuple[int, float]] = []
@@ -2110,42 +2115,49 @@ def test_joint_masses_window_never_invokes_solve_modal(qt_app, monkeypatch):
     assert calls["n"] == 0
 
 
-def test_modal_dialog_default_formulation_is_consistent(qt_app):
-    """v0.9.2: the modal-analysis dialog's formulation dropdown defaults
-    to 'consistent', and round-trips the selection through _accept()."""
+def test_modal_dialog_only_offers_lumped_formulation(qt_app):
+    """Final-submission build: the Modal Analysis dialog exposes ONLY
+    the lumped formulation. The combo retains a single (read-only)
+    item so the form layout is preserved, but the user can no longer
+    pick consistent. The accepted result always carries
+    ``mass_formulation = "lumped"``. This rewrites the pre-cleanup
+    test that pinned default = "consistent"."""
     from structural_analysis.gui_qt.dialogs import ModalAnalysisDialog
 
     w = MainWindow()
     qt_app.processEvents()
     d = ModalAnalysisDialog(w, default_n_modes=4)
     qt_app.processEvents()
-    # Default is consistent.
-    assert d._mass_combo.currentData() == "consistent"
-    # Validation path round-trips.
-    accepted = d._accept()
-    assert accepted["mass_formulation"] == "consistent"
-    # Flip to lumped.
-    idx = d._mass_combo.findData("lumped")
-    assert idx >= 0
-    d._mass_combo.setCurrentIndex(idx)
+    # Only the lumped item is present; consistent is gone from the GUI.
+    items = [d._mass_combo.itemData(i) for i in range(d._mass_combo.count())]
+    assert items == ["lumped"]
+    assert d._mass_combo.findData("consistent") == -1
+    # Combo is disabled because there is only one option.
+    assert not d._mass_combo.isEnabled()
+    # Round-trips through _accept() as lumped.
     accepted = d._accept()
     assert accepted["mass_formulation"] == "lumped"
 
 
-def test_joint_masses_window_lumped_radio_zeros_rotational_cells(qt_app):
-    """v0.9.2: flipping the joint-masses formulation radio to Lumped
-    routes through joint_mass_table(mass_formulation='lumped') and the
-    table's rz column reads 0.0 for every node."""
+def test_joint_masses_window_uses_lumped_formulation(qt_app):
+    """Final-submission build: the Joint Masses inspection window no
+    longer has a Consistent / Lumped formulation radio (modal analysis
+    only supports lumped). The window now always builds the table
+    with the lumped formulation so the rz cells read 0.0 for every
+    node — same as what the modal solver actually sees. The Row-sum /
+    Diagonal radios above remain because those are diagnostic
+    *table-view* modes, not mass formulations.
+
+    Rewrites the pre-cleanup test that flipped a Lumped radio: that
+    radio no longer exists. Instead we verify the table is already
+    lumped-built on open, and the Row-sum / Diagonal table-view radios
+    are still present and functional."""
     from structural_analysis.element import FrameElement2D
     from structural_analysis.model import (
         Material, Node, Section, StructuralModel, Support,
     )
 
-    # Build a fresh 2-node cantilever with positive density so the
-    # consistent path produces nonzero rz cells (the legacy
-    # q2a_settlement.txt fixture has ρ=0 and would give zero rz on
-    # both formulations, masking the contrast we're testing).
-    m = StructuralModel(title="lumped-radio-test")
+    m = StructuralModel(title="lumped-only joint-masses")
     m.nodes[1] = Node(1, 0.0, 0.0)
     m.nodes[2] = Node(2, 3.0, 0.0)
     m.materials[1] = Material(id=1, name="Steel", E=2.1e8, density=7850.0)
@@ -2167,17 +2179,16 @@ def test_joint_masses_window_lumped_radio_zeros_rotational_cells(qt_app):
     win.refresh()
     qt_app.processEvents()
 
-    rz_col = 3  # Mrz / rz column
-    # Sanity: consistent mode is the default; node-2 rz cell should be
-    # nonzero (cantilever free end carries rotational consistent mass).
-    rz_text_consistent = win._table.item(1, rz_col).text()
-    assert rz_text_consistent not in ("—", "0.0000", "0.000e+00"), (
-        f"expected nonzero rz cell on consistent mass, got {rz_text_consistent!r}"
-    )
+    # Lumped formulation is the only formulation — no radio to flip.
+    assert win._mass_formulation == "lumped"
+    assert not hasattr(win, "_rb_consistent")
+    assert not hasattr(win, "_rb_lumped")
+    # Table-view radios are still here (diagnostic display modes).
+    assert hasattr(win, "_rb_rowsum") and hasattr(win, "_rb_diag")
 
-    # Flip to lumped.
-    win._rb_lumped.setChecked(True)
-    qt_app.processEvents()
+    # Every rz cell reads 0.0 (lumped formulation) — same value the modal
+    # solver's condensation path will exclude.
+    rz_col = 3
     for r in range(win._table.rowCount()):
         text = win._table.item(r, rz_col).text()
         assert text in ("—", "0.0000", "0.000e+00"), (
