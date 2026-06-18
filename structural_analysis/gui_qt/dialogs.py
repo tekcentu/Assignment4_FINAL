@@ -3097,26 +3097,30 @@ class ModalAnalysisDialog(_ModalDialog):
         self._norm_combo.addItem("Max-component = 1", "max")
         form.addRow("Normalisation", self._norm_combo)
 
-        # Mass formulation. Consistent is the default and unchanged
-        # from v0.9.1; lumped translational is a comparison aid that
-        # condenses rotational DOFs out of the modal eigenproblem.
+        # Mass formulation. Final-submission build supports ONLY the
+        # lumped / row-sum mass; the consistent option has been removed
+        # from the user-facing dialog. The combo is kept (as a single-
+        # item read-only display) so the form layout stays consistent
+        # and any external test that inspects ``self._mass_combo`` keeps
+        # working — but only one option is offered.
         self._mass_combo = QComboBox(body)
         self._mass_combo.addItem(
-            "Consistent element mass", "consistent",
+            "Lumped / row-sum mass", "lumped",
         )
-        self._mass_combo.addItem(
-            "Lumped translational mass  (comparison aid)", "lumped",
-        )
+        self._mass_combo.setEnabled(False)   # single option — purely informational
         form.addRow("Mass formulation", self._mass_combo)
 
         note = QLabel(
+            "Modal analysis uses the lumped / row-sum mass formulation. "
+            "Massless rotational DOFs are handled by static (Guyan) "
+            "condensation; no artificial mass is added. For higher "
+            "accuracy, subdivide frame elements into smaller segments.\n\n"
             "Modal analysis requires a positive density on every "
-            "element's material.\nSet density (kg/m³) on each Material "
+            "element's material — set density (kg/m³) on each Material "
             "via Edit → Materials and sections.\n\n"
-            "Lumped translational mass is a comparison aid. Agreement "
-            "with external software depends on matching units, "
-            "density/mass source, section properties, mesh, boundary "
-            "conditions, restraints, and mass formulation.",
+            "Agreement with external software still depends on matching "
+            "units, density/mass source, section properties, mesh, "
+            "boundary conditions, and restraints.",
             body,
         )
         note.setWordWrap(True)

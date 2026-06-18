@@ -69,9 +69,18 @@ def test_row_sum_translational_total_matches_rho_A_L():
 
 
 def test_consistent_mass_has_nonzero_rz_on_frame_diagonal():
-    """FrameElement2D's consistent mass diagonal at θ DOFs is positive."""
+    """FrameElement2D's consistent mass diagonal at θ DOFs is positive.
+
+    The consistent path is still reachable through the diagnostic Joint
+    Masses inspector by passing ``mass_formulation="consistent"`` (it is
+    only the user-facing MODAL workflow that is restricted to lumped).
+    This test continues to lock the underlying physics of the consistent
+    formulation; the modal solver no longer uses it through the public
+    API."""
     m, _, _, _ = _single_frame_model()
-    report = joint_mass_table(m, method="diagonal")
+    report = joint_mass_table(
+        m, method="diagonal", mass_formulation="consistent",
+    )
 
     rows_by_id = {row.node_id: row for row in report.rows}
     for nid in (1, 2):
@@ -179,9 +188,17 @@ def test_row_sum_rotational_cell_is_physical_kg_m2():
     """rz row, restricted to rz columns, must yield a non-negative
     physical kg·m² value. Cross-block sums could go negative because
     of the -3L² off-diagonal in the consistent mass — that's the
-    reviewer's concern, locked down here."""
+    reviewer's concern, locked down here.
+
+    Explicitly uses the consistent formulation (only reachable through
+    the diagnostic ``joint_mass_table`` after the lumped-only modal
+    cleanup) because the closed-form `L² · ρAL/420` value is a
+    consistent-mass identity. Under the lumped formulation rz cells are
+    exactly zero, which is also non-negative but trivially so."""
     m, L, rho, A = _single_frame_model(L=5.0)
-    report = joint_mass_table(m, method="row_sum")
+    report = joint_mass_table(
+        m, method="row_sum", mass_formulation="consistent",
+    )
 
     for row in report.rows:
         rz = row.values["rz"]
