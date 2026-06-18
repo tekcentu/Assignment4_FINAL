@@ -858,9 +858,11 @@ class MainWindow(QMainWindow):
             triggered=self._on_active_case_loads_only_toggled,
         )
         self.act_active_case_loads_only.setToolTip(
-            "When on, loads attached to non-active load cases render "
-            "dimmed on the canvas. When off, every load draws at full "
-            "intensity regardless of which case is active."
+            "When on, the canvas shows only the loads of the selected "
+            "case/combination (a combination shows its referenced cases' "
+            "loads factored; SUM_ALL shows everything). Works before and "
+            "after solving. When off, every load draws regardless of the "
+            "active case."
         )
         m_view.addAction(self.act_active_case_loads_only)
         # Show local axes (v0.24.0) — draws each element's local x/y
