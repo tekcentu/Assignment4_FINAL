@@ -27,7 +27,7 @@ from structural_analysis.element import FrameElement2D, TrussElement2D  # noqa: 
 from structural_analysis.gui_qt.app import MainWindow  # noqa: E402
 from structural_analysis.model import (  # noqa: E402
     LoadCase, LoadCombination, Material, Node, Section, Support,
-    NodalLoad, UniformDistributedLoad,
+    NodalLoad, PointLoad, UniformDistributedLoad,
 )
 from structural_analysis.gui_qt.element_graphics import (  # noqa: E402
     sample_internal_force, effective_member_loads,
@@ -307,6 +307,30 @@ def test_build_station_rows_all_vs_selected(qt_app):
     assert len(all_rows) == 1 + 2 * 21
     assert len(sel_rows) == 1 + 21
     assert {r[1] for r in sel_rows[1:]} == {1}
+
+
+def test_split_stations_stay_aligned_across_nvm(qt_app):
+    """Export anchors V/M on the axial station list and indexes by position,
+    which is only safe because ``split_discontinuities`` inserts a duplicate
+    pair at *every* point-load location for *every* kind (the limits just
+    coincide where a kind has no jump). Lock that invariant so a future
+    sampler change can't silently misalign the CSV columns.
+
+    A transverse-only and an axial-only point load deliberately put the
+    jumps on different force types at different x — the station lists must
+    still be identical in length and coordinates."""
+    ni, nj = Node(1, 0.0, 0.0), Node(2, 6.0, 0.0)
+    e = FrameElement2D(id=1, node_i=1, node_j=2, E=2e8,
+                       A=0.02, I=0.08, section_id=1)
+    e.member_loads.append(PointLoad(py=-30.0, a=2.0))           # V jump only
+    e.member_loads.append(PointLoad(py=0.0, a=4.0, px=-15.0))   # N jump only
+    f = [0.0] * 6
+    kw = dict(member_loads=e.member_loads, split_discontinuities=True)
+    xn, _ = sample_internal_force(e, ni, nj, f, "axial", **kw)
+    xv, _ = sample_internal_force(e, ni, nj, f, "shear", **kw)
+    xm, _ = sample_internal_force(e, ni, nj, f, "moment", **kw)
+    assert len(xn) == len(xv) == len(xm)
+    assert xn == xv == xm
 
 
 def test_station_export_matches_canvas_sampling(qt_app, tmp_path, monkeypatch):
