@@ -1,13 +1,20 @@
 """Rigid end offsets — member-load handling and diagram conventions.
 
-V1 load semantics (Option A):
+Load semantics (v0.41 — UDL full-length fix):
 
-* UDL / point / thermal member loads act on the FLEXIBLE span only;
-* point-load station ``a`` stays measured from analytical node i and
+* a UDL is applied over the FULL analytical member, including the rigid
+  end zones: ``ΣR = w · L_total`` (the rigid zones carry their share of
+  the load straight to their joints — see
+  ``FrameElement2D.local_consistent_load``);
+* point / thermal member loads still act on the FLEXIBLE span only;
+  point-load station ``a`` stays measured from analytical node i and
   must land inside the flexible span — a load in a rigid zone is
   rejected, never silently relocated;
-* self-weight is applied over the flexible span (documented);
-* diagrams are sampled on the flexible span; ``dM/dx = V`` holds.
+* self-weight is still applied over the flexible span (documented;
+  out of scope for the UDL fix);
+* diagrams are SAMPLED on the flexible span (display footprint
+  unchanged), but the values integrate the UDL from x = 0 so they are
+  consistent with the full-length load; ``dM/dx = V`` holds.
 """
 
 import os
@@ -46,23 +53,26 @@ def _ss_beam(L=6.0, *, offset_i=0.0, offset_j=0.0):
 # ── UDL on the flexible span ─────────────────────────────────────────────
 
 
-def test_udl_reactions_equal_flexible_span_total():
-    """w over the flexible span only ⇒ ΣR = w·L_flex, split evenly on
-    the symmetric configuration."""
+def test_udl_reactions_equal_full_member_total():
+    """A UDL acts over the FULL analytical member (incl. rigid zones) ⇒
+    ΣR = w·L_total, split evenly on the symmetric configuration. (This
+    replaces the pre-fix ``…equal_flexible_span_total`` which encoded the
+    old ΣR = w·L_flex behaviour.)"""
     L, e_off, w = 6.0, 1.0, 10.0
     m = _ss_beam(L, offset_i=e_off, offset_j=e_off)
     m.elements[0].member_loads.append(UniformDistributedLoad(wy=-w))
     r = run_analysis(m, verbose=False)
     assert r.status == "ok"
-    Lf = L - 2 * e_off
     total = sum(rx.get("uy", 0.0) for rx in r.reactions.values())
-    assert total == pytest.approx(w * Lf, rel=1e-9)
-    assert r.reactions[1]["uy"] == pytest.approx(w * Lf / 2, rel=1e-9)
+    assert total == pytest.approx(w * L, rel=1e-9)
+    assert r.reactions[1]["uy"] == pytest.approx(w * L / 2, rel=1e-9)
 
 
 def test_udl_midspan_moment_static_equivalent():
-    """Static system: supports at the joints, UDL w over the central
-    L_f. Midspan moment = R·L/2 − w·(L_f/2)²/2."""
+    """Supports at the joints, UDL w over the FULL member [0, L]: this is
+    a plain simply-supported beam, so the midspan moment is the textbook
+    w·L²/8 (the rigid zones don't change the support reactions of a
+    determinate beam)."""
     L, e_off, w = 6.0, 1.0, 10.0
     m = _ss_beam(L, offset_i=e_off, offset_j=e_off)
     m.elements[0].member_loads.append(UniformDistributedLoad(wy=-w))
@@ -70,11 +80,8 @@ def test_udl_midspan_moment_static_equivalent():
     elem = m.elements[0]
     ni, nj = m.nodes[1], m.nodes[2]
     f_local = r.member_results[1]["f_local"]
-    Lf = L - 2 * e_off
-    R_sup = w * Lf / 2
-    m_mid_expected = R_sup * (L / 2) - w * (Lf / 2) ** 2 / 2
     m_mid = internal_force_at(elem, ni, nj, f_local, "moment", L / 2)
-    assert m_mid == pytest.approx(m_mid_expected, rel=1e-9)
+    assert m_mid == pytest.approx(w * L ** 2 / 8.0, rel=1e-9)
 
 
 # ── point loads ──────────────────────────────────────────────────────────
@@ -214,9 +221,12 @@ def test_dM_dx_equals_V_on_flexible_span_with_offsets():
         assert dmdx == pytest.approx(vs[i], abs=1e-6)
 
 
-def test_face_moment_carries_linearly_from_joint():
-    """M at the i-face equals −M_i + V_i·e_i — the rigid zone transfers
-    the joint actions linearly (no load inside the zone)."""
+def test_face_moment_includes_rigid_zone_udl():
+    """With the full-length UDL the i-face moment is
+    −M_i + V_i·e_i + ½·w_y·e_i² — the rigid zone now carries its share of
+    the distributed load, so the reconstruction integrates the UDL from
+    x = 0 (this replaces the pre-fix ``…carries_linearly_from_joint``
+    which assumed the rigid zone was unloaded)."""
     L, ei, w = 6.0, 1.0, 10.0
     m = _ss_beam(L, offset_i=ei)
     m.elements[0].member_loads.append(UniformDistributedLoad(wy=-w))
@@ -225,10 +235,12 @@ def test_face_moment_carries_linearly_from_joint():
     f_local = r.member_results[1]["f_local"]
     V_i = float(f_local[1])
     M_i = float(f_local[2])
+    wy = -w   # local +y intensity for a downward UDL on a horizontal beam
     m_face = internal_force_at(
         elem, m.nodes[1], m.nodes[2], f_local, "moment", ei,
     )
-    assert m_face == pytest.approx(-M_i + V_i * ei, abs=1e-9)
+    assert m_face == pytest.approx(
+        -M_i + V_i * ei + 0.5 * wy * ei ** 2, abs=1e-9)
 
 
 def test_zero_offset_diagrams_unchanged():

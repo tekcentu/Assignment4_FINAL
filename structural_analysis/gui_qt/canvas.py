@@ -35,6 +35,12 @@ from ..model import (
     TrussTemperatureLoad,
     UniformDistributedLoad,
 )
+from ..gui_common.load_view import (
+    visible_nodal_loads as _visible_nodal_loads,
+    visible_member_loads as _visible_member_loads,
+    ACTIVE_CASE as _LOAD_MODE_ACTIVE_CASE,
+    ALL as _LOAD_MODE_ALL,
+)
 from ..gui_common.geometry import (
     physical_member_polygon as _physical_member_polygon,
     physical_display_thickness as _physical_display_thickness,
@@ -49,6 +55,7 @@ from .snap import SnapCandidate, SnapEngine
 from .element_graphics import (
     sample_internal_force as _diagram_ordinates,
     internal_force_at as _diagram_value,
+    effective_member_loads as _effective_member_loads,
     _split_segments_by_sign as _diagram_sign_split,
     sign_fill_color as _diagram_sign_color,
     _RIGID_ZONE_COLOR,
@@ -219,6 +226,20 @@ class ModelCanvas(QWidget):
         self._active_case: str = "DEFAULT"
         self._active_case_loads_only: bool = True
         self._inactive_load_alpha: float = 0.35
+        # Load-glyph VISIBILITY mode (distinct from the alpha-dimming
+        # above). Decides which load arrows are drawn at all, before OR
+        # after a solve, driven purely by the active-case selection:
+        #   "active_case" → only the selected case's loads (a combination
+        #                    shows its referenced cases' loads factored;
+        #                    SUM_ALL shows everything)
+        #   "all"         → every load glyph (legacy view)
+        #   "hide"        → no load glyphs
+        # Kept in lock-step with ``_active_case_loads_only`` so the
+        # existing View toggle drives it, but exposed separately via
+        # ``set_load_display_mode`` for direct/host control. See
+        # ``gui_common.load_view``. Visual-only — no numeric result,
+        # N/V/M, reaction, or station value is touched by this.
+        self._load_display_mode: str = _LOAD_MODE_ACTIVE_CASE
         # PR #29: when a load COMBINATION is active, this holds the set
         # of constituent case names so loads from ANY of them render at
         # full alpha (signalling "all these cases contribute") while
@@ -473,11 +494,33 @@ class ModelCanvas(QWidget):
         self.redraw()
 
     def set_active_case_loads_only(self, on: bool) -> None:
-        """Host signal: toggle the "show only active-case loads" mode
-        (when off, all loads draw at full alpha)."""
-        if on == self._active_case_loads_only:
+        """Host signal: toggle the "show only active-case loads" mode.
+
+        ON  → active-case load glyphs only (the new visibility filter).
+        OFF → every load glyph at full alpha (the legacy "all" view).
+
+        Drives ``_load_display_mode`` so the existing View menu toggle is
+        the single control for load visibility; ``_active_case_loads_only``
+        is also kept in sync because ``_load_case_alpha`` still consults
+        it for combination/SUM_ALL highlighting."""
+        on = bool(on)
+        new_mode = _LOAD_MODE_ACTIVE_CASE if on else _LOAD_MODE_ALL
+        if on == self._active_case_loads_only and new_mode == self._load_display_mode:
             return
-        self._active_case_loads_only = bool(on)
+        self._active_case_loads_only = on
+        self._load_display_mode = new_mode
+        self.redraw()
+
+    def set_load_display_mode(self, mode: str) -> None:
+        """Host signal: set the load-glyph visibility mode directly
+        (``"active_case"`` / ``"all"`` / ``"hide"``). Keeps
+        ``_active_case_loads_only`` consistent for the alpha-dimming
+        helper. Idempotent on no-op."""
+        mode = str(mode)
+        if mode == self._load_display_mode:
+            return
+        self._load_display_mode = mode
+        self._active_case_loads_only = (mode == _LOAD_MODE_ACTIVE_CASE)
         self.redraw()
 
     def set_active_combination_cases(
@@ -1386,18 +1429,35 @@ class ModelCanvas(QWidget):
 
     def _draw_model(self) -> None:
         model = self._model()
-        # Pre-compute the largest force/UDL/point-load magnitude in the
-        # model so every drawn arrow length is proportional to the
-        # actual load magnitude relative to the rest of the model. We
-        # cap it at the model span so a runaway 1e9 load doesn't fill
+        # Resolve which load glyphs are visible for the active selection
+        # (case / combination / SUM_ALL) under the current visibility
+        # mode. Both the auto-scale pass below AND the draw passes use
+        # this exact set, so arrow lengths reflect only what's shown and
+        # combinations show factored magnitudes. Visual-only: no numeric
+        # result, member force, or station value is consulted here.
+        load_mode = self._load_display_mode
+        load_combos = model.load_combinations
+        visible_nodal = _visible_nodal_loads(
+            model, self._active_case, load_combos, load_mode,
+        )
+        visible_member_by_elem = {
+            elem.id: _visible_member_loads(
+                elem, self._active_case, load_combos, load_mode,
+            )
+            for elem in model.elements
+        }
+        # Pre-compute the largest force/UDL/point-load magnitude among the
+        # VISIBLE loads so every drawn arrow length is proportional to the
+        # actual load magnitude relative to the rest of the visible set.
+        # We cap it at the model span so a runaway 1e9 load doesn't fill
         # the screen.
         max_force = 0.0
         max_udl = 0.0
         max_point = 0.0
-        for ld in model.nodal_loads:
+        for ld in visible_nodal:
             max_force = max(max_force, (ld.fx ** 2 + ld.fy ** 2) ** 0.5)
-        for elem in model.elements:
-            for ml in getattr(elem, "member_loads", []):
+        for mls in visible_member_by_elem.values():
+            for ml in mls:
                 if isinstance(ml, UniformDistributedLoad):
                     max_udl = max(
                         max_udl, abs(ml.wy), abs(getattr(ml, "wx", 0.0)),
@@ -1497,7 +1557,10 @@ class ModelCanvas(QWidget):
                     release_xs.append(nj.x - 0.15 * (nj.x - ni.x))
                     release_ys.append(nj.y - 0.15 * (nj.y - ni.y))
                     release_edges.append(color)
-            self._draw_member_loads(elem, ni, nj, load_scales)
+            self._draw_member_loads(
+                elem, ni, nj, load_scales,
+                member_loads=visible_member_by_elem.get(elem.id),
+            )
 
         if self.show_physical_members:
             self._draw_physical_members(model)
@@ -1561,7 +1624,7 @@ class ModelCanvas(QWidget):
                 zorder=20,
             )
 
-        for ld in model.nodal_loads:
+        for ld in visible_nodal:
             n = model.nodes.get(ld.node_id)
             if n is None:
                 continue
@@ -1843,7 +1906,9 @@ class ModelCanvas(QWidget):
                              color="#2ca02c", zorder=6,
                              alpha=case_alpha)
 
-    def _draw_member_loads(self, elem, ni, nj, load_scales: dict) -> None:
+    def _draw_member_loads(
+        self, elem, ni, nj, load_scales: dict, member_loads=None,
+    ) -> None:
         """Draw each member load in its TRUE direction:
 
         * ``coord_system == "local"`` — axial component along the member
@@ -1859,8 +1924,15 @@ class ModelCanvas(QWidget):
         arrows (UDL: six along the element; PointLoad: one at ``a``).
         The arrow "tail offset" sign convention matches the legacy
         renderer so visual orientation stays consistent for existing
-        local loads."""
-        if not elem.member_loads:
+        local loads.
+
+        ``member_loads`` is the pre-filtered visible/effective load list
+        from ``gui_common.load_view`` (combination factors already
+        applied). It defaults to the element's own loads so direct callers
+        keep the legacy behaviour."""
+        if member_loads is None:
+            member_loads = elem.member_loads
+        if not member_loads:
             return
         L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
         if L < 1e-12:
@@ -1872,7 +1944,7 @@ class ModelCanvas(QWidget):
         udl_scale = load_scales.get("udl", 0.0)
         point_scale = load_scales.get("point", 0.0)
 
-        for ml in elem.member_loads:
+        for ml in member_loads:
             # PR-A: dim loads belonging to non-active cases when the
             # host has the "active case only" overlay on.
             case_alpha = self._load_case_alpha(ml)
@@ -2224,8 +2296,15 @@ class ModelCanvas(QWidget):
             # counts (e.g. 5) may miss the true peak between stations —
             # surfaced to the user via the menu tooltip + status hint.
             n = max(2, int(self.diagram_stations))
+            # Span loads must match the displayed result (single case /
+            # factored combination / SUM_ALL) — not the raw all-cases
+            # list — or the curve won't match its own end forces.
+            eff_loads = _effective_member_loads(
+                elem, self._active_case, model.load_combinations,
+            )
             xs, ys = _diagram_ordinates(
                 elem, ni, nj, mr["f_local"], self.diagram_kind, n_samples=n,
+                member_loads=eff_loads, split_discontinuities=True,
             )
             if xs is None:
                 continue
@@ -2253,10 +2332,12 @@ class ModelCanvas(QWidget):
             def _conv(v: float) -> float:
                 return _U.force_to_display(v, pid)
         # Conventional structural orientation: positive sagging moment
-        # plots BELOW the member centerline; positive shear / axial
-        # plot on the +normal side as before. The flip is display-only
-        # — sampled ys, max_ord, scale, critical-point picks, and the
-        # hover read-out (_diagram_value) all use the un-flipped ys.
+        # plots BELOW the member centerline (handled via ord_sign on the
+        # element-local normal). Shear uses a separate WORLD-anchored
+        # display normal (see below) so the diagram side matches the
+        # common SAP-like drafting convention. Both are display-only —
+        # sampled ys, max_ord, scale, critical-point picks, and the hover
+        # read-out (_diagram_value) all use the un-flipped numerical ys.
         if self.diagram_kind == "moment":
             ord_sign = -1.0
         else:
@@ -2267,23 +2348,83 @@ class ModelCanvas(QWidget):
             if L < 1e-12:
                 continue
             cx, cy = (nj.x - ni.x) / L, (nj.y - ni.y) / L
-            nx, ny = -cy, cx
 
-            def offset_point(xx, yy):
-                yy_disp = yy * ord_sign
-                return (
-                    ni.x + xx * cx + scale * yy_disp * nx,
-                    ni.y + xx * cy + scale * yy_disp * ny,
-                )
+            # ── Canonical display alignment ──
+            # SAP and our solver may disagree on which end of a member is
+            # "i" vs "j". For display we pick a canonical direction from
+            # the geometry alone:
+            #   • mostly horizontal member → canonical = left → right
+            #   • mostly vertical   member → canonical = bottom → top
+            # If the element's tangent (i → j) opposes the canonical
+            # direction, the diagram station coordinate is REVERSED — we
+            # walk the canonical direction starting from ``nj`` and read
+            # the sampled values in reverse order. This is display-only;
+            # ``sample_internal_force`` numerical values are untouched.
+            can_tx, can_ty, is_reversed = _canonical_display_direction(cx, cy)
+            if is_reversed:
+                # Walk follows the MEMBER (not the world canonical axis)
+                # so the diagram polyline lies on the inclined element
+                # for diagonal members. The canonical direction is only
+                # used to decide whether to reverse the iteration.
+                start_x, start_y = nj.x, nj.y
+                walk_tx, walk_ty = -cx, -cy
+                xs_disp = [L - x for x in reversed(xs)]
+                # Moment values pick up an overall sign under node-order
+                # reversal (they are computed in the element local frame,
+                # whose +y_local rotation flips when ``i`` and ``j`` swap),
+                # so the displayed moment needs an additional sign flip
+                # for the BMD to land on the same canonical side as the
+                # forward orientation. Shear and axial don't need this:
+                # for shear the world-anchored normal absorbs the swap,
+                # for axial the values are invariant. The user's spec:
+                # "numerical internal moment values remain unchanged;
+                # mirrored drawing side is display-only" — implemented
+                # here at the canvas layer.
+                if self.diagram_kind == "moment":
+                    ys_disp = [-y for y in reversed(ys)]
+                else:
+                    ys_disp = list(reversed(ys))
+            else:
+                start_x, start_y = ni.x, ni.y
+                walk_tx, walk_ty = cx, cy
+                xs_disp = list(xs)
+                ys_disp = list(ys)
+            # Element-local normal, computed for the CANONICAL tangent so
+            # moment / axial render the same regardless of node order.
+            nx, ny = -walk_ty, walk_tx
+
+            if self.diagram_kind == "shear":
+                # Shear display side: SIGN-based, anchored to WORLD axes
+                # (not the element local +y). Choose a positive visual
+                # normal from the canonical orientation:
+                #   • mostly horizontal member → world UP   → +V above
+                #   • mostly vertical member   → world RIGHT → +V right
+                # Then offset = signed V × positive_visual_normal, so
+                # +V draws top/right and −V draws bottom/left. The
+                # canonical-walk alignment above means a beam drawn
+                # right→left renders identically to the same beam drawn
+                # left→right. The element local y-axis and every numerical
+                # value are untouched.
+                vnx, vny = _shear_display_normal(can_tx, can_ty)
+
+                def offset_point(xx, yy):
+                    return (
+                        start_x + xx * walk_tx + scale * yy * vnx,
+                        start_y + xx * walk_ty + scale * yy * vny,
+                    )
+            else:
+                # Moment / axial: canonical-element-local normal + ord_sign.
+                # Walk + normal both follow the canonical direction so the
+                # diagram side stays consistent across node-order swaps.
+                def offset_point(xx, yy):
+                    yy_disp = yy * ord_sign
+                    return (
+                        start_x + xx * walk_tx + scale * yy_disp * nx,
+                        start_y + xx * walk_ty + scale * yy_disp * ny,
+                    )
 
             if self.diagram_kind in ("shear", "moment"):
-                # Split the sampled curve at interpolated zero crossings
-                # and fill each single-sign segment with the sign colour.
-                # Each closed polygon goes from the i-end of the segment
-                # along the curve to the j-end, then back along the
-                # member centerline so the fill sits between the curve
-                # and the member (just like the legacy single-fill).
-                segments = _diagram_sign_split(list(xs), list(ys))
+                segments = _diagram_sign_split(list(xs_disp), list(ys_disp))
                 for seg_xs, seg_ys, sign in segments:
                     if len(seg_xs) < 2:
                         continue
@@ -2300,25 +2441,26 @@ class ModelCanvas(QWidget):
                     self.ax.plot(
                         poly_x, poly_y, color=color, linewidth=1.0, zorder=2,
                     )
-                    # Close the polygon back along the member centerline.
-                    poly_x.append(ni.x + seg_xs[-1] * cx)
-                    poly_y.append(ni.y + seg_xs[-1] * cy)
-                    poly_x.append(ni.x + seg_xs[0] * cx)
-                    poly_y.append(ni.y + seg_xs[0] * cy)
+                    # Close the polygon back along the canonical centerline.
+                    poly_x.append(start_x + seg_xs[-1] * walk_tx)
+                    poly_y.append(start_y + seg_xs[-1] * walk_ty)
+                    poly_x.append(start_x + seg_xs[0] * walk_tx)
+                    poly_y.append(start_y + seg_xs[0] * walk_ty)
                     self.ax.fill(
                         poly_x, poly_y, color=color, alpha=0.25, zorder=1,
                     )
             else:
                 # Axial — single colour, no sign split.
                 color = axial_color
-                poly_x = [ni.x]
-                poly_y = [ni.y]
-                for xx, yy in zip(xs, ys):
+                poly_x = [start_x]
+                poly_y = [start_y]
+                for xx, yy in zip(xs_disp, ys_disp):
                     px, py = offset_point(xx, yy)
                     poly_x.append(px)
                     poly_y.append(py)
-                poly_x.append(nj.x)
-                poly_y.append(nj.y)
+                # Close to the far end of the canonical walk.
+                poly_x.append(start_x + L * walk_tx)
+                poly_y.append(start_y + L * walk_ty)
                 self.ax.fill(
                     poly_x, poly_y, color=color, alpha=0.25, zorder=1,
                 )
@@ -2326,36 +2468,38 @@ class ModelCanvas(QWidget):
                     poly_x, poly_y, color=color, linewidth=1.0, zorder=2,
                 )
 
-            # Per-element critical points: argmax(ys) and argmin(ys).
-            # If the diagram is constant (axial), max == min — label
-            # only once at midspan. Skip near-zero peaks (clutter).
+            # Per-element critical points: argmax / argmin of the displayed
+            # ordinates so the labels track the canonical walk too.
             threshold = 0.05 * max_ord
-            i_max = max(range(len(ys)), key=lambda i: ys[i])
-            i_min = min(range(len(ys)), key=lambda i: ys[i])
+            i_max = max(range(len(ys_disp)), key=lambda i: ys_disp[i])
+            i_min = min(range(len(ys_disp)), key=lambda i: ys_disp[i])
             picks: list[int] = []
-            if abs(ys[i_max] - ys[i_min]) < 1e-12 * max(max_ord, 1.0):
+            if (abs(ys_disp[i_max] - ys_disp[i_min])
+                    < 1e-12 * max(max_ord, 1.0)):
                 # Constant diagram — label once near the midspan.
-                picks = [len(xs) // 2]
+                picks = [len(xs_disp) // 2]
             else:
-                if abs(ys[i_max]) > threshold:
+                if abs(ys_disp[i_max]) > threshold:
                     picks.append(i_max)
-                if abs(ys[i_min]) > threshold and i_min != i_max:
+                if abs(ys_disp[i_min]) > threshold and i_min != i_max:
                     picks.append(i_min)
             for i in picks:
-                xx = xs[i]
-                yy = ys[i]
-                yy_disp = yy * ord_sign
+                xx = xs_disp[i]
+                yy = ys_disp[i]
                 # World-coords on the diagram polyline at this sample,
-                # using the same display flip applied to the fill.
-                world_x = ni.x + xx * cx + scale * yy_disp * nx
-                world_y = ni.y + xx * cy + scale * yy_disp * ny
+                # using the SAME display normal applied to the fill so
+                # the peak label sits on its matching polygon.
+                if self.diagram_kind == "shear":
+                    world_x = start_x + xx * walk_tx + scale * yy * vnx
+                    world_y = start_y + xx * walk_ty + scale * yy * vny
+                else:
+                    yy_disp = yy * ord_sign
+                    world_x = start_x + xx * walk_tx + scale * yy_disp * nx
+                    world_y = start_y + xx * walk_ty + scale * yy_disp * ny
                 # World-coords of the matching point on the element
-                # axis itself — that's what the snap engine should
-                # snap to (so a left-click in modelling tools still
-                # lands on the member geometry, not on the offset
-                # diagram polyline).
-                axis_x = ni.x + xx * cx
-                axis_y = ni.y + xx * cy
+                # axis itself (canonical walk) for snap targets.
+                axis_x = start_x + xx * walk_tx
+                axis_y = start_y + xx * walk_ty
                 # Marker colour follows the sign convention used for the
                 # fill (blue positive / red negative for V & M; legacy
                 # brown for axial).
@@ -2456,6 +2600,58 @@ class ModelCanvas(QWidget):
         no longer silently re-fits and throws their view away."""
         if not self._setting_axes_limits:
             self._user_view_dirty = True
+
+
+def _canonical_display_direction(
+    cx: float, cy: float,
+) -> tuple[float, float, bool]:
+    """Canonical (left→right / bottom→top) display direction for a member.
+
+    Display-only. Returns ``(canonical_tx, canonical_ty, is_reversed)``:
+
+    * ``(canonical_tx, canonical_ty)`` — the unit tangent in canonical
+      direction (``(+1, 0)`` for mostly horizontal members, ``(0, +1)``
+      for mostly vertical members);
+    * ``is_reversed`` — ``True`` when the element's geometric tangent
+      ``(cx, cy)`` (i → j) opposes the canonical direction. In that case
+      callers walk the diagram from ``nj`` along the canonical direction
+      and read the sampled ``xs`` / ``ys`` arrays in reverse order so
+      the displayed station axis matches the canonical convention.
+
+    This addresses the SAP-vs-our-program orientation mismatch (members
+    can be modelled with either end as "i") at the display layer only —
+    ``sample_internal_force`` and every numerical value are untouched.
+    A 45° tie picks horizontal (matches ``_shear_display_normal``).
+    """
+    if abs(cx) >= abs(cy):
+        canonical = (1.0, 0.0)
+    else:
+        canonical = (0.0, 1.0)
+    is_reversed = (cx * canonical[0] + cy * canonical[1]) < 0.0
+    return canonical[0], canonical[1], is_reversed
+
+
+def _shear_display_normal(cx: float, cy: float) -> tuple[float, float]:
+    """Positive visual normal for a shear diagram, anchored to WORLD axes.
+
+    Display-only. Given a member's unit tangent ``(cx, cy)`` (from node i
+    to node j), return the world-space direction in which a POSITIVE shear
+    value should be drawn, following the common SAP-like convention:
+
+    * mostly horizontal member (``|cx| >= |cy|``) → world UP ``(0, +1)``
+      so ``+V`` plots above the member and ``−V`` below it;
+    * mostly vertical member (``|cy| > |cx|``) → world RIGHT ``(+1, 0)``
+      so ``+V`` plots to the right of the member and ``−V`` to the left.
+
+    This never touches the element's structural local y-axis or any
+    numerical value; it only decides which side of the on-screen member
+    line the signed shear ordinate is offset toward. The caller draws
+    ``offset = signed_V × this_normal``, so the sign of V alone picks the
+    side (top/right for +, bottom/left for −).
+    """
+    if abs(cx) >= abs(cy):
+        return (0.0, 1.0)     # horizontal member → +V up
+    return (1.0, 0.0)         # vertical member → +V right
 
 
 def _udl_visual_components(

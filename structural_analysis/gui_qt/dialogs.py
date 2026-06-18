@@ -3695,8 +3695,17 @@ class ElementPropertiesDialog(QDialog):
         self._detail_canvas = FigureCanvasQTAgg(self._detail_fig)
         self._detail_canvas.setMinimumSize(560, 320)
         layout.addWidget(self._detail_canvas)
+        # Span loads must match the result selected in this dialog
+        # (case / factored combination / SUM_ALL) so the N/V/M curves —
+        # and the crosshair / maxima below, which reuse this list — agree
+        # with the displayed end forces.
+        from .element_graphics import effective_member_loads
+        self._eff_loads_ref = effective_member_loads(
+            elem, self._results_selection, model.load_combinations,
+        )
         results_axes = draw_element_detail(
             self._detail_fig, elem, model, ok_result, panels="diagrams",
+            member_loads=self._eff_loads_ref,
         )
         self._detail_canvas.draw_idle()
 
@@ -4068,15 +4077,16 @@ class ElementPropertiesDialog(QDialog):
         for c in self._cursors:
             c.set_xdata([x, x])
             c.set_alpha(0.7)
+        _eff = getattr(self, "_eff_loads_ref", None)
         n_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "axial", x)
+            self._f_local_ref, "axial", x, member_loads=_eff)
         v_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "shear", x)
+            self._f_local_ref, "shear", x, member_loads=_eff)
         m_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "moment", x)
+            self._f_local_ref, "moment", x, member_loads=_eff)
         self._lbl_x.setText(f"x: {x:.3f} m")
         self._lbl_N.setText(f"N: {n_val:.3f} kN"
                             if n_val is not None else "N: —")
@@ -4099,6 +4109,7 @@ class ElementPropertiesDialog(QDialog):
                 pass
         self._maxima_annotations.clear()
         if checked and self._f_local_ref is not None:
+            _eff = getattr(self, "_eff_loads_ref", None)
             for kind, ax in (
                 ("axial",  self._ax_n),
                 ("shear",  self._ax_v),
@@ -4107,6 +4118,7 @@ class ElementPropertiesDialog(QDialog):
                 xs, ys = self._sample_internal_force(
                     self._elem_ref, self._ni_ref, self._nj_ref,
                     self._f_local_ref, kind, n_samples=101,
+                    member_loads=_eff, split_discontinuities=True,
                 )
                 if xs is None or ys is None:
                     continue
@@ -4159,15 +4171,16 @@ def _direction_label_for_row(row) -> str:
             c.set_xdata([x, x])
             c.set_alpha(0.7)
 
+        _eff = getattr(self, "_eff_loads_ref", None)
         n_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "axial", x)
+            self._f_local_ref, "axial", x, member_loads=_eff)
         v_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "shear", x)
+            self._f_local_ref, "shear", x, member_loads=_eff)
         m_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "moment", x)
+            self._f_local_ref, "moment", x, member_loads=_eff)
 
         self._lbl_x.setText(f"x: {x:.3f} m")
         self._lbl_N.setText(f"N: {n_val:.3f} kN"
@@ -4188,6 +4201,7 @@ def _direction_label_for_row(row) -> str:
         self._maxima_annotations.clear()
 
         if state and self._f_local_ref is not None:
+            _eff = getattr(self, "_eff_loads_ref", None)
             for kind, ax in (
                 ("axial",  self._ax_n),
                 ("shear",  self._ax_v),
@@ -4196,6 +4210,7 @@ def _direction_label_for_row(row) -> str:
                 xs, ys = self._sample_internal_force(
                     self._elem_ref, self._ni_ref, self._nj_ref,
                     self._f_local_ref, kind, n_samples=101,
+                    member_loads=_eff, split_discontinuities=True,
                 )
                 if xs is None or ys is None:
                     continue

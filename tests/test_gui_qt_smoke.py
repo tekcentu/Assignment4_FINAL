@@ -1393,15 +1393,38 @@ def test_main_window_keeps_version_badge_top_right(qt_app):
     """The top-right version + what's-new badge in the menu bar
     must stay populated and reflect the current package version —
     don't regress the existing badge.
+
+    v0.40.6 layout: the badge is a small QWidget container with a
+    vertical stack of QLabels — first row is the version, subsequent
+    rows are the ``__what_is_new__`` clauses, so a long release note
+    no longer pushes the File / Edit / View menu titles aside on the
+    same row. The version + the full ``__what_is_new__`` must still
+    be reachable (one in the version row, the rest split across the
+    clause rows; the full text also lives in the tooltip).
     """
+    from PyQt6.QtWidgets import QLabel
     from structural_analysis import __version__, __what_is_new__
 
     w = MainWindow()
     qt_app.processEvents()
+    # Backward-compat alias still points at the version row label.
     assert w._version_label is not None
-    text = w._version_label.text()
-    assert __version__ in text
-    assert __what_is_new__ in text
+    assert __version__ in w._version_label.text()
+    # The container exists and stacks the version + clause labels.
+    assert w._version_widget is not None
+    labels = w._version_widget.findChildren(QLabel)
+    assert len(labels) >= 2, "badge must show >= 2 stacked rows"
+    combined = " ".join(lbl.text() for lbl in labels)
+    assert __version__ in combined
+    # Every clause from __what_is_new__ appears in some row.
+    for clause in (s.strip() for s in __what_is_new__.split(" · ")):
+        if not clause:
+            continue
+        assert clause in combined, f"clause missing from badge: {clause!r}"
+    # The full release text still lives in the tooltip for reference.
+    tooltip = w._version_widget.toolTip()
+    assert __version__ in tooltip
+    assert __what_is_new__ in tooltip
 
 
 # ── Element-detail interactive layer (crosshair, maxima, BMD) ─────
@@ -1789,6 +1812,20 @@ def _is_column(elem, nodes) -> bool:
     return abs(ni.x - nj.x) < 1e-9
 
 
+def test_building_wizard_toolbar_button_shows_caption(qt_app):
+    """The toolbar button shows a visible 'Building Wizard' caption under
+    its icon (not icon-only), so it is discoverable without hovering."""
+    from PyQt6.QtCore import Qt
+
+    w = MainWindow()
+    btn = getattr(w, "_building_wizard_button", None)
+    assert btn is not None
+    assert btn.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+    # iconText drives the under-icon caption; menu text keeps the full label.
+    assert w.act_building_wizard.iconText() == "Building Wizard"
+    assert "Building Wizard" in w.act_building_wizard.text()
+
+
 def test_building_wizard_has_separate_beam_column_section_inputs(qt_app):
     """The wizard exposes distinct column / beam section selectors, both
     populated from the existing section library."""
@@ -1797,7 +1834,6 @@ def test_building_wizard_has_separate_beam_column_section_inputs(qt_app):
     w = MainWindow()
     d = BuildingWizardDialog(w, model=w._model)
     assert hasattr(d, "_col_sec_combo") and hasattr(d, "_beam_sec_combo")
-    # Both list every section in the source model.
     n_sections = len(w._model.sections)
     assert d._col_sec_combo.count() == n_sections
     assert d._beam_sec_combo.count() == n_sections
@@ -1808,7 +1844,6 @@ def test_building_wizard_assigns_distinct_beam_column_sections(qt_app):
     from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
 
     w = MainWindow()
-    # Starter model ships two sections (ids 1 and 2).
     sids = sorted(w._model.sections)
     assert len(sids) >= 2
     col_sid, beam_sid = sids[1], sids[0]
@@ -1825,7 +1860,6 @@ def test_building_wizard_assigns_distinct_beam_column_sections(qt_app):
     assert cols and beams
     assert all(e.section_id == col_sid for e in cols)
     assert all(e.section_id == beam_sid for e in beams)
-    # Per-section material/property flow through to the elements.
     col_sec = w._model.sections[col_sid]
     beam_sec = w._model.sections[beam_sid]
     assert all(abs(e.I - col_sec.I) < 1e-15 for e in cols)

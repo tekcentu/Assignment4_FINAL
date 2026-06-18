@@ -410,6 +410,9 @@ class MainWindow(QMainWindow):
             triggered=self._do_building_wizard,
         )
         self.act_building_wizard.setToolTip("Building Wizard (Ctrl+B)")
+        # Caption shown under the toolbar icon (clean text, no mnemonic
+        # or ellipsis); the menu entry keeps the full "&Building Wizard…".
+        self.act_building_wizard.setIconText("Building Wizard")
         self.act_batch_assign = QAction(
             "&Batch assign properties…", self,
             triggered=self._do_batch_assign_selected,
@@ -765,18 +768,34 @@ class MainWindow(QMainWindow):
 
         # Top-right corner of the menu bar: version + what's-new summary
         # so the user always sees which features ship in this build.
-        self._version_label = QLabel(
-            f"  v{__version__} · {__what_is_new__}  ", self,
+        # Stacked vertically (one clause per row, smaller font) so the
+        # text never grows wide enough to crowd the File / Edit / View
+        # menu titles on the same row — the bug a long __what_is_new__
+        # string used to cause.
+        self._version_widget = QWidget(self)
+        _v_layout = QVBoxLayout(self._version_widget)
+        _v_layout.setContentsMargins(6, 0, 6, 0)
+        _v_layout.setSpacing(0)
+        _ver_lbl = QLabel(f"v{__version__}", self._version_widget)
+        _ver_lbl.setStyleSheet(
+            "color: #1f3a5f; font-size: 8pt; font-weight: bold;"
         )
-        self._version_label.setStyleSheet(
-            "color: #555; font-size: 9pt; padding-right: 6px;"
-        )
-        self._version_label.setToolTip(
+        _v_layout.addWidget(_ver_lbl)
+        for _clause in (s.strip() for s in __what_is_new__.split(" · ")):
+            if not _clause:
+                continue
+            lbl = QLabel(_clause, self._version_widget)
+            lbl.setStyleSheet("color: #555; font-size: 7pt;")
+            _v_layout.addWidget(lbl)
+        # Keep the old attribute name as an alias for any caller that
+        # still inspects ``self._version_label`` (e.g. external tests).
+        self._version_label = _ver_lbl
+        self._version_widget.setToolTip(
             f"Structural Analysis GUI v{__version__}\n"
             f"This release: {__what_is_new__}"
         )
         self.menuBar().setCornerWidget(
-            self._version_label, Qt.Corner.TopRightCorner,
+            self._version_widget, Qt.Corner.TopRightCorner,
         )
 
         # ── Selection menu (v0.27.0) ──
@@ -860,9 +879,11 @@ class MainWindow(QMainWindow):
             triggered=self._on_active_case_loads_only_toggled,
         )
         self.act_active_case_loads_only.setToolTip(
-            "When on, loads attached to non-active load cases render "
-            "dimmed on the canvas. When off, every load draws at full "
-            "intensity regardless of which case is active."
+            "When on, the canvas shows only the loads of the selected "
+            "case/combination (a combination shows its referenced cases' "
+            "loads factored; SUM_ALL shows everything). Works before and "
+            "after solving. When off, every load draws regardless of the "
+            "active case."
         )
         m_view.addAction(self.act_active_case_loads_only)
         # Show local axes (v0.24.0) — draws each element's local x/y
@@ -955,6 +976,16 @@ class MainWindow(QMainWindow):
             tb.addAction(self._tool_actions[name])
         tb.addSeparator()
         tb.addAction(self.act_building_wizard)
+        # Show the "Building Wizard" caption UNDER the toolbar icon (the
+        # other tool buttons stay icon-only). Makes the wizard
+        # discoverable at a glance instead of relying on hover-tooltip.
+        self._building_wizard_button = tb.widgetForAction(
+            self.act_building_wizard
+        )
+        if self._building_wizard_button is not None:
+            self._building_wizard_button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+            )
 
         # Case selector — sits IMMEDIATELY above Solve so the
         # toolbar reads "[case combo] → Solve". The combo is hidden
@@ -2389,6 +2420,7 @@ class MainWindow(QMainWindow):
         Returns ``None`` when no value is meaningful (truss + shear /
         moment, or the kind doesn't apply)."""
         from .canvas import _diagram_value
+        from .element_graphics import effective_member_loads
         if self._result is None or not self._result.member_results:
             return None
         elem = next((e for e in self._model.elements
@@ -2411,7 +2443,11 @@ class MainWindow(QMainWindow):
         t = max(0.0, min(1.0, t))
         x_loc = t * L
         kind = self.canvas.diagram_kind
-        value = _diagram_value(elem, ni, nj, mr["f_local"], kind, x_loc)
+        eff_loads = effective_member_loads(
+            elem, self._active_case, self._model.load_combinations,
+        )
+        value = _diagram_value(elem, ni, nj, mr["f_local"], kind, x_loc,
+                               member_loads=eff_loads)
         if value is None:
             return None
         # Convert the result value to the active display preset; the x
@@ -3524,7 +3560,9 @@ class MainWindow(QMainWindow):
         only N (V/M cells left blank). Station count = 21 (≈ SAP's
         1/20 span output)."""
         import csv
-        from .element_graphics import sample_internal_force
+        from .element_graphics import (
+            effective_member_loads, sample_internal_force,
+        )
         from ..gui_common import units as _units_mod
 
         if self._result is None or not getattr(
@@ -3550,9 +3588,19 @@ class MainWindow(QMainWindow):
             ni = self._model.nodes[elem.node_i]
             nj = self._model.nodes[elem.node_j]
             f_local = list(mr["f_local"])
-            xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local, "axial")
-            xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local, "shear")
-            xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local, "moment")
+            # Match the displayed result: case-filtered / factored span
+            # loads and the same vertical-jump stations as the canvas so
+            # exported numbers equal what the diagram shows.
+            eff_loads = effective_member_loads(
+                elem, self._active_case, self._model.load_combinations,
+            )
+            kw = dict(member_loads=eff_loads, split_discontinuities=True)
+            xs_n, ys_n = sample_internal_force(
+                elem, ni, nj, f_local, "axial", **kw)
+            xs_v, ys_v = sample_internal_force(
+                elem, ni, nj, f_local, "shear", **kw)
+            xs_m, ys_m = sample_internal_force(
+                elem, ni, nj, f_local, "moment", **kw)
             if xs_n is None:
                 continue
             for i, x in enumerate(xs_n):

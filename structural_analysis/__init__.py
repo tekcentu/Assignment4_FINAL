@@ -1,9 +1,9 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.41.0"
+__version__ = "0.42.0"
 __what_is_new__ = (
     "Building Wizard: separate beam / column section selectors · "
-    "Clearer 'Building Wizard' button label · "
+    "Visible 'Building Wizard' toolbar caption · "
     "Validates both sections before generating"
 )
 

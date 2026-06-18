@@ -36,61 +36,6 @@ This package extends the Assignment 3 2D frame-truss solver with the two capabil
    - prescribed displacements at restrained support DOFs handled through the partitioned system
      `K_ff * D_f = F_f - K_fs * D_s`
 
-## Final submission (CE 4011)
-
-**Purpose.** A 2D structural-analysis program for plane frames and trusses based
-on the Direct Stiffness Method, with a pure-Python computational engine and a
-PyQt6 GUI. It computes displacements, member internal forces (N/V/M), and support
-reactions, and visualizes the deformed shape and force diagrams. It also supports
-thermal loads, support settlements, load combinations, and modal analysis.
-
-**Install** (Python ≥ 3.11):
-
-```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"     # or: pip install numpy scipy matplotlib PyQt6 pytest
-```
-
-Full steps and troubleshooting: [`docs/installation_manual.md`](docs/installation_manual.md).
-
-**Run the CLI solver:**
-
-```bash
-python -m structural_analysis.main examples/final_demo/demo_portal_frame.txt
-```
-
-**Launch the GUI:**
-
-```bash
-python -m structural_analysis.gui_qt
-```
-
-**Run the tests** (~670 tests; GUI smoke tests need an offscreen Qt platform):
-
-```bash
-QT_QPA_PLATFORM=offscreen python -m pytest -q
-```
-
-**Where things are:**
-
-| What | Location |
-|------|----------|
-| Final demo examples (portal frame, cantilever, backup) | [`examples/final_demo/`](examples/final_demo/) |
-| Demo example outputs | [`examples/final_demo/outputs/`](examples/final_demo/outputs/) |
-| Project report | [`report/final_project_report.md`](report/final_project_report.md) (+ `.pdf`) |
-| Installation manual | [`docs/installation_manual.md`](docs/installation_manual.md) |
-| User manual | [`docs/user_manual.md`](docs/user_manual.md) |
-| Verification (vs. hand calc) | [`docs/verification/final_verification.md`](docs/verification/final_verification.md) |
-| UML / architecture | [`docs/uml/`](docs/uml/) (`class_diagram.mmd`, `.dot`, `.png`, `architecture.md`) |
-| Video outline / checklists | [`docs/final_video_outline.md`](docs/final_video_outline.md), [`docs/final_video_checklist.md`](docs/final_video_checklist.md), [`docs/final_submission_checklist.md`](docs/final_submission_checklist.md) |
-| Demo video link | [`video_link.txt`](video_link.txt) |
-
-**Known limitations.** 2D only; linear-elastic; static + modal analysis (no
-nonlinearity, P-Δ, dynamics, or design-code checks); member loads and self-weight
-over rigid end-offset zones are integrated on the flexible span only (a UDL across
-an offset member sums to `w·L_flex`, not `w·L_total`) — a deliberate, documented
-convention. See the report's limitations section for the full list.
-
 # Architecture
 
 Diagrams of the `structural_analysis` package: the layered design, the
@@ -171,9 +116,7 @@ flowchart LR
 ## 3. Domain model (class diagram)
 
 Frozen dataclasses hang off `StructuralModel`. `Element2D` is the abstract base
-for the two element kinds. Note the **Material / Section split**: a `Material`
-carries `E`, `alpha`, `density`; a `Section` carries `A`, `I`, `depth` and points
-back to a `Material`.
+for the two element kinds.
 
 ```mermaid
 classDiagram
@@ -185,7 +128,7 @@ classDiagram
         +list elements
         +list nodal_loads
         +dict load_cases
-        +dict load_combinations
+        +list load_combinations
     }
 
     class Node {
@@ -196,24 +139,18 @@ classDiagram
     class Material {
         +int id
         +float E
-        +float alpha
-        +float density
     }
     class Section {
         +int id
         +int material_id
         +float A
         +float I
-        +float depth
     }
     class Support {
         +int node_id
         +bool ux
         +bool uy
         +bool rz
-        +float settle_ux
-        +float settle_uy
-        +float settle_rz
     }
     class Element2D {
         <<abstract>>
@@ -234,7 +171,7 @@ classDiagram
     }
     class LoadCombination {
         +str name
-        +dict terms
+        +dict factors
     }
     class AnalysisResult
     class MultiCaseAnalysisResult
@@ -254,7 +191,7 @@ classDiagram
     Section --> Material : material_id
     Element2D --> Section : section_id
     NodalLoad --> LoadCase : load_case
-    LoadCombination ..> LoadCase : terms over cases
+    LoadCombination ..> LoadCase : factors over cases
 
     StructuralModel ..> AnalysisResult : run_analysis
     StructuralModel ..> MultiCaseAnalysisResult : run_multi_case_analysis
@@ -292,7 +229,7 @@ flowchart TB
   DOF/singularity check) vs. `gui_common.validation.validate_model` (pre-solve UX pass
   that highlights problems on the canvas). Different layers.
 - **GUI changes bump the version:** any visible GUI change sets `__version__` and
-  `__what_is_new__` in `structural_analysis/__init__.py`.
+  `__what_is_new__` in `structural_analysis/__init__.py` (currently `0.22.0`).
 - **Solver isolation:** GUI-scoped PRs must not touch `solver`, `assembler`,
   `postprocessor`, `modal`, `element`, `model`, `profiles`, `file_io`, `mass`,
   `gui_common/{file_writer,commands}`, `project_io`, `main`, or `inputs/*.txt`.
@@ -372,3 +309,4 @@ TRUSS_TEMPERATURE n
 ## Assignment 4 modeling note for Q2(b)
 
 The reported Q2(b) solution uses the **standard centerline idealization**. The thermal gradient of the concrete beam is modeled explicitly with `t_top = 0` and `t_bottom = +50`, which gives both a mean-temperature axial effect and a bending-gradient effect. Any secondary eccentricity between the beam centroidal axis and the bottom-fiber truss attachment is neglected as a higher-order refinement.
+
