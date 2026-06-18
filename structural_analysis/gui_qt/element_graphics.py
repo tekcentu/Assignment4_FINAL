@@ -26,6 +26,7 @@ Public surface:
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Callable, Optional
 
 from matplotlib.figure import Figure
@@ -46,11 +47,72 @@ from ..model import (
 from ..profiles import section_outline
 
 
+# ── Case-consistent member-load resolution ────────────────────────
+
+
+def _scaled_load(ml, factor: float):
+    """Return a magnitude-scaled copy of a mechanical member load.
+
+    Only ``UniformDistributedLoad`` / ``PointLoad`` carry magnitudes the
+    N/V/M reconstruction reads; everything else (thermal loads) is
+    returned unchanged because :func:`evaluate_internal_force` ignores it
+    in the span math (its effect is already baked into ``f_local``).
+    Projection to local axes is linear, so scaling the raw components and
+    then projecting is identical to projecting and then scaling.
+    """
+    if isinstance(ml, UniformDistributedLoad):
+        return replace(ml, wx=ml.wx * factor, wy=ml.wy * factor)
+    if isinstance(ml, PointLoad):
+        return replace(ml, px=ml.px * factor, py=ml.py * factor)
+    return ml
+
+
+def effective_member_loads(elem, active_case=None, load_combinations=None):
+    """Member loads whose magnitudes match the *displayed* result.
+
+    The N/V/M reconstruction anchors to the solved end forces
+    (``f_local``), which the multi-case layer filters by case and scales
+    by combination factors. The in-span load term must use the **same**
+    provenance or the diagram (and station export) is physically wrong:
+    a combination's factored ``f_local`` paired with raw, unfactored,
+    all-cases ``elem.member_loads`` produces a parabola that no longer
+    matches its own end forces.
+
+    Resolution:
+
+    * ``active_case`` is a key in ``load_combinations`` → keep only loads
+      whose ``load_case`` is referenced by the combination and scale each
+      copy by that term's factor (the evaluator sums them).
+    * ``active_case`` is a real single case name → keep only that case's
+      loads (factor 1).
+    * ``active_case`` is ``None`` / ``"SUM_ALL"`` → the full list
+      (factor 1) — identical to the legacy behaviour, so the default
+      single-case / SUM_ALL paths are byte-for-byte unchanged.
+    """
+    raw = list(getattr(elem, "member_loads", []) or [])
+    if not raw or active_case is None or active_case == "SUM_ALL":
+        return raw
+    combos = load_combinations or {}
+    combo = combos.get(active_case)
+    if combo is not None:
+        terms = getattr(combo, "terms", {}) or {}
+        out = []
+        for ml in raw:
+            lc = getattr(ml, "load_case", "DEFAULT")
+            if lc in terms:
+                out.append(_scaled_load(ml, float(terms[lc])))
+        return out
+    # Real single case name: keep only that case's loads, unscaled.
+    return [ml for ml in raw
+            if getattr(ml, "load_case", "DEFAULT") == active_case]
+
+
 # ── N / V / M evaluator + sampler ─────────────────────────────────
 
 
 def evaluate_internal_force(
     elem, ni: Node, nj: Node, f_local, kind: str,
+    *, member_loads=None,
 ) -> tuple[float, Optional[Callable[[float], float]]]:
     """Build a single-x evaluator ``f(x_loc) -> value`` for ``kind`` on
     this element. Returns ``(L, evaluator)``; ``evaluator`` is ``None``
@@ -58,6 +120,14 @@ def evaluate_internal_force(
     bar). Reused by :func:`sample_internal_force` for drawing and by
     the hover-status path on the main canvas for "value at the cursor's
     projected x_loc".
+
+    ``member_loads`` overrides the span-load set used for the in-span
+    contribution. Pass the case-consistent list from
+    :func:`effective_member_loads` so the span term matches the
+    (filtered / factored) ``f_local`` being anchored. ``None`` falls back
+    to the element's live ``member_loads`` — the legacy behaviour, kept
+    byte-identical for the default single-case path and all callers that
+    don't opt in.
 
     Sign convention. ``V_i`` and ``M_i`` are the local member-end
     shear / moment at the i-end (``q_local = K·d − p_local`` entries
@@ -77,15 +147,18 @@ def evaluate_internal_force(
         return 0.0, None
     N_i, V_i, M_i, _N_j, _V_j, _M_j = (float(v) for v in f_local)
 
-    # Rigid end offsets (v0.31.0): member loads act on the flexible
-    # span [e_i, L − e_j], so the distributed-load terms accumulate
-    # from x = e_i, not x = 0. ``f_local`` is at the analytical joints;
-    # the rigid zones carry no member load, so the joint values carry
-    # linearly across them (M(e_i) = −M_i + V_i·e_i). Samplers restrict
-    # the plotted domain to the flexible span — see
-    # :func:`diagram_domain`. Zero offsets reduce every formula to the
-    # legacy form exactly.
-    e_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+    # Rigid end offsets: a UDL is applied over the FULL analytical member
+    # (incl. the rigid end zones — see FrameElement2D.local_consistent_load),
+    # so the distributed-load terms accumulate from x = 0, exactly as for
+    # a member with no offsets. ``f_local`` is at the analytical joints, so
+    # the cantilever-from-joint reconstruction V(x)=V_i+w·x,
+    # M(x)=−M_i+V_i·x+½w·x² is correct over the whole member and reproduces
+    # the textbook SS-beam result on the flexible span. (Point loads remain
+    # flexible-span-only — they are rejected inside a rigid zone — so their
+    # station ``a`` is still measured from node i.) Samplers restrict the
+    # PLOTTED domain to the flexible span (display choice — see
+    # :func:`diagram_domain`); the values they show already include the
+    # rigid-zone load via this from-x=0 integration.
 
     # Project each mechanical load onto the element's local axes so the
     # diagram math sees the same (wx_l, wy_l) / (px_l, py_l) the FEM
@@ -97,7 +170,9 @@ def evaluate_internal_force(
     udl_wy_total = 0.0
     axial_points: list[tuple[float, float]] = []
     transverse_points: list[tuple[float, float]] = []
-    for ml in getattr(elem, "member_loads", []):
+    loads = (member_loads if member_loads is not None
+             else getattr(elem, "member_loads", []))
+    for ml in loads:
         if isinstance(ml, UniformDistributedLoad):
             wx_l, wy_l = _project_load_to_local(
                 ml.wx, ml.wy, ml.coord_system, c, s,
@@ -115,11 +190,11 @@ def evaluate_internal_force(
 
     if kind == "axial":
         # N(x) tension-positive, derived from left-FBD equilibrium:
-        #   N(x) = -N_i - wx_local * (x - e_i) - Σ px_local for a < x
-        # When there are no axial member loads this collapses to the
-        # constant -N_i used by every existing test.
+        #   N(x) = -N_i - wx_local * x - Σ px_local for a < x
+        # The UDL accumulates from x = 0 (full-member load). When there
+        # are no axial member loads this collapses to the constant -N_i.
         def axial(x):
-            n = -N_i - udl_wx_total * max(0.0, x - e_i)
+            n = -N_i - udl_wx_total * x
             for a, px in axial_points:
                 if x > a:
                     n -= px
@@ -131,7 +206,7 @@ def evaluate_internal_force(
 
     if kind == "shear":
         def shear(x):
-            v = V_i + udl_wy_total * max(0.0, x - e_i)
+            v = V_i + udl_wy_total * x
             for a, py in transverse_points:
                 if x > a:
                     v += py
@@ -140,8 +215,7 @@ def evaluate_internal_force(
 
     if kind == "moment":
         def moment(x):
-            xw = max(0.0, x - e_i)
-            m = -M_i + V_i * x + 0.5 * udl_wy_total * xw * xw
+            m = -M_i + V_i * x + 0.5 * udl_wy_total * x * x
             for a, py in transverse_points:
                 if x > a:
                     m += py * (x - a)
@@ -169,6 +243,7 @@ def diagram_domain(elem, ni: Node, nj: Node) -> tuple[float, float]:
 
 def sample_internal_force(
     elem, ni: Node, nj: Node, f_local, kind: str, n_samples: int = 21,
+    *, member_loads=None, split_discontinuities: bool = False,
 ):
     """Discretise :func:`evaluate_internal_force` at ``n_samples``
     evenly spaced station points along the element. Returns
@@ -178,12 +253,26 @@ def sample_internal_force(
     not enough to form a polyline, and we'd otherwise divide by zero
     in the step calculation. Fail fast with a clear message instead
     of letting the caller see a ZeroDivisionError.
+
+    ``member_loads`` overrides the span-load set (see
+    :func:`evaluate_internal_force` / :func:`effective_member_loads`).
+
+    ``split_discontinuities`` (opt-in; default ``False`` keeps the legacy
+    evenly-spaced output byte-identical for existing callers/tests) adds a
+    pair of stations at each in-span point-load location ``a`` — the left
+    limit ``fn(a)`` and the right limit ``fn(nextafter(a, +inf))`` — both
+    plotted at ``x = a`` so the renderer draws the true vertical shear
+    jump (and the moment kink) instead of a smeared diagonal. The
+    duplicate x-points are intentional and must not be de-duplicated.
     """
     if n_samples < 2:
         raise ValueError(
             f"n_samples must be >= 2 to form a polyline, got {n_samples}"
         )
-    L, fn = evaluate_internal_force(elem, ni, nj, f_local, kind)
+    loads = (member_loads if member_loads is not None
+             else getattr(elem, "member_loads", []))
+    L, fn = evaluate_internal_force(elem, ni, nj, f_local, kind,
+                                    member_loads=loads)
     if fn is None:
         return None, None
     # Stations cover the flexible span only (== [0, L] without rigid
@@ -191,19 +280,48 @@ def sample_internal_force(
     # world-space projection is unchanged.
     x_start, x_end = diagram_domain(elem, ni, nj)
     span = x_end - x_start
-    xs = [x_start + i * span / (n_samples - 1) for i in range(n_samples)]
-    ys = [fn(x) for x in xs]
+    grid = [x_start + i * span / (n_samples - 1) for i in range(n_samples)]
+
+    if not split_discontinuities:
+        return grid, [fn(x) for x in grid]
+
+    # In-span point-load locations are the only diagram discontinuities
+    # (UDLs give a continuous parabola/linear shape). Insert a left/right
+    # pair at each so the vertical jump renders. ``fn`` uses strict
+    # ``x > a`` so fn(a) is the left limit and fn(nextafter(a)) the right.
+    breaks = sorted({
+        float(ml.a) for ml in loads
+        if isinstance(ml, PointLoad) and x_start < float(ml.a) < x_end
+    })
+    merged = sorted(set(grid) | set(breaks))
+    break_set = set(breaks)
+    xs: list[float] = []
+    ys: list[float] = []
+    for x in merged:
+        if x in break_set:
+            xs.append(x)
+            ys.append(fn(x))                              # left limit
+            xs.append(x)
+            ys.append(fn(math.nextafter(x, math.inf)))    # right limit
+        else:
+            xs.append(x)
+            ys.append(fn(x))
     return xs, ys
 
 
 def internal_force_at(
     elem, ni: Node, nj: Node, f_local, kind: str, x_loc: float,
+    *, member_loads=None,
 ) -> Optional[float]:
     """Return the diagram value at arc-length ``x_loc`` along the
     element, or ``None`` if the kind doesn't apply. Used by the
     canvas hover handler to report the value at the projected cursor.
+
+    ``member_loads`` overrides the span-load set (see
+    :func:`evaluate_internal_force` / :func:`effective_member_loads`).
     """
-    L, fn = evaluate_internal_force(elem, ni, nj, f_local, kind)
+    L, fn = evaluate_internal_force(elem, ni, nj, f_local, kind,
+                                    member_loads=member_loads)
     if fn is None:
         return None
     x_start, x_end = diagram_domain(elem, ni, nj)
@@ -751,6 +869,7 @@ def draw_element_detail(
     *, n_samples: int = 11,
     section_fig: Optional[Figure] = None,
     panels: str = "all",
+    member_loads=None,
 ) -> ElementDetailAxes:
     """Render the landscape-stacked element detail into ``fig``.
 
@@ -937,12 +1056,14 @@ def draw_element_detail(
                         ha="center", va="center", color="#bbb", fontsize=8,
                         style="italic")
         else:
+            _smp = dict(member_loads=member_loads,
+                        split_discontinuities=True)
             xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local,
-                                                "axial",  n_samples)
+                                                "axial",  n_samples, **_smp)
             xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local,
-                                                "shear",  n_samples)
+                                                "shear",  n_samples, **_smp)
             xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local,
-                                                "moment", n_samples)
+                                                "moment", n_samples, **_smp)
 
             _draw_single_nvm_diagram(ax_n, xs_n, ys_n, "N", "kN",
                                      color=_DIAGRAM_COLOR["axial"])
