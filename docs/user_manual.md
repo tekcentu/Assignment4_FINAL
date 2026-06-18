@@ -58,6 +58,15 @@ Undo/redo (`Ctrl+Z` / `Ctrl+Y`) work for **every** edit.
 2. Choose **Frame** or **Truss** and click a start node then an end node to
    create a member.
 
+**Building Wizard (Ctrl+B).** To generate a whole portal-frame building at
+once, click the **Building Wizard** button (toolbar / **Edit** menu). Type the
+number of stories and bays, the story height and bay width, and choose a
+**column section** and a **beam section** separately from your existing section
+library — columns get the column section, beams get the beam section. (Both
+default to the first section, so a single-section model behaves as before.) The
+wizard validates both selections before replacing the current model, and the
+whole step is a single Undo.
+
 ### 3.2 Materials and sections
 
 1. Open **Edit ▸ Materials…** (also reachable from the element dialog).

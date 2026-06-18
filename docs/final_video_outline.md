@@ -72,6 +72,10 @@ force recovery — that's the polymorphism at the heart of the engine."*
 **Talking points**
 - Narrate units as you go (metres, kN, kN·m).
 - Point out snapping/grid for clean geometry and that every edit is undoable.
+- (Optional, fast multi-story alternative) The **Building Wizard** (Ctrl+B)
+  generates a whole frame from typed stories/bays and lets you pick **separate
+  beam and column sections** — columns get the column section, beams the beam
+  section — then runs through the same solver.
 
 **Key sentence:** *"I'm building this portal frame from scratch using the normal
 drawing tools — nodes, members, supports, then loads."*

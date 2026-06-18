@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.40.2"
+__version__ = "0.41.0"
 __what_is_new__ = (
-    "File → Export station results CSV (21 stations/member, SAP-compare) · "
-    "Columns scaled to active Units V1 preset · "
-    "Truss rows emit N only"
+    "Building Wizard: separate beam / column section selectors · "
+    "Clearer 'Building Wizard' button label · "
+    "Validates both sections before generating"
 )
 
 from .model import (
