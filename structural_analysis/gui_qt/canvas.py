@@ -2274,18 +2274,28 @@ class ModelCanvas(QWidget):
         # columns of a portal frame render their shear lobes on the same
         # global side, so the right column ends up drawing INSIDE the
         # portal — the textbook drafting convention is the opposite, with
-        # both columns mirroring outward. Resolve "outward" from the
-        # structure's own node geometry (no global-axis assumptions, no
-        # beam/column hardcoding): use the structure's node centroid as a
-        # reference, and flip the normal for a member whose +y_local
-        # points clearly toward the centroid. Single-member / collinear
-        # models leave the +y_local convention untouched, so the existing
-        # "positive shear above horizontal beam" regression keeps passing.
-        flip_for_outward = (
+        # both columns mirroring outward.
+        #
+        # Two-part rule (applied only for shear, only with ≥ 3 nodes —
+        # single-member / collinear models keep the legacy +y_local
+        # convention so the "positive shear above horizontal beam" test
+        # still passes byte-for-byte):
+        #
+        # 1.  Flip the +y_local normal so it points OUTWARD from the
+        #     structure's node centroid. After this, +nx is the outward
+        #     direction for the member.
+        # 2.  Lobe |V| in the +outward direction regardless of V sign.
+        #     With the legacy ``yy * nx`` rule, the SIGN of V flips the
+        #     lobe back to the inward side — so a left column with
+        #     negative V ends up drawing INSIDE the portal even after the
+        #     normal flip. Using |V| keeps every lobe on the outward
+        #     side; sign is communicated by the fill colour
+        #     (blue = +V, red = −V).
+        outward_lobe = (
             self.diagram_kind == "shear"
             and len(model.nodes) >= 3
         )
-        if flip_for_outward:
+        if outward_lobe:
             node_xs = [n.x for n in model.nodes.values()]
             node_ys = [n.y for n in model.nodes.values()]
             struct_cx = sum(node_xs) / len(node_xs)
@@ -2299,22 +2309,35 @@ class ModelCanvas(QWidget):
                 continue
             cx, cy = (nj.x - ni.x) / L, (nj.y - ni.y) / L
             nx, ny = -cy, cx
-            if flip_for_outward:
+            if outward_lobe:
                 # Outward from the structure centroid at the member's mid.
                 ox = (ni.x + nj.x) / 2.0 - struct_cx
                 oy = (ni.y + nj.y) / 2.0 - struct_cy
                 # Project the normal onto that outward direction. A clearly
                 # negative projection means +y_local points inward — flip
-                # so positive shear consistently lobes toward the outside.
+                # so +nx truly points OUTWARD for the lobe step below.
                 if (nx * ox + ny * oy) < -1e-9 * L:
                     nx, ny = -nx, -ny
 
-            def offset_point(xx, yy):
-                yy_disp = yy * ord_sign
-                return (
-                    ni.x + xx * cx + scale * yy_disp * nx,
-                    ni.y + xx * cy + scale * yy_disp * ny,
-                )
+            if outward_lobe:
+                # Step (2) of the rule: lobe |V| outward regardless of sign.
+                # Sign is shown by the fill colour, not by the side.
+                def offset_point(xx, yy):
+                    yy_disp = abs(yy) * ord_sign
+                    return (
+                        ni.x + xx * cx + scale * yy_disp * nx,
+                        ni.y + xx * cy + scale * yy_disp * ny,
+                    )
+            else:
+                # Legacy: sign of V determines the lobe side. Preserves the
+                # horizontal-beam "positive above / negative below" lock for
+                # single-member / collinear models that don't get the flip.
+                def offset_point(xx, yy):
+                    yy_disp = yy * ord_sign
+                    return (
+                        ni.x + xx * cx + scale * yy_disp * nx,
+                        ni.y + xx * cy + scale * yy_disp * ny,
+                    )
 
             if self.diagram_kind in ("shear", "moment"):
                 # Split the sampled curve at interpolated zero crossings
@@ -2384,9 +2407,12 @@ class ModelCanvas(QWidget):
             for i in picks:
                 xx = xs[i]
                 yy = ys[i]
-                yy_disp = yy * ord_sign
                 # World-coords on the diagram polyline at this sample,
                 # using the same display flip applied to the fill.
+                yy_disp = (
+                    abs(yy) * ord_sign if outward_lobe
+                    else yy * ord_sign
+                )
                 world_x = ni.x + xx * cx + scale * yy_disp * nx
                 world_y = ni.y + xx * cy + scale * yy_disp * ny
                 # World-coords of the matching point on the element

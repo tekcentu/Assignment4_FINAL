@@ -297,7 +297,111 @@ def test_hover_readout_V_value_unchanged(qt_app):
     assert float(m.group(1)) == pytest.approx(expected_v, rel=1e-3, abs=1e-3)
 
 
-# ── 5. Node-order invariance: swapping i↔j on the right column does not
+# ── 5. Outward-lobe rule: both +V (blue) and −V (red) lobes always
+# ── extend OUTWARD from the structure centroid; sign is communicated
+# ── by colour only. This catches the case where a column has negative
+# ── shear: with the legacy yy * nx rule the lobe flipped back inward
+# ── after the centroid-flip, ending up on the wrong side.
+
+
+def _portal_with_udl_beam_canvas() -> tuple[ModelCanvas, StructuralModel]:
+    """Build a portal whose columns carry frame-action V ≈ ∓16.7 kN
+    (left column NEGATIVE, right column POSITIVE) — the configuration
+    that exposed the outward-lobe bug. UDL on the beam guarantees a V
+    sign change along the beam too."""
+    m = StructuralModel(title="portal outward-lobe check")
+    m.materials[1] = Material(id=1, name="C", E=2.0e8, density=0.0)
+    m.sections[1] = Section(id=1, name="S", material_id=1,
+                            A=0.02, I=8e-4, depth=0.3)
+    m.nodes = {1: Node(1, 0, 0), 2: Node(2, 6, 0),
+               3: Node(3, 0, 4), 4: Node(4, 6, 4)}
+    beam = FrameElement2D(id=3, node_i=3, node_j=4, E=2e8,
+                          A=0.02, I=8e-4, section_id=1)
+    beam.member_loads = [UniformDistributedLoad(wy=-20.0)]
+    m.elements = [
+        FrameElement2D(id=1, node_i=1, node_j=3, E=2e8,
+                       A=0.02, I=8e-4, section_id=1),
+        FrameElement2D(id=2, node_i=2, node_j=4, E=2e8,
+                       A=0.02, I=8e-4, section_id=1),
+        beam,
+    ]
+    m.supports = {1: Support(node_id=1, ux=True, uy=True, rz=True),
+                  2: Support(node_id=2, ux=True, uy=True, rz=True)}
+    r = run_analysis(m, verbose=False)
+    canvas = ModelCanvas(None, model_provider=lambda: m)
+    canvas._result = r
+    canvas.diagram_kind = "shear"
+    canvas.diagram_scale = 1.0
+    canvas.diagram_stations = 21
+    canvas._draw_diagrams()
+    return canvas, m
+
+
+def _patches_with_colour(canvas: ModelCanvas):
+    """Return per-patch (xmin, xmax, ymin, ymax, 'red'|'blue')."""
+    out = []
+    for p in canvas.ax.patches:
+        v = p.get_path().vertices
+        c = p.get_facecolor()
+        col = "blue" if c[2] > 0.5 else "red" if c[0] > 0.5 else "other"
+        out.append((float(v[:, 0].min()), float(v[:, 0].max()),
+                    float(v[:, 1].min()), float(v[:, 1].max()), col))
+    return out
+
+
+def test_left_column_negative_shear_lobes_outward_left(qt_app):
+    """V < 0 on the left column → red lobe extends to the LEFT of
+    x = 0 (outward), not to the right (inward as it did before)."""
+    canvas, _ = _portal_with_udl_beam_canvas()
+    left_col_patch = next(
+        p for p in _patches_with_colour(canvas)
+        if abs(p[3] - 4.0) < 1e-6 and abs(p[2]) < 1e-6
+        and p[1] <= 0.0 + 1e-3       # column at x=0
+    )
+    xmin, xmax, _, _, colour = left_col_patch
+    assert colour == "red"           # left col V is negative for this model
+    assert xmax == pytest.approx(0.0, abs=1e-6)
+    assert xmin < -0.05              # OUTWARD (left)
+
+
+def test_right_column_positive_shear_lobes_outward_right(qt_app):
+    """V > 0 on the right column → blue lobe extends to the RIGHT of
+    x = 6 (outward) — unchanged from previous fix iteration."""
+    canvas, _ = _portal_with_udl_beam_canvas()
+    right_col_patch = next(
+        p for p in _patches_with_colour(canvas)
+        if abs(p[3] - 4.0) < 1e-6 and abs(p[2]) < 1e-6
+        and p[0] >= 6.0 - 1e-3
+    )
+    xmin, xmax, _, _, colour = right_col_patch
+    assert colour == "blue"
+    assert xmin == pytest.approx(6.0, abs=1e-6)
+    assert xmax > 6.05
+
+
+def test_beam_sign_change_both_lobes_outward(qt_app):
+    """A UDL beam has V > 0 on the left half and V < 0 on the right
+    half. With the outward-lobe rule both lobes extend ABOVE the beam
+    (outward of the portal); sign is shown by colour only."""
+    canvas, _ = _portal_with_udl_beam_canvas()
+    # Beam patches sit on y = 4. Find them — both must lobe ABOVE (y > 4).
+    beam_patches = [
+        p for p in _patches_with_colour(canvas)
+        if abs(p[2] - 4.0) < 1e-3 and p[3] > 4.0
+    ]
+    assert len(beam_patches) == 2
+    colours = sorted(p[4] for p in beam_patches)
+    assert colours == ["blue", "red"]    # both signs present
+    # All beam patches extend ABOVE the beam (outward = up since the beam
+    # is the top member of the portal).
+    for p in beam_patches:
+        assert p[3] > 4.05, (
+            f"beam {p[4]} lobe must extend above the beam "
+            f"(outward), got ymax={p[3]:.3f}"
+        )
+
+
+# ── 6. Node-order invariance: swapping i↔j on the right column does not
 # ── change which screen side the lobe lands on (the visual is geometry-
 # ── driven, not node-name-driven).
 
