@@ -1,8 +1,9 @@
 """PyQt6 smoke tests for the File → Export station results CSV.
 
-Covers the new export action: it is gated behind a successful solve,
-it writes one header row + 21 station rows per element, the N/V/M
-columns are scaled to the active Units V1 preset, and the x column
+Covers the export action: it is gated behind a successful solve, the
+:class:`StationExportDialog` chooses which cases / combinations and which
+elements are written, every row carries a ``Load case / combination`` tag,
+the N/V/M columns are scaled to the active Units V1 preset, and the x column
 stays in metres (matching the rest of the Units V1 contract).
 """
 
@@ -18,18 +19,24 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PyQt6.QtCore import QSettings  # noqa: E402
-    from PyQt6.QtWidgets import QApplication  # noqa: E402
+    from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 except Exception as exc:  # noqa: BLE001
     pytest.skip(f"PyQt6 unavailable: {exc}", allow_module_level=True)
 
 from structural_analysis.element import FrameElement2D, TrussElement2D  # noqa: E402
 from structural_analysis.gui_qt.app import MainWindow  # noqa: E402
 from structural_analysis.model import (  # noqa: E402
-    Material, Node, Section, Support, NodalLoad, UniformDistributedLoad,
+    LoadCase, LoadCombination, Material, Node, Section, Support,
+    NodalLoad, UniformDistributedLoad,
 )
 from structural_analysis.gui_qt.element_graphics import (  # noqa: E402
     sample_internal_force, effective_member_loads,
 )
+
+HEADER = [
+    "Load case / combination", "Element", "x (m)",
+    "N (kN)", "V (kN)", "M (kN·m)",
+]
 
 
 @pytest.fixture(scope="module")
@@ -46,6 +53,36 @@ def _clean_qsettings():
     s.remove("units_preset")
     yield
     s.remove("units_preset")
+
+
+def _patch_export(monkeypatch, out, *, case_keys=None, scope="all", path=None):
+    """Bypass the two modal dialogs the export now opens.
+
+    ``StationExportDialog`` is replaced by a fake that auto-accepts and
+    returns ``(case_keys, scope)`` — ``case_keys=None`` defers to the active
+    case the real dialog would pre-check. ``path`` overrides the save target
+    (use ``""`` to simulate a cancelled file dialog)."""
+    import structural_analysis.gui_qt.dialogs as dlgmod
+    import structural_analysis.gui_qt.app as appmod
+
+    class _FakeDialog:
+        def __init__(self, *_a, **k):
+            self._active = k.get("active_case", "DEFAULT")
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        @property
+        def result_value(self):
+            keys = case_keys if case_keys is not None else [self._active]
+            return (keys, scope)
+
+    monkeypatch.setattr(dlgmod, "StationExportDialog", _FakeDialog)
+    save_path = str(out) if path is None else path
+    monkeypatch.setattr(
+        appmod.QFileDialog, "getSaveFileName",
+        lambda *a, **k: (save_path, "CSV (*.csv)"),
+    )
 
 
 def _seed_frame_solved(w: MainWindow) -> None:
@@ -87,6 +124,33 @@ def _seed_mixed_solved(w: MainWindow) -> None:
     w._run_static_solve(active_only=False)
 
 
+def _seed_two_case_solved(w: MainWindow) -> None:
+    """Two load cases (DEAD, LIVE) plus a combination, all solved, so the
+    multi-case export path and the combination tag can be exercised."""
+    m = w._model
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 5.0, 0.0)}
+    m.materials = {1: Material(id=1, name="C", E=3e7, density=0.0)}
+    m.sections = {1: Section(id=1, name="S", material_id=1,
+                             A=0.05, I=1.0e-3, depth=0.3)}
+    m.elements = [FrameElement2D(id=1, node_i=1, node_j=2, E=3e7,
+                                 A=0.05, I=1.0e-3, section_id=1)]
+    m.supports = {1: Support(node_id=1, ux=True, uy=True, rz=True),
+                  2: Support(node_id=2, ux=False, uy=True, rz=False)}
+    m.load_cases = {
+        "DEAD": LoadCase(name="DEAD", enabled=True),
+        "LIVE": LoadCase(name="LIVE", enabled=True),
+    }
+    m.nodal_loads = [
+        NodalLoad(node_id=2, fx=10.0, load_case="DEAD"),
+        NodalLoad(node_id=2, fx=20.0, load_case="LIVE"),
+    ]
+    m.load_combinations = {
+        "ULS": LoadCombination(name="ULS", terms={"DEAD": 1.2, "LIVE": 1.6}),
+    }
+    w._active_case = "DEAD"
+    w._run_static_solve(active_only=False)
+
+
 def test_export_action_disabled_before_solve(qt_app):
     w = MainWindow()
     assert not w.act_export_stations.isEnabled()
@@ -104,35 +168,27 @@ def test_export_writes_header_and_21_stations_per_element(
     w = MainWindow()
     _seed_frame_solved(w)
     out = tmp_path / "stations.csv"
-
-    import structural_analysis.gui_qt.app as appmod
-
-    def _fake_save(*_a, **_k):
-        return (str(out), "CSV (*.csv)")
-
-    monkeypatch.setattr(appmod.QFileDialog, "getSaveFileName", _fake_save)
+    _patch_export(monkeypatch, out)
     w._export_station_results()
 
     assert out.exists()
     with open(out, newline="", encoding="utf-8") as fh:
         rows = list(csv.reader(fh))
-    # Header + 21 stations × 1 element.
+    # Header + 21 stations × 1 element × 1 case.
     assert len(rows) == 1 + 21
-    assert rows[0] == ["Element", "x (m)", "N (kN)", "V (kN)", "M (kN·m)"]
-    # First and last x for the 5 m frame.
-    assert float(rows[1][1]) == pytest.approx(0.0)
-    assert float(rows[-1][1]) == pytest.approx(5.0)
+    assert rows[0] == HEADER
+    # Every data row tagged with the active case.
+    assert all(r[0] == "DEFAULT" for r in rows[1:])
+    # First and last x for the 5 m frame (x is now column index 2).
+    assert float(rows[1][2]) == pytest.approx(0.0)
+    assert float(rows[-1][2]) == pytest.approx(5.0)
 
 
 def test_export_no_path_is_noop(qt_app, tmp_path, monkeypatch):
     """Cancelling the save dialog must not raise or write anything."""
     w = MainWindow()
     _seed_frame_solved(w)
-    import structural_analysis.gui_qt.app as appmod
-    monkeypatch.setattr(
-        appmod.QFileDialog, "getSaveFileName",
-        lambda *a, **k: ("", ""),
-    )
+    _patch_export(monkeypatch, tmp_path / "x.csv", path="")
     w._export_station_results()  # must return cleanly, no exception
     assert list(tmp_path.iterdir()) == []
 
@@ -146,24 +202,18 @@ def test_export_headers_and_values_follow_units_preset(
     _seed_frame_solved(w)
     w._set_units_preset("kip_ft")
     out = tmp_path / "stations_kip.csv"
-    import structural_analysis.gui_qt.app as appmod
-    monkeypatch.setattr(
-        appmod.QFileDialog, "getSaveFileName",
-        lambda *a, **k: (str(out), "CSV (*.csv)"),
-    )
+    _patch_export(monkeypatch, out)
     w._export_station_results()
 
     with open(out, newline="", encoding="utf-8") as fh:
         rows = list(csv.reader(fh))
     assert rows[0] == [
-        "Element", "x (m)", "N (kip)", "V (kip)", "M (kip·ft)",
+        "Load case / combination", "Element", "x (m)",
+        "N (kip)", "V (kip)", "M (kip·ft)",
     ]
 
     # Cross-check N column against the helper: an axial force read from
-    # the same f_local should match the row scaled to kip.
-    from structural_analysis.gui_qt.element_graphics import (
-        sample_internal_force,
-    )
+    # the same f_local should match the row scaled to kip (N now col 3).
     from structural_analysis.gui_common import units as U
 
     elem = w._model.elements[0]
@@ -173,30 +223,90 @@ def test_export_headers_and_values_follow_units_preset(
         list(mr["f_local"]), "axial",
     )
     expected_n_first = U.force_to_display(ys[0], "kip_ft")
-    assert float(rows[1][2]) == pytest.approx(expected_n_first, rel=1e-5)
+    assert float(rows[1][3]) == pytest.approx(expected_n_first, rel=1e-5)
 
 
 def test_export_truss_row_emits_only_axial(qt_app, tmp_path, monkeypatch):
     w = MainWindow()
     _seed_mixed_solved(w)
     out = tmp_path / "mixed.csv"
-    import structural_analysis.gui_qt.app as appmod
-    monkeypatch.setattr(
-        appmod.QFileDialog, "getSaveFileName",
-        lambda *a, **k: (str(out), "CSV (*.csv)"),
-    )
+    _patch_export(monkeypatch, out)
     w._export_station_results()
     with open(out, newline="", encoding="utf-8") as fh:
         rows = list(csv.reader(fh))
     # Two elements × 21 stations + header.
     assert len(rows) == 1 + 2 * 21
-    truss_rows = [r for r in rows[1:] if r[0] == "2"]
+    truss_rows = [r for r in rows[1:] if r[1] == "2"]
     assert len(truss_rows) == 21
-    # Every truss row: N populated, V and M blank.
+    # Every truss row: N populated (col 3), V (col 4) and M (col 5) blank.
     for r in truss_rows:
-        assert r[2] != ""        # N present
-        assert r[3] == ""        # no V
-        assert r[4] == ""        # no M
+        assert r[3] != ""        # N present
+        assert r[4] == ""        # no V
+        assert r[5] == ""        # no M
+
+
+def test_export_tags_combination_rows(qt_app, tmp_path, monkeypatch):
+    """A combination selection must tag every row '<name> [comb]'."""
+    w = MainWindow()
+    _seed_two_case_solved(w)
+    out = tmp_path / "combo.csv"
+    _patch_export(monkeypatch, out, case_keys=["ULS"])
+    w._export_station_results()
+    with open(out, newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))[1:]
+    assert rows, "expected combination rows"
+    assert all(r[0] == "ULS [comb]" for r in rows)
+
+
+def test_export_multiple_cases_stacked_and_tagged(
+    qt_app, tmp_path, monkeypatch,
+):
+    """Selecting two cases stacks both, each block tagged with its name."""
+    w = MainWindow()
+    _seed_two_case_solved(w)
+    out = tmp_path / "stacked.csv"
+    _patch_export(monkeypatch, out, case_keys=["DEAD", "LIVE"])
+    w._export_station_results()
+    with open(out, newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))[1:]
+    # 2 cases × 1 element × 21 stations.
+    assert len(rows) == 2 * 21
+    assert {r[0] for r in rows} == {"DEAD", "LIVE"}
+    # LIVE axial (fx=20) should be double DEAD axial (fx=10) at every station.
+    dead = [float(r[3]) for r in rows if r[0] == "DEAD"]
+    live = [float(r[3]) for r in rows if r[0] == "LIVE"]
+    for d, ln in zip(dead, live):
+        if abs(d) > 1e-9:
+            assert ln == pytest.approx(2.0 * d, rel=1e-6)
+
+
+def test_export_selected_elements_only(qt_app, tmp_path, monkeypatch):
+    """scope='selected' must restrict the rows to the given element ids."""
+    w = MainWindow()
+    _seed_mixed_solved(w)
+    # Pretend element 1 is the only canvas selection.
+    monkeypatch.setattr(
+        w.canvas, "get_selected_elements", lambda: {1},
+    )
+    out = tmp_path / "sel.csv"
+    _patch_export(monkeypatch, out, scope="selected")
+    w._export_station_results()
+    with open(out, newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))[1:]
+    # Only element 1 rows (21), no element 2.
+    assert len(rows) == 21
+    assert {r[1] for r in rows} == {"1"}
+
+
+def test_build_station_rows_all_vs_selected(qt_app):
+    """The testable core honours the elem_ids filter without any dialog."""
+    w = MainWindow()
+    _seed_mixed_solved(w)
+    all_rows = w._build_station_rows([w._active_case], None)
+    sel_rows = w._build_station_rows([w._active_case], {1})
+    assert len(all_rows) == 1 + 2 * 21
+    assert len(sel_rows) == 1 + 21
+    assert {r[1] for r in sel_rows[1:]} == {1}
 
 
 def test_station_export_matches_canvas_sampling(qt_app, tmp_path, monkeypatch):
@@ -204,7 +314,6 @@ def test_station_export_matches_canvas_sampling(qt_app, tmp_path, monkeypatch):
     same active selection — both route through ``effective_member_loads`` +
     ``sample_internal_force`` with the discontinuity split on (the
     member-load reconstruction fix)."""
-    import csv
     w = MainWindow()
     m = w._model
     m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
@@ -220,11 +329,7 @@ def test_station_export_matches_canvas_sampling(qt_app, tmp_path, monkeypatch):
     w._run_static_solve(active_only=False)
 
     out = tmp_path / "stations.csv"
-    import structural_analysis.gui_qt.app as appmod
-    monkeypatch.setattr(
-        appmod.QFileDialog, "getSaveFileName",
-        lambda *a, **k: (str(out), "CSV (*.csv)"),
-    )
+    _patch_export(monkeypatch, out)
     w._export_station_results()
 
     with open(out, newline="", encoding="utf-8") as fh:
@@ -235,7 +340,7 @@ def test_station_export_matches_canvas_sampling(qt_app, tmp_path, monkeypatch):
     _, ms = sample_internal_force(
         e, ni, nj, list(f), "moment",
         member_loads=eff, split_discontinuities=True)
-    csv_m = [float(r[4]) for r in rows]
+    csv_m = [float(r[5]) for r in rows]   # M is now column index 5
     assert len(csv_m) == len(ms)
     for got, exp in zip(csv_m, ms):
         assert got == pytest.approx(exp, rel=1e-6, abs=1e-6)
@@ -250,11 +355,7 @@ def test_internal_model_untouched_by_export(qt_app, tmp_path, monkeypatch):
     _seed_frame_solved(w)
     mr_before = copy.deepcopy(w._result.member_results)
     out = tmp_path / "stations.csv"
-    import structural_analysis.gui_qt.app as appmod
-    monkeypatch.setattr(
-        appmod.QFileDialog, "getSaveFileName",
-        lambda *a, **k: (str(out), "CSV (*.csv)"),
-    )
+    _patch_export(monkeypatch, out)
     w._export_station_results()
     mr_after = w._result.member_results
     assert mr_after.keys() == mr_before.keys()

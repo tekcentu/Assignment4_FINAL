@@ -152,6 +152,23 @@ def resolve_view(
     return result, ""
 
 
+def view_label(model: StructuralModel, name: str) -> str:
+    """Short, self-describing label for a case / combination / SUM_ALL key.
+
+    Used where a result selection has to be written into data (e.g. the
+    station-export ``Load case / combination`` column) rather than shown in
+    a combo. Combinations are tagged ``"<name> [comb]"`` so they can't be
+    mistaken for a same-named load case; ``SUM_ALL`` stays as-is; plain load
+    cases are returned bare. Kept here so the tag matches
+    :func:`case_combo_entries` and the two never drift.
+    """
+    if name in model.load_combinations:
+        return f"{name} [comb]"
+    if name == SUM_ALL_KEY:
+        return SUM_ALL_KEY
+    return name
+
+
 def format_result(
     model: StructuralModel,
     result: AnalysisResult | None,
