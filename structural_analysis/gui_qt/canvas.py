@@ -2291,8 +2291,12 @@ class ModelCanvas(QWidget):
             # ``sample_internal_force`` numerical values are untouched.
             can_tx, can_ty, is_reversed = _canonical_display_direction(cx, cy)
             if is_reversed:
+                # Walk follows the MEMBER (not the world canonical axis)
+                # so the diagram polyline lies on the inclined element
+                # for diagonal members. The canonical direction is only
+                # used to decide whether to reverse the iteration.
                 start_x, start_y = nj.x, nj.y
-                walk_tx, walk_ty = can_tx, can_ty
+                walk_tx, walk_ty = -cx, -cy
                 xs_disp = [L - x for x in reversed(xs)]
                 # Moment values pick up an overall sign under node-order
                 # reversal (they are computed in the element local frame,

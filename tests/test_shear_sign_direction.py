@@ -484,3 +484,108 @@ def test_moment_diagram_reversed_node_order_renders_identically(qt_app):
         and a[1] == pytest.approx(b[1], abs=1e-6)
         for a, b in zip(m_fwd._centroids, m_rev._centroids)
     )
+
+
+# ── 9. Sanity on the canonical V profile + inclined-member coverage ─────
+
+
+def test_ss_beam_global_udl_midspan_V_is_zero_and_ends_are_plus_minus_30():
+    """Pin the SS beam V profile used by the node-order tests so the
+    PR notes can quote it without ambiguity: V at midspan is 0 (the
+    classical symmetric-load result), end-station V at i / j is ±30.
+    Reversing the node order flips the sign at every station EXCEPT
+    midspan, which stays zero."""
+    L = 6.0
+    w = 10.0      # |wy| of the global UDL
+    expected_end = w * L / 2.0     # 30.0
+
+    m_fwd = _ss_beam_global_udl(reversed_order=False)
+    m_rev = _ss_beam_global_udl(reversed_order=True)
+    for label, m in (("forward", m_fwd), ("reversed", m_rev)):
+        r = run_analysis(m, verbose=False)
+        e = m.elements[0]
+        _, vs = sample_internal_force(
+            e, m.nodes[e.node_i], m.nodes[e.node_j],
+            list(r.member_results[e.id]["f_local"]),
+            "shear", n_samples=5)
+        # 5 samples: indices 0 (i-end), 1, 2 (midspan), 3, 4 (j-end).
+        assert vs[2] == pytest.approx(0.0, abs=1e-9), (
+            f"{label}: midspan V must be 0 for a symmetric SS UDL beam")
+        assert abs(vs[0]) == pytest.approx(expected_end, abs=1e-6)
+        assert abs(vs[-1]) == pytest.approx(expected_end, abs=1e-6)
+        assert vs[0] * vs[-1] < 0, (
+            f"{label}: end-station V signs are opposite "
+            f"(reactions push opposite ways)")
+
+
+def test_canonical_handles_diagonal_members_with_45deg_threshold():
+    """Inclined members are classified by |cx| ≥ |cy|:
+
+    * ≤ 45° from horizontal → treated as horizontal (canonical = +x);
+    * > 45° from horizontal → treated as vertical (canonical = +y).
+
+    This rule covers structural-realistic geometry (most beams and
+    columns are within a few degrees of the world axes). Truss
+    diagonals at exactly 30°–60° render as horizontal or vertical based
+    on which side of the 45° threshold they fall on, and the world-up /
+    world-right shear normal is used accordingly. Documenting the
+    behaviour here so a future improvement (e.g. a member-perpendicular
+    normal for steep diagonals) can be added in a follow-up PR without
+    silently changing what users currently see."""
+    import math
+
+    for angle_deg in (0, 15, 30, 44):
+        rad = math.radians(angle_deg)
+        cx, cy = math.cos(rad), math.sin(rad)
+        can_tx, can_ty, is_rev = _canonical_display_direction(cx, cy)
+        assert (can_tx, can_ty) == (1.0, 0.0)
+        assert is_rev is False
+        assert _shear_display_normal(can_tx, can_ty) == (0.0, 1.0)
+
+    for angle_deg in (46, 60, 75, 90):
+        rad = math.radians(angle_deg)
+        cx, cy = math.cos(rad), math.sin(rad)
+        can_tx, can_ty, is_rev = _canonical_display_direction(cx, cy)
+        assert (can_tx, can_ty) == (0.0, 1.0)
+        assert is_rev is False
+        assert _shear_display_normal(can_tx, can_ty) == (1.0, 0.0)
+
+
+def test_diagonal_member_reversed_node_order_renders_identically(qt_app):
+    """A 30° inclined truss diagonal modelled with swapped node order
+    must still render identically — the canonical-walk alignment
+    extends to inclined members via the 45° classification rule."""
+    import math
+
+    def diagonal(reversed_order: bool):
+        m = StructuralModel(title="diagonal")
+        m.materials[1] = Material(id=1, name="C", E=2.0e8, density=0.0)
+        m.sections[1] = Section(id=1, name="S", material_id=1,
+                                A=0.02, I=8e-4, depth=0.3)
+        L = 6.0
+        angle = math.radians(30.0)
+        m.nodes = {
+            1: Node(1, 0.0, 0.0),
+            2: Node(2, L * math.cos(angle), L * math.sin(angle)),
+        }
+        if reversed_order:
+            e = FrameElement2D(id=1, node_i=2, node_j=1, E=2.0e8,
+                               A=0.02, I=8e-4, section_id=1)
+        else:
+            e = FrameElement2D(id=1, node_i=1, node_j=2, E=2.0e8,
+                               A=0.02, I=8e-4, section_id=1)
+        e.member_loads.append(
+            UniformDistributedLoad(wy=-10.0, coord_system="global"))
+        m.elements = [e]
+        m.supports = {1: Support(1, ux=True, uy=True, rz=False),
+                      2: Support(2, ux=False, uy=True, rz=False)}
+        return m
+
+    a = _patch_centroids(_shear_canvas(diagonal(reversed_order=False)))
+    b = _patch_centroids(_shear_canvas(diagonal(reversed_order=True)))
+    assert len(a) == len(b)
+    for (ax, ay, ac), (bx, by, bc) in zip(a, b):
+        assert ac == bc
+        assert ax == pytest.approx(bx, abs=1e-6)
+        assert ay == pytest.approx(by, abs=1e-6)
+
