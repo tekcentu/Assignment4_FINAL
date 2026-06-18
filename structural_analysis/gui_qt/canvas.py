@@ -2262,12 +2262,44 @@ class ModelCanvas(QWidget):
         else:
             ord_sign = +1.0
 
+        # Shear-diagram display side: with member +y_local alone, both
+        # columns of a portal frame render their shear lobes on the same
+        # global side, so the right column ends up drawing INSIDE the
+        # portal — the textbook drafting convention is the opposite, with
+        # both columns mirroring outward. Resolve "outward" from the
+        # structure's own node geometry (no global-axis assumptions, no
+        # beam/column hardcoding): use the structure's node centroid as a
+        # reference, and flip the normal for a member whose +y_local
+        # points clearly toward the centroid. Single-member / collinear
+        # models leave the +y_local convention untouched, so the existing
+        # "positive shear above horizontal beam" regression keeps passing.
+        flip_for_outward = (
+            self.diagram_kind == "shear"
+            and len(model.nodes) >= 3
+        )
+        if flip_for_outward:
+            node_xs = [n.x for n in model.nodes.values()]
+            node_ys = [n.y for n in model.nodes.values()]
+            struct_cx = sum(node_xs) / len(node_xs)
+            struct_cy = sum(node_ys) / len(node_ys)
+        else:
+            struct_cx = struct_cy = 0.0
+
         for elem, ni, nj, xs, ys in per_elem:
             L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
             if L < 1e-12:
                 continue
             cx, cy = (nj.x - ni.x) / L, (nj.y - ni.y) / L
             nx, ny = -cy, cx
+            if flip_for_outward:
+                # Outward from the structure centroid at the member's mid.
+                ox = (ni.x + nj.x) / 2.0 - struct_cx
+                oy = (ni.y + nj.y) / 2.0 - struct_cy
+                # Project the normal onto that outward direction. A clearly
+                # negative projection means +y_local points inward — flip
+                # so positive shear consistently lobes toward the outside.
+                if (nx * ox + ny * oy) < -1e-9 * L:
+                    nx, ny = -nx, -ny
 
             def offset_point(xx, yy):
                 yy_disp = yy * ord_sign

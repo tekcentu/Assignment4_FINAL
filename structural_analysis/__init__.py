@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.40.2"
+__version__ = "0.40.3"
 __what_is_new__ = (
-    "File → Export station results CSV (21 stations/member, SAP-compare) · "
-    "Columns scaled to active Units V1 preset · "
-    "Truss rows emit N only"
+    "Display: shear-diagram lobes mirror outward for portal columns · "
+    "Numerical V values, station export, hover read-outs unchanged · "
+    "Single-member / collinear models keep the +y_local convention"
 )
 
 from .model import (
