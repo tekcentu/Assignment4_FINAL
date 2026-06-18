@@ -2261,94 +2261,46 @@ class ModelCanvas(QWidget):
             def _conv(v: float) -> float:
                 return _U.force_to_display(v, pid)
         # Conventional structural orientation: positive sagging moment
-        # plots BELOW the member centerline; positive shear / axial
-        # plot on the +normal side as before. The flip is display-only
-        # — sampled ys, max_ord, scale, critical-point picks, and the
-        # hover read-out (_diagram_value) all use the un-flipped ys.
+        # plots BELOW the member centerline (handled via ord_sign on the
+        # element-local normal). Shear uses a separate WORLD-anchored
+        # display normal (see below) so the diagram side matches the
+        # common SAP-like drafting convention. Both are display-only —
+        # sampled ys, max_ord, scale, critical-point picks, and the hover
+        # read-out (_diagram_value) all use the un-flipped numerical ys.
         if self.diagram_kind == "moment":
             ord_sign = -1.0
         else:
             ord_sign = +1.0
-
-        # Shear-diagram display side: with member +y_local alone, both
-        # columns of a portal frame render their shear lobes on the same
-        # global side, so the right column ends up drawing INSIDE the
-        # portal — the textbook drafting convention is the opposite, with
-        # both columns mirroring outward.
-        #
-        # Two-part rule (applied only for shear, only with ≥ 3 nodes —
-        # single-member / collinear models keep the legacy +y_local
-        # convention so the "positive shear above horizontal beam" test
-        # still passes byte-for-byte):
-        #
-        # 1.  Flip the +y_local normal so it points OUTWARD from the
-        #     structure's node centroid. After this, +nx is the outward
-        #     direction for the member.
-        # 2.  Lobe |V| in the +outward direction regardless of V sign.
-        #     With the legacy ``yy * nx`` rule, the SIGN of V flips the
-        #     lobe back to the inward side — so a left column with
-        #     negative V ends up drawing INSIDE the portal even after the
-        #     normal flip. Using |V| keeps every lobe on the outward
-        #     side; sign is communicated by the fill colour
-        #     (blue = +V, red = −V).
-        outward_lobe = (
-            self.diagram_kind == "shear"
-            and len(model.nodes) >= 3
-        )
-        if outward_lobe:
-            node_xs = [n.x for n in model.nodes.values()]
-            node_ys = [n.y for n in model.nodes.values()]
-            struct_cx = sum(node_xs) / len(node_xs)
-            struct_cy = sum(node_ys) / len(node_ys)
-        else:
-            struct_cx = struct_cy = 0.0
 
         for elem, ni, nj, xs, ys in per_elem:
             L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
             if L < 1e-12:
                 continue
             cx, cy = (nj.x - ni.x) / L, (nj.y - ni.y) / L
+            # Element-local normal (moment + axial use this, unchanged).
             nx, ny = -cy, cx
-            if outward_lobe:
-                # Outward from the structure centroid at the member's mid.
-                ox = (ni.x + nj.x) / 2.0 - struct_cx
-                oy = (ni.y + nj.y) / 2.0 - struct_cy
-                # Project the normal onto that outward direction. A clearly
-                # negative projection means +y_local points inward — flip
-                # so +nx truly points OUTWARD for the lobe step below.
-                if (nx * ox + ny * oy) < -1e-9 * L:
-                    nx, ny = -nx, -ny
 
-            # Single-sign vs. sign-changing element: only single-sign
-            # elements get the "always lobe outward" rule. A sign-changing
-            # element keeps the textbook convention (positive +V on the
-            # +nx side, negative −V on the −nx side) so a beam where V
-            # crosses zero shows blue above / red below — the natural
-            # axis convention the user expects to see along the member.
-            peak = max((abs(v) for v in ys), default=0.0)
-            tol = 1e-9 * max(peak, 1.0)
-            has_pos = any(v > tol for v in ys)
-            has_neg = any(v < -tol for v in ys)
-            element_sign_changing = has_pos and has_neg
+            if self.diagram_kind == "shear":
+                # Shear display side: SIGN-based, anchored to WORLD axes
+                # (not the element local +y, which points left for a
+                # bottom→top column and would draw positive shear on the
+                # wrong side). Choose a positive visual normal from the
+                # member's geometric orientation:
+                #   • mostly horizontal member → world UP   → +V above
+                #   • mostly vertical member   → world RIGHT → +V right
+                # Then offset = signed V × positive_visual_normal, so
+                # +V draws top/right and −V draws bottom/left. This does
+                # NOT touch the core local y-axis or any numerical value.
+                vnx, vny = _shear_display_normal(cx, cy)
 
-            if outward_lobe and not element_sign_changing:
-                # Single-sign element in a multi-node structure:
-                # lobe |V| OUTWARD regardless of sign. Sign is shown by
-                # the fill colour. This is what mirrors the two columns
-                # of a portal frame so both lobe outward — including a
-                # left column with V < 0.
                 def offset_point(xx, yy):
-                    yy_disp = abs(yy) * ord_sign
                     return (
-                        ni.x + xx * cx + scale * yy_disp * nx,
-                        ni.y + xx * cy + scale * yy_disp * ny,
+                        ni.x + xx * cx + scale * yy * vnx,
+                        ni.y + xx * cy + scale * yy * vny,
                     )
             else:
-                # Sign-changing element (e.g. UDL beam) OR single-member
-                # / collinear model: textbook — positive V on +nx,
-                # negative V on −nx. For a horizontal beam this puts
-                # +V above and −V below the centerline, matching the
-                # local-axis convention.
+                # Moment / axial: element-local normal + ord_sign,
+                # unchanged from prior behaviour.
                 def offset_point(xx, yy):
                     yy_disp = yy * ord_sign
                     return (
@@ -2425,18 +2377,17 @@ class ModelCanvas(QWidget):
                 xx = xs[i]
                 yy = ys[i]
                 # World-coords on the diagram polyline at this sample,
-                # using the same display flip applied to the fill.
-                # Single-sign element in a multi-node structure gets the
-                # outward |V| treatment; everything else uses the
-                # textbook ``yy`` sign so labels land on the same side
-                # as the matching fill polygon.
-                yy_disp = (
-                    abs(yy) * ord_sign
-                    if outward_lobe and not element_sign_changing
-                    else yy * ord_sign
-                )
-                world_x = ni.x + xx * cx + scale * yy_disp * nx
-                world_y = ni.y + xx * cy + scale * yy_disp * ny
+                # using the SAME display normal applied to the fill so
+                # the peak label sits on its matching polygon: shear uses
+                # the world-anchored visual normal, moment / axial use the
+                # element-local normal + ord_sign.
+                if self.diagram_kind == "shear":
+                    world_x = ni.x + xx * cx + scale * yy * vnx
+                    world_y = ni.y + xx * cy + scale * yy * vny
+                else:
+                    yy_disp = yy * ord_sign
+                    world_x = ni.x + xx * cx + scale * yy_disp * nx
+                    world_y = ni.y + xx * cy + scale * yy_disp * ny
                 # World-coords of the matching point on the element
                 # axis itself — that's what the snap engine should
                 # snap to (so a left-click in modelling tools still
@@ -2544,6 +2495,29 @@ class ModelCanvas(QWidget):
         no longer silently re-fits and throws their view away."""
         if not self._setting_axes_limits:
             self._user_view_dirty = True
+
+
+def _shear_display_normal(cx: float, cy: float) -> tuple[float, float]:
+    """Positive visual normal for a shear diagram, anchored to WORLD axes.
+
+    Display-only. Given a member's unit tangent ``(cx, cy)`` (from node i
+    to node j), return the world-space direction in which a POSITIVE shear
+    value should be drawn, following the common SAP-like convention:
+
+    * mostly horizontal member (``|cx| >= |cy|``) → world UP ``(0, +1)``
+      so ``+V`` plots above the member and ``−V`` below it;
+    * mostly vertical member (``|cy| > |cx|``) → world RIGHT ``(+1, 0)``
+      so ``+V`` plots to the right of the member and ``−V`` to the left.
+
+    This never touches the element's structural local y-axis or any
+    numerical value; it only decides which side of the on-screen member
+    line the signed shear ordinate is offset toward. The caller draws
+    ``offset = signed_V × this_normal``, so the sign of V alone picks the
+    side (top/right for +, bottom/left for −).
+    """
+    if abs(cx) >= abs(cy):
+        return (0.0, 1.0)     # horizontal member → +V up
+    return (1.0, 0.0)         # vertical member → +V right
 
 
 def _udl_visual_components(
