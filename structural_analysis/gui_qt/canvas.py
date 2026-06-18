@@ -2319,9 +2319,24 @@ class ModelCanvas(QWidget):
                 if (nx * ox + ny * oy) < -1e-9 * L:
                     nx, ny = -nx, -ny
 
-            if outward_lobe:
-                # Step (2) of the rule: lobe |V| outward regardless of sign.
-                # Sign is shown by the fill colour, not by the side.
+            # Single-sign vs. sign-changing element: only single-sign
+            # elements get the "always lobe outward" rule. A sign-changing
+            # element keeps the textbook convention (positive +V on the
+            # +nx side, negative −V on the −nx side) so a beam where V
+            # crosses zero shows blue above / red below — the natural
+            # axis convention the user expects to see along the member.
+            peak = max((abs(v) for v in ys), default=0.0)
+            tol = 1e-9 * max(peak, 1.0)
+            has_pos = any(v > tol for v in ys)
+            has_neg = any(v < -tol for v in ys)
+            element_sign_changing = has_pos and has_neg
+
+            if outward_lobe and not element_sign_changing:
+                # Single-sign element in a multi-node structure:
+                # lobe |V| OUTWARD regardless of sign. Sign is shown by
+                # the fill colour. This is what mirrors the two columns
+                # of a portal frame so both lobe outward — including a
+                # left column with V < 0.
                 def offset_point(xx, yy):
                     yy_disp = abs(yy) * ord_sign
                     return (
@@ -2329,9 +2344,11 @@ class ModelCanvas(QWidget):
                         ni.y + xx * cy + scale * yy_disp * ny,
                     )
             else:
-                # Legacy: sign of V determines the lobe side. Preserves the
-                # horizontal-beam "positive above / negative below" lock for
-                # single-member / collinear models that don't get the flip.
+                # Sign-changing element (e.g. UDL beam) OR single-member
+                # / collinear model: textbook — positive V on +nx,
+                # negative V on −nx. For a horizontal beam this puts
+                # +V above and −V below the centerline, matching the
+                # local-axis convention.
                 def offset_point(xx, yy):
                     yy_disp = yy * ord_sign
                     return (
@@ -2409,8 +2426,13 @@ class ModelCanvas(QWidget):
                 yy = ys[i]
                 # World-coords on the diagram polyline at this sample,
                 # using the same display flip applied to the fill.
+                # Single-sign element in a multi-node structure gets the
+                # outward |V| treatment; everything else uses the
+                # textbook ``yy`` sign so labels land on the same side
+                # as the matching fill polygon.
                 yy_disp = (
-                    abs(yy) * ord_sign if outward_lobe
+                    abs(yy) * ord_sign
+                    if outward_lobe and not element_sign_changing
                     else yy * ord_sign
                 )
                 world_x = ni.x + xx * cx + scale * yy_disp * nx

@@ -379,26 +379,29 @@ def test_right_column_positive_shear_lobes_outward_right(qt_app):
     assert xmax > 6.05
 
 
-def test_beam_sign_change_both_lobes_outward(qt_app):
+def test_beam_sign_change_keeps_textbook_axis_convention(qt_app):
     """A UDL beam has V > 0 on the left half and V < 0 on the right
-    half. With the outward-lobe rule both lobes extend ABOVE the beam
-    (outward of the portal); sign is shown by colour only."""
+    half. The outward-lobe rule applies ONLY to single-sign elements;
+    a sign-changing element keeps the textbook axis convention so
+    +V plots ABOVE the centerline and −V plots BELOW it (i.e. red
+    on the −y_local side of the beam) — the same convention the user
+    sees on any V/M axis diagram."""
     canvas, _ = _portal_with_udl_beam_canvas()
-    # Beam patches sit on y = 4. Find them — both must lobe ABOVE (y > 4).
+    # All beam patches sit at y ≈ 4. Group them by colour.
     beam_patches = [
         p for p in _patches_with_colour(canvas)
-        if abs(p[2] - 4.0) < 1e-3 and p[3] > 4.0
+        if abs(p[3] - 4.0) < 1.0 or abs(p[2] - 4.0) < 1.0
     ]
-    assert len(beam_patches) == 2
-    colours = sorted(p[4] for p in beam_patches)
-    assert colours == ["blue", "red"]    # both signs present
-    # All beam patches extend ABOVE the beam (outward = up since the beam
-    # is the top member of the portal).
-    for p in beam_patches:
-        assert p[3] > 4.05, (
-            f"beam {p[4]} lobe must extend above the beam "
-            f"(outward), got ymax={p[3]:.3f}"
-        )
+    blue_patch = next(p for p in beam_patches if p[4] == "blue"
+                      and abs(p[2] - 4.0) < 1e-3 and p[3] > 4.0)
+    red_patch = next(p for p in beam_patches if p[4] == "red"
+                     and abs(p[3] - 4.0) < 1e-3 and p[2] < 4.0)
+    # Positive V (blue) is ABOVE the beam centerline at y = 4.
+    assert blue_patch[3] > 4.05
+    assert blue_patch[2] == pytest.approx(4.0, abs=1e-6)
+    # Negative V (red) is BELOW the beam centerline.
+    assert red_patch[2] < 3.95
+    assert red_patch[3] == pytest.approx(4.0, abs=1e-6)
 
 
 # ── 6. Node-order invariance: swapping i↔j on the right column does not
