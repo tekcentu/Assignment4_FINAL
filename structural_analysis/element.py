@@ -525,28 +525,55 @@ class FrameElement2D(Element2D):
                 (use FrameTemperatureLoad with equal t_top/t_bottom instead).
         """
         L, c, s = self.length_cos_sin(nodes)
-        # Rigid offsets: member loads act on the FLEXIBLE span only.
-        # Fixed-end vectors are built on L_eff at the offset faces; the
-        # Tᵀ map at the end of this method carries them to the joints
-        # (face shear × rigid arm becomes a joint moment). Zero offsets
-        # ⇒ L_eff == L, x0 == 0, no transform — legacy math unchanged.
+        # Rigid offsets: stiffness is on the FLEXIBLE span, but a uniform
+        # member load is physically applied over the FULL analytical
+        # member (incl. the rigid end zones). Build the fixed-end vector
+        # for the flexible portion at the offset faces and map it to the
+        # joints with Tᵀ; then add the rigid-zone load portions as direct
+        # JOINT force/moment resultants (rigid-body transfer — a rigid arm
+        # carries its share of the load straight to its joint). The
+        # rigid-zone resultants are already in joint coordinates, so they
+        # are added AFTER the Tᵀ map, never through it. Zero offsets ⇒
+        # L_eff == L, x0 == 0, p_rigid == 0 — legacy math is unchanged.
+        #
+        # Equilibrium of the combined local joint vector (transverse w):
+        #   ΣFy = w·L_eff + w·(ei+ej) = w·L_total
+        #   ΣM_i = w·L_total²/2  (matches the real UDL resultant exactly)
         x0 = self.offset_i
         L_eff = self.flexible_length(nodes) if self.has_offsets else L
         p = np.zeros(6)
+        p_rigid = np.zeros(6)
         for load in self.member_loads:
             if isinstance(load, UniformDistributedLoad):
                 wx_l, wy_l = _project_load_to_local(
                     load.wx, load.wy, load.coord_system, c, s,
                 )
-                # Axial (linear shape functions): half to each end.
+                # Axial (linear shape functions): half of the flexible
+                # portion to each face.
                 if wx_l != 0.0:
                     p += np.array([wx_l*L_eff/2, 0, 0, wx_l*L_eff/2, 0, 0])
-                # Transverse (Hermite cubics): wL/2 and ±wL²/12.
+                # Transverse (Hermite cubics): wL/2 and ±wL²/12 on the
+                # flexible span.
                 if wy_l != 0.0:
                     p += np.array([
                         0, wy_l*L_eff/2, wy_l*L_eff**2/12,
                         0, wy_l*L_eff/2, -wy_l*L_eff**2/12,
                     ])
+                # Rigid-zone portions → direct joint resultants. The
+                # i-zone (length ei) puts its total load at joint i with
+                # the moment of that load about joint i (centroid at
+                # ei/2 → moment = w·ei²/2); likewise for the j-zone
+                # (centroid ej/2 on the −x side of joint j → −w·ej²/2).
+                if self.has_offsets:
+                    ei = self.offset_i
+                    ej = self.offset_j
+                    if wx_l != 0.0:
+                        p_rigid += np.array([wx_l*ei, 0, 0, wx_l*ej, 0, 0])
+                    if wy_l != 0.0:
+                        p_rigid += np.array([
+                            0, wy_l*ei, wy_l*ei**2/2.0,
+                            0, wy_l*ej, -wy_l*ej**2/2.0,
+                        ])
             elif isinstance(load, PointLoad):
                 a = float(load.a)
                 if not (0 <= a <= L + 1e-10):
@@ -610,11 +637,14 @@ class FrameElement2D(Element2D):
             else:
                 raise TypeError(f"Unsupported load on element {self.id}: {type(load)}")
         if self.has_offsets:
-            # Map face fixed-end forces to joint coordinates. Thermal
-            # axial/moment pairs pass through unchanged (zero face
-            # shear); UDL/point face shears pick up the rigid-arm
-            # moment at the joints.
-            return self._offset_transform().T @ p
+            # Map the flexible-face fixed-end forces to joint coordinates
+            # (face shear × rigid arm → joint moment). Thermal axial/moment
+            # pairs pass through unchanged (zero face shear). Then add the
+            # rigid-zone UDL resultants, which are ALREADY in joint
+            # coordinates and must NOT be re-mapped by Tᵀ. Both terms are
+            # in the element LOCAL frame; the caller rotates the sum to
+            # global exactly once (R.T @ p_local).
+            return self._offset_transform().T @ p + p_rigid
         return p
 
     def self_weight_fixed_end_local(self, nodes: dict) -> np.ndarray:
