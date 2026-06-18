@@ -240,14 +240,16 @@ flowchart TB
 - `tests/` - automated tests
 - `inputs/` - Assignment 4 Q2 input files
 - `outputs/` - generated console/text outputs for the reported Q2 runs
-  
+- `examples/final_demo/` - final-submission demo models + outputs
+- `docs/`, `report/` - manuals, verification, UML/architecture, and the report
+
 
 
 ## OOP / architecture highlights
 
 - `Element2D` is the abstract base class for all structural members.
 - `FrameElement2D` and `TrussElement2D` specialize stiffness, compatible load handling, and force recovery polymorphically.
-- `Material` stores `E`, `A`, `I`, `alpha`, and `depth` because the thermal expansion coefficient and the section depth are intrinsic material/section properties, not properties of a specific load.
+- `Material` stores `E`, `alpha`, and `density`; cross-section geometry (`A`, `I`, `depth`) lives on a separate `Section` that references a `Material`. The thermal expansion coefficient is an intrinsic material property, while `depth` is a section property used for the through-depth thermal gradient.
 - Strict validation rejects incompatible thermal load-element combinations with a clear `TypeError`.
 - Support settlements are modeled as prescribed restrained-DOF displacements rather than fake external loads.
 
@@ -258,19 +260,25 @@ From the package root:
 ```bash
 python -m structural_analysis.main inputs/q2a_settlement.txt
 python -m structural_analysis.main inputs/q2b_thermal.txt
-python -m pytest -q
+QT_QPA_PLATFORM=offscreen python -m pytest -q
 ```
-
-## Current automated test status
-
-The included suite contains **59 automated tests**, all passing:
-
-- 53 preserved Assignment 3 tests
-- 6 new Assignment 4 tests (4 unit, 2 integration)
 
 ## Input format notes
 
-### `MATERIALS`
+### `MATERIALS` / `SECTIONS`
+
+The current format separates materials (E, α, ρ) from sections (A, I, depth):
+
+```text
+MATERIALS n
+<id> <E> [alpha] [density] [name]
+
+SECTIONS n
+<id> <material_id> <A> <I> [depth] [name]
+```
+
+A legacy single-block shape (no `SECTIONS`) is still accepted for backward
+compatibility — the parser synthesises a 1:1 Material+Section pair:
 
 ```text
 MATERIALS n

@@ -402,12 +402,17 @@ class MainWindow(QMainWindow):
                                        triggered=self._open_material_list)
         self.act_building_wizard = QAction(
             _make_building_icon(),
-            "&Building wizard…", self,
+            "&Building Wizard…", self,
             shortcut="Ctrl+B",
             statusTip="Generate a portal-frame building from typed stories, "
-                       "bays, and dimensions (Ctrl+B).",
+                       "bays, dimensions, and separate beam / column "
+                       "sections (Ctrl+B).",
             triggered=self._do_building_wizard,
         )
+        self.act_building_wizard.setToolTip("Building Wizard (Ctrl+B)")
+        # Caption shown under the toolbar icon (clean text, no mnemonic
+        # or ellipsis); the menu entry keeps the full "&Building Wizard…".
+        self.act_building_wizard.setIconText("Building Wizard")
         self.act_batch_assign = QAction(
             "&Batch assign properties…", self,
             triggered=self._do_batch_assign_selected,
@@ -971,6 +976,16 @@ class MainWindow(QMainWindow):
             tb.addAction(self._tool_actions[name])
         tb.addSeparator()
         tb.addAction(self.act_building_wizard)
+        # Show the "Building Wizard" caption UNDER the toolbar icon (the
+        # other tool buttons stay icon-only). Makes the wizard
+        # discoverable at a glance instead of relying on hover-tooltip.
+        self._building_wizard_button = tb.widgetForAction(
+            self.act_building_wizard
+        )
+        if self._building_wizard_button is not None:
+            self._building_wizard_button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+            )
 
         # Case selector — sits IMMEDIATELY above Solve so the
         # toolbar reads "[case combo] → Solve". The combo is hidden
@@ -3216,12 +3231,12 @@ class MainWindow(QMainWindow):
         try:
             d = BuildingWizardDialog(self, model=self._model)
         except ValueError as exc:
-            QMessageBox.warning(self, "Building wizard", str(exc))
+            QMessageBox.warning(self, "Building Wizard", str(exc))
             return
         if self._model.nodes or self._model.elements:
             ans = QMessageBox.question(
                 self, "Replace model?",
-                "The building wizard will replace the current model "
+                "The Building Wizard will replace the current model "
                 "(materials and sections are kept). Use Undo to restore.\n\n"
                 "Continue?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -3234,7 +3249,7 @@ class MainWindow(QMainWindow):
         self.execute(ReplaceModelCmd(new_model=d.result_value))
         self.canvas.fit_to_view()
         self.set_status(
-            f"Building wizard: created {len(self._model.nodes)} nodes, "
+            f"Building Wizard: created {len(self._model.nodes)} nodes, "
             f"{len(self._model.elements)} elements."
         )
 

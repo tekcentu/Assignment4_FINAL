@@ -1811,6 +1811,108 @@ def test_building_wizard_action_undoable(qt_app):
     assert len(w._model.elements) == 0
 
 
+def _is_column(elem, nodes) -> bool:
+    """A generated column is vertical (its two nodes share an x)."""
+    ni, nj = nodes[elem.node_i], nodes[elem.node_j]
+    return abs(ni.x - nj.x) < 1e-9
+
+
+def test_building_wizard_toolbar_button_shows_caption(qt_app):
+    """The toolbar button shows a visible 'Building Wizard' caption under
+    its icon (not icon-only), so it is discoverable without hovering."""
+    from PyQt6.QtCore import Qt
+
+    w = MainWindow()
+    btn = getattr(w, "_building_wizard_button", None)
+    assert btn is not None
+    assert btn.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+    # iconText drives the under-icon caption; menu text keeps the full label.
+    assert w.act_building_wizard.iconText() == "Building Wizard"
+    assert "Building Wizard" in w.act_building_wizard.text()
+
+
+def test_building_wizard_has_separate_beam_column_section_inputs(qt_app):
+    """The wizard exposes distinct column / beam section selectors, both
+    populated from the existing section library."""
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+
+    w = MainWindow()
+    d = BuildingWizardDialog(w, model=w._model)
+    assert hasattr(d, "_col_sec_combo") and hasattr(d, "_beam_sec_combo")
+    n_sections = len(w._model.sections)
+    assert d._col_sec_combo.count() == n_sections
+    assert d._beam_sec_combo.count() == n_sections
+
+
+def test_building_wizard_assigns_distinct_beam_column_sections(qt_app):
+    """Columns receive the selected column section; beams the beam section."""
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+
+    w = MainWindow()
+    sids = sorted(w._model.sections)
+    assert len(sids) >= 2
+    col_sid, beam_sid = sids[1], sids[0]
+
+    d = BuildingWizardDialog(w, model=w._model)
+    d._stories.setValue(2)
+    d._bays.setValue(2)
+    d._col_sec_combo.setCurrentIndex(d._col_sec_combo.findData(col_sid))
+    d._beam_sec_combo.setCurrentIndex(d._beam_sec_combo.findData(beam_sid))
+    m = d._accept()
+
+    cols = [e for e in m.elements if _is_column(e, m.nodes)]
+    beams = [e for e in m.elements if not _is_column(e, m.nodes)]
+    assert cols and beams
+    assert all(e.section_id == col_sid for e in cols)
+    assert all(e.section_id == beam_sid for e in beams)
+    col_sec = w._model.sections[col_sid]
+    beam_sec = w._model.sections[beam_sid]
+    assert all(abs(e.I - col_sec.I) < 1e-15 for e in cols)
+    assert all(abs(e.I - beam_sec.I) < 1e-15 for e in beams)
+
+
+def test_building_wizard_defaults_both_sections_to_first(qt_app):
+    """Backward-compat: unchanged selectors default to the first section
+    for both beams and columns (the legacy single-section behaviour)."""
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+
+    w = MainWindow()
+    first_sid = sorted(w._model.sections)[0]
+    d = BuildingWizardDialog(w, model=w._model)
+    assert d._col_sec_combo.currentData() == first_sid
+    assert d._beam_sec_combo.currentData() == first_sid
+    m = d._accept()
+    assert all(e.section_id == first_sid for e in m.elements)
+
+
+def test_building_wizard_rejects_invalid_section(qt_app):
+    """A missing/invalid section selection raises a clear validation error
+    instead of generating an invalid model."""
+    import pytest
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+
+    w = MainWindow()
+    d = BuildingWizardDialog(w, model=w._model)
+    d._col_sec_combo.clear()  # currentData() -> None
+    with pytest.raises(ValueError, match="column section"):
+        d._accept()
+
+
+def test_building_wizard_model_is_solvable(qt_app):
+    """A generated frame still runs through the analysis pipeline."""
+    from structural_analysis.gui_qt.dialogs import BuildingWizardDialog
+    from structural_analysis.main import run_analysis
+
+    w = MainWindow()
+    d = BuildingWizardDialog(w, model=w._model)
+    d._stories.setValue(2)
+    d._bays.setValue(2)
+    d._fixed_base.setChecked(True)
+    m = d._accept()
+    result = run_analysis(m, verbose=False)
+    assert result.status == "ok"
+
+
 # ── v0.9.0: analysis settings dialog + mass / self-weight summary ──
 
 

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "title": "Final Demo C - Portal frame BACKUP (quick-load fallback)",
+  "units": "kN_m",
+  "grid": {
+    "x": [],
+    "y": []
+  },
+  "view": {
+    "xlim": [-2.0, 8.0],
+    "ylim": [-2.0, 6.0],
+    "snap_kinds": ["endpoint", "midpoint", "node", "project"]
+  },
+  "model_txt": "TITLE\nFinal Demo C - Portal frame BACKUP (same model as demo_portal_frame)\n\nNODES 4\n1  0.0  0.0\n2  6.0  0.0\n3  0.0  4.0\n4  6.0  4.0\n\nMATERIALS 1\n1  33000000.0  1.0e-05  2500.0  Concrete_C30\n\nSECTIONS 1\n1  1  0.15  0.003125  0.5  Concrete_30x50\n\nELEMENTS 3\n1  1  3  1  FRAME\n2  2  4  1  FRAME\n3  3  4  1  FRAME\n\nSUPPORTS 2\n1  1  1  1\n2  1  1  1\n\nLOADS 1\n3  30.0  0.0  0.0\n\nMEMBER_UDL 1\n3  0.0  -15.0\n"
+}
