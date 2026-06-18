@@ -323,9 +323,16 @@ smoke tests.
   buckling.
 - **Static + modal** — no dynamic time-history or response-spectrum analysis.
 - **No design checks** — the program reports demands, not code utilization.
-- **Self-weight on rigid end zones** is neglected (the rigid offset zones carry
-  no distributed self-weight in the current version — a documented modelling
-  approximation).
+- **Loads over rigid end-offset zones are not transferred to the joints.** When a
+  frame member has rigid end offsets (`offset_i`/`offset_j`), member loads (UDLs,
+  point loads) and self-weight are integrated over the **flexible span only**; the
+  rigid zones are idealised as part of the joint and carry no distributed load.
+  As a result, for a UDL applied across the full element the summed vertical
+  reactions equal `w · L_flex`, **not** `w · L_total`. This is a deliberate,
+  internally-consistent convention (point loads placed inside a rigid zone are
+  rejected with an error rather than silently relocated), but it differs from
+  tools such as SAP2000, which transfer the rigid-zone tributary load to the
+  adjacent joint. Benchmark rigid-offset member-load totals with this in mind.
 - **Two `validate_model` functions** (core vs. GUI UX) share a name across
   layers; correct by design but a potential point of confusion.
 - **`element_graphics`** (a GUI-package module) holds the N/V/M mechanics rather

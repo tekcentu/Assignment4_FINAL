@@ -86,8 +86,10 @@ QT_QPA_PLATFORM=offscreen python -m pytest -q
 | Demo video link | [`video_link.txt`](video_link.txt) |
 
 **Known limitations.** 2D only; linear-elastic; static + modal analysis (no
-nonlinearity, P-Δ, dynamics, or design-code checks); self-weight on rigid end
-zones is neglected. See the report's limitations section for the full list.
+nonlinearity, P-Δ, dynamics, or design-code checks); member loads and self-weight
+over rigid end-offset zones are integrated on the flexible span only (a UDL across
+an offset member sums to `w·L_flex`, not `w·L_total`) — a deliberate, documented
+convention. See the report's limitations section for the full list.
 
 # Architecture
 
