@@ -147,15 +147,18 @@ def evaluate_internal_force(
         return 0.0, None
     N_i, V_i, M_i, _N_j, _V_j, _M_j = (float(v) for v in f_local)
 
-    # Rigid end offsets (v0.31.0): member loads act on the flexible
-    # span [e_i, L − e_j], so the distributed-load terms accumulate
-    # from x = e_i, not x = 0. ``f_local`` is at the analytical joints;
-    # the rigid zones carry no member load, so the joint values carry
-    # linearly across them (M(e_i) = −M_i + V_i·e_i). Samplers restrict
-    # the plotted domain to the flexible span — see
-    # :func:`diagram_domain`. Zero offsets reduce every formula to the
-    # legacy form exactly.
-    e_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
+    # Rigid end offsets: a UDL is applied over the FULL analytical member
+    # (incl. the rigid end zones — see FrameElement2D.local_consistent_load),
+    # so the distributed-load terms accumulate from x = 0, exactly as for
+    # a member with no offsets. ``f_local`` is at the analytical joints, so
+    # the cantilever-from-joint reconstruction V(x)=V_i+w·x,
+    # M(x)=−M_i+V_i·x+½w·x² is correct over the whole member and reproduces
+    # the textbook SS-beam result on the flexible span. (Point loads remain
+    # flexible-span-only — they are rejected inside a rigid zone — so their
+    # station ``a`` is still measured from node i.) Samplers restrict the
+    # PLOTTED domain to the flexible span (display choice — see
+    # :func:`diagram_domain`); the values they show already include the
+    # rigid-zone load via this from-x=0 integration.
 
     # Project each mechanical load onto the element's local axes so the
     # diagram math sees the same (wx_l, wy_l) / (px_l, py_l) the FEM
@@ -187,11 +190,11 @@ def evaluate_internal_force(
 
     if kind == "axial":
         # N(x) tension-positive, derived from left-FBD equilibrium:
-        #   N(x) = -N_i - wx_local * (x - e_i) - Σ px_local for a < x
-        # When there are no axial member loads this collapses to the
-        # constant -N_i used by every existing test.
+        #   N(x) = -N_i - wx_local * x - Σ px_local for a < x
+        # The UDL accumulates from x = 0 (full-member load). When there
+        # are no axial member loads this collapses to the constant -N_i.
         def axial(x):
-            n = -N_i - udl_wx_total * max(0.0, x - e_i)
+            n = -N_i - udl_wx_total * x
             for a, px in axial_points:
                 if x > a:
                     n -= px
@@ -203,7 +206,7 @@ def evaluate_internal_force(
 
     if kind == "shear":
         def shear(x):
-            v = V_i + udl_wy_total * max(0.0, x - e_i)
+            v = V_i + udl_wy_total * x
             for a, py in transverse_points:
                 if x > a:
                     v += py
@@ -212,8 +215,7 @@ def evaluate_internal_force(
 
     if kind == "moment":
         def moment(x):
-            xw = max(0.0, x - e_i)
-            m = -M_i + V_i * x + 0.5 * udl_wy_total * xw * xw
+            m = -M_i + V_i * x + 0.5 * udl_wy_total * x * x
             for a, py in transverse_points:
                 if x > a:
                     m += py * (x - a)

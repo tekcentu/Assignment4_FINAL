@@ -1,14 +1,16 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.40.9"
+__version__ = "0.41.0"
 __what_is_new__ = (
-    "Fix: N/V/M diagrams + station export use case-filtered / factored "
-    "member loads (matches the displayed combination) · "
-    "Display: shear/moment diagrams use a canonical display direction "
-    "(left→right or bottom→top) so node-order doesn't affect the visual · "
-    "Shear side is world-anchored: +V above/right, −V below/left (SAP-like) · "
-    "Top-right release badge: stacked rows so menu titles never get crowded · "
-    "Numerical sample_internal_force, station export, hover read-outs unchanged"
+    "Mechanics fix: a UDL on a frame member with rigid end offsets now "
+    "loads the FULL member (ΣR = w·L_total), with rigid-zone load "
+    "transferred to the joints (force + moment); inclined members verified "
+    "by global equilibrium · "
+    "Diagrams integrate the UDL from x=0 so flexible-span values stay "
+    "consistent with the full-length load · "
+    "Shear/moment display: canonical direction + world-anchored side "
+    "(node-order invariant, +V above/right) · "
+    "Numerical reactions for point/thermal/self-weight paths unchanged"
 )
 
 from .model import (
