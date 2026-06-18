@@ -2409,7 +2409,14 @@ class MainWindow(QMainWindow):
         t = max(0.0, min(1.0, t))
         x_loc = t * L
         kind = self.canvas.diagram_kind
-        value = _diagram_value(elem, ni, nj, mr["f_local"], kind, x_loc)
+        result_loads = (
+            getattr(self._result, "effective_member_loads", {})
+            .get(elem.id)
+        )
+        value = _diagram_value(
+            elem, ni, nj, mr["f_local"], kind, x_loc,
+            member_loads=result_loads,
+        )
         if value is None:
             return None
         # Convert the result value to the active display preset; the x
@@ -3548,9 +3555,19 @@ class MainWindow(QMainWindow):
             ni = self._model.nodes[elem.node_i]
             nj = self._model.nodes[elem.node_j]
             f_local = list(mr["f_local"])
-            xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local, "axial")
-            xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local, "shear")
-            xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local, "moment")
+            result_loads = (
+                getattr(self._result, "effective_member_loads", {})
+                .get(elem.id)
+            )
+            xs_n, ys_n = sample_internal_force(
+                elem, ni, nj, f_local, "axial", member_loads=result_loads,
+            )
+            xs_v, ys_v = sample_internal_force(
+                elem, ni, nj, f_local, "shear", member_loads=result_loads,
+            )
+            xs_m, ys_m = sample_internal_force(
+                elem, ni, nj, f_local, "moment", member_loads=result_loads,
+            )
             if xs_n is None:
                 continue
             for i, x in enumerate(xs_n):

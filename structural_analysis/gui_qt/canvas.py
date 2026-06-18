@@ -2224,8 +2224,13 @@ class ModelCanvas(QWidget):
             # counts (e.g. 5) may miss the true peak between stations —
             # surfaced to the user via the menu tooltip + status hint.
             n = max(2, int(self.diagram_stations))
+            result_loads = (
+                getattr(result, "effective_member_loads", {})
+                .get(elem.id)
+            )
             xs, ys = _diagram_ordinates(
                 elem, ni, nj, mr["f_local"], self.diagram_kind, n_samples=n,
+                member_loads=result_loads,
             )
             if xs is None:
                 continue

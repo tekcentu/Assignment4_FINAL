@@ -277,6 +277,10 @@ def run_analysis(
         G_vectors={e.id: dofs.g_vector_for_display(e) for e in model.elements},
         K=K, F=F, D=D, residual=residual,
         member_results=member_results,
+        effective_member_loads={
+            e.id: list(getattr(e, "member_loads", []) or [])
+            for e in model.elements
+        },
         reactions=reactions, eq_residual=eq_res,
         elem_data=elem_data,
     )

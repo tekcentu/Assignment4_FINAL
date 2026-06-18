@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.40.2"
+__version__ = "0.40.3"
 __what_is_new__ = (
-    "File → Export station results CSV (21 stations/member, SAP-compare) · "
-    "Columns scaled to active Units V1 preset · "
-    "Truss rows emit N only"
+    "Active load-case member-load N/V/M reconstruction · "
+    "Case/combination diagrams use effective member loads · "
+    "Station export and hover share active result path"
 )
 
 from .model import (

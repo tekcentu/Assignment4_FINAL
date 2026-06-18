@@ -3729,6 +3729,10 @@ class ElementPropertiesDialog(QDialog):
         self._f_local_ref = (
             list(f_local_raw) if f_local_raw is not None else None
         )
+        self._effective_member_loads_ref = (
+            getattr(ok_result, "effective_member_loads", {}).get(elem.id)
+            if ok_result is not None else None
+        )
         self._cursors = []
         self._maxima_annotations = []
         if self._f_local_ref is not None:
@@ -4070,13 +4074,16 @@ class ElementPropertiesDialog(QDialog):
             c.set_alpha(0.7)
         n_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "axial", x)
+            self._f_local_ref, "axial", x,
+            member_loads=self._effective_member_loads_ref)
         v_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "shear", x)
+            self._f_local_ref, "shear", x,
+            member_loads=self._effective_member_loads_ref)
         m_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "moment", x)
+            self._f_local_ref, "moment", x,
+            member_loads=self._effective_member_loads_ref)
         self._lbl_x.setText(f"x: {x:.3f} m")
         self._lbl_N.setText(f"N: {n_val:.3f} kN"
                             if n_val is not None else "N: —")
@@ -4107,6 +4114,7 @@ class ElementPropertiesDialog(QDialog):
                 xs, ys = self._sample_internal_force(
                     self._elem_ref, self._ni_ref, self._nj_ref,
                     self._f_local_ref, kind, n_samples=101,
+                    member_loads=self._effective_member_loads_ref,
                 )
                 if xs is None or ys is None:
                     continue
@@ -4161,13 +4169,16 @@ def _direction_label_for_row(row) -> str:
 
         n_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "axial", x)
+            self._f_local_ref, "axial", x,
+            member_loads=self._effective_member_loads_ref)
         v_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "shear", x)
+            self._f_local_ref, "shear", x,
+            member_loads=self._effective_member_loads_ref)
         m_val = self._internal_force_at(
             self._elem_ref, self._ni_ref, self._nj_ref,
-            self._f_local_ref, "moment", x)
+            self._f_local_ref, "moment", x,
+            member_loads=self._effective_member_loads_ref)
 
         self._lbl_x.setText(f"x: {x:.3f} m")
         self._lbl_N.setText(f"N: {n_val:.3f} kN"
@@ -4196,6 +4207,7 @@ def _direction_label_for_row(row) -> str:
                 xs, ys = self._sample_internal_force(
                     self._elem_ref, self._ni_ref, self._nj_ref,
                     self._f_local_ref, kind, n_samples=101,
+                    member_loads=self._effective_member_loads_ref,
                 )
                 if xs is None or ys is None:
                     continue

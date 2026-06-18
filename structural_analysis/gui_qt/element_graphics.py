@@ -26,7 +26,7 @@ Public surface:
 from __future__ import annotations
 
 import math
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
@@ -51,6 +51,7 @@ from ..profiles import section_outline
 
 def evaluate_internal_force(
     elem, ni: Node, nj: Node, f_local, kind: str,
+    member_loads: Sequence | None = None,
 ) -> tuple[float, Optional[Callable[[float], float]]]:
     """Build a single-x evaluator ``f(x_loc) -> value`` for ``kind`` on
     this element. Returns ``(L, evaluator)``; ``evaluator`` is ``None``
@@ -97,7 +98,12 @@ def evaluate_internal_force(
     udl_wy_total = 0.0
     axial_points: list[tuple[float, float]] = []
     transverse_points: list[tuple[float, float]] = []
-    for ml in getattr(elem, "member_loads", []):
+    loads_for_result = (
+        list(member_loads)
+        if member_loads is not None
+        else list(getattr(elem, "member_loads", []) or [])
+    )
+    for ml in loads_for_result:
         if isinstance(ml, UniformDistributedLoad):
             wx_l, wy_l = _project_load_to_local(
                 ml.wx, ml.wy, ml.coord_system, c, s,
@@ -169,6 +175,7 @@ def diagram_domain(elem, ni: Node, nj: Node) -> tuple[float, float]:
 
 def sample_internal_force(
     elem, ni: Node, nj: Node, f_local, kind: str, n_samples: int = 21,
+    member_loads: Sequence | None = None,
 ):
     """Discretise :func:`evaluate_internal_force` at ``n_samples``
     evenly spaced station points along the element. Returns
@@ -183,7 +190,9 @@ def sample_internal_force(
         raise ValueError(
             f"n_samples must be >= 2 to form a polyline, got {n_samples}"
         )
-    L, fn = evaluate_internal_force(elem, ni, nj, f_local, kind)
+    L, fn = evaluate_internal_force(
+        elem, ni, nj, f_local, kind, member_loads=member_loads,
+    )
     if fn is None:
         return None, None
     # Stations cover the flexible span only (== [0, L] without rigid
@@ -198,12 +207,15 @@ def sample_internal_force(
 
 def internal_force_at(
     elem, ni: Node, nj: Node, f_local, kind: str, x_loc: float,
+    member_loads: Sequence | None = None,
 ) -> Optional[float]:
     """Return the diagram value at arc-length ``x_loc`` along the
     element, or ``None`` if the kind doesn't apply. Used by the
     canvas hover handler to report the value at the projected cursor.
     """
-    L, fn = evaluate_internal_force(elem, ni, nj, f_local, kind)
+    L, fn = evaluate_internal_force(
+        elem, ni, nj, f_local, kind, member_loads=member_loads,
+    )
     if fn is None:
         return None
     x_start, x_end = diagram_domain(elem, ni, nj)
@@ -429,7 +441,8 @@ def _draw_member_sketch(ax, elem, ni: Node, nj: Node,
 
 def _draw_fbd(ax, elem, ni: Node, nj: Node,
               f_local: Optional[list],
-              section: Optional[Section] = None) -> None:
+              section: Optional[Section] = None,
+              member_loads: Sequence | None = None) -> None:
     """Free body diagram in LOCAL coordinate frame.
 
     Member drawn as a horizontal line x ∈ [0, L].  Loads and end-force
@@ -474,7 +487,12 @@ def _draw_fbd(ax, elem, ni: Node, nj: Node,
     udls: list[float] = []
     points_list: list[tuple[float, float]] = []
     thermals: list[str] = []
-    for ml in getattr(elem, "member_loads", []):
+    loads_for_result = (
+        list(member_loads)
+        if member_loads is not None
+        else list(getattr(elem, "member_loads", []) or [])
+    )
+    for ml in loads_for_result:
         if isinstance(ml, UniformDistributedLoad):
             _wx_l, wy_l = _project_load_to_local(
                 ml.wx, ml.wy, ml.coord_system, c_fbd, s_fbd,
@@ -909,7 +927,15 @@ def draw_element_detail(
     # ── Upper panels (local frame) ────────────────────────────────
     if want_sketch_fbd:
         _draw_member_sketch(ax_sketch, elem, ni, nj, section)
-        _draw_fbd(ax_fbd, elem, ni, nj, f_local, section)
+        result_loads = (
+            getattr(result, "effective_member_loads", {})
+            .get(elem.id)
+            if result is not None else None
+        )
+        _draw_fbd(
+            ax_fbd, elem, ni, nj, f_local, section,
+            member_loads=result_loads,
+        )
         if ax_section is not None:
             _draw_section_thumbnail(ax_section, section)
 
@@ -937,12 +963,22 @@ def draw_element_detail(
                         ha="center", va="center", color="#bbb", fontsize=8,
                         style="italic")
         else:
-            xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local,
-                                                "axial",  n_samples)
-            xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local,
-                                                "shear",  n_samples)
-            xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local,
-                                                "moment", n_samples)
+            result_loads = (
+                getattr(result, "effective_member_loads", {})
+                .get(elem.id)
+            )
+            xs_n, ys_n = sample_internal_force(
+                elem, ni, nj, f_local, "axial", n_samples,
+                member_loads=result_loads,
+            )
+            xs_v, ys_v = sample_internal_force(
+                elem, ni, nj, f_local, "shear", n_samples,
+                member_loads=result_loads,
+            )
+            xs_m, ys_m = sample_internal_force(
+                elem, ni, nj, f_local, "moment", n_samples,
+                member_loads=result_loads,
+            )
 
             _draw_single_nvm_diagram(ax_n, xs_n, ys_n, "N", "kN",
                                      color=_DIAGRAM_COLOR["axial"])

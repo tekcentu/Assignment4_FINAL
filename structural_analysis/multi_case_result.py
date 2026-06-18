@@ -12,13 +12,53 @@ already-solved cases.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
 import numpy as np
 
-from .model import AnalysisResult, StructuralModel
+from .model import (
+    AnalysisResult,
+    FrameTemperatureLoad,
+    PointLoad,
+    TrussTemperatureLoad,
+    UniformDistributedLoad,
+)
 
+
+def _scale_member_load(load, coeff: float):
+    """Return a copy of ``load`` scaled for a derived result view.
+
+    This is post-processing metadata only: it preserves the solved FEM
+    math while giving N/V/M reconstruction the same effective load set
+    as the active case, SUM_ALL, or user combination.
+    """
+    c = float(coeff)
+    if isinstance(load, UniformDistributedLoad):
+        return replace(load, wx=load.wx * c, wy=load.wy * c)
+    if isinstance(load, PointLoad):
+        return replace(load, px=load.px * c, py=load.py * c)
+    if isinstance(load, TrussTemperatureLoad):
+        return replace(load, delta_T=load.delta_T * c)
+    if isinstance(load, FrameTemperatureLoad):
+        return replace(
+            load,
+            t_top=load.t_top * c,
+            t_bottom=load.t_bottom * c,
+        )
+    return load
+
+
+def _combine_effective_member_loads(
+    pairs: list[tuple[AnalysisResult, float]],
+) -> dict[int, list]:
+    buckets: dict[int, list] = {}
+    for result, coeff in pairs:
+        for eid, loads in getattr(result, "effective_member_loads", {}).items():
+            buckets.setdefault(eid, []).extend(
+                _scale_member_load(load, coeff) for load in loads
+            )
+    return buckets
 
 # Sentinel string the GUI uses to select the SUM_ALL view in toolbar
 # combos / dialog dropdowns. Never written to disk and never a key in
@@ -281,6 +321,7 @@ def _combine_results(
         D=D_sum,
         residual=max_res,
         member_results=combined_member_results,
+        effective_member_loads=_combine_effective_member_loads(pairs),
         reactions=reactions_sum,
         eq_residual=max_eqres,
         elem_data=first.elem_data,

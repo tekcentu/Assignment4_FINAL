@@ -712,6 +712,13 @@ class AnalysisResult:
     # Step E
     member_results: dict[int, dict] = field(default_factory=dict)
 
+    # Member loads that are effective for this particular result view,
+    # keyed by element id. Per-case results contain only that case's
+    # loads; derived combinations contain scaled referenced-case loads.
+    # Diagram reconstruction must read this instead of raw
+    # ``elem.member_loads`` so active-case views stay isolated.
+    effective_member_loads: dict[int, list] = field(default_factory=dict)
+
     # Step F
     reactions: dict[int, dict[str, float]] = field(default_factory=dict)
     eq_residual: float = 0.0
