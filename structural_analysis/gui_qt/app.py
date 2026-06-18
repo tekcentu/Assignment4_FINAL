@@ -2387,6 +2387,7 @@ class MainWindow(QMainWindow):
         Returns ``None`` when no value is meaningful (truss + shear /
         moment, or the kind doesn't apply)."""
         from .canvas import _diagram_value
+        from .element_graphics import effective_member_loads
         if self._result is None or not self._result.member_results:
             return None
         elem = next((e for e in self._model.elements
@@ -2409,7 +2410,11 @@ class MainWindow(QMainWindow):
         t = max(0.0, min(1.0, t))
         x_loc = t * L
         kind = self.canvas.diagram_kind
-        value = _diagram_value(elem, ni, nj, mr["f_local"], kind, x_loc)
+        eff_loads = effective_member_loads(
+            elem, self._active_case, self._model.load_combinations,
+        )
+        value = _diagram_value(elem, ni, nj, mr["f_local"], kind, x_loc,
+                               member_loads=eff_loads)
         if value is None:
             return None
         # Convert the result value to the active display preset; the x
@@ -3522,7 +3527,9 @@ class MainWindow(QMainWindow):
         only N (V/M cells left blank). Station count = 21 (≈ SAP's
         1/20 span output)."""
         import csv
-        from .element_graphics import sample_internal_force
+        from .element_graphics import (
+            effective_member_loads, sample_internal_force,
+        )
         from ..gui_common import units as _units_mod
 
         if self._result is None or not getattr(
@@ -3548,9 +3555,19 @@ class MainWindow(QMainWindow):
             ni = self._model.nodes[elem.node_i]
             nj = self._model.nodes[elem.node_j]
             f_local = list(mr["f_local"])
-            xs_n, ys_n = sample_internal_force(elem, ni, nj, f_local, "axial")
-            xs_v, ys_v = sample_internal_force(elem, ni, nj, f_local, "shear")
-            xs_m, ys_m = sample_internal_force(elem, ni, nj, f_local, "moment")
+            # Match the displayed result: case-filtered / factored span
+            # loads and the same vertical-jump stations as the canvas so
+            # exported numbers equal what the diagram shows.
+            eff_loads = effective_member_loads(
+                elem, self._active_case, self._model.load_combinations,
+            )
+            kw = dict(member_loads=eff_loads, split_discontinuities=True)
+            xs_n, ys_n = sample_internal_force(
+                elem, ni, nj, f_local, "axial", **kw)
+            xs_v, ys_v = sample_internal_force(
+                elem, ni, nj, f_local, "shear", **kw)
+            xs_m, ys_m = sample_internal_force(
+                elem, ni, nj, f_local, "moment", **kw)
             if xs_n is None:
                 continue
             for i, x in enumerate(xs_n):
