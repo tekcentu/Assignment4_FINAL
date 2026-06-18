@@ -147,16 +147,14 @@ def evaluate_internal_force(
         return 0.0, None
     N_i, V_i, M_i, _N_j, _V_j, _M_j = (float(v) for v in f_local)
 
-    # Rigid end offsets (v0.31.0): member loads act on the flexible
-    # span [e_i, L − e_j], so the distributed-load terms accumulate
-    # from x = e_i, not x = 0. ``f_local`` is at the analytical joints;
-    # the rigid zones carry no member load, so the joint values carry
-    # linearly across them (M(e_i) = −M_i + V_i·e_i). Samplers restrict
-    # the plotted domain to the flexible span — see
+    # Rigid end offsets (v0.31.0): ``f_local`` is at the analytical
+    # joints. Uniform member loads act over the full analytical member,
+    # including rigid end zones, so their diagram terms accumulate from
+    # x = 0. Point loads keep their analytical station ``a`` and are
+    # still validated by the solver to lie on the flexible span.
+    # Samplers restrict the plotted domain to the flexible span — see
     # :func:`diagram_domain`. Zero offsets reduce every formula to the
     # legacy form exactly.
-    e_i = float(getattr(elem, "offset_i", 0.0) or 0.0)
-
     # Project each mechanical load onto the element's local axes so the
     # diagram math sees the same (wx_l, wy_l) / (px_l, py_l) the FEM
     # math used (see element._project_load_to_local). For local loads
@@ -187,11 +185,11 @@ def evaluate_internal_force(
 
     if kind == "axial":
         # N(x) tension-positive, derived from left-FBD equilibrium:
-        #   N(x) = -N_i - wx_local * (x - e_i) - Σ px_local for a < x
+        #   N(x) = -N_i - wx_local * x - Σ px_local for a < x
         # When there are no axial member loads this collapses to the
         # constant -N_i used by every existing test.
         def axial(x):
-            n = -N_i - udl_wx_total * max(0.0, x - e_i)
+            n = -N_i - udl_wx_total * x
             for a, px in axial_points:
                 if x > a:
                     n -= px
@@ -203,7 +201,7 @@ def evaluate_internal_force(
 
     if kind == "shear":
         def shear(x):
-            v = V_i + udl_wy_total * max(0.0, x - e_i)
+            v = V_i + udl_wy_total * x
             for a, py in transverse_points:
                 if x > a:
                     v += py
@@ -212,8 +210,7 @@ def evaluate_internal_force(
 
     if kind == "moment":
         def moment(x):
-            xw = max(0.0, x - e_i)
-            m = -M_i + V_i * x + 0.5 * udl_wy_total * xw * xw
+            m = -M_i + V_i * x + 0.5 * udl_wy_total * x * x
             for a, py in transverse_points:
                 if x > a:
                     m += py * (x - a)

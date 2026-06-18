@@ -342,10 +342,12 @@ class FrameElement2D(Element2D):
     release condensation on k_joint → rotate local→global. Nodal loads
     stay at the analytical joints; the lever-arm transfer to the
     flexible face is captured by ``Tᵀ`` (master–slave rigid link), not
-    by moving loads. Member loads act on the flexible span only; their
-    fixed-end vectors are built on ``L_flex`` at the faces and mapped
-    to joint coordinates via ``Tᵀ``. With both offsets zero every path
-    short-circuits to the legacy formulas — results are bit-identical.
+    by moving loads. Uniform member loads act over the full analytical
+    member length: the flexible-span fixed-end vector is mapped back
+    with ``Tᵀ`` and the load portions inside the rigid end zones are
+    added directly as joint force/moment resultants. With both offsets
+    zero every path short-circuits to the legacy formulas — results are
+    bit-identical.
     """
 
     I: float = 0.0
@@ -525,28 +527,46 @@ class FrameElement2D(Element2D):
                 (use FrameTemperatureLoad with equal t_top/t_bottom instead).
         """
         L, c, s = self.length_cos_sin(nodes)
-        # Rigid offsets: member loads act on the FLEXIBLE span only.
-        # Fixed-end vectors are built on L_eff at the offset faces; the
-        # Tᵀ map at the end of this method carries them to the joints
-        # (face shear × rigid arm becomes a joint moment). Zero offsets
-        # ⇒ L_eff == L, x0 == 0, no transform — legacy math unchanged.
+        # Rigid offsets: stiffness is on the FLEXIBLE span, but uniform
+        # member loads are defined over the full analytical member. Build
+        # the fixed-end vector for the flexible portion at the offset
+        # faces, map it back with Tᵀ, then add direct joint resultants
+        # from the load portions that lie inside the rigid end zones.
+        # Zero offsets ⇒ L_eff == L, x0 == 0, no transform — legacy math
+        # unchanged.
         x0 = self.offset_i
         L_eff = self.flexible_length(nodes) if self.has_offsets else L
         p = np.zeros(6)
+        p_rigid = np.zeros(6)
         for load in self.member_loads:
             if isinstance(load, UniformDistributedLoad):
                 wx_l, wy_l = _project_load_to_local(
                     load.wx, load.wy, load.coord_system, c, s,
                 )
-                # Axial (linear shape functions): half to each end.
+                # Axial (linear shape functions): half of the flexible
+                # portion to each face. Rigid-zone portions are direct
+                # joint forces because rigid arms have no axial strain
+                # interpolation along their length.
                 if wx_l != 0.0:
                     p += np.array([wx_l*L_eff/2, 0, 0, wx_l*L_eff/2, 0, 0])
-                # Transverse (Hermite cubics): wL/2 and ±wL²/12.
+                # Transverse (Hermite cubics): wL/2 and ±wL²/12 on the
+                # flexible span; rigid-zone shears/moments are added
+                # below after the face-to-joint Tᵀ mapping.
                 if wy_l != 0.0:
                     p += np.array([
                         0, wy_l*L_eff/2, wy_l*L_eff**2/12,
                         0, wy_l*L_eff/2, -wy_l*L_eff**2/12,
                     ])
+                if self.has_offsets:
+                    ei = self.offset_i
+                    ej = self.offset_j
+                    if wx_l != 0.0:
+                        p_rigid += np.array([wx_l*ei, 0, 0, wx_l*ej, 0, 0])
+                    if wy_l != 0.0:
+                        p_rigid += np.array([
+                            0, wy_l*ei, wy_l*ei**2/2.0,
+                            0, wy_l*ej, -wy_l*ej**2/2.0,
+                        ])
             elif isinstance(load, PointLoad):
                 a = float(load.a)
                 if not (0 <= a <= L + 1e-10):
@@ -614,7 +634,7 @@ class FrameElement2D(Element2D):
             # axial/moment pairs pass through unchanged (zero face
             # shear); UDL/point face shears pick up the rigid-arm
             # moment at the joints.
-            return self._offset_transform().T @ p
+            return self._offset_transform().T @ p + p_rigid
         return p
 
     def self_weight_fixed_end_local(self, nodes: dict) -> np.ndarray:
