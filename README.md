@@ -302,10 +302,3 @@ TRUSS_TEMPERATURE n
 
 The reported Q2(b) solution uses the **standard centerline idealization**. The thermal gradient of the concrete beam is modeled explicitly with `t_top = 0` and `t_bottom = +50`, which gives both a mean-temperature axial effect and a bending-gradient effect. Any secondary eccentricity between the beam centroidal axis and the bottom-fiber truss attachment is neglected as a higher-order refinement.
 
-## GitHub
-
-The public repository for this assignment lives at:
-
-`https://github.com/tekcentu/StructureGUI`
-
-Update the report cover page accordingly.
