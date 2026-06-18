@@ -35,6 +35,12 @@ from ..model import (
     TrussTemperatureLoad,
     UniformDistributedLoad,
 )
+from ..gui_common.load_view import (
+    visible_nodal_loads as _visible_nodal_loads,
+    visible_member_loads as _visible_member_loads,
+    ACTIVE_CASE as _LOAD_MODE_ACTIVE_CASE,
+    ALL as _LOAD_MODE_ALL,
+)
 from ..gui_common.geometry import (
     physical_member_polygon as _physical_member_polygon,
     physical_display_thickness as _physical_display_thickness,
@@ -220,6 +226,20 @@ class ModelCanvas(QWidget):
         self._active_case: str = "DEFAULT"
         self._active_case_loads_only: bool = True
         self._inactive_load_alpha: float = 0.35
+        # Load-glyph VISIBILITY mode (distinct from the alpha-dimming
+        # above). Decides which load arrows are drawn at all, before OR
+        # after a solve, driven purely by the active-case selection:
+        #   "active_case" → only the selected case's loads (a combination
+        #                    shows its referenced cases' loads factored;
+        #                    SUM_ALL shows everything)
+        #   "all"         → every load glyph (legacy view)
+        #   "hide"        → no load glyphs
+        # Kept in lock-step with ``_active_case_loads_only`` so the
+        # existing View toggle drives it, but exposed separately via
+        # ``set_load_display_mode`` for direct/host control. See
+        # ``gui_common.load_view``. Visual-only — no numeric result,
+        # N/V/M, reaction, or station value is touched by this.
+        self._load_display_mode: str = _LOAD_MODE_ACTIVE_CASE
         # PR #29: when a load COMBINATION is active, this holds the set
         # of constituent case names so loads from ANY of them render at
         # full alpha (signalling "all these cases contribute") while
@@ -474,11 +494,33 @@ class ModelCanvas(QWidget):
         self.redraw()
 
     def set_active_case_loads_only(self, on: bool) -> None:
-        """Host signal: toggle the "show only active-case loads" mode
-        (when off, all loads draw at full alpha)."""
-        if on == self._active_case_loads_only:
+        """Host signal: toggle the "show only active-case loads" mode.
+
+        ON  → active-case load glyphs only (the new visibility filter).
+        OFF → every load glyph at full alpha (the legacy "all" view).
+
+        Drives ``_load_display_mode`` so the existing View menu toggle is
+        the single control for load visibility; ``_active_case_loads_only``
+        is also kept in sync because ``_load_case_alpha`` still consults
+        it for combination/SUM_ALL highlighting."""
+        on = bool(on)
+        new_mode = _LOAD_MODE_ACTIVE_CASE if on else _LOAD_MODE_ALL
+        if on == self._active_case_loads_only and new_mode == self._load_display_mode:
             return
-        self._active_case_loads_only = bool(on)
+        self._active_case_loads_only = on
+        self._load_display_mode = new_mode
+        self.redraw()
+
+    def set_load_display_mode(self, mode: str) -> None:
+        """Host signal: set the load-glyph visibility mode directly
+        (``"active_case"`` / ``"all"`` / ``"hide"``). Keeps
+        ``_active_case_loads_only`` consistent for the alpha-dimming
+        helper. Idempotent on no-op."""
+        mode = str(mode)
+        if mode == self._load_display_mode:
+            return
+        self._load_display_mode = mode
+        self._active_case_loads_only = (mode == _LOAD_MODE_ACTIVE_CASE)
         self.redraw()
 
     def set_active_combination_cases(
@@ -1387,18 +1429,35 @@ class ModelCanvas(QWidget):
 
     def _draw_model(self) -> None:
         model = self._model()
-        # Pre-compute the largest force/UDL/point-load magnitude in the
-        # model so every drawn arrow length is proportional to the
-        # actual load magnitude relative to the rest of the model. We
-        # cap it at the model span so a runaway 1e9 load doesn't fill
+        # Resolve which load glyphs are visible for the active selection
+        # (case / combination / SUM_ALL) under the current visibility
+        # mode. Both the auto-scale pass below AND the draw passes use
+        # this exact set, so arrow lengths reflect only what's shown and
+        # combinations show factored magnitudes. Visual-only: no numeric
+        # result, member force, or station value is consulted here.
+        load_mode = self._load_display_mode
+        load_combos = model.load_combinations
+        visible_nodal = _visible_nodal_loads(
+            model, self._active_case, load_combos, load_mode,
+        )
+        visible_member_by_elem = {
+            elem.id: _visible_member_loads(
+                elem, self._active_case, load_combos, load_mode,
+            )
+            for elem in model.elements
+        }
+        # Pre-compute the largest force/UDL/point-load magnitude among the
+        # VISIBLE loads so every drawn arrow length is proportional to the
+        # actual load magnitude relative to the rest of the visible set.
+        # We cap it at the model span so a runaway 1e9 load doesn't fill
         # the screen.
         max_force = 0.0
         max_udl = 0.0
         max_point = 0.0
-        for ld in model.nodal_loads:
+        for ld in visible_nodal:
             max_force = max(max_force, (ld.fx ** 2 + ld.fy ** 2) ** 0.5)
-        for elem in model.elements:
-            for ml in getattr(elem, "member_loads", []):
+        for mls in visible_member_by_elem.values():
+            for ml in mls:
                 if isinstance(ml, UniformDistributedLoad):
                     max_udl = max(
                         max_udl, abs(ml.wy), abs(getattr(ml, "wx", 0.0)),
@@ -1498,7 +1557,10 @@ class ModelCanvas(QWidget):
                     release_xs.append(nj.x - 0.15 * (nj.x - ni.x))
                     release_ys.append(nj.y - 0.15 * (nj.y - ni.y))
                     release_edges.append(color)
-            self._draw_member_loads(elem, ni, nj, load_scales)
+            self._draw_member_loads(
+                elem, ni, nj, load_scales,
+                member_loads=visible_member_by_elem.get(elem.id),
+            )
 
         if self.show_physical_members:
             self._draw_physical_members(model)
@@ -1562,7 +1624,7 @@ class ModelCanvas(QWidget):
                 zorder=20,
             )
 
-        for ld in model.nodal_loads:
+        for ld in visible_nodal:
             n = model.nodes.get(ld.node_id)
             if n is None:
                 continue
@@ -1844,7 +1906,9 @@ class ModelCanvas(QWidget):
                              color="#2ca02c", zorder=6,
                              alpha=case_alpha)
 
-    def _draw_member_loads(self, elem, ni, nj, load_scales: dict) -> None:
+    def _draw_member_loads(
+        self, elem, ni, nj, load_scales: dict, member_loads=None,
+    ) -> None:
         """Draw each member load in its TRUE direction:
 
         * ``coord_system == "local"`` — axial component along the member
@@ -1860,8 +1924,15 @@ class ModelCanvas(QWidget):
         arrows (UDL: six along the element; PointLoad: one at ``a``).
         The arrow "tail offset" sign convention matches the legacy
         renderer so visual orientation stays consistent for existing
-        local loads."""
-        if not elem.member_loads:
+        local loads.
+
+        ``member_loads`` is the pre-filtered visible/effective load list
+        from ``gui_common.load_view`` (combination factors already
+        applied). It defaults to the element's own loads so direct callers
+        keep the legacy behaviour."""
+        if member_loads is None:
+            member_loads = elem.member_loads
+        if not member_loads:
             return
         L = ((nj.x - ni.x) ** 2 + (nj.y - ni.y) ** 2) ** 0.5
         if L < 1e-12:
@@ -1873,7 +1944,7 @@ class ModelCanvas(QWidget):
         udl_scale = load_scales.get("udl", 0.0)
         point_scale = load_scales.get("point", 0.0)
 
-        for ml in elem.member_loads:
+        for ml in member_loads:
             # PR-A: dim loads belonging to non-active cases when the
             # host has the "active case only" overlay on.
             case_alpha = self._load_case_alpha(ml)

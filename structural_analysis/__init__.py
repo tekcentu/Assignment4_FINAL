@@ -2,15 +2,9 @@
 
 __version__ = "0.41.0"
 __what_is_new__ = (
-    "Mechanics fix: a UDL on a frame member with rigid end offsets now "
-    "loads the FULL member (ΣR = w·L_total), with rigid-zone load "
-    "transferred to the joints (force + moment); inclined members verified "
-    "by global equilibrium · "
-    "Diagrams integrate the UDL from x=0 so flexible-span values stay "
-    "consistent with the full-length load · "
-    "Shear/moment display: canonical direction + world-anchored side "
-    "(node-order invariant, +V above/right) · "
-    "Numerical reactions for point/thermal/self-weight paths unchanged"
+    "Case selector now filters canvas load glyphs (works before solve) · "
+    "Combination shows factored effective loads · "
+    "SUM_ALL shows every load"
 )
 
 from .model import (
