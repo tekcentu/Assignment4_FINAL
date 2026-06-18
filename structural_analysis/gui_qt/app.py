@@ -763,18 +763,34 @@ class MainWindow(QMainWindow):
 
         # Top-right corner of the menu bar: version + what's-new summary
         # so the user always sees which features ship in this build.
-        self._version_label = QLabel(
-            f"  v{__version__} · {__what_is_new__}  ", self,
+        # Stacked vertically (one clause per row, smaller font) so the
+        # text never grows wide enough to crowd the File / Edit / View
+        # menu titles on the same row — the bug a long __what_is_new__
+        # string used to cause.
+        self._version_widget = QWidget(self)
+        _v_layout = QVBoxLayout(self._version_widget)
+        _v_layout.setContentsMargins(6, 0, 6, 0)
+        _v_layout.setSpacing(0)
+        _ver_lbl = QLabel(f"v{__version__}", self._version_widget)
+        _ver_lbl.setStyleSheet(
+            "color: #1f3a5f; font-size: 8pt; font-weight: bold;"
         )
-        self._version_label.setStyleSheet(
-            "color: #555; font-size: 9pt; padding-right: 6px;"
-        )
-        self._version_label.setToolTip(
+        _v_layout.addWidget(_ver_lbl)
+        for _clause in (s.strip() for s in __what_is_new__.split(" · ")):
+            if not _clause:
+                continue
+            lbl = QLabel(_clause, self._version_widget)
+            lbl.setStyleSheet("color: #555; font-size: 7pt;")
+            _v_layout.addWidget(lbl)
+        # Keep the old attribute name as an alias for any caller that
+        # still inspects ``self._version_label`` (e.g. external tests).
+        self._version_label = _ver_lbl
+        self._version_widget.setToolTip(
             f"Structural Analysis GUI v{__version__}\n"
             f"This release: {__what_is_new__}"
         )
         self.menuBar().setCornerWidget(
-            self._version_label, Qt.Corner.TopRightCorner,
+            self._version_widget, Qt.Corner.TopRightCorner,
         )
 
         # ── Selection menu (v0.27.0) ──

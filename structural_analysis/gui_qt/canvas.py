@@ -2261,10 +2261,12 @@ class ModelCanvas(QWidget):
             def _conv(v: float) -> float:
                 return _U.force_to_display(v, pid)
         # Conventional structural orientation: positive sagging moment
-        # plots BELOW the member centerline; positive shear / axial
-        # plot on the +normal side as before. The flip is display-only
-        # — sampled ys, max_ord, scale, critical-point picks, and the
-        # hover read-out (_diagram_value) all use the un-flipped ys.
+        # plots BELOW the member centerline (handled via ord_sign on the
+        # element-local normal). Shear uses a separate WORLD-anchored
+        # display normal (see below) so the diagram side matches the
+        # common SAP-like drafting convention. Both are display-only —
+        # sampled ys, max_ord, scale, critical-point picks, and the hover
+        # read-out (_diagram_value) all use the un-flipped numerical ys.
         if self.diagram_kind == "moment":
             ord_sign = -1.0
         else:
@@ -2275,23 +2277,83 @@ class ModelCanvas(QWidget):
             if L < 1e-12:
                 continue
             cx, cy = (nj.x - ni.x) / L, (nj.y - ni.y) / L
-            nx, ny = -cy, cx
 
-            def offset_point(xx, yy):
-                yy_disp = yy * ord_sign
-                return (
-                    ni.x + xx * cx + scale * yy_disp * nx,
-                    ni.y + xx * cy + scale * yy_disp * ny,
-                )
+            # ── Canonical display alignment ──
+            # SAP and our solver may disagree on which end of a member is
+            # "i" vs "j". For display we pick a canonical direction from
+            # the geometry alone:
+            #   • mostly horizontal member → canonical = left → right
+            #   • mostly vertical   member → canonical = bottom → top
+            # If the element's tangent (i → j) opposes the canonical
+            # direction, the diagram station coordinate is REVERSED — we
+            # walk the canonical direction starting from ``nj`` and read
+            # the sampled values in reverse order. This is display-only;
+            # ``sample_internal_force`` numerical values are untouched.
+            can_tx, can_ty, is_reversed = _canonical_display_direction(cx, cy)
+            if is_reversed:
+                # Walk follows the MEMBER (not the world canonical axis)
+                # so the diagram polyline lies on the inclined element
+                # for diagonal members. The canonical direction is only
+                # used to decide whether to reverse the iteration.
+                start_x, start_y = nj.x, nj.y
+                walk_tx, walk_ty = -cx, -cy
+                xs_disp = [L - x for x in reversed(xs)]
+                # Moment values pick up an overall sign under node-order
+                # reversal (they are computed in the element local frame,
+                # whose +y_local rotation flips when ``i`` and ``j`` swap),
+                # so the displayed moment needs an additional sign flip
+                # for the BMD to land on the same canonical side as the
+                # forward orientation. Shear and axial don't need this:
+                # for shear the world-anchored normal absorbs the swap,
+                # for axial the values are invariant. The user's spec:
+                # "numerical internal moment values remain unchanged;
+                # mirrored drawing side is display-only" — implemented
+                # here at the canvas layer.
+                if self.diagram_kind == "moment":
+                    ys_disp = [-y for y in reversed(ys)]
+                else:
+                    ys_disp = list(reversed(ys))
+            else:
+                start_x, start_y = ni.x, ni.y
+                walk_tx, walk_ty = cx, cy
+                xs_disp = list(xs)
+                ys_disp = list(ys)
+            # Element-local normal, computed for the CANONICAL tangent so
+            # moment / axial render the same regardless of node order.
+            nx, ny = -walk_ty, walk_tx
+
+            if self.diagram_kind == "shear":
+                # Shear display side: SIGN-based, anchored to WORLD axes
+                # (not the element local +y). Choose a positive visual
+                # normal from the canonical orientation:
+                #   • mostly horizontal member → world UP   → +V above
+                #   • mostly vertical member   → world RIGHT → +V right
+                # Then offset = signed V × positive_visual_normal, so
+                # +V draws top/right and −V draws bottom/left. The
+                # canonical-walk alignment above means a beam drawn
+                # right→left renders identically to the same beam drawn
+                # left→right. The element local y-axis and every numerical
+                # value are untouched.
+                vnx, vny = _shear_display_normal(can_tx, can_ty)
+
+                def offset_point(xx, yy):
+                    return (
+                        start_x + xx * walk_tx + scale * yy * vnx,
+                        start_y + xx * walk_ty + scale * yy * vny,
+                    )
+            else:
+                # Moment / axial: canonical-element-local normal + ord_sign.
+                # Walk + normal both follow the canonical direction so the
+                # diagram side stays consistent across node-order swaps.
+                def offset_point(xx, yy):
+                    yy_disp = yy * ord_sign
+                    return (
+                        start_x + xx * walk_tx + scale * yy_disp * nx,
+                        start_y + xx * walk_ty + scale * yy_disp * ny,
+                    )
 
             if self.diagram_kind in ("shear", "moment"):
-                # Split the sampled curve at interpolated zero crossings
-                # and fill each single-sign segment with the sign colour.
-                # Each closed polygon goes from the i-end of the segment
-                # along the curve to the j-end, then back along the
-                # member centerline so the fill sits between the curve
-                # and the member (just like the legacy single-fill).
-                segments = _diagram_sign_split(list(xs), list(ys))
+                segments = _diagram_sign_split(list(xs_disp), list(ys_disp))
                 for seg_xs, seg_ys, sign in segments:
                     if len(seg_xs) < 2:
                         continue
@@ -2308,25 +2370,26 @@ class ModelCanvas(QWidget):
                     self.ax.plot(
                         poly_x, poly_y, color=color, linewidth=1.0, zorder=2,
                     )
-                    # Close the polygon back along the member centerline.
-                    poly_x.append(ni.x + seg_xs[-1] * cx)
-                    poly_y.append(ni.y + seg_xs[-1] * cy)
-                    poly_x.append(ni.x + seg_xs[0] * cx)
-                    poly_y.append(ni.y + seg_xs[0] * cy)
+                    # Close the polygon back along the canonical centerline.
+                    poly_x.append(start_x + seg_xs[-1] * walk_tx)
+                    poly_y.append(start_y + seg_xs[-1] * walk_ty)
+                    poly_x.append(start_x + seg_xs[0] * walk_tx)
+                    poly_y.append(start_y + seg_xs[0] * walk_ty)
                     self.ax.fill(
                         poly_x, poly_y, color=color, alpha=0.25, zorder=1,
                     )
             else:
                 # Axial — single colour, no sign split.
                 color = axial_color
-                poly_x = [ni.x]
-                poly_y = [ni.y]
-                for xx, yy in zip(xs, ys):
+                poly_x = [start_x]
+                poly_y = [start_y]
+                for xx, yy in zip(xs_disp, ys_disp):
                     px, py = offset_point(xx, yy)
                     poly_x.append(px)
                     poly_y.append(py)
-                poly_x.append(nj.x)
-                poly_y.append(nj.y)
+                # Close to the far end of the canonical walk.
+                poly_x.append(start_x + L * walk_tx)
+                poly_y.append(start_y + L * walk_ty)
                 self.ax.fill(
                     poly_x, poly_y, color=color, alpha=0.25, zorder=1,
                 )
@@ -2334,36 +2397,38 @@ class ModelCanvas(QWidget):
                     poly_x, poly_y, color=color, linewidth=1.0, zorder=2,
                 )
 
-            # Per-element critical points: argmax(ys) and argmin(ys).
-            # If the diagram is constant (axial), max == min — label
-            # only once at midspan. Skip near-zero peaks (clutter).
+            # Per-element critical points: argmax / argmin of the displayed
+            # ordinates so the labels track the canonical walk too.
             threshold = 0.05 * max_ord
-            i_max = max(range(len(ys)), key=lambda i: ys[i])
-            i_min = min(range(len(ys)), key=lambda i: ys[i])
+            i_max = max(range(len(ys_disp)), key=lambda i: ys_disp[i])
+            i_min = min(range(len(ys_disp)), key=lambda i: ys_disp[i])
             picks: list[int] = []
-            if abs(ys[i_max] - ys[i_min]) < 1e-12 * max(max_ord, 1.0):
+            if (abs(ys_disp[i_max] - ys_disp[i_min])
+                    < 1e-12 * max(max_ord, 1.0)):
                 # Constant diagram — label once near the midspan.
-                picks = [len(xs) // 2]
+                picks = [len(xs_disp) // 2]
             else:
-                if abs(ys[i_max]) > threshold:
+                if abs(ys_disp[i_max]) > threshold:
                     picks.append(i_max)
-                if abs(ys[i_min]) > threshold and i_min != i_max:
+                if abs(ys_disp[i_min]) > threshold and i_min != i_max:
                     picks.append(i_min)
             for i in picks:
-                xx = xs[i]
-                yy = ys[i]
-                yy_disp = yy * ord_sign
+                xx = xs_disp[i]
+                yy = ys_disp[i]
                 # World-coords on the diagram polyline at this sample,
-                # using the same display flip applied to the fill.
-                world_x = ni.x + xx * cx + scale * yy_disp * nx
-                world_y = ni.y + xx * cy + scale * yy_disp * ny
+                # using the SAME display normal applied to the fill so
+                # the peak label sits on its matching polygon.
+                if self.diagram_kind == "shear":
+                    world_x = start_x + xx * walk_tx + scale * yy * vnx
+                    world_y = start_y + xx * walk_ty + scale * yy * vny
+                else:
+                    yy_disp = yy * ord_sign
+                    world_x = start_x + xx * walk_tx + scale * yy_disp * nx
+                    world_y = start_y + xx * walk_ty + scale * yy_disp * ny
                 # World-coords of the matching point on the element
-                # axis itself — that's what the snap engine should
-                # snap to (so a left-click in modelling tools still
-                # lands on the member geometry, not on the offset
-                # diagram polyline).
-                axis_x = ni.x + xx * cx
-                axis_y = ni.y + xx * cy
+                # axis itself (canonical walk) for snap targets.
+                axis_x = start_x + xx * walk_tx
+                axis_y = start_y + xx * walk_ty
                 # Marker colour follows the sign convention used for the
                 # fill (blue positive / red negative for V & M; legacy
                 # brown for axial).
@@ -2464,6 +2529,58 @@ class ModelCanvas(QWidget):
         no longer silently re-fits and throws their view away."""
         if not self._setting_axes_limits:
             self._user_view_dirty = True
+
+
+def _canonical_display_direction(
+    cx: float, cy: float,
+) -> tuple[float, float, bool]:
+    """Canonical (left→right / bottom→top) display direction for a member.
+
+    Display-only. Returns ``(canonical_tx, canonical_ty, is_reversed)``:
+
+    * ``(canonical_tx, canonical_ty)`` — the unit tangent in canonical
+      direction (``(+1, 0)`` for mostly horizontal members, ``(0, +1)``
+      for mostly vertical members);
+    * ``is_reversed`` — ``True`` when the element's geometric tangent
+      ``(cx, cy)`` (i → j) opposes the canonical direction. In that case
+      callers walk the diagram from ``nj`` along the canonical direction
+      and read the sampled ``xs`` / ``ys`` arrays in reverse order so
+      the displayed station axis matches the canonical convention.
+
+    This addresses the SAP-vs-our-program orientation mismatch (members
+    can be modelled with either end as "i") at the display layer only —
+    ``sample_internal_force`` and every numerical value are untouched.
+    A 45° tie picks horizontal (matches ``_shear_display_normal``).
+    """
+    if abs(cx) >= abs(cy):
+        canonical = (1.0, 0.0)
+    else:
+        canonical = (0.0, 1.0)
+    is_reversed = (cx * canonical[0] + cy * canonical[1]) < 0.0
+    return canonical[0], canonical[1], is_reversed
+
+
+def _shear_display_normal(cx: float, cy: float) -> tuple[float, float]:
+    """Positive visual normal for a shear diagram, anchored to WORLD axes.
+
+    Display-only. Given a member's unit tangent ``(cx, cy)`` (from node i
+    to node j), return the world-space direction in which a POSITIVE shear
+    value should be drawn, following the common SAP-like convention:
+
+    * mostly horizontal member (``|cx| >= |cy|``) → world UP ``(0, +1)``
+      so ``+V`` plots above the member and ``−V`` below it;
+    * mostly vertical member (``|cy| > |cx|``) → world RIGHT ``(+1, 0)``
+      so ``+V`` plots to the right of the member and ``−V`` to the left.
+
+    This never touches the element's structural local y-axis or any
+    numerical value; it only decides which side of the on-screen member
+    line the signed shear ordinate is offset toward. The caller draws
+    ``offset = signed_V × this_normal``, so the sign of V alone picks the
+    side (top/right for +, bottom/left for −).
+    """
+    if abs(cx) >= abs(cy):
+        return (0.0, 1.0)     # horizontal member → +V up
+    return (1.0, 0.0)         # vertical member → +V right
 
 
 def _udl_visual_components(
