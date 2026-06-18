@@ -1393,15 +1393,38 @@ def test_main_window_keeps_version_badge_top_right(qt_app):
     """The top-right version + what's-new badge in the menu bar
     must stay populated and reflect the current package version —
     don't regress the existing badge.
+
+    v0.40.6 layout: the badge is a small QWidget container with a
+    vertical stack of QLabels — first row is the version, subsequent
+    rows are the ``__what_is_new__`` clauses, so a long release note
+    no longer pushes the File / Edit / View menu titles aside on the
+    same row. The version + the full ``__what_is_new__`` must still
+    be reachable (one in the version row, the rest split across the
+    clause rows; the full text also lives in the tooltip).
     """
+    from PyQt6.QtWidgets import QLabel
     from structural_analysis import __version__, __what_is_new__
 
     w = MainWindow()
     qt_app.processEvents()
+    # Backward-compat alias still points at the version row label.
     assert w._version_label is not None
-    text = w._version_label.text()
-    assert __version__ in text
-    assert __what_is_new__ in text
+    assert __version__ in w._version_label.text()
+    # The container exists and stacks the version + clause labels.
+    assert w._version_widget is not None
+    labels = w._version_widget.findChildren(QLabel)
+    assert len(labels) >= 2, "badge must show >= 2 stacked rows"
+    combined = " ".join(lbl.text() for lbl in labels)
+    assert __version__ in combined
+    # Every clause from __what_is_new__ appears in some row.
+    for clause in (s.strip() for s in __what_is_new__.split(" · ")):
+        if not clause:
+            continue
+        assert clause in combined, f"clause missing from badge: {clause!r}"
+    # The full release text still lives in the tooltip for reference.
+    tooltip = w._version_widget.toolTip()
+    assert __version__ in tooltip
+    assert __what_is_new__ in tooltip
 
 
 # ── Element-detail interactive layer (crosshair, maxima, BMD) ─────
