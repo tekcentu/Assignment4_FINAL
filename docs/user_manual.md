@@ -136,7 +136,12 @@ After solving, the right-hand **overlay panel** controls what is drawn:
   (`element_graphics.evaluate_internal_force`), so the hover read-out, the
   canvas diagram, and the detail dialog always agree (`dM/dx = V`).
 - **File ▸ Export station results…** writes a CSV of N/V/M sampled at 21
-  stations per member (handy for comparing against SAP2000).
+  stations per member (handy for comparing against SAP2000). A dialog lets
+  you pick **which load cases / combinations** to write (any mix of solved
+  cases, `SUM_ALL`, and combinations — the active one is pre-checked) and
+  whether to export **all elements or only the current canvas selection**.
+  Every row is tagged with a leading **Load case / combination** column, so
+  several cases can be stacked in one file and pivoted/filtered in Excel.
 
 The CLI prints the same information as a text report: equation numbering, the
 assembled `K`/`F`, nodal displacements, member end forces, support reactions,

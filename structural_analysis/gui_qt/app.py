@@ -80,6 +80,7 @@ from ..gui_common.results_view import (
     format_result,
     relabel_component_to_structure,
     resolve_view,
+    view_label,
 )
 from ..gui_common.validation import (
     ModelValidationResult,
@@ -3555,19 +3556,37 @@ class MainWindow(QMainWindow):
     def _export_station_results(self) -> None:
         """Write a SAP2000-comparable per-element station CSV.
 
-        Columns: Element, x (m), N, V, M — N/V/M scaled to the active
-        Units V1 preset, x kept in metres. Truss elements contribute
-        only N (V/M cells left blank). Station count = 21 (≈ SAP's
-        1/20 span output)."""
+        Opens :class:`StationExportDialog` so the user picks *which* load
+        cases / combinations to export (each tagged in a leading
+        ``Load case / combination`` column) and whether to export every
+        element or only the canvas selection. N/V/M are scaled to the
+        active Units V1 preset, x stays in metres; truss elements contribute
+        only N (V/M cells blank). Station count = 21 (≈ SAP's 1/20 span)."""
         import csv
-        from .element_graphics import (
-            effective_member_loads, sample_internal_force,
-        )
-        from ..gui_common import units as _units_mod
+        from .dialogs import StationExportDialog
 
         if self._result is None or not getattr(
             self._result, "member_results", None,
         ):
+            return
+        sel_ids = set(self.canvas.get_selected_elements())
+        dlg = StationExportDialog(
+            self,
+            model=self._model,
+            multi_result=self._multi_result,
+            active_case=self._active_case,
+            selected_elem_ids=sel_ids,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.result_value is None:
+            return
+        case_keys, scope = dlg.result_value
+        elem_ids = sel_ids if scope == "selected" else None
+        rows = self._build_station_rows(case_keys, elem_ids)
+        if len(rows) <= 1:
+            QMessageBox.information(
+                self, "Nothing to export",
+                "The chosen cases / elements produced no station rows.",
+            )
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export station results", "stations.csv",
@@ -3575,47 +3594,6 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        pid = self._units_preset
-        fl = _units_mod.force_label(pid)
-        ml = _units_mod.moment_label(pid)
-        rows: list[list[object]] = [
-            ["Element", "x (m)", f"N ({fl})", f"V ({fl})", f"M ({ml})"],
-        ]
-        for elem in self._model.elements:
-            mr = self._result.member_results.get(elem.id)
-            if mr is None:
-                continue
-            ni = self._model.nodes[elem.node_i]
-            nj = self._model.nodes[elem.node_j]
-            f_local = list(mr["f_local"])
-            # Match the displayed result: case-filtered / factored span
-            # loads and the same vertical-jump stations as the canvas so
-            # exported numbers equal what the diagram shows.
-            eff_loads = effective_member_loads(
-                elem, self._active_case, self._model.load_combinations,
-            )
-            kw = dict(member_loads=eff_loads, split_discontinuities=True)
-            xs_n, ys_n = sample_internal_force(
-                elem, ni, nj, f_local, "axial", **kw)
-            xs_v, ys_v = sample_internal_force(
-                elem, ni, nj, f_local, "shear", **kw)
-            xs_m, ys_m = sample_internal_force(
-                elem, ni, nj, f_local, "moment", **kw)
-            if xs_n is None:
-                continue
-            for i, x in enumerate(xs_n):
-                n_val = _units_mod.force_to_display(ys_n[i], pid)
-                v_cell = (
-                    f"{_units_mod.force_to_display(ys_v[i], pid):.6g}"
-                    if ys_v is not None else ""
-                )
-                m_cell = (
-                    f"{_units_mod.moment_to_display(ys_m[i], pid):.6g}"
-                    if ys_m is not None else ""
-                )
-                rows.append([
-                    elem.id, f"{x:.6g}", f"{n_val:.6g}", v_cell, m_cell,
-                ])
         try:
             with open(path, "w", newline="", encoding="utf-8") as fh:
                 csv.writer(fh).writerows(rows)
@@ -3626,6 +3604,79 @@ class MainWindow(QMainWindow):
             )
             return
         self.set_status(f"Station results exported → {path}")
+
+    def _build_station_rows(
+        self,
+        case_keys: list[str],
+        elem_ids: set[int] | None = None,
+    ) -> list[list[object]]:
+        """Build the station CSV rows (header + data) — the testable core.
+
+        For each requested ``case_keys`` entry (a case / combination /
+        ``SUM_ALL`` identifier) the matching result is resolved via
+        :func:`resolve_view`, then every in-scope element is sampled through
+        the single-source-of-truth helpers so exported numbers equal the
+        on-canvas diagram. ``elem_ids=None`` exports all elements; otherwise
+        only the listed ids. Each row is tagged with the case/combination
+        label so stacked exports stay self-identifying in Excel."""
+        from .element_graphics import (
+            effective_member_loads, sample_internal_force,
+        )
+        from ..gui_common import units as _units_mod
+
+        pid = self._units_preset
+        fl = _units_mod.force_label(pid)
+        ml = _units_mod.moment_label(pid)
+        rows: list[list[object]] = [
+            ["Load case / combination", "Element", "x (m)",
+             f"N ({fl})", f"V ({fl})", f"M ({ml})"],
+        ]
+        for key in case_keys:
+            result, _status = resolve_view(
+                self._model, self._multi_result, key,
+            )
+            if result is None or not getattr(result, "member_results", None):
+                continue
+            label = view_label(self._model, key)
+            for elem in self._model.elements:
+                if elem_ids is not None and elem.id not in elem_ids:
+                    continue
+                mr = result.member_results.get(elem.id)
+                if mr is None:
+                    continue
+                ni = self._model.nodes[elem.node_i]
+                nj = self._model.nodes[elem.node_j]
+                f_local = list(mr["f_local"])
+                # Match the displayed result: case-filtered / factored span
+                # loads and the same vertical-jump stations as the canvas so
+                # exported numbers equal what the diagram shows.
+                eff_loads = effective_member_loads(
+                    elem, key, self._model.load_combinations,
+                )
+                kw = dict(member_loads=eff_loads, split_discontinuities=True)
+                xs_n, ys_n = sample_internal_force(
+                    elem, ni, nj, f_local, "axial", **kw)
+                _, ys_v = sample_internal_force(
+                    elem, ni, nj, f_local, "shear", **kw)
+                _, ys_m = sample_internal_force(
+                    elem, ni, nj, f_local, "moment", **kw)
+                if xs_n is None:
+                    continue
+                for i, x in enumerate(xs_n):
+                    n_val = _units_mod.force_to_display(ys_n[i], pid)
+                    v_cell = (
+                        f"{_units_mod.force_to_display(ys_v[i], pid):.6g}"
+                        if ys_v is not None else ""
+                    )
+                    m_cell = (
+                        f"{_units_mod.moment_to_display(ys_m[i], pid):.6g}"
+                        if ys_m is not None else ""
+                    )
+                    rows.append([
+                        label, elem.id, f"{x:.6g}",
+                        f"{n_val:.6g}", v_cell, m_cell,
+                    ])
+        return rows
 
     # ── solve ──
 

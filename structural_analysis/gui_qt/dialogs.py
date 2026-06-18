@@ -5182,3 +5182,119 @@ class GroupManagerDialog(QDialog):
     def _on_delete(self) -> None:
         self._host._group_delete()
         self._rebuild_table()
+
+
+class StationExportDialog(_ModalDialog):
+    """Pick what goes into a station-results CSV (File → Export station results…).
+
+    Two choices, both requested for the Excel workflow:
+
+    * **Which results** — a checklist of every solved load case, ``SUM_ALL``
+      (when available), and every combination, built from the same
+      :func:`case_combo_entries` the toolbar selector uses so labels match.
+      The currently-active selection is pre-checked.
+    * **Which elements** — *all* elements, or only the ones selected on the
+      canvas (disabled when the selection is empty).
+
+    ``result_value`` is set to ``(case_keys, elem_scope)`` where ``case_keys``
+    is the list of raw case / combination / ``SUM_ALL`` identifiers (combo
+    userData, not the display label) and ``elem_scope`` is ``"all"`` or
+    ``"selected"``.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        model: StructuralModel,
+        multi_result,
+        active_case: str,
+        selected_elem_ids: frozenset[int] | set[int] = frozenset(),
+    ) -> None:
+        self._model = model
+        self._multi_result = multi_result
+        self._active_case = active_case
+        self._selected_ids = frozenset(selected_elem_ids)
+        super().__init__(parent, "Export station results")
+        self.resize(380, 440)
+
+    def _build_body(self, body: QWidget) -> None:
+        from PyQt6.QtWidgets import (
+            QGroupBox, QListWidget, QListWidgetItem,
+        )
+        from ..gui_common.results_view import case_combo_entries
+
+        layout = QVBoxLayout(body)
+
+        layout.addWidget(QLabel("Load cases / combinations to export:", body))
+        self._list = QListWidget(body)
+        entries = case_combo_entries(self._model, self._multi_result)
+        any_checked = False
+        for label, raw in entries:
+            item = QListWidgetItem(label, self._list)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            checked = raw == self._active_case
+            any_checked = any_checked or checked
+            item.setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+            item.setData(Qt.ItemDataRole.UserRole, raw)
+        # If the active selection isn't a normal case/combo (e.g. nothing
+        # solved yet, or a stale key), fall back to checking the first row so
+        # the dialog never opens with an all-blank list.
+        if not any_checked and self._list.count():
+            self._list.item(0).setCheckState(Qt.CheckState.Checked)
+        layout.addWidget(self._list)
+
+        row = QHBoxLayout()
+        btn_all = QPushButton("Select all", body)
+        btn_none = QPushButton("Clear", body)
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        row.addWidget(btn_all)
+        row.addWidget(btn_none)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        scope_box = QGroupBox("Elements", body)
+        scope_layout = QVBoxLayout(scope_box)
+        self._rb_all = QRadioButton("All elements", scope_box)
+        n_sel = len(self._selected_ids)
+        self._rb_sel = QRadioButton(
+            f"Selected elements only ({n_sel})", scope_box,
+        )
+        self._rb_all.setChecked(True)
+        self._rb_sel.setEnabled(bool(self._selected_ids))
+        if not self._selected_ids:
+            self._rb_sel.setToolTip(
+                "No element selection. Close, select elements on the "
+                "canvas, then reopen this dialog."
+            )
+        group = QButtonGroup(scope_box)
+        group.addButton(self._rb_all)
+        group.addButton(self._rb_sel)
+        scope_layout.addWidget(self._rb_all)
+        scope_layout.addWidget(self._rb_sel)
+        layout.addWidget(scope_box)
+
+    def _set_all(self, on: bool) -> None:
+        state = Qt.CheckState.Checked if on else Qt.CheckState.Unchecked
+        for i in range(self._list.count()):
+            self._list.item(i).setCheckState(state)
+
+    def _checked_keys(self) -> list[str]:
+        keys: list[str] = []
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                keys.append(it.data(Qt.ItemDataRole.UserRole))
+        return keys
+
+    def _accept(self) -> tuple[list[str], str]:
+        keys = self._checked_keys()
+        if not keys:
+            raise ValueError(
+                "Select at least one load case or combination to export."
+            )
+        scope = "selected" if self._rb_sel.isChecked() else "all"
+        return keys, scope
