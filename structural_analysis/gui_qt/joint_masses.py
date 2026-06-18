@@ -94,14 +94,21 @@ class JointMassesWindow(QMainWindow):
         header_row.addStretch(1)
 
         self._method_group = QButtonGroup(self)
-        self._rb_rowsum = QRadioButton("Row-sum equivalent", central)
-        self._rb_diag = QRadioButton("Diagonal", central)
+        # ``method`` is a TABLE-DISPLAY toggle (Row-sum / raw diagonal of M),
+        # NOT a mass formulation. The mass formulation lives in a separate
+        # row below (Consistent / Lumped). The label clarifies this for
+        # reviewers (final-submission cleanup) — see docs/mass_inspect for
+        # the SAP-mirrored definitions.
+        self._rb_rowsum = QRadioButton(
+            "Row-sum (Σ block) — SAP-style", central)
+        self._rb_diag = QRadioButton(
+            "Diagonal — raw M[i,i]", central)
         self._rb_rowsum.setChecked(True)
         self._method_group.addButton(self._rb_rowsum)
         self._method_group.addButton(self._rb_diag)
         self._rb_rowsum.toggled.connect(self._on_method_changed)
         self._rb_diag.toggled.connect(self._on_method_changed)
-        header_row.addWidget(QLabel("Summary method:", central))
+        header_row.addWidget(QLabel("Table view:", central))
         header_row.addWidget(self._rb_rowsum)
         header_row.addWidget(self._rb_diag)
 
