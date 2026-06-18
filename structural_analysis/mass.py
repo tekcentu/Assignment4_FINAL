@@ -65,17 +65,20 @@ def assemble_mass_matrix(
     model: StructuralModel,
     dofs: DofManager,
     *,
-    formulation: MassFormulation = "consistent",
+    formulation: MassFormulation = "lumped",
 ) -> np.ndarray:
     """Assemble the global mass matrix.
 
     Args:
         model: The structural model.
         dofs: DOF manager whose ordering matches the one used for K.
-        formulation: ``"consistent"`` (default — Hermite-cubic element
-            mass, carries rotational inertia on rz DOFs) or ``"lumped"``
-            (translational-only — half the bar mass at each end on ux
-            and uy, zero on rz). The lumped path is a modal-comparison
+        formulation: ``"lumped"`` (default — translational-only, half
+            the bar mass at each end on ux and uy, zero on rz; the
+            only formulation exposed by the user-facing modal workflow
+            in the final-submission build) or ``"consistent"`` (internal
+            helper kept for low-level tests and the diagnostic Joint
+            Masses inspector — energy-consistent Hermite-cubic element
+            mass, carries rotational inertia on rz DOFs). The lumped path
             aid; with it the global M is singular on every rz row/col
             and the modal solver in :func:`solve_modal` condenses those
             DOFs out (Guyan reduction).
@@ -119,7 +122,7 @@ def assemble_mass_matrix_with_source(
     model: StructuralModel,
     dofs: DofManager,
     *,
-    formulation: MassFormulation = "consistent",
+    formulation: MassFormulation = "lumped",
     source: ModalMassSource | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     """Assemble the global mass matrix using a :class:`ModalMassSource`.

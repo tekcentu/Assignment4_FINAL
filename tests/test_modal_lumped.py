@@ -57,19 +57,34 @@ def _fixed_base_column(
 # ── 1. default-consistent regression lock ─────────────────────
 
 
-def test_default_modal_is_unchanged_from_v0_9_1():
-    """Calling solve_modal without mass_formulation must use consistent
-    mass and return identical numbers to the v0.9.1 default path. If a
-    future edit accidentally changes the default behaviour, this test
-    catches it."""
+def test_default_modal_is_lumped_and_consistent_is_deprecated():
+    """Final-submission build: the default formulation is lumped, and
+    passing ``"consistent"`` is accepted only as a graceful backward-
+    compat path — it emits a :class:`DeprecationWarning` and is
+    transparently mapped to lumped (no silent crash, no fake result).
+    Previously this test pinned ``default == "consistent"``; the
+    final-submission cleanup intentionally flips it."""
+    import warnings
+
     m = _fixed_base_column()
     r_default = solve_modal(m, n_modes=3)
-    r_explicit = solve_modal(m, n_modes=3, mass_formulation="consistent")
+    assert r_default.mass_formulation == "lumped"
+    # Explicit lumped must equal the default.
+    r_explicit_lumped = solve_modal(m, n_modes=3, mass_formulation="lumped")
     np.testing.assert_allclose(
-        r_default.frequencies, r_explicit.frequencies,
+        r_default.frequencies, r_explicit_lumped.frequencies,
         rtol=0.0, atol=0.0,
     )
-    assert r_default.mass_formulation == "consistent"
+    # Passing "consistent" warns and maps to lumped (= default).
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        r_legacy = solve_modal(m, n_modes=3, mass_formulation="consistent")
+    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+    assert r_legacy.mass_formulation == "lumped"
+    np.testing.assert_allclose(
+        r_legacy.frequencies, r_default.frequencies,
+        rtol=0.0, atol=0.0,
+    )
 
 
 # ── 2. analytical 1-DOF mass-on-spring (axial cantilever) ──────
@@ -106,31 +121,45 @@ def test_lumped_axial_cantilever_matches_one_dof_omega():
 # ── 3. fixed-base column: lumped removes rotational mode(s) ────
 
 
-def test_lumped_column_has_fewer_modes_than_consistent_when_rotational_excluded():
-    """Lumped mass removes rotational kinetic energy → fewer modal DOFs
-    than consistent on a model with rz DOFs. We assert the inequality,
-    not an exact count, because the answer depends on the mesh and on
-    whether intermediate nodes carry rz."""
-    m = _fixed_base_column()
-    r_c = solve_modal(m, n_modes=10, mass_formulation="consistent")
-    r_l = solve_modal(m, n_modes=10, mass_formulation="lumped")
+def test_lumped_column_modes_match_mass_bearing_dof_count():
+    """Lumped mass condenses massless rotational DOFs out of the modal
+    eigenproblem, so the returned mode count equals the number of
+    mass-bearing free DOFs (translational only on a frame member).
 
-    # Single 2-node column has free DOFs at node 2: {ux, uy, rz} (3).
-    # Lumped condenses rz out → 2 mass-bearing DOFs → at most 2 modes.
-    # We don't hard-code "2"; we assert lumped < consistent and lumped >= 1.
-    assert r_l.n_modes < r_c.n_modes
-    assert r_l.n_modes >= 1
+    Replaces the pre-fix lumped-vs-consistent comparison: since the
+    user-facing modal workflow now only exposes lumped, the comparison
+    is no longer meaningful through the public API. We instead pin the
+    physical invariant — fewer modes than free DOFs because the rz
+    block was condensed away — which is what the user actually relies
+    on for output."""
+    m = _fixed_base_column()
+    r = solve_modal(m, n_modes=10, mass_formulation="lumped")
+
+    # Single 2-node column has 3 free DOFs at node 2 (ux, uy, rz).
+    # Lumped is translational-only → 2 mass-bearing DOFs → at most 2 modes.
+    assert r.n_modes <= 2
+    assert r.n_modes >= 1
+    assert r.mass_formulation == "lumped"
 
 
 # ── 4. ModalResult carries the formulation tag ────────────────
 
 
 def test_modal_result_records_mass_formulation():
+    """Round-trip the formulation tag through ``ModalResult``. In the
+    final-submission build, the public path always tags the result
+    ``"lumped"`` — passing ``"consistent"`` is mapped to lumped (and
+    emits a DeprecationWarning) so the recorded tag is still
+    ``"lumped"``."""
+    import warnings
+
     m = _fixed_base_column()
     r_l = solve_modal(m, n_modes=3, mass_formulation="lumped")
     assert r_l.mass_formulation == "lumped"
-    r_c = solve_modal(m, n_modes=3, mass_formulation="consistent")
-    assert r_c.mass_formulation == "consistent"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        r_legacy = solve_modal(m, n_modes=3, mass_formulation="consistent")
+    assert r_legacy.mass_formulation == "lumped"
 
 
 def test_lumped_modal_appends_comparison_note_warning():
