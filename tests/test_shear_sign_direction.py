@@ -319,3 +319,168 @@ def test_hover_readout_V_value_unchanged(qt_app):
     m = re.search(r"=\s*([+-]?\d+\.?\d*)", txt)
     assert m, txt
     assert float(m.group(1)) == pytest.approx(expected_v, rel=1e-3, abs=1e-3)
+
+
+# ── 8. Canonical display direction & node-order invariance ──────────────
+
+
+from structural_analysis.gui_qt.canvas import (  # noqa: E402
+    _canonical_display_direction,
+)
+
+
+def test_canonical_horizontal_left_to_right_is_not_reversed():
+    can_tx, can_ty, is_rev = _canonical_display_direction(1.0, 0.0)
+    assert (can_tx, can_ty) == (1.0, 0.0)
+    assert is_rev is False
+
+
+def test_canonical_horizontal_right_to_left_is_reversed():
+    can_tx, can_ty, is_rev = _canonical_display_direction(-1.0, 0.0)
+    assert (can_tx, can_ty) == (1.0, 0.0)
+    assert is_rev is True
+
+
+def test_canonical_vertical_bottom_to_top_is_not_reversed():
+    can_tx, can_ty, is_rev = _canonical_display_direction(0.0, 1.0)
+    assert (can_tx, can_ty) == (0.0, 1.0)
+    assert is_rev is False
+
+
+def test_canonical_vertical_top_to_bottom_is_reversed():
+    can_tx, can_ty, is_rev = _canonical_display_direction(0.0, -1.0)
+    assert (can_tx, can_ty) == (0.0, 1.0)
+    assert is_rev is True
+
+
+def _ss_beam_global_udl(*, reversed_order: bool):
+    """SS beam with a GLOBAL-coord UDL (physical load independent of
+    element node order)."""
+    m = StructuralModel(title="ss beam")
+    m.materials[1] = Material(id=1, name="C", E=2.0e8, density=0.0)
+    m.sections[1] = Section(id=1, name="S", material_id=1,
+                            A=0.02, I=8e-4, depth=0.3)
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 6.0, 0.0)}
+    if reversed_order:
+        e = FrameElement2D(id=1, node_i=2, node_j=1, E=2.0e8,
+                           A=0.02, I=8e-4, section_id=1)
+    else:
+        e = FrameElement2D(id=1, node_i=1, node_j=2, E=2.0e8,
+                           A=0.02, I=8e-4, section_id=1)
+    e.member_loads.append(
+        UniformDistributedLoad(wy=-10.0, coord_system="global"))
+    m.elements = [e]
+    m.supports = {1: Support(1, ux=True, uy=True, rz=False),
+                  2: Support(2, ux=False, uy=True, rz=False)}
+    return m
+
+
+def _vertical_column_global(*, reversed_order: bool, tip_fx: float):
+    m = StructuralModel(title="column")
+    m.materials[1] = Material(id=1, name="C", E=2.0e8, density=0.0)
+    m.sections[1] = Section(id=1, name="S", material_id=1,
+                            A=0.02, I=8e-4, depth=0.3)
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, 0.0, 4.0)}
+    if reversed_order:
+        e = FrameElement2D(id=1, node_i=2, node_j=1, E=2.0e8,
+                           A=0.02, I=8e-4, section_id=1)
+    else:
+        e = FrameElement2D(id=1, node_i=1, node_j=2, E=2.0e8,
+                           A=0.02, I=8e-4, section_id=1)
+    m.elements = [e]
+    m.supports = {1: Support(1, ux=True, uy=True, rz=True)}
+    m.nodal_loads = [NodalLoad(node_id=2, fx=tip_fx)]
+    return m
+
+
+def _patch_centroids(canvas: ModelCanvas):
+    """Per-patch (cx, cy, colour) — used to compare visual layout
+    between two node-order variants of the same model."""
+    out = []
+    for p in canvas.ax.patches:
+        v = p.get_path().vertices
+        c = p.get_facecolor()
+        col = "blue" if c[2] > 0.5 else "red" if c[0] > 0.5 else "other"
+        out.append((float(v[:, 0].mean()), float(v[:, 1].mean()), col))
+    # Sort so the two variants compare element-wise.
+    return sorted(out)
+
+
+def test_horizontal_beam_reversed_node_order_renders_identically(qt_app):
+    """A sign-changing SS beam: drawn left→right vs right→left must
+    produce the SAME physical visual (same colours, same sides) after
+    the canonical-display alignment."""
+    a = _patch_centroids(_shear_canvas(_ss_beam_global_udl(
+        reversed_order=False)))
+    b = _patch_centroids(_shear_canvas(_ss_beam_global_udl(
+        reversed_order=True)))
+    assert len(a) == len(b)
+    for (ax, ay, ac), (bx, by, bc) in zip(a, b):
+        assert ac == bc
+        assert ax == pytest.approx(bx, abs=1e-6)
+        assert ay == pytest.approx(by, abs=1e-6)
+
+
+def test_vertical_column_reversed_node_order_renders_identically(qt_app):
+    """A vertical column with horizontal tip load: drawn bottom→top vs
+    top→bottom must produce the same visual (positive shear right)."""
+    for tip_fx in (+10.0, -10.0):
+        a = _patch_centroids(_shear_canvas(_vertical_column_global(
+            reversed_order=False, tip_fx=tip_fx)))
+        b = _patch_centroids(_shear_canvas(_vertical_column_global(
+            reversed_order=True, tip_fx=tip_fx)))
+        assert len(a) == len(b)
+        for (ax, ay, ac), (bx, by, bc) in zip(a, b):
+            assert ac == bc
+            assert ax == pytest.approx(bx, abs=1e-6)
+            assert ay == pytest.approx(by, abs=1e-6)
+
+
+def test_internal_sample_internal_force_values_are_node_order_dependent():
+    """Sanity: ``sample_internal_force`` itself IS sensitive to node
+    order (the canonical alignment lives in the CANVAS, not in the
+    helper) — so numerical V values still reflect the local frame the
+    solver used."""
+    m_fwd = _ss_beam_global_udl(reversed_order=False)
+    m_rev = _ss_beam_global_udl(reversed_order=True)
+    r_fwd = run_analysis(m_fwd, verbose=False)
+    r_rev = run_analysis(m_rev, verbose=False)
+    e_fwd = m_fwd.elements[0]
+    e_rev = m_rev.elements[0]
+    _, vs_fwd = sample_internal_force(
+        e_fwd, m_fwd.nodes[e_fwd.node_i], m_fwd.nodes[e_fwd.node_j],
+        list(r_fwd.member_results[e_fwd.id]["f_local"]),
+        "shear", n_samples=5)
+    _, vs_rev = sample_internal_force(
+        e_rev, m_rev.nodes[e_rev.node_i], m_rev.nodes[e_rev.node_j],
+        list(r_rev.member_results[e_rev.id]["f_local"]),
+        "shear", n_samples=5)
+    # Reversed orientation: V values sign-flipped relative to forward
+    # (so when read in reverse iteration order they recreate the same
+    # physical curve — which the canvas exploits).
+    for a, b in zip(vs_fwd, list(reversed(vs_rev))):
+        assert a == pytest.approx(b, abs=1e-6)
+
+
+def test_moment_diagram_reversed_node_order_renders_identically(qt_app):
+    """A SS-beam moment diagram: drawn left→right vs right→left must
+    render to the SAME side of the member. The user's instruction
+    'moment numerical values unchanged, station order reverses when
+    member direction is reversed' lands the moment fill on the same
+    canonical side regardless of node order."""
+    m_fwd = _ss_beam_global_udl(reversed_order=False)
+    m_rev = _ss_beam_global_udl(reversed_order=True)
+    for m in (m_fwd, m_rev):
+        canvas = ModelCanvas(None, model_provider=lambda mm=m: mm)
+        canvas._result = run_analysis(m, verbose=False)
+        canvas.diagram_kind = "moment"
+        canvas.diagram_scale = 1.0
+        canvas.diagram_stations = 21
+        canvas._draw_diagrams()
+        m._centroids = _patch_centroids(canvas)
+    assert m_fwd._centroids == m_rev._centroids or all(
+        a[2] == b[2]
+        and a[0] == pytest.approx(b[0], abs=1e-6)
+        and a[1] == pytest.approx(b[1], abs=1e-6)
+        for a, b in zip(m_fwd._centroids, m_rev._centroids)
+    )
