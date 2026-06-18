@@ -1,10 +1,10 @@
 """2D Structural Analysis Package — CE 4011 Assignment 3."""
 
-__version__ = "0.41.0"
+__version__ = "0.42.0"
 __what_is_new__ = (
-    "Case selector now filters canvas load glyphs (works before solve) · "
-    "Combination shows factored effective loads · "
-    "SUM_ALL shows every load"
+    "Building Wizard: separate beam / column section selectors · "
+    "Visible 'Building Wizard' toolbar caption · "
+    "Validates both sections before generating"
 )
 
 from .model import (

@@ -4281,9 +4281,9 @@ class BuildingWizardDialog(_ModalDialog):
         if not model.sections:
             raise ValueError(
                 "No sections defined — add a section before running the "
-                "building wizard."
+                "Building Wizard."
             )
-        super().__init__(parent, "Building wizard")
+        super().__init__(parent, "Building Wizard")
 
     def _build_body(self, body: QWidget) -> None:
         form = QFormLayout(body)
@@ -4310,15 +4310,12 @@ class BuildingWizardDialog(_ModalDialog):
         self._bay_w.setSuffix(" m")
         self._bay_w.setValue(5.0)
 
-        self._sec_combo = QComboBox(body)
-        for sid in sorted(self._source_model.sections):
-            s = self._source_model.sections[sid]
-            mat = self._source_model.materials.get(s.material_id)
-            mat_name = (
-                mat.name if (mat and mat.name) else f"mat {s.material_id}"
-            )
-            label = f"{s.name or 'unnamed'} / {mat_name}"
-            self._sec_combo.addItem(label, sid)
+        # Separate column / beam section selectors, each populated from the
+        # source model's existing section library (no new section system).
+        # Both default to the first section so the legacy single-default
+        # behaviour is preserved when the user doesn't change them.
+        self._col_sec_combo = self._make_section_combo(body)
+        self._beam_sec_combo = self._make_section_combo(body)
 
         self._fixed_base = QCheckBox(
             "Fixed (ux, uy, rz) supports at every ground node", body,
@@ -4329,35 +4326,63 @@ class BuildingWizardDialog(_ModalDialog):
         form.addRow("Story height:", self._story_h)
         form.addRow("Bays (X direction):", self._bays)
         form.addRow("Bay width:", self._bay_w)
-        form.addRow("Section (cols & beams):", self._sec_combo)
+        form.addRow("Column section:", self._col_sec_combo)
+        form.addRow("Beam section:", self._beam_sec_combo)
         form.addRow("", self._fixed_base)
 
         hint = QLabel(
             "Generates a planar moment-frame: vertical columns at each "
             "column line, horizontal beams at every floor above ground. "
-            "Replaces the current model — materials and sections are "
-            "preserved. Use Undo (Ctrl+Z) to restore.",
+            "Columns get the selected column section, beams the selected "
+            "beam section. Replaces the current model — materials and "
+            "sections are preserved. Use Undo (Ctrl+Z) to restore.",
             body,
         )
         hint.setWordWrap(True)
         form.addRow(hint)
+
+    def _make_section_combo(self, body: QWidget) -> QComboBox:
+        """Build a section selector populated from the source model's
+        existing section library, labelled ``"<section> / <material>"``."""
+        combo = QComboBox(body)
+        for sid in sorted(self._source_model.sections):
+            s = self._source_model.sections[sid]
+            mat = self._source_model.materials.get(s.material_id)
+            mat_name = (
+                mat.name if (mat and mat.name) else f"mat {s.material_id}"
+            )
+            label = f"{s.name or 'unnamed'} / {mat_name}"
+            combo.addItem(label, sid)
+        return combo
+
+    def _resolve_section(self, combo: QComboBox, role: str):
+        """Return the ``(Section, Material)`` for a section combo, raising
+        a clear validation error if the selection or its material is
+        missing — so the wizard never generates an invalid model."""
+        sid = combo.currentData()
+        if sid is None or sid not in self._source_model.sections:
+            raise ValueError(f"No valid {role} section selected.")
+        section = self._source_model.sections[sid]
+        mat = self._source_model.materials.get(section.material_id)
+        if mat is None:
+            raise ValueError(
+                f"The {role} section '{section.name or sid}' references "
+                f"missing material {section.material_id}."
+            )
+        return section, mat
 
     def _accept(self) -> StructuralModel:
         stories = int(self._stories.value())
         h = float(self._story_h.value())
         bays = int(self._bays.value())
         bw = float(self._bay_w.value())
-        sid = self._sec_combo.currentData()
-        if sid is None or sid not in self._source_model.sections:
-            raise ValueError("No valid section selected.")
 
-        section = self._source_model.sections[sid]
-        mat = self._source_model.materials.get(section.material_id)
-        if mat is None:
-            raise ValueError(
-                f"Section {sid} references missing material "
-                f"{section.material_id}."
-            )
+        col_section, col_mat = self._resolve_section(
+            self._col_sec_combo, "column",
+        )
+        beam_section, beam_mat = self._resolve_section(
+            self._beam_sec_combo, "beam",
+        )
 
         m = StructuralModel(title=f"Building {stories}s × {bays}b")
         m.materials = dict(self._source_model.materials)
@@ -4376,30 +4401,31 @@ class BuildingWizardDialog(_ModalDialog):
             node_grid.append(row)
 
         eid = 1
-        # Columns: each column line, each story.
+        # Columns: each column line, each story — selected column section.
         for i in range(bays + 1):
             for j in range(stories):
                 m.elements.append(FrameElement2D(
                     id=eid,
                     node_i=node_grid[j][i],
                     node_j=node_grid[j + 1][i],
-                    E=mat.E, A=section.A, I=section.I,
-                    alpha=mat.alpha, rho=mat.density,
-                    depth=section.depth,
-                    section_id=section.id,
+                    E=col_mat.E, A=col_section.A, I=col_section.I,
+                    alpha=col_mat.alpha, rho=col_mat.density,
+                    depth=col_section.depth,
+                    section_id=col_section.id,
                 ))
                 eid += 1
-        # Beams: every floor above ground, between adjacent columns.
+        # Beams: every floor above ground, between adjacent columns —
+        # selected beam section.
         for j in range(1, stories + 1):
             for i in range(bays):
                 m.elements.append(FrameElement2D(
                     id=eid,
                     node_i=node_grid[j][i],
                     node_j=node_grid[j][i + 1],
-                    E=mat.E, A=section.A, I=section.I,
-                    alpha=mat.alpha, rho=mat.density,
-                    depth=section.depth,
-                    section_id=section.id,
+                    E=beam_mat.E, A=beam_section.A, I=beam_section.I,
+                    alpha=beam_mat.alpha, rho=beam_mat.density,
+                    depth=beam_section.depth,
+                    section_id=beam_section.id,
                 ))
                 eid += 1
 
