@@ -946,3 +946,30 @@ class TestA4IntegrationClampedThermalBar:
         # 3. Member internal axial force = −N_T (compression)
         assert abs(r.member_results[1]["f_local"][0] - (-N_T)) < 1e-6
 
+
+def test_rigid_offset_udl_reactions_include_full_member_length():
+    """Regression: a full-length UDL must include rigid end-zone load."""
+    L_total = 10.0
+    offset_i = 3.0
+    offset_j = 2.0
+    w = 7.5
+    m = StructuralModel(title="rigid offset full-length UDL equilibrium")
+    m.nodes = {1: Node(1, 0.0, 0.0), 2: Node(2, L_total, 0.0)}
+    m.elements = [FrameElement2D(
+        id=1, node_i=1, node_j=2, E=200000.0, A=0.02, I=0.08,
+        offset_i=offset_i, offset_j=offset_j,
+        member_loads=[UniformDistributedLoad(wy=-w)],
+    )]
+    m.supports = {
+        1: Support(1, ux=True, uy=True, rz=False),
+        2: Support(2, ux=False, uy=True, rz=False),
+    }
+    m.nodal_loads = []
+
+    r = run_analysis(m, verbose=False)
+
+    assert r.status == "ok"
+    total_ry = sum(reac.get("uy", 0.0) for reac in r.reactions.values())
+    assert total_ry == pytest.approx(w * L_total, rel=1e-9)
+    flexible_only = w * (L_total - offset_i - offset_j)
+    assert total_ry != pytest.approx(flexible_only, rel=1e-9)
